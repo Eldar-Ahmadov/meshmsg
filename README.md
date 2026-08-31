@@ -1,0 +1,85 @@
+# meshmsg
+
+A small peer-to-peer messaging CLI built on [Iroh Gossip](https://github.com/n0-computer/iroh-gossip). The VPS is a persistent bootstrap **seed**, not a message broker.
+
+## Install
+
+```sh
+cargo install --path .
+```
+
+State defaults to `$XDG_DATA_HOME/meshmsg` (`~/.local/share/meshmsg`). Override it with `--state-dir` or `MESHMSG_STATE_DIR`.
+
+## First message
+
+On the VPS:
+
+```sh
+meshmsg seed init
+meshmsg seed run
+```
+
+`seed run` prints an invite. It can also be retrieved in another shell after the seed has started:
+
+```sh
+meshmsg seed invite
+```
+
+On each client:
+
+```sh
+meshmsg join '<invite>'
+meshmsg listen
+```
+
+Send from another joined client:
+
+```sh
+meshmsg send 'hello'
+```
+
+Or send and receive interactively:
+
+```sh
+meshmsg chat
+```
+
+## Automation
+
+Use `--json` for one-shot JSON and NDJSON event streams:
+
+```sh
+meshmsg --json status
+meshmsg --json listen
+meshmsg --json send 'hello'
+meshmsg doctor
+```
+
+The private identity is stored in `secret.key` with mode `0600`. Keep the seed process running so new peers can bootstrap and the gossip swarm remains available.
+
+## systemd seed service
+
+Create `~/.config/systemd/user/meshmsg-seed.service` (adjust the executable path):
+
+```ini
+[Unit]
+Description=meshmsg Iroh Gossip seed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/meshmsg --json seed run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+Then run:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now meshmsg-seed
+journalctl --user -u meshmsg-seed -f
+```
