@@ -44,6 +44,19 @@ Or send and receive interactively:
 meshmsg chat
 ```
 
+## Add redundant seeds
+
+On a new always-on machine, join the existing seed set and run it:
+
+```sh
+meshmsg seed join '<invite-from-existing-seed>'
+meshmsg seed run
+```
+
+The new seed retains its own identity, connects to the same topic, and prints a new invite containing both the old seed set and itself. Distribute that expanded invite to clients so they can bootstrap through any listed seed. Seeds are equal peers; there is no leader or broker. Up to 16 seeds are accepted in an invite.
+
+A seed safely ignores its own endpoint in its persisted invite when restarting.
+
 ## Automation
 
 Use `--json` for one-shot JSON and NDJSON event streams:
@@ -55,7 +68,7 @@ meshmsg --json send 'hello'
 meshmsg doctor
 ```
 
-The private identity is stored in `secret.key` with mode `0600`. Keep the seed process running so new peers can bootstrap and the gossip swarm remains available.
+The private identity is stored in `secret.key` with mode `0600`. Keep at least one seed process running so new peers can bootstrap and the gossip swarm remains available.
 
 ## systemd seed service
 

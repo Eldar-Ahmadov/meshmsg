@@ -77,15 +77,22 @@ async fn start(dir: &Path) -> Result<RunningNode> {
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .spawn();
-    let subscription = if let Some(token) = state.invite {
+    let mut bootstrap = Vec::new();
+    if let Some(token) = state.invite {
         let invite: Invite = token.parse()?;
-        lookup.add_endpoint_info(invite.seed.clone());
-        gossip
-            .subscribe_and_join(topic, vec![invite.seed.id])
-            .await?
-    } else {
-        // A seed creates the swarm, so there is no peer for it to wait to join.
+        for seed in invite.seeds {
+            // A seed's persisted invite also contains itself after its first run.
+            if seed.id != endpoint.id() {
+                bootstrap.push(seed.id);
+                lookup.add_endpoint_info(seed);
+            }
+        }
+    }
+    let subscription = if bootstrap.is_empty() {
+        // The first seed creates the swarm, so there is no peer to wait for.
         gossip.subscribe(topic, vec![]).await?
+    } else {
+        gossip.subscribe_and_join(topic, bootstrap).await?
     };
     let (sender, receiver) = subscription.split();
     Ok(RunningNode {
@@ -101,13 +108,16 @@ pub async fn run_seed(dir: &Path, json: bool) -> Result<()> {
     let mut state = State::load(dir)?;
     let mut node = start(dir).await?;
     node.endpoint.online().await;
-    state.invite = Some(
-        Invite {
+    let mut invite = match &state.invite {
+        Some(token) => token.parse::<Invite>()?,
+        None => Invite {
             topic: state.topic_id()?,
-            seed: node.endpoint.addr(),
-        }
-        .to_string(),
-    );
+            seeds: Vec::new(),
+        },
+    };
+    invite.seeds.push(node.endpoint.addr());
+    invite.deduplicate();
+    state.invite = Some(invite.to_string());
     state.save(dir)?;
     event(
         json,

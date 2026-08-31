@@ -46,6 +46,8 @@ pub enum SeedCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Join an existing seed set while retaining a seed role
+    Join { token: String },
     /// Run the persistent bootstrap node
     Run,
     /// Print the current invite token

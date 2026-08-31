@@ -29,9 +29,9 @@ impl State {
         }
     }
 
-    pub fn new_member(token: String, invite: &Invite) -> Self {
+    pub fn from_invite(role: Role, token: String, invite: &Invite) -> Self {
         Self {
-            role: Role::Member,
+            role,
             topic: invite.topic.to_string(),
             invite: Some(token),
         }

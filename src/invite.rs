@@ -8,7 +8,14 @@ use std::{fmt, str::FromStr};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Invite {
     pub topic: TopicId,
-    pub seed: EndpointAddr,
+    pub seeds: Vec<EndpointAddr>,
+}
+
+impl Invite {
+    pub fn deduplicate(&mut self) {
+        self.seeds.sort_by_key(|seed| seed.id);
+        self.seeds.dedup_by_key(|seed| seed.id);
+    }
 }
 
 impl fmt::Display for Invite {
@@ -26,6 +33,13 @@ impl FromStr for Invite {
         let bytes = BASE32_NOPAD
             .decode(value.to_ascii_uppercase().as_bytes())
             .context("invalid invite token")?;
-        postcard::from_bytes(&bytes).context("invalid invite contents")
+        let mut invite: Self = postcard::from_bytes(&bytes).context("invalid invite contents")?;
+        invite.deduplicate();
+        anyhow::ensure!(!invite.seeds.is_empty(), "invite contains no seeds");
+        anyhow::ensure!(
+            invite.seeds.len() <= 16,
+            "invite contains more than 16 seeds"
+        );
+        Ok(invite)
     }
 }

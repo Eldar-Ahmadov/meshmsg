@@ -38,6 +38,20 @@ async fn run() -> Result<()> {
                     }),
                 );
             }
+            SeedCommand::Join { token } => {
+                let invite: invite::Invite = token.parse()?;
+                let state = State::from_invite(config::Role::Seed, token, &invite);
+                state.save_new(&dir, true)?;
+                let peer = State::load_secret(&dir)?.public().to_string();
+                cli::print_result(
+                    cli.json,
+                    "seed joined",
+                    serde_json::json!({
+                        "type":"seed_joined", "state_dir":dir, "peer":peer,
+                        "topic":state.topic, "known_seeds":invite.seeds.len()
+                    }),
+                );
+            }
             SeedCommand::Run => node::run_seed(&dir, cli.json).await?,
             SeedCommand::Invite => {
                 let state = State::load(&dir)?;
@@ -53,7 +67,7 @@ async fn run() -> Result<()> {
         },
         Command::Join { token } => {
             let invite: invite::Invite = token.parse()?;
-            let state = State::new_member(token, &invite);
+            let state = State::from_invite(config::Role::Member, token, &invite);
             state.save_new(&dir, true)?;
             let peer = State::load_secret(&dir)?.public().to_string();
             cli::print_result(
