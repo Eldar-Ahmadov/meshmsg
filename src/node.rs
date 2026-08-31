@@ -20,6 +20,7 @@ use std::{
 };
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
+const MAX_MESSAGE_SIZE: usize = 4096;
 type Signature = ByteArray<SIGNATURE_LENGTH>;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,7 +43,13 @@ impl Envelope {
             signature: ByteArray::new(signature.to_bytes()),
         };
         signed.clear();
-        Ok(postcard::to_stdvec(&value)?.into())
+        let encoded = postcard::to_stdvec(&value)?;
+        anyhow::ensure!(
+            encoded.len() <= MAX_MESSAGE_SIZE,
+            "encoded message is {} bytes; maximum is {MAX_MESSAGE_SIZE} bytes",
+            encoded.len()
+        );
+        Ok(encoded.into())
     }
     fn decode(data: &[u8]) -> Result<Self> {
         let value: Self = postcard::from_bytes(data).context("decode message")?;
@@ -115,7 +122,14 @@ pub async fn run_seed(dir: &Path, json: bool) -> Result<()> {
             seeds: Vec::new(),
         },
     };
-    invite.seeds.push(node.endpoint.addr());
+    let local_addr = node.endpoint.addr();
+    invite.seeds.retain(|seed| seed.id != local_addr.id);
+    anyhow::ensure!(
+        invite.seeds.len() < crate::invite::MAX_SEEDS,
+        "seed set already contains the maximum of {} other seeds",
+        crate::invite::MAX_SEEDS
+    );
+    invite.seeds.push(local_addr);
     invite.deduplicate();
     state.invite = Some(invite.to_string());
     state.save(dir)?;
@@ -251,6 +265,19 @@ pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if character.is_control() {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
 fn event(json: bool, value: serde_json::Value) {
     if json {
         println!("{value}");
@@ -259,9 +286,12 @@ fn event(json: bool, value: serde_json::Value) {
             "message" => println!(
                 "{}: {}",
                 value["from"].as_str().unwrap_or("peer"),
-                value["body"].as_str().unwrap_or("")
+                terminal_safe(value["body"].as_str().unwrap_or(""))
             ),
-            "sent" => println!("sent: {}", value["body"].as_str().unwrap_or("")),
+            "sent" => println!(
+                "sent: {}",
+                terminal_safe(value["body"].as_str().unwrap_or(""))
+            ),
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
             "listening" => println!(

@@ -5,6 +5,8 @@ use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
+pub const MAX_SEEDS: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Invite {
     pub topic: TopicId,
@@ -37,8 +39,8 @@ impl FromStr for Invite {
         invite.deduplicate();
         anyhow::ensure!(!invite.seeds.is_empty(), "invite contains no seeds");
         anyhow::ensure!(
-            invite.seeds.len() <= 16,
-            "invite contains more than 16 seeds"
+            invite.seeds.len() <= MAX_SEEDS,
+            "invite contains more than {MAX_SEEDS} seeds"
         );
         Ok(invite)
     }

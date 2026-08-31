@@ -38,10 +38,10 @@ async fn run() -> Result<()> {
                     }),
                 );
             }
-            SeedCommand::Join { token } => {
+            SeedCommand::Join { token, force } => {
                 let invite: invite::Invite = token.parse()?;
                 let state = State::from_invite(config::Role::Seed, token, &invite);
-                state.save_new(&dir, true)?;
+                state.save_new(&dir, force)?;
                 let peer = State::load_secret(&dir)?.public().to_string();
                 cli::print_result(
                     cli.json,
@@ -65,10 +65,10 @@ async fn run() -> Result<()> {
                 }
             }
         },
-        Command::Join { token } => {
+        Command::Join { token, force } => {
             let invite: invite::Invite = token.parse()?;
             let state = State::from_invite(config::Role::Member, token, &invite);
-            state.save_new(&dir, true)?;
+            state.save_new(&dir, force)?;
             let peer = State::load_secret(&dir)?.public().to_string();
             cli::print_result(
                 cli.json,

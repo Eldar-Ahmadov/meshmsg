@@ -26,7 +26,12 @@ pub enum Command {
         command: SeedCommand,
     },
     /// Save configuration from an invite token
-    Join { token: String },
+    Join {
+        token: String,
+        /// Replace existing state and identity
+        #[arg(long)]
+        force: bool,
+    },
     /// Broadcast one message and exit
     Send { message: String },
     /// Stream incoming messages
@@ -47,7 +52,12 @@ pub enum SeedCommand {
         force: bool,
     },
     /// Join an existing seed set while retaining a seed role
-    Join { token: String },
+    Join {
+        token: String,
+        /// Replace existing state and identity
+        #[arg(long)]
+        force: bool,
+    },
     /// Run the persistent bootstrap node
     Run,
     /// Print the current invite token
