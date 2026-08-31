@@ -20,7 +20,11 @@ use std::{
 };
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
-const MAX_MESSAGE_SIZE: usize = 4096;
+/// Maximum serialized application envelope accepted for broadcast.
+const MAX_ENVELOPE_SIZE: usize = 4096;
+/// Iroh's limit includes its own framing, so reserve explicit protocol headroom.
+const GOSSIP_PROTOCOL_HEADROOM: usize = 512;
+const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADROOM;
 type Signature = ByteArray<SIGNATURE_LENGTH>;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +38,10 @@ struct Envelope {
 impl Envelope {
     fn encode(secret: &SecretKey, body: String) -> Result<Bytes> {
         let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+        Self::encode_at(secret, body, timestamp_ms)
+    }
+
+    fn encode_at(secret: &SecretKey, body: String, timestamp_ms: u64) -> Result<Bytes> {
         let mut signed = postcard::to_stdvec(&(secret.public(), timestamp_ms, &body))?;
         let signature = secret.sign(&signed);
         let value = Self {
@@ -45,13 +53,18 @@ impl Envelope {
         signed.clear();
         let encoded = postcard::to_stdvec(&value)?;
         anyhow::ensure!(
-            encoded.len() <= MAX_MESSAGE_SIZE,
-            "encoded message is {} bytes; maximum is {MAX_MESSAGE_SIZE} bytes",
+            encoded.len() <= MAX_ENVELOPE_SIZE,
+            "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
             encoded.len()
         );
         Ok(encoded.into())
     }
     fn decode(data: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
+            data.len() <= MAX_ENVELOPE_SIZE,
+            "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
+            data.len()
+        );
         let value: Self = postcard::from_bytes(data).context("decode message")?;
         let signed = postcard::to_stdvec(&(value.from, value.timestamp_ms, &value.body))?;
         value
@@ -80,7 +93,9 @@ async fn start(dir: &Path) -> Result<RunningNode> {
         .address_lookup(lookup.clone())
         .bind()
         .await?;
-    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let gossip = Gossip::builder()
+        .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
+        .spawn(endpoint.clone());
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .spawn();
@@ -122,22 +137,14 @@ pub async fn run_seed(dir: &Path, json: bool) -> Result<()> {
             seeds: Vec::new(),
         },
     };
-    let local_addr = node.endpoint.addr();
-    invite.seeds.retain(|seed| seed.id != local_addr.id);
-    anyhow::ensure!(
-        invite.seeds.len() < crate::invite::MAX_SEEDS,
-        "seed set already contains the maximum of {} other seeds",
-        crate::invite::MAX_SEEDS
-    );
-    invite.seeds.push(local_addr);
-    invite.deduplicate();
+    invite.upsert_seed(node.endpoint.addr())?;
     state.invite = Some(invite.to_string());
     state.save(dir)?;
     event(
         json,
         serde_json::json!({"type":"listening", "peer":node.endpoint.id().to_string(), "topic":state.topic, "invite":state.invite}),
     );
-    receive_until_signal(&mut node.receiver, json).await?;
+    receive_until_signal(&mut node.receiver, json, MessageVisibility::MetadataOnly).await?;
     node.router.shutdown().await?;
     Ok(())
 }
@@ -162,7 +169,7 @@ pub async fn listen(dir: &Path, json: bool) -> Result<()> {
         json,
         serde_json::json!({"type":"connected", "peer":node.endpoint.id().to_string()}),
     );
-    receive_until_signal(&mut node.receiver, json).await?;
+    receive_until_signal(&mut node.receiver, json, MessageVisibility::Full).await?;
     node.router.shutdown().await?;
     Ok(())
 }
@@ -188,7 +195,7 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
                 None => break,
             },
             incoming = node.receiver.try_next() => match incoming? {
-                Some(value) => handle_event(value, json), None => break,
+                Some(value) => handle_event(value, json, MessageVisibility::Full), None => break,
             },
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -197,23 +204,43 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn receive_until_signal(receiver: &mut GossipReceiver, json: bool) -> Result<()> {
+#[derive(Clone, Copy)]
+enum MessageVisibility {
+    Full,
+    MetadataOnly,
+}
+
+async fn receive_until_signal(
+    receiver: &mut GossipReceiver,
+    json: bool,
+    visibility: MessageVisibility,
+) -> Result<()> {
     loop {
         tokio::select! {
-            incoming = receiver.try_next() => match incoming? { Some(value) => handle_event(value, json), None => break },
+            incoming = receiver.try_next() => match incoming? { Some(value) => handle_event(value, json, visibility), None => break },
             _ = tokio::signal::ctrl_c() => break,
         }
     }
     Ok(())
 }
 
-fn handle_event(value: Event, json: bool) {
+fn message_event(msg: Envelope, visibility: MessageVisibility) -> serde_json::Value {
+    match visibility {
+        MessageVisibility::Full => serde_json::json!({
+            "type":"message", "from":msg.from.to_string(),
+            "timestamp_ms":msg.timestamp_ms, "body":msg.body
+        }),
+        MessageVisibility::MetadataOnly => serde_json::json!({
+            "type":"message", "from":msg.from.to_string(),
+            "timestamp_ms":msg.timestamp_ms, "body_bytes":msg.body.len(), "body_suppressed":true
+        }),
+    }
+}
+
+fn handle_event(value: Event, json: bool, visibility: MessageVisibility) {
     match value {
         Event::Received(message) => match Envelope::decode(&message.content) {
-            Ok(msg) => event(
-                json,
-                serde_json::json!({"type":"message", "from":msg.from.to_string(), "timestamp_ms":msg.timestamp_ms, "body":msg.body}),
-            ),
+            Ok(msg) => event(json, message_event(msg, visibility)),
             Err(error) => event(
                 json,
                 serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
@@ -227,7 +254,10 @@ fn handle_event(value: Event, json: bool) {
             json,
             serde_json::json!({"type":"peer_down", "peer":peer.to_string()}),
         ),
-        _ => {}
+        Event::Lagged => event(
+            json,
+            serde_json::json!({"type":"lagged", "message":"receiver fell behind; one or more events were dropped"}),
+        ),
     }
 }
 
@@ -283,6 +313,11 @@ fn event(json: bool, value: serde_json::Value) {
         println!("{value}");
     } else {
         match value["type"].as_str().unwrap_or("event") {
+            "message" if value["body_suppressed"].as_bool() == Some(true) => println!(
+                "message from {} ({} bytes; body suppressed)",
+                value["from"].as_str().unwrap_or("peer"),
+                value["body_bytes"].as_u64().unwrap_or(0)
+            ),
             "message" => println!(
                 "{}: {}",
                 value["from"].as_str().unwrap_or("peer"),
@@ -300,7 +335,82 @@ fn event(json: bool, value: serde_json::Value) {
                 value["invite"].as_str().unwrap_or("")
             ),
             "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
+            "lagged" => println!(
+                "warning: {}",
+                value["message"].as_str().unwrap_or("receiver lagged")
+            ),
             _ => println!("{value}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_boundary_matches_configured_gossip_headroom() {
+        assert_eq!(
+            GOSSIP_MAX_MESSAGE_SIZE - MAX_ENVELOPE_SIZE,
+            GOSSIP_PROTOCOL_HEADROOM
+        );
+
+        let secret = SecretKey::generate();
+        let timestamp_ms = 1_700_000_000_000;
+        let largest_body = (0..=MAX_ENVELOPE_SIZE)
+            .rev()
+            .find(|length| Envelope::encode_at(&secret, "a".repeat(*length), timestamp_ms).is_ok())
+            .expect("an empty message must fit");
+
+        let encoded = Envelope::encode_at(&secret, "a".repeat(largest_body), timestamp_ms)
+            .expect("boundary message must fit");
+        assert_eq!(encoded.len(), MAX_ENVELOPE_SIZE);
+        assert!(Envelope::encode_at(&secret, "a".repeat(largest_body + 1), timestamp_ms).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_signed_envelope() {
+        let secret = SecretKey::generate();
+        let timestamp_ms = 1_700_000_000_000;
+        let body = "a".repeat(MAX_ENVELOPE_SIZE);
+        let signed = postcard::to_stdvec(&(secret.public(), timestamp_ms, &body)).unwrap();
+        let envelope = Envelope {
+            from: secret.public(),
+            timestamp_ms,
+            body,
+            signature: ByteArray::new(secret.sign(&signed).to_bytes()),
+        };
+        let encoded = postcard::to_stdvec(&envelope).unwrap();
+
+        assert!(encoded.len() > MAX_ENVELOPE_SIZE);
+        assert!(Envelope::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn seed_message_event_suppresses_body_but_keeps_metadata() {
+        let secret = SecretKey::generate();
+        let value = message_event(
+            Envelope {
+                from: secret.public(),
+                timestamp_ms: 42,
+                body: "private text".to_owned(),
+                signature: ByteArray::new([0; SIGNATURE_LENGTH]),
+            },
+            MessageVisibility::MetadataOnly,
+        );
+
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["timestamp_ms"], 42);
+        assert_eq!(value["body_bytes"], 12);
+        assert_eq!(value["body_suppressed"], true);
+        assert!(value.get("body").is_none());
+    }
+
+    #[test]
+    fn terminal_output_escapes_control_sequences() {
+        let escaped = terminal_safe("hello\n\u{1b}]0;owned\u{7}");
+
+        assert_eq!(escaped, "hello\\n\\u{1b}]0;owned\\u{7}");
+        assert!(!escaped.chars().any(char::is_control));
     }
 }

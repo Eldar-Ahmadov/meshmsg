@@ -53,9 +53,15 @@ meshmsg seed join '<invite-from-existing-seed>'
 meshmsg seed run
 ```
 
-The new seed retains its own identity, connects to the same topic, and prints a new invite containing both the old seed set and itself. Distribute that expanded invite to clients so they can bootstrap through any listed seed. Seeds are equal peers; there is no leader or broker. Up to 16 seeds are accepted in an invite.
+The new seed retains its own identity, connects to the same topic, and prints a new invite containing both the old seed set and itself. Distribute that expanded invite to clients so they can bootstrap through any listed seed. Seeds are equal peers; there is no leader or broker. Up to 16 seeds are accepted in an invite. A full 16-seed invite cannot be used to add a seventeenth seed.
 
-A seed safely ignores its own endpoint in its persisted invite when restarting.
+A seed safely replaces its own endpoint in its persisted invite when restarting.
+
+## Privacy model
+
+Seeds are full peers in the gossip topic, not opaque relays. Messages are signed but currently sent as plaintext, so every seed and client participating in the topic is technically able to read them. End-to-end encryption is not implemented.
+
+To reduce accidental disclosure in service logs, `seed run` suppresses received message bodies by default. Its events retain only sender, timestamp, body byte length, and suppression metadata. This logging behavior is not a privacy boundary: an operator controlling a seed can still modify or inspect the process and read plaintext traffic.
 
 ## Automation
 
@@ -68,7 +74,7 @@ meshmsg --json send 'hello'
 meshmsg doctor
 ```
 
-The private identity is stored in `secret.key` with mode `0600`. Keep at least one seed process running so new peers can bootstrap and the gossip swarm remains available.
+The private identity is stored in `secret.key` with mode `0600`. Keep at least one seed process running so new peers can bootstrap and the gossip swarm remains available. Application envelopes are limited to 4096 bytes; the maximum text length is smaller because the signed envelope includes identity, timestamp, and signature metadata.
 
 ## systemd seed service
 

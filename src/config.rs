@@ -86,3 +86,26 @@ pub fn write_secret(dir: &Path, key: &SecretKey) -> Result<()> {
     file.write_all(HEXLOWER.encode(&key.to_bytes()).as_bytes())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_new_does_not_replace_existing_state_or_identity_without_force() {
+        let dir =
+            std::env::temp_dir().join(format!("meshmsg-config-test-{}", rand::random::<u64>()));
+        let original = State::new_seed();
+        original.save_new(&dir, false).unwrap();
+        let config_before = fs::read(dir.join("config.json")).unwrap();
+        let secret_before = fs::read(dir.join("secret.key")).unwrap();
+
+        let replacement = State::new_seed();
+        let error = replacement.save_new(&dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("state already exists"));
+        assert_eq!(fs::read(dir.join("config.json")).unwrap(), config_before);
+        assert_eq!(fs::read(dir.join("secret.key")).unwrap(), secret_before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

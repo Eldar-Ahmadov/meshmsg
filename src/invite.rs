@@ -18,6 +18,22 @@ impl Invite {
         self.seeds.sort_by_key(|seed| seed.id);
         self.seeds.dedup_by_key(|seed| seed.id);
     }
+
+    pub fn ensure_room_for_new_seed(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.seeds.len() < MAX_SEEDS,
+            "seed set already contains the maximum of {MAX_SEEDS} seeds"
+        );
+        Ok(())
+    }
+
+    pub fn upsert_seed(&mut self, seed: EndpointAddr) -> Result<()> {
+        self.seeds.retain(|existing| existing.id != seed.id);
+        self.ensure_room_for_new_seed()?;
+        self.seeds.push(seed);
+        self.deduplicate();
+        Ok(())
+    }
 }
 
 impl fmt::Display for Invite {
@@ -43,5 +59,52 @@ impl FromStr for Invite {
             "invite contains more than {MAX_SEEDS} seeds"
         );
         Ok(invite)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn endpoint() -> EndpointAddr {
+        EndpointAddr::new(SecretKey::generate().public())
+    }
+
+    fn invite_with_seed_count(count: usize) -> Invite {
+        Invite {
+            topic: TopicId::from_bytes([7; 32]),
+            seeds: (0..count).map(|_| endpoint()).collect(),
+        }
+    }
+
+    #[test]
+    fn full_invite_cannot_add_a_new_seed() {
+        let mut invite = invite_with_seed_count(MAX_SEEDS);
+        assert!(invite.ensure_room_for_new_seed().is_err());
+        assert!(invite.upsert_seed(endpoint()).is_err());
+        assert_eq!(invite.seeds.len(), MAX_SEEDS);
+    }
+
+    #[test]
+    fn full_invite_can_replace_an_existing_seed_endpoint() {
+        let mut invite = invite_with_seed_count(MAX_SEEDS);
+        let existing = invite.seeds[0].clone();
+        let replacement =
+            EndpointAddr::new(existing.id).with_ip_addr("127.0.0.1:7777".parse().unwrap());
+
+        invite.upsert_seed(replacement.clone()).unwrap();
+
+        assert_eq!(invite.seeds.len(), MAX_SEEDS);
+        assert_eq!(
+            invite
+                .seeds
+                .iter()
+                .filter(|seed| seed.id == existing.id)
+                .count(),
+            1
+        );
+        assert!(invite.seeds.contains(&replacement));
+        assert!(!invite.seeds.contains(&existing));
     }
 }

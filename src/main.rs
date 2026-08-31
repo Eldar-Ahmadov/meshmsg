@@ -40,6 +40,7 @@ async fn run() -> Result<()> {
             }
             SeedCommand::Join { token, force } => {
                 let invite: invite::Invite = token.parse()?;
+                invite.ensure_room_for_new_seed()?;
                 let state = State::from_invite(config::Role::Seed, token, &invite);
                 state.save_new(&dir, force)?;
                 let peer = State::load_secret(&dir)?.public().to_string();
