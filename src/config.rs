@@ -1,10 +1,68 @@
 use crate::invite::Invite;
 use anyhow::{bail, Context, Result};
 use data_encoding::HEXLOWER;
+use fs2::FileExt;
 use iroh::SecretKey;
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, str::FromStr};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+
+const LOCK_NAME: &str = ".meshmsg.lock";
+
+/// Exclusive ownership of mutable state and the network identity.
+pub struct StateLock {
+    _file: fs::File,
+}
+
+impl StateLock {
+    pub fn acquire(dir: &Path) -> Result<Self> {
+        prepare_state_dir(dir)?;
+        let path = dir.join(LOCK_NAME);
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).context("open state lock")?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::anyhow!("state is in use by a running meshmsg daemon")
+            } else {
+                anyhow::Error::new(error).context("lock meshmsg state")
+            }
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+pub fn prepare_state_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).context("create state directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(dir).context("inspect state directory")?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "state path is not a directory"
+        );
+        // SAFETY: geteuid has no preconditions and only reads process credentials.
+        let effective_uid = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            metadata.uid() == effective_uid,
+            "state directory is not owned by the current user"
+        );
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .context("restrict state directory permissions")?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
@@ -13,7 +71,7 @@ pub struct State {
     pub invite: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     Seed,
@@ -58,33 +116,62 @@ impl State {
     }
 
     pub fn save_new(&self, dir: &Path, force: bool) -> Result<()> {
+        let lock = StateLock::acquire(dir)?;
         if dir.join("config.json").exists() && !force {
             bail!("state already exists (use --force to replace it)");
         }
-        fs::create_dir_all(dir).context("create state directory")?;
         let secret = SecretKey::generate();
         write_secret(dir, &secret)?;
-        self.save(dir)
+        self.save(dir, &lock)
     }
 
-    pub fn save(&self, dir: &Path) -> Result<()> {
-        fs::write(dir.join("config.json"), serde_json::to_vec_pretty(self)?)
+    pub fn save(&self, dir: &Path, _lock: &StateLock) -> Result<()> {
+        atomic_write(dir, "config.json", &serde_json::to_vec_pretty(self)?, 0o600)
             .context("write config.json")
     }
 }
 
-pub fn write_secret(dir: &Path, key: &SecretKey) -> Result<()> {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join("secret.key");
-    let mut opts = fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let mut file = opts.open(path).context("write secret.key")?;
-    file.write_all(HEXLOWER.encode(&key.to_bytes()).as_bytes())?;
-    Ok(())
+fn write_secret(dir: &Path, key: &SecretKey) -> Result<()> {
+    atomic_write(
+        dir,
+        "secret.key",
+        HEXLOWER.encode(&key.to_bytes()).as_bytes(),
+        0o600,
+    )
+    .context("write secret.key")
+}
+
+fn atomic_write(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
+    prepare_state_dir(dir)?;
+    let destination = dir.join(name);
+    let temporary = temporary_path(dir, name);
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &destination)?;
+        fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn temporary_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ))
 }
 
 #[cfg(test)]
@@ -106,6 +193,42 @@ mod tests {
         assert!(error.to_string().contains("state already exists"));
         assert_eq!(fs::read(dir.join("config.json")).unwrap(), config_before);
         assert_eq!(fs::read(dir.join("secret.key")).unwrap(), secret_before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_state_lock_rejects_forced_identity_replacement() {
+        let dir =
+            std::env::temp_dir().join(format!("meshmsg-config-test-{}", rand::random::<u64>()));
+        let original = State::new_seed();
+        original.save_new(&dir, false).unwrap();
+        let secret_before = fs::read(dir.join("secret.key")).unwrap();
+        let lock = StateLock::acquire(&dir).unwrap();
+
+        let error = State::new_seed().save_new(&dir, true).unwrap_err();
+
+        assert!(error.to_string().contains("state is in use"));
+        assert_eq!(fs::read(dir.join("secret.key")).unwrap(), secret_before);
+        drop(lock);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn state_save_is_atomic_and_leaves_no_temporary_file() {
+        let dir =
+            std::env::temp_dir().join(format!("meshmsg-config-test-{}", rand::random::<u64>()));
+        let state = State::new_seed();
+        state.save_new(&dir, false).unwrap();
+        let state_lock = StateLock::acquire(&dir).unwrap();
+        state.save(&dir, &state_lock).unwrap();
+
+        let loaded = State::load(&dir).unwrap();
+        assert_eq!(loaded.topic, state.topic);
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
         fs::remove_dir_all(dir).unwrap();
     }
 }

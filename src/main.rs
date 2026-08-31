@@ -53,7 +53,7 @@ async fn run() -> Result<()> {
                     }),
                 );
             }
-            SeedCommand::Run => node::run_seed(&dir, cli.json).await?,
+            SeedCommand::Run => node::run_daemon(&dir, cli.json).await?,
             SeedCommand::Invite => {
                 let state = State::load(&dir)?;
                 let token = state
@@ -79,6 +79,8 @@ async fn run() -> Result<()> {
                 }),
             );
         }
+        Command::Daemon => node::run_daemon(&dir, cli.json).await?,
+        Command::Stop => node::stop(&dir, cli.json).await?,
         Command::Send { message } => node::send_once(&dir, &message, cli.json).await?,
         Command::Listen => node::listen(&dir, cli.json).await?,
         Command::Chat => node::chat(&dir, cli.json).await?,

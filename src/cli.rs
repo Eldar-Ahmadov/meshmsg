@@ -32,13 +32,17 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Broadcast one message and exit
+    /// Run the local network daemon in the foreground
+    Daemon,
+    /// Ask the local daemon to shut down
+    Stop,
+    /// Ask the local daemon to broadcast one message
     Send { message: String },
     /// Stream incoming messages
     Listen,
     /// Send lines from stdin while receiving messages
     Chat,
-    /// Show local configuration and connectivity
+    /// Show live daemon configuration and connectivity
     Status,
     /// Validate local state
     Doctor,
