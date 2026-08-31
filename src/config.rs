@@ -99,6 +99,32 @@ impl State {
         TopicId::from_str(&self.topic).context("invalid topic in state")
     }
 
+    pub fn ensure_role(&self, expected: Role) -> Result<()> {
+        anyhow::ensure!(
+            self.role == expected,
+            "command requires {:?} state, but this state is {:?}",
+            expected,
+            self.role
+        );
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let topic = self.topic_id()?;
+        match (&self.role, &self.invite) {
+            (Role::Member, None) => bail!("member state must contain an invite"),
+            (_, Some(token)) => {
+                let invite: Invite = token.parse().context("invalid invite in state")?;
+                anyhow::ensure!(
+                    invite.topic == topic,
+                    "configured invite topic does not match state topic"
+                );
+            }
+            (Role::Seed, None) => {}
+        }
+        Ok(())
+    }
+
     pub fn load_secret(dir: &Path) -> Result<SecretKey> {
         let text = fs::read_to_string(dir.join("secret.key")).context("read secret.key")?;
         let bytes = HEXLOWER
@@ -211,6 +237,49 @@ mod tests {
         assert_eq!(fs::read(dir.join("secret.key")).unwrap(), secret_before);
         drop(lock);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn seed_only_commands_reject_member_state() {
+        let state = State {
+            role: Role::Member,
+            topic: TopicId::from_bytes(rand::random()).to_string(),
+            invite: None,
+        };
+
+        let error = state.ensure_role(Role::Seed).unwrap_err();
+        assert!(error.to_string().contains("requires Seed state"));
+    }
+
+    #[test]
+    fn member_state_requires_an_invite() {
+        let state = State {
+            role: Role::Member,
+            topic: TopicId::from_bytes(rand::random()).to_string(),
+            invite: None,
+        };
+
+        assert!(state
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must contain"));
+    }
+
+    #[test]
+    fn configured_invite_must_match_state_topic() {
+        let invite = Invite {
+            topic: TopicId::from_bytes(rand::random()),
+            seeds: vec![iroh::EndpointAddr::new(SecretKey::generate().public())],
+        };
+        let state = State {
+            role: Role::Seed,
+            topic: TopicId::from_bytes(rand::random()).to_string(),
+            invite: Some(invite.to_string()),
+        };
+
+        let error = state.validate().unwrap_err();
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]

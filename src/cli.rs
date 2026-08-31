@@ -36,7 +36,7 @@ pub enum Command {
     Daemon,
     /// Ask the local daemon to shut down
     Stop,
-    /// Ask the local daemon to broadcast one message
+    /// Queue one message for broadcast (not a delivery acknowledgement)
     Send { message: String },
     /// Stream incoming messages
     Listen,

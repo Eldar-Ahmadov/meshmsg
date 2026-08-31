@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures_util::TryStreamExt;
 use iroh::{
     address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint, PublicKey,
-    SecretKey,
+    SecretKey, Watcher,
 };
 use iroh_gossip::{
     api::{Event, GossipReceiver, GossipSender},
@@ -17,10 +17,9 @@ use iroh_gossip::{
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 use std::{
-    collections::HashSet,
     io::BufRead as _,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -38,6 +37,8 @@ const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADR
 const MAX_IPC_REQUEST_SIZE: usize = MAX_ENVELOPE_SIZE * 6 + 1024;
 const MAX_IPC_EVENT_SIZE: usize = MAX_ENVELOPE_SIZE * 6 + 1024;
 const IPC_EVENT_CAPACITY: usize = 256;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
 
@@ -103,6 +104,7 @@ struct RunningNode {
 
 async fn start(dir: &Path) -> Result<RunningNode> {
     let state = State::load(dir)?;
+    state.validate()?;
     let secret = State::load_secret(dir)?;
     let topic: TopicId = state.topic_id()?;
     let lookup = MemoryLookup::new();
@@ -284,7 +286,18 @@ async fn handle_local_client(
     Ok(())
 }
 
+pub async fn run_seed_daemon(dir: &Path, json: bool) -> Result<()> {
+    // Fail fast with a role-specific error, then validate again after acquiring
+    // daemon ownership to close the concurrent forced-replacement gap.
+    State::load(dir)?.ensure_role(Role::Seed)?;
+    run_daemon_with_role(dir, json, Some(Role::Seed)).await
+}
+
 pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
+    run_daemon_with_role(dir, json, None).await
+}
+
+async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role>) -> Result<()> {
     // Install the service-manager signal handler before daemon startup becomes externally visible.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
@@ -293,13 +306,36 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     // Claim local ownership before reading the identity, starting networking, or mutating state.
     let state_lock = StateLock::acquire(dir)?;
     let mut state = State::load(dir)?;
-    let mut node = tokio::select! {
-        result = start(dir) => result?,
+    state.validate()?;
+    if let Some(expected_role) = expected_role {
+        state.ensure_role(expected_role)?;
+    }
+    let startup = tokio::select! {
+        result = tokio::time::timeout(STARTUP_TIMEOUT, start(dir)) => result,
         _ = terminate.recv() => return Ok(()),
         _ = interrupt.recv() => return Ok(()),
     };
-    tokio::select! {
-        _ = node.endpoint.online() => {}
+    let mut node = match startup {
+        Ok(Ok(node)) => node,
+        Ok(Err(error)) => {
+            startup_error(json, "topic_join", &error.to_string());
+            return Err(error)
+                .context("start gossip topic; verify the invite and seed reachability");
+        }
+        Err(_) => {
+            startup_error(
+                json,
+                "topic_join",
+                "startup timed out while joining the gossip topic",
+            );
+            anyhow::bail!(
+                "startup timed out after {}s while joining the gossip topic; verify that at least one configured seed is reachable",
+                STARTUP_TIMEOUT.as_secs()
+            );
+        }
+    };
+    let online = tokio::select! {
+        result = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, node.endpoint.online()) => result,
         _ = terminate.recv() => {
             node.router.shutdown().await?;
             return Ok(());
@@ -308,6 +344,18 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
             node.router.shutdown().await?;
             return Ok(());
         }
+    };
+    if online.is_err() {
+        startup_error(
+            json,
+            "endpoint_online",
+            "endpoint did not become online before the deadline",
+        );
+        node.router.shutdown().await?;
+        anyhow::bail!(
+            "endpoint did not become online within {}s; check internet, DNS, firewall, and relay access",
+            ENDPOINT_ONLINE_TIMEOUT.as_secs()
+        );
     }
 
     if state.role == Role::Seed {
@@ -329,14 +377,13 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let peer = node.endpoint.id().to_string();
     let started = serde_json::json!({
         "type":"daemon_started", "peer":peer, "topic":state.topic,
-        "role":state.role, "socket":socket_path(dir), "invite":state.invite
+        "role":state.role, "socket":socket_path(dir),
+        "endpoint_online":true, "topic_joined":node.receiver.is_joined()
     });
     event(json, started);
 
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
-    let connected = serde_json::json!({"type":"connected", "peer":peer});
-    let mut peers = HashSet::new();
 
     loop {
         tokio::select! {
@@ -344,7 +391,10 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 let (stream, _) = accepted.context("accept local daemon client")?;
                 let commands = command_tx.clone();
                 let events = event_tx.subscribe();
-                let connected = connected.clone();
+                let connected = serde_json::json!({
+                    "type":"connected", "peer":peer, "endpoint_online":true,
+                    "topic_joined":node.receiver.is_joined()
+                });
                 tokio::spawn(async move {
                     if let Err(error) = handle_local_client(stream, commands, events, connected).await {
                         if !is_local_disconnect(&error) {
@@ -357,21 +407,25 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 Some(DaemonCommand::Send { body, reply }) => {
                     let response = match Envelope::encode(&node.secret, body.clone()) {
                         Ok(envelope) => match node.sender.broadcast(envelope).await {
-                            Ok(()) => serde_json::json!({"type":"sent", "from":peer, "body":body}),
+                            Ok(()) => queued_event(&peer, body),
                             Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
                         },
                         Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
                     };
-                    if response["type"] == "sent" {
+                    if response["type"] == "queued" {
                         let _ = event_tx.send(response.clone());
                     }
                     let _ = reply.send(response);
                 }
                 Some(DaemonCommand::Status { reply }) => {
+                    let endpoint_online = node.endpoint.home_relay_status().get()
+                        .iter().any(|status| status.is_connected());
+                    let neighbors = node.receiver.neighbors().count();
                     let _ = reply.send(serde_json::json!({
                         "type":"status", "running":true, "role":state.role, "peer":peer,
                         "topic":state.topic, "configured_seed":state.invite.is_some(),
-                        "neighbors":peers.len(), "socket":socket_path(dir)
+                        "neighbors":neighbors, "socket":socket_path(dir),
+                        "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined()
                     }));
                 }
                 Some(DaemonCommand::Stop) => break,
@@ -379,16 +433,10 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
             },
             incoming = node.receiver.try_next() => match incoming? {
                 Some(value) => {
-                    match &value {
-                        Event::NeighborUp(peer) => { peers.insert(*peer); }
-                        Event::NeighborDown(peer) => { peers.remove(peer); }
-                        _ => {}
-                    }
                     let values = network_event(value);
                     for full_value in values {
                         let _ = event_tx.send(full_value.clone());
-                        let logged = if state.role == Role::Seed { suppress_message_body(full_value) } else { full_value };
-                        event(json, logged);
+                        event(json, suppress_message_body(full_value));
                     }
                 }
                 None => break,
@@ -435,6 +483,13 @@ fn network_event(value: Event) -> Vec<serde_json::Value> {
             serde_json::json!({"type":"lagged", "message":"receiver fell behind; one or more events were dropped"}),
         ],
     }
+}
+
+fn queued_event(peer: &str, body: String) -> serde_json::Value {
+    serde_json::json!({
+        "type":"queued", "from":peer, "body":body,
+        "delivery_acknowledged":false
+    })
 }
 
 fn message_event(msg: Envelope) -> serde_json::Value {
@@ -575,10 +630,12 @@ pub async fn status(dir: &Path, json: bool) -> Result<()> {
         println!("{value}");
     } else {
         println!(
-            "daemon: running\nrole: {}\npeer: {}\ntopic: {}\nneighbors: {}\nseed configured: {}",
+            "daemon: running\nrole: {}\npeer: {}\ntopic: {}\nendpoint online: {}\ntopic joined: {}\nneighbors: {}\nseed configured: {}",
             value["role"].as_str().unwrap_or("unknown"),
             value["peer"].as_str().unwrap_or(""),
             value["topic"].as_str().unwrap_or(""),
+            value["endpoint_online"].as_bool().unwrap_or(false),
+            value["topic_joined"].as_bool().unwrap_or(false),
             value["neighbors"].as_u64().unwrap_or(0),
             value["configured_seed"].as_bool().unwrap_or(false)
         );
@@ -595,17 +652,30 @@ pub async fn stop(dir: &Path, json: bool) -> Result<()> {
 pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
     let state = State::load(dir)?;
     let secret = State::load_secret(dir)?;
-    state.topic_id()?;
-    if let Some(token) = &state.invite {
-        let _: Invite = token.parse()?;
-    }
-    let value = serde_json::json!({"type":"doctor", "ok":true, "peer":secret.public().to_string()});
+    state.validate()?;
+    let value = serde_json::json!({
+        "type":"doctor", "ok":true, "peer":secret.public().to_string(),
+        "role":state.role, "topic":state.topic, "configured_seed":state.invite.is_some()
+    });
     if json {
         println!("{value}");
     } else {
         println!("ok: state, identity, topic, and invite are valid");
     }
     Ok(())
+}
+
+fn startup_error_value(phase: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type":"startup_error", "phase":phase, "message":message,
+        "retryable":true
+    })
+}
+
+fn startup_error(json: bool, phase: &str, message: &str) {
+    if json {
+        println!("{}", startup_error_value(phase, message));
+    }
 }
 
 fn terminal_safe(value: &str) -> String {
@@ -636,23 +706,18 @@ fn event(json: bool, value: serde_json::Value) {
                 value["from"].as_str().unwrap_or("peer"),
                 terminal_safe(value["body"].as_str().unwrap_or(""))
             ),
-            "sent" => println!(
-                "sent: {}",
+            "queued" => println!(
+                "queued locally (delivery not acknowledged): {}",
                 terminal_safe(value["body"].as_str().unwrap_or(""))
             ),
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
-            "daemon_started" => {
-                println!(
-                    "daemon running as {} ({})\nsocket: {}",
-                    value["peer"].as_str().unwrap_or(""),
-                    value["role"].as_str().unwrap_or("unknown"),
-                    value["socket"].as_str().unwrap_or("")
-                );
-                if let Some(invite) = value["invite"].as_str() {
-                    println!("invite: {invite}");
-                }
-            }
+            "daemon_started" => println!(
+                "daemon running as {} ({})\nsocket: {}",
+                value["peer"].as_str().unwrap_or(""),
+                value["role"].as_str().unwrap_or("unknown"),
+                value["socket"].as_str().unwrap_or("")
+            ),
             "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
             "stopping" => println!("daemon stopping"),
             "lagged" => println!(
@@ -715,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_message_event_suppresses_body_but_keeps_metadata() {
+    fn daemon_log_message_event_suppresses_body_but_keeps_metadata_for_every_role() {
         let secret = SecretKey::generate();
         let value = suppress_message_body(message_event(Envelope {
             from: secret.public(),
@@ -727,6 +792,26 @@ mod tests {
         assert_eq!(value["body_bytes"], 12);
         assert_eq!(value["body_suppressed"], true);
         assert!(value.get("body").is_none());
+    }
+
+    #[test]
+    fn queued_event_does_not_claim_delivery() {
+        let value = queued_event("peer", "hello".to_owned());
+
+        assert_eq!(value["type"], "queued");
+        assert_eq!(value["delivery_acknowledged"], false);
+        assert!(value.get("sent").is_none());
+    }
+
+    #[test]
+    fn startup_errors_are_structured_and_retryable() {
+        let value = startup_error_value("topic_join", "seed unavailable");
+
+        assert_eq!(value["type"], "startup_error");
+        assert_eq!(value["phase"], "topic_join");
+        assert_eq!(value["retryable"], true);
+        assert!(STARTUP_TIMEOUT <= Duration::from_secs(60));
+        assert!(ENDPOINT_ONLINE_TIMEOUT <= Duration::from_secs(60));
     }
 
     #[test]

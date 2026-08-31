@@ -1,38 +1,48 @@
 # meshmsg
 
-A small peer-to-peer messaging CLI built on [Iroh Gossip](https://github.com/n0-computer/iroh-gossip). Each machine runs one local daemon that owns its persistent identity and network connection. The CLI talks to that daemon over an owner-only Unix socket; there is no central message broker.
+`meshmsg` 0.1.1 is a small peer-to-peer messaging CLI built on [Iroh Gossip](https://github.com/n0-computer/iroh-gossip). Each machine runs one local daemon that owns its persistent identity and network connection. CLI commands talk to that daemon over an owner-only Unix socket; there is no central message broker.
+
+## Trust and privacy model
+
+**meshmsg is currently a trusted plaintext swarm, not a private messenger.** An invite is effectively membership capability: anyone who obtains it can join the topic, read plaintext messages, and send signed messages. Seeds are full gossip peers rather than opaque relays. Signatures authenticate a peer key, but there is no end-to-end encryption, membership revocation, key rotation, replay protection, or human-friendly identity verification.
+
+Daemon stdout/stderr suppresses incoming message bodies for **both seed and member roles** by default, reducing accidental disclosure to terminals and journald. It logs sender, timestamp, and byte count. Owner-only local `listen` and `chat` IPC subscribers still receive complete bodies. Log suppression is operational hygiene, not a privacy boundary against the machine operator or another swarm participant.
 
 ## Install
 
+Build locally:
+
 ```sh
-cargo install --path .
+cargo install --locked --path .
 ```
 
-State defaults to `$XDG_DATA_HOME/meshmsg` (`~/.local/share/meshmsg`). Override it with `--state-dir` or `MESHMSG_STATE_DIR` on both the daemon and CLI commands.
+Release archives are provided for `x86_64-unknown-linux-gnu` and portable `x86_64-unknown-linux-musl`. Verify `SHA256SUMS` before installing a downloaded binary.
+
+State defaults to `$XDG_DATA_HOME/meshmsg` (`~/.local/share/meshmsg`). Override it with `--state-dir` or `MESHMSG_STATE_DIR` consistently for daemon and CLI commands.
 
 ## First message
 
-Initialize and run the seed daemon on the VPS:
+Initialize and run an always-on seed:
 
 ```sh
 meshmsg seed init
-meshmsg seed run
+meshmsg --json seed run
 ```
 
-`seed run` is the seed-compatible spelling of `meshmsg daemon`: both run in the foreground. The daemon writes its control socket to `~/.local/share/meshmsg/daemon.sock` with mode `0600`. Retrieve the seed invite from another shell:
+`seed run` is seed-only and rejects member state. It runs in the foreground and writes an owner-only control socket at `~/.local/share/meshmsg/daemon.sock`. Daemon startup output never includes the invite capability. In another shell, retrieve it explicitly:
 
 ```sh
 meshmsg seed invite
 ```
 
-On each client, save the invite and start its daemon:
+On each client:
 
 ```sh
 meshmsg join '<invite>'
-meshmsg daemon
+meshmsg --json daemon
 ```
 
-Then use separate terminals to send, listen, inspect live status, or chat:
+Then use separate terminals:
 
 ```sh
 meshmsg send 'hello'
@@ -41,30 +51,118 @@ meshmsg status
 meshmsg chat
 ```
 
-Stop the local daemon cleanly with:
+Stop the local daemon cleanly:
 
 ```sh
 meshmsg stop
 ```
 
-`send`, `listen`, `chat`, and `status` never create their own Iroh endpoint. If the daemon is unavailable they fail with an instruction to start `meshmsg daemon`. This prevents multiple processes from using the same persistent identity.
+`send`, `listen`, `chat`, and `status` never create another Iroh endpoint. They fail with an actionable error when the daemon is unavailable. The exclusive state lock prevents multiple processes from using one identity.
 
-## Add redundant seeds
+## Send semantics
 
-On a new always-on machine:
+A successful send reports `queued`, for example:
+
+```json
+{"type":"queued","from":"<peer-id>","body":"hello","delivery_acknowledged":false}
+```
+
+`queued` means the local gossip implementation accepted the broadcast request. It is **not** a delivery acknowledgement and does not guarantee that any remote peer received or persisted the message.
+
+## Redundant seeds
+
+On another always-on machine:
 
 ```sh
 meshmsg seed join '<invite-from-existing-seed>'
-meshmsg seed run
+meshmsg --json seed run
 ```
 
-The new seed connects to the same topic and persists a new invite containing itself and the previous seeds. Distribute that expanded invite to clients. Seeds are equal peers; there is no leader. Up to 16 seeds are accepted, and a full invite cannot add a seventeenth seed. A restarting seed replaces its own old endpoint.
+The seed persists an expanded invite containing itself and previous seeds. Distribute the newest invite to clients. Seeds are equal peers; there is no leader. Invites accept up to 16 seeds, reject adding a seventeenth, and replace a restarting seed's stale endpoint by identity.
 
-## Local daemon and automation
+A member must use `meshmsg daemon`; seed-only `seed run` and `seed invite` reject member state. The generic daemon supports both roles.
 
-The daemon is intentionally foreground-only so a process supervisor owns lifecycle and logs. It holds an exclusive state lock, removes stale socket files at startup, rejects a second daemon for the same state directory, and removes its socket on clean shutdown, Ctrl-C, or SIGTERM. The state directory and control socket are owner-only. IPC frames are bounded, and local listener disconnects do not affect the daemon.
+## Startup, status, and diagnosis
 
-Use `--json` for one-shot JSON and NDJSON streams:
+Startup and topic bootstrap are bounded. If joining configured seeds or becoming online exceeds its deadline, the process exits nonzero with an actionable error so systemd can retry; JSON mode also emits a `startup_error` event with `phase` and `retryable` fields. At least one configured seed must be reachable for a member or additional seed to bootstrap.
+
+Live status distinguishes the observations available after startup:
+
+```sh
+meshmsg --json status
+```
+
+```json
+{"type":"status","running":true,"endpoint_online":true,"topic_joined":true,"neighbors":2}
+```
+
+These are local runtime states, not guarantees of end-to-end message delivery. `neighbors` is the current direct gossip-neighbor count, including the neighbor consumed during initial bootstrap. `topic_joined` is derived from that live gossip state and becomes false when no direct neighbors remain (including for a lone first seed).
+
+Validate persisted role, identity, topic, and invite invariants offline:
+
+```sh
+meshmsg --json doctor
+```
+
+Member state must contain an invite; every configured invite must parse and match the persisted topic.
+
+## Local daemon operation
+
+The foreground daemon:
+
+- holds an exclusive lock for state and identity;
+- uses atomic state writes;
+- restricts the state directory to `0700` and socket to `0600`;
+- removes stale sockets safely;
+- bounds IPC frames and subscriber queues;
+- reports lag when a local or gossip receiver drops events;
+- suppresses incoming bodies from unattended logs for every role;
+- shuts down on `meshmsg stop`, Ctrl-C, SIGINT, or SIGTERM.
+
+Application envelopes are limited to 4096 serialized bytes. Maximum body text is smaller because signatures and metadata consume space.
+
+## systemd user service
+
+Initialize seed or member state first, then create `~/.config/systemd/user/meshmsg.service`:
+
+```ini
+[Unit]
+Description=meshmsg peer daemon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/meshmsg --json daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Enable it:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now meshmsg
+meshmsg status
+journalctl --user -u meshmsg -f
+```
+
+For service operation after logout:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+Startup timeouts exit nonzero, so `Restart=on-failure` retries temporary network/bootstrap failures without a permanently hung service.
+
+## JSON automation
+
+Use the global `--json` option for one-shot JSON and NDJSON streams:
 
 ```sh
 meshmsg --json daemon
@@ -73,40 +171,17 @@ meshmsg --json listen
 meshmsg --json send 'hello'
 ```
 
-`listen` and `chat` receive full message events over the local socket. A bounded event queue protects the daemon from slow local listeners; a lag event reports dropped local events. The private identity is stored in `secret.key` with mode `0600`. Application envelopes are limited to 4096 bytes; the maximum text length is smaller because signatures and other metadata consume space.
+`listen` and `chat` receive complete messages through owner-only IPC. Slow subscribers receive a `lagged` event when their bounded queue drops events.
 
-## Privacy model
-
-Seeds are full gossip peers, not opaque relays. Messages are signed but currently plaintext, so every participating seed and client can technically read them. End-to-end encryption is not implemented.
-
-To reduce accidental disclosure, a seed daemon suppresses received message bodies in its own stdout/service logs. Local `meshmsg listen` and `meshmsg chat` clients still receive full bodies through the owner-only socket. This is not a privacy boundary against the machine or seed operator.
-
-## systemd user service
-
-The same service works for seed and member state. For a seed, initialize it first with `meshmsg seed init`; for a member, run `meshmsg join` first.
-
-Create `~/.config/systemd/user/meshmsg.service` (adjust the executable path):
-
-```ini
-[Unit]
-Description=meshmsg peer daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=%h/.cargo/bin/meshmsg --json daemon
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-```
-
-Then run:
+## Development and release checks
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user enable --now meshmsg
-meshmsg status
-journalctl --user -u meshmsg -f
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+bash tests/integration-3-seed-2-client.sh target/debug/meshmsg
 ```
+
+CI also runs dependency audit/policy checks. Pushing a version tag matching `Cargo.toml` builds GNU on an older Ubuntu baseline plus a portable musl archive, generates `SHA256SUMS`, and uploads release assets. The release workflow does not run for ordinary commits.
+
+Licensed under either of Apache-2.0 or MIT at your option; see `LICENSE-APACHE` and `LICENSE-MIT`.

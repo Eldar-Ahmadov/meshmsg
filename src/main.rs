@@ -53,9 +53,10 @@ async fn run() -> Result<()> {
                     }),
                 );
             }
-            SeedCommand::Run => node::run_daemon(&dir, cli.json).await?,
+            SeedCommand::Run => node::run_seed_daemon(&dir, cli.json).await?,
             SeedCommand::Invite => {
                 let state = State::load(&dir)?;
+                state.ensure_role(config::Role::Seed)?;
                 let token = state
                     .invite
                     .context("seed has not run yet; run `meshmsg seed run` first")?;
