@@ -167,7 +167,7 @@ fn write_secret(dir: &Path, key: &SecretKey) -> Result<()> {
     .context("write secret.key")
 }
 
-fn atomic_write(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
+fn atomic_write(dir: &Path, name: &str, contents: &[u8], _mode: u32) -> Result<()> {
     prepare_state_dir(dir)?;
     let destination = dir.join(name);
     let temporary = temporary_path(dir, name);
@@ -177,12 +177,13 @@ fn atomic_write(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(mode);
+            options.mode(_mode);
         }
         let mut file = options.open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
-        fs::rename(&temporary, &destination)?;
+        atomic_replace(&temporary, &destination)?;
+        #[cfg(unix)]
         fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
@@ -190,6 +191,38 @@ fn atomic_write(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(unix)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn temporary_path(dir: &Path, name: &str) -> PathBuf {

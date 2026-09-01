@@ -5,13 +5,18 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+# A tag has exactly one release publisher. Failed attempts leave only a draft;
+# retries replace that draft rather than mixing assets from separate builds.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  linux:
-    # GNU binaries built on this older baseline run on that glibc and newer.
+  validate:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -21,17 +26,39 @@ jobs:
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "${version}"
           test "${GITHUB_REF_NAME}" = "v${version}"
+
+  linux:
+    needs: validate
+    # GNU binaries built on this older baseline run on that glibc and newer.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install targets and musl linker
+        shell: bash
         run: |
+          set -euo pipefail
           rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - name: Build locked release binaries
+      - name: Run locked Linux tests
+        shell: bash
         run: |
+          set -euo pipefail
+          cargo test --locked --all-targets
+          cargo build --locked
+          timeout 1100 bash tests/integration-3-seed-2-client.sh target/debug/meshmsg
+      - name: Build locked release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo build --release --locked --target x86_64-unknown-linux-gnu
           cargo build --release --locked --target x86_64-unknown-linux-musl
-      - name: Package and checksum
+      - name: Package Linux archives
         shell: bash
         run: |
           set -euo pipefail
@@ -44,13 +71,85 @@ jobs:
             tar -C dist -czf "dist/${name}.tar.gz" "${name}"
             rm -rf "dist/${name}"
           done
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
-      - name: Create release and upload assets
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Upload Linux archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    needs: validate
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      # Keep the release archive self-contained on clean Windows hosts.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test Windows IPC and state handling
+        shell: pwsh
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Build locked Windows release binary
+        shell: pwsh
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package Windows archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "x86_64-pc-windows-msvc"
+          $name = "meshmsg-$env:GITHUB_REF_NAME-$target"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/$target/release/meshmsg.exe" "dist/$name/meshmsg.exe"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse -Force "dist/$name"
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-windows
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [linux, windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate unified checksums
         shell: bash
         run: |
           set -euo pipefail
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
-            gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes --title "meshmsg ${GITHUB_REF_NAME}"
-          gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS --clobber
+          cd dist
+          mapfile -t archives < <(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' | sort)
+          test "${#archives[@]}" -eq 3
+          sha256sum "${archives[@]}" > SHA256SUMS
+      - name: Publish complete GitHub release atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "${tag}" --json isDraft >/dev/null 2>&1; then
+            if test "$(gh release view "${tag}" --json isDraft --jq .isDraft)" != true; then
+              echo "refusing to overwrite already-published release ${tag}" >&2
+              exit 1
+            fi
+            gh release delete "${tag}" --yes
+          fi
+          gh release create "${tag}" --draft --verify-tag --generate-notes --title "meshmsg ${tag}"
+          gh release upload "${tag}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS
+          gh release edit "${tag}" --draft=false

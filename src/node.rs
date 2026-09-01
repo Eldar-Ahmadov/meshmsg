@@ -16,14 +16,21 @@ use iroh_gossip::{
 };
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::{
     io::BufRead as _,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{broadcast, mpsc, oneshot},
 };
 
@@ -39,6 +46,7 @@ const MAX_IPC_EVENT_SIZE: usize = MAX_ENVELOPE_SIZE * 6 + 1024;
 const IPC_EVENT_CAPACITY: usize = 256;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
 
@@ -164,13 +172,15 @@ enum DaemonCommand {
     Stop,
 }
 
-struct SocketGuard {
+#[cfg(unix)]
+struct LocalEndpointGuard {
     path: PathBuf,
     device: u64,
     inode: u64,
 }
 
-impl Drop for SocketGuard {
+#[cfg(unix)]
+impl Drop for LocalEndpointGuard {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
         if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
@@ -181,15 +191,194 @@ impl Drop for SocketGuard {
     }
 }
 
-fn socket_path(dir: &Path) -> PathBuf {
-    dir.join(SOCKET_NAME)
+#[cfg(windows)]
+struct LocalEndpointGuard;
+
+#[cfg(unix)]
+type LocalServerStream = UnixStream;
+#[cfg(unix)]
+type LocalClientStream = UnixStream;
+#[cfg(windows)]
+type LocalServerStream = NamedPipeServer;
+#[cfg(windows)]
+type LocalClientStream = NamedPipeClient;
+
+#[cfg(unix)]
+struct LocalListener(UnixListener);
+
+#[cfg(unix)]
+impl LocalListener {
+    async fn accept(&mut self) -> Result<LocalServerStream> {
+        Ok(self
+            .0
+            .accept()
+            .await
+            .context("accept local daemon client")?
+            .0)
+    }
 }
 
-async fn bind_socket(dir: &Path, _state_lock: &StateLock) -> Result<(UnixListener, SocketGuard)> {
+#[cfg(windows)]
+struct LocalListener {
+    pipe_name: String,
+    pending: Option<NamedPipeServer>,
+}
+
+#[cfg(windows)]
+impl LocalListener {
+    async fn accept(&mut self) -> Result<LocalServerStream> {
+        let server = self.pending.take().context("named pipe listener missing")?;
+        server
+            .connect()
+            .await
+            .context("accept local daemon client")?;
+        self.pending = Some(create_pipe_server(&self.pipe_name, false)?);
+        Ok(server)
+    }
+}
+
+#[cfg(unix)]
+fn local_endpoint(dir: &Path) -> String {
+    dir.join(SOCKET_NAME).display().to_string()
+}
+
+#[cfg(windows)]
+fn local_endpoint(dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::ffi::OsStrExt;
+
+    let path = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(b"meshmsg-windows-pipe-v1\0");
+    for unit in path.as_os_str().encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let suffix: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(r"\\.\pipe\meshmsg-{suffix}")
+}
+
+#[cfg(windows)]
+struct WindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn token_user_buffer(token: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<usize>> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser};
+
+    let mut required = 0;
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required);
+    }
+    anyhow::ensure!(required > 0, "determine Windows token owner size");
+    let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    let loaded = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            required,
+            &mut required,
+        )
+    };
+    anyhow::ensure!(
+        loaded != 0,
+        "read Windows token owner: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(buffer)
+}
+
+#[cfg(windows)]
+fn sid_belongs_to_current_user(candidate: windows_sys::Win32::Security::PSID) -> Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Security::{EqualSid, TOKEN_QUERY, TOKEN_USER},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut current_token: HANDLE = std::ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut current_token) };
+    anyhow::ensure!(
+        opened != 0,
+        "open current process token: {}",
+        std::io::Error::last_os_error()
+    );
+    let current_token = WindowsHandle(current_token);
+    let current_user = token_user_buffer(current_token.0)?;
+    let current_sid = unsafe { (*(current_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    Ok(unsafe { EqualSid(candidate, current_sid) } != 0)
+}
+
+#[cfg(windows)]
+fn process_belongs_to_current_user(process_id: u32) -> Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Security::{TOKEN_QUERY, TOKEN_USER},
+        System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    anyhow::ensure!(
+        !process.is_null(),
+        "open named pipe server process: {}",
+        std::io::Error::last_os_error()
+    );
+    let process = WindowsHandle(process);
+
+    let mut server_token: HANDLE = std::ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut server_token) };
+    anyhow::ensure!(
+        opened != 0,
+        "open named pipe server token: {}",
+        std::io::Error::last_os_error()
+    );
+    let server_token = WindowsHandle(server_token);
+
+    let server_user = token_user_buffer(server_token.0)?;
+    let server_sid = unsafe { (*(server_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    sid_belongs_to_current_user(server_sid)
+}
+
+#[cfg(windows)]
+fn verify_named_pipe_server_owner(stream: &NamedPipeClient) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::HANDLE, System::Pipes::GetNamedPipeServerProcessId};
+
+    let mut process_id = 0;
+    let found =
+        unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle() as HANDLE, &mut process_id) };
+    anyhow::ensure!(
+        found != 0,
+        "identify named pipe server: {}",
+        std::io::Error::last_os_error()
+    );
+    anyhow::ensure!(
+        process_belongs_to_current_user(process_id)?,
+        "refusing named pipe server owned by another Windows user"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn bind_local_endpoint(
+    dir: &Path,
+    _state_lock: &StateLock,
+) -> Result<(LocalListener, LocalEndpointGuard)> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     prepare_state_dir(dir)?;
-    let path = socket_path(dir);
+    let path = dir.join(SOCKET_NAME);
     if path.exists() {
         if UnixStream::connect(&path).await.is_ok() {
             anyhow::bail!("a meshmsg daemon is already running for {}", dir.display());
@@ -201,8 +390,8 @@ async fn bind_socket(dir: &Path, _state_lock: &StateLock) -> Result<(UnixListene
         .context("restrict daemon socket permissions")?;
     let metadata = std::fs::symlink_metadata(&path).context("inspect daemon socket")?;
     Ok((
-        listener,
-        SocketGuard {
+        LocalListener(listener),
+        LocalEndpointGuard {
             path,
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -210,7 +399,76 @@ async fn bind_socket(dir: &Path, _state_lock: &StateLock) -> Result<(UnixListene
     ))
 }
 
-async fn read_frame(stream: &mut UnixStream, maximum: usize) -> Result<Vec<u8>> {
+#[cfg(windows)]
+fn create_pipe_server(name: &str, first: bool) -> Result<NamedPipeServer> {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SECURITY_ATTRIBUTES,
+        },
+    };
+
+    // Protect the pipe DACL and grant access only to its owner, LocalSystem,
+    // and administrators. PIPE_REJECT_REMOTE_CLIENTS additionally excludes
+    // network clients.
+    let mut sddl: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)\0"
+        .encode_utf16()
+        .collect();
+    let mut descriptor = ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_mut_ptr(),
+            1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    anyhow::ensure!(
+        converted != 0,
+        "create owner-only named pipe security descriptor: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let result = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(
+                name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+    };
+    unsafe { LocalFree(descriptor as *mut c_void) };
+    result.context("create owner-only daemon named pipe")
+}
+
+#[cfg(windows)]
+async fn bind_local_endpoint(
+    dir: &Path,
+    _state_lock: &StateLock,
+) -> Result<(LocalListener, LocalEndpointGuard)> {
+    prepare_state_dir(dir)?;
+    let pipe_name = local_endpoint(dir);
+    let pending = create_pipe_server(&pipe_name, true)?;
+    Ok((
+        LocalListener {
+            pipe_name,
+            pending: Some(pending),
+        },
+        LocalEndpointGuard,
+    ))
+}
+
+async fn read_frame<S>(stream: &mut S, maximum: usize) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut frame = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
@@ -228,7 +486,10 @@ async fn read_frame(stream: &mut UnixStream, maximum: usize) -> Result<Vec<u8>> 
     Ok(frame)
 }
 
-async fn write_value(stream: &mut UnixStream, value: &serde_json::Value) -> Result<()> {
+async fn write_value<S>(stream: &mut S, value: &serde_json::Value) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut encoded = serde_json::to_vec(value)?;
     anyhow::ensure!(
         encoded.len() <= MAX_IPC_EVENT_SIZE,
@@ -242,12 +503,15 @@ async fn write_value(stream: &mut UnixStream, value: &serde_json::Value) -> Resu
     Ok(())
 }
 
-async fn handle_local_client(
-    mut stream: UnixStream,
+async fn handle_local_client<S>(
+    mut stream: S,
     commands: mpsc::Sender<DaemonCommand>,
     mut events: broadcast::Receiver<serde_json::Value>,
     connected: serde_json::Value,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let frame = read_frame(&mut stream, MAX_IPC_REQUEST_SIZE).await?;
     let request: IpcRequest =
         serde_json::from_slice(&frame).context("invalid local IPC request")?;
@@ -286,6 +550,33 @@ async fn handle_local_client(
     Ok(())
 }
 
+fn shutdown_signals() -> Result<mpsc::Receiver<()>> {
+    let (sender, receiver) = mpsc::channel(1);
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install SIGTERM handler")?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("install SIGINT handler")?;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+            let _ = sender.send(()).await;
+        });
+    }
+    #[cfg(windows)]
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = sender.send(()).await;
+        }
+    });
+    Ok(receiver)
+}
+
 pub async fn run_seed_daemon(dir: &Path, json: bool) -> Result<()> {
     // Fail fast with a role-specific error, then validate again after acquiring
     // daemon ownership to close the concurrent forced-replacement gap.
@@ -298,11 +589,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
 }
 
 async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role>) -> Result<()> {
-    // Install the service-manager signal handler before daemon startup becomes externally visible.
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("install SIGTERM handler")?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("install SIGINT handler")?;
+    // Install service-manager/console signal handling before startup becomes visible.
+    let mut shutdown = shutdown_signals()?;
     // Claim local ownership before reading the identity, starting networking, or mutating state.
     let state_lock = StateLock::acquire(dir)?;
     let mut state = State::load(dir)?;
@@ -312,8 +600,7 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
     }
     let startup = tokio::select! {
         result = tokio::time::timeout(STARTUP_TIMEOUT, start(dir)) => result,
-        _ = terminate.recv() => return Ok(()),
-        _ = interrupt.recv() => return Ok(()),
+        _ = shutdown.recv() => return Ok(()),
     };
     let mut node = match startup {
         Ok(Ok(node)) => node,
@@ -336,11 +623,7 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
     };
     let online = tokio::select! {
         result = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, node.endpoint.online()) => result,
-        _ = terminate.recv() => {
-            node.router.shutdown().await?;
-            return Ok(());
-        }
-        _ = interrupt.recv() => {
+        _ = shutdown.recv() => {
             node.router.shutdown().await?;
             return Ok(());
         }
@@ -373,12 +656,13 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
 
     // Expose IPC only after networking is ready, so clients never connect to a
     // socket whose daemon is still blocked during bootstrap.
-    let (listener, _socket_guard) = bind_socket(dir, &state_lock).await?;
+    let (mut listener, _endpoint_guard) = bind_local_endpoint(dir, &state_lock).await?;
     let peer = node.endpoint.id().to_string();
     let started = serde_json::json!({
         "type":"daemon_started", "peer":peer, "topic":state.topic,
-        "role":state.role, "socket":socket_path(dir),
-        "endpoint_online":true, "topic_joined":node.receiver.is_joined()
+        "role":state.role, "socket":local_endpoint(dir),
+        "local_endpoint":local_endpoint(dir), "endpoint_online":true,
+        "topic_joined":node.receiver.is_joined()
     });
     event(json, started);
 
@@ -388,7 +672,7 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept local daemon client")?;
+                let stream = accepted?;
                 let commands = command_tx.clone();
                 let events = event_tx.subscribe();
                 let connected = serde_json::json!({
@@ -424,8 +708,9 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
                     let _ = reply.send(serde_json::json!({
                         "type":"status", "running":true, "role":state.role, "peer":peer,
                         "topic":state.topic, "configured_seed":state.invite.is_some(),
-                        "neighbors":neighbors, "socket":socket_path(dir),
-                        "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined()
+                        "neighbors":neighbors, "socket":local_endpoint(dir),
+                        "local_endpoint":local_endpoint(dir), "endpoint_online":endpoint_online,
+                        "topic_joined":node.receiver.is_joined()
                     }));
                 }
                 Some(DaemonCommand::Stop) => break,
@@ -441,8 +726,7 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
                 }
                 None => break,
             },
-            _ = interrupt.recv() => break,
-            _ = terminate.recv() => break,
+            _ = shutdown.recv() => break,
         }
     }
 
@@ -509,15 +793,39 @@ fn suppress_message_body(value: serde_json::Value) -> serde_json::Value {
     })
 }
 
-async fn connect_daemon(dir: &Path) -> Result<UnixStream> {
-    UnixStream::connect(socket_path(dir))
+#[cfg(unix)]
+async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
+    UnixStream::connect(dir.join(SOCKET_NAME))
         .await
         .with_context(|| {
             format!(
                 "connect to local daemon at {}; start it with `meshmsg daemon`",
-                socket_path(dir).display()
+                local_endpoint(dir)
             )
         })
+}
+
+#[cfg(windows)]
+async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
+    let endpoint = local_endpoint(dir);
+    for attempt in 0..20 {
+        match ClientOptions::new().open(&endpoint) {
+            Ok(stream) => {
+                verify_named_pipe_server_owner(&stream)
+                    .context("authenticate local daemon named pipe")?;
+                return Ok(stream);
+            }
+            Err(error) if attempt < 19 && matches!(error.raw_os_error(), Some(2 | 231)) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("connect to local daemon at {endpoint}; start it with `meshmsg daemon`")
+                });
+            }
+        }
+    }
+    unreachable!("named pipe connection retry loop always returns")
 }
 
 async fn send_request(dir: &Path, request: &IpcRequest) -> Result<serde_json::Value> {
@@ -556,7 +864,7 @@ pub async fn send_once(dir: &Path, body: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn subscribe(dir: &Path) -> Result<BufReader<UnixStream>> {
+async fn subscribe(dir: &Path) -> Result<BufReader<LocalClientStream>> {
     let mut stream = connect_daemon(dir).await?;
     let mut request = serde_json::to_vec(&IpcRequest::Subscribe)?;
     request.push(b'\n');
@@ -565,7 +873,7 @@ async fn subscribe(dir: &Path) -> Result<BufReader<UnixStream>> {
 }
 
 async fn read_subscription(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut BufReader<LocalClientStream>,
 ) -> Result<Option<serde_json::Value>> {
     let mut line = Vec::new();
     let read = reader.read_until(b'\n', &mut line).await?;
@@ -713,10 +1021,10 @@ fn event(json: bool, value: serde_json::Value) {
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
             "daemon_started" => println!(
-                "daemon running as {} ({})\nsocket: {}",
+                "daemon running as {} ({})\nlocal endpoint: {}",
                 value["peer"].as_str().unwrap_or(""),
                 value["role"].as_str().unwrap_or("unknown"),
-                value["socket"].as_str().unwrap_or("")
+                value["local_endpoint"].as_str().unwrap_or("")
             ),
             "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
             "stopping" => println!("daemon stopping"),
@@ -732,6 +1040,7 @@ fn event(json: bool, value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -838,49 +1147,171 @@ mod tests {
         assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_IPC_EVENT_SIZE);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_socket_is_owner_only_and_replaces_stale_file() {
         let dir = std::env::temp_dir().join(format!("meshmsg-ipc-test-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(socket_path(&dir), b"stale").unwrap();
+        let path = dir.join(SOCKET_NAME);
+        std::fs::write(&path, b"stale").unwrap();
         let state_lock = StateLock::acquire(&dir).unwrap();
-        let (_listener, guard) = bind_socket(&dir, &state_lock).await.unwrap();
+        let (_listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
         assert_eq!(
-            std::fs::metadata(socket_path(&dir))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         drop(guard);
-        assert!(!socket_path(&dir).exists());
+        assert!(!path.exists());
         drop(state_lock);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_guard_does_not_remove_a_replacement_path() {
         let dir = std::env::temp_dir().join(format!("meshmsg-ipc-test-{}", rand::random::<u64>()));
         let state_lock = StateLock::acquire(&dir).unwrap();
-        let (listener, guard) = bind_socket(&dir, &state_lock).await.unwrap();
+        let (listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
         drop(listener);
-        std::fs::remove_file(socket_path(&dir)).unwrap();
-        std::fs::write(socket_path(&dir), b"replacement").unwrap();
+        let path = dir.join(SOCKET_NAME);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
 
         drop(guard);
-        assert_eq!(std::fs::read(socket_path(&dir)).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+        drop(state_lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_name_stably_hashes_wide_paths() {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+        let first = std::path::PathBuf::from(OsString::from_wide(&[0x0061, 0xd800]));
+        let second = std::path::PathBuf::from(OsString::from_wide(&[0x0061, 0xd801]));
+        assert_eq!(local_endpoint(&first), local_endpoint(&first));
+        assert_ne!(local_endpoint(&first), local_endpoint(&second));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_has_protected_owner_dacl() {
+        use std::{ffi::c_void, os::windows::io::AsRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{LocalFree, HANDLE},
+            Security::{
+                Authorization::{
+                    BuildTrusteeWithSidW, GetEffectiveRightsFromAclW, GetSecurityInfo,
+                    SE_KERNEL_OBJECT, TRUSTEE_W,
+                },
+                CreateWellKnownSid, GetSecurityDescriptorControl, WinWorldSid,
+                DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+                SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED,
+            },
+        };
+
+        let dir = std::env::temp_dir().join(format!("meshmsg-ipc-test-{}", rand::random::<u64>()));
+        let state_lock = StateLock::acquire(&dir).unwrap();
+        let (listener, _guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
+        let server = listener.pending.as_ref().unwrap();
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                server.as_raw_handle() as HANDLE,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0);
+        assert!(!owner.is_null());
+        assert!(!dacl.is_null());
+        assert!(sid_belongs_to_current_user(owner).unwrap());
+
+        let mut control = 0;
+        let mut revision = 0;
+        let read_control =
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+        assert_ne!(read_control, 0);
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+
+        let mut world_sid = vec![0_u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut world_sid_size = world_sid.len() as u32;
+        let made_world = unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                std::ptr::null_mut(),
+                world_sid.as_mut_ptr().cast(),
+                &mut world_sid_size,
+            )
+        };
+        assert_ne!(made_world, 0);
+        let mut trustee = TRUSTEE_W::default();
+        unsafe { BuildTrusteeWithSidW(&mut trustee, world_sid.as_mut_ptr().cast()) };
+        let mut rights = 0;
+        let status = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut rights) };
+        assert_eq!(status, 0);
+        assert_eq!(rights, 0, "Everyone must not receive named-pipe access");
+
+        unsafe { LocalFree(descriptor.cast::<c_void>()) };
+        drop(state_lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_foreign_pipe_owner_sid_is_rejected() {
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, WinLocalSystemSid, SECURITY_MAX_SID_SIZE,
+        };
+
+        let mut system_sid = vec![0_u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = system_sid.len() as u32;
+        let created = unsafe {
+            CreateWellKnownSid(
+                WinLocalSystemSid,
+                std::ptr::null_mut(),
+                system_sid.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        assert_ne!(created, 0, "{}", std::io::Error::last_os_error());
+        assert!(!sid_belongs_to_current_user(system_sid.as_mut_ptr().cast()).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_accepts_authenticated_local_ipc() {
+        let dir = std::env::temp_dir().join(format!("meshmsg-ipc-test-{}", rand::random::<u64>()));
+        let state_lock = StateLock::acquire(&dir).unwrap();
+        let endpoint = local_endpoint(&dir);
+        let (mut listener, _guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let mut client = connect_daemon(&dir).await.unwrap();
+        let mut server = accept.await.unwrap();
+        assert_eq!(endpoint, local_endpoint(&dir));
+        client.write_all(b"ping").await.unwrap();
+        let mut received = [0; 4];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"ping");
         drop(state_lock);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
     async fn subscriber_exits_when_daemon_event_channel_closes() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
         let task = tokio::spawn(handle_local_client(
@@ -905,7 +1336,7 @@ mod tests {
 
     #[tokio::test]
     async fn slow_subscriber_receives_lag_event() {
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
         events.send(serde_json::json!({"type":"first"})).unwrap();
@@ -931,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_reader_rejects_oversized_request() {
-        let (mut left, mut right) = UnixStream::pair().unwrap();
+        let (mut left, mut right) = tokio::io::duplex(MAX_IPC_REQUEST_SIZE + 1);
         let writer = tokio::spawn(async move {
             right
                 .write_all(&vec![b'a'; MAX_IPC_REQUEST_SIZE + 1])
