@@ -51,7 +51,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --all-targets
           cargo build --locked
-          timeout 1100 bash tests/integration-3-seed-2-client.sh target/debug/meshmsg
+          timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
       - name: Build locked release binaries
         shell: bash
         run: |

@@ -13,7 +13,6 @@ use std::{
 };
 
 const LOCK_NAME: &str = ".meshmsg.lock";
-const LEGACY_SECRET_NAME: &str = "secret.key";
 const IDENTITY_VERSION: u8 = 1;
 
 /// Exclusive ownership of mutable state and the network identity.
@@ -69,41 +68,36 @@ pub fn prepare_state_dir(dir: &Path) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct State {
-    pub role: Role,
+    pub advertise_self: bool,
     pub topic: String,
     pub invite: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<IdentityBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IdentityBinding {
     version: u8,
     generation: String,
     public_key: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Seed,
-    Member,
-}
-
 impl State {
-    pub fn new_seed() -> Self {
+    pub fn new_topic() -> Self {
         Self {
-            role: Role::Seed,
+            advertise_self: true,
             topic: TopicId::from_bytes(rand::random()).to_string(),
             invite: None,
             identity: None,
         }
     }
 
-    pub fn from_invite(role: Role, token: String, invite: &Invite) -> Self {
+    pub fn from_invite(token: String, invite: &Invite, advertise_self: bool) -> Self {
         Self {
-            role,
+            advertise_self,
             topic: invite.topic.to_string(),
             invite: Some(token),
             identity: None,
@@ -114,28 +108,30 @@ impl State {
         TopicId::from_str(&self.topic).context("invalid topic in state")
     }
 
-    pub fn ensure_role(&self, expected: Role) -> Result<()> {
-        anyhow::ensure!(
-            self.role == expected,
-            "command requires {:?} state, but this state is {:?}",
-            expected,
-            self.role
-        );
+    pub fn validate(&self) -> Result<()> {
+        let topic = self.topic_id()?;
+        if let Some(token) = &self.invite {
+            let invite: Invite = token.parse().context("invalid invite in state")?;
+            anyhow::ensure!(
+                invite.topic == topic,
+                "configured invite topic does not match state topic"
+            );
+        } else {
+            anyhow::ensure!(
+                self.advertise_self,
+                "state without an invite must advertise itself"
+            );
+        }
         Ok(())
     }
 
-    pub fn validate(&self) -> Result<()> {
-        let topic = self.topic_id()?;
-        match (&self.role, &self.invite) {
-            (Role::Member, None) => bail!("member state must contain an invite"),
-            (_, Some(token)) => {
+    pub fn validate_for_identity(&self, identity: PublicKey) -> Result<()> {
+        self.validate()?;
+        if self.advertise_self {
+            if let Some(token) = &self.invite {
                 let invite: Invite = token.parse().context("invalid invite in state")?;
-                anyhow::ensure!(
-                    invite.topic == topic,
-                    "configured invite topic does not match state topic"
-                );
+                invite.ensure_can_advertise(identity)?;
             }
-            (Role::Seed, None) => {}
         }
         Ok(())
     }
@@ -145,45 +141,29 @@ impl State {
             .context("parse config.json")
     }
 
-    /// Load state while holding daemon ownership, migrating legacy identity metadata if needed.
-    pub fn load_locked(dir: &Path, lock: &StateLock) -> Result<(Self, SecretKey)> {
-        let mut state = Self::load(dir)?;
-        if state.identity.is_none() {
-            migrate_legacy(dir, lock, &mut state)?;
-        }
+    pub fn load_locked(dir: &Path, _lock: &StateLock) -> Result<(Self, SecretKey)> {
+        let state = Self::load(dir)?;
         let secret = load_bound_secret(
             dir,
             state
                 .identity
                 .as_ref()
-                .context("identity binding missing after migration")?,
+                .context("identity binding missing from config.json")?,
         )?;
         Ok((state, secret))
     }
 
-    /// Doctor remains lock-free for current state, but serializes a required legacy migration.
+    /// Current state is immutable while the daemon runs and can be diagnosed lock-free.
     pub fn load_for_doctor(dir: &Path) -> Result<(Self, SecretKey)> {
         let state = Self::load(dir)?;
-        if let Some(binding) = &state.identity {
-            let secret = load_bound_secret(dir, binding)?;
-            return Ok((state, secret));
-        }
-        let lock = match StateLock::acquire(dir) {
-            Ok(lock) => lock,
-            Err(error) => {
-                // Daemon startup may have completed migration between our first read and
-                // lock attempt. Reload once before reporting that migration is blocked.
-                let refreshed = Self::load(dir)?;
-                if let Some(binding) = &refreshed.identity {
-                    let secret = load_bound_secret(dir, binding)?;
-                    return Ok((refreshed, secret));
-                }
-                bail!(
-                    "legacy identity metadata requires migration; stop the daemon and retry doctor: {error}"
-                );
-            }
-        };
-        Self::load_locked(dir, &lock)
+        let secret = load_bound_secret(
+            dir,
+            state
+                .identity
+                .as_ref()
+                .context("identity binding missing from config.json")?,
+        )?;
+        Ok((state, secret))
     }
 
     /// Create and durably select a new immutable identity generation.
@@ -221,28 +201,6 @@ impl State {
         atomic_write(dir, "config.json", &serde_json::to_vec_pretty(self)?, 0o600)
             .context("write config.json")
     }
-}
-
-fn migrate_legacy(dir: &Path, lock: &StateLock, state: &mut State) -> Result<()> {
-    let legacy_path = dir.join(LEGACY_SECRET_NAME);
-    let (_legacy_file, secret) = open_secret(&legacy_path).context("load legacy identity")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        _legacy_file
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .context("restrict legacy secret.key permissions")?;
-    }
-    let generation = new_generation();
-    write_generation(dir, &generation, &secret)?;
-    state.identity = Some(IdentityBinding {
-        version: IDENTITY_VERSION,
-        generation,
-        public_key: secret.public().to_string(),
-    });
-    state
-        .save(dir, lock)
-        .context("commit legacy identity migration")
 }
 
 fn new_generation() -> String {
@@ -289,10 +247,6 @@ fn load_bound_secret(dir: &Path, binding: &IdentityBinding) -> Result<SecretKey>
 }
 
 fn read_secret(path: &Path) -> Result<SecretKey> {
-    open_secret(path).map(|(_, secret)| secret)
-}
-
-fn open_secret(path: &Path) -> Result<(fs::File, SecretKey)> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -319,7 +273,7 @@ fn open_secret(path: &Path) -> Result<(fs::File, SecretKey)> {
     let bytes: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("{} must contain 32 bytes", path.display()))?;
-    Ok((file, SecretKey::from_bytes(&bytes)))
+    Ok(SecretKey::from_bytes(&bytes))
 }
 
 fn atomic_write(dir: &Path, name: &str, contents: &[u8], _mode: u32) -> Result<()> {
@@ -398,30 +352,26 @@ mod tests {
 
     fn load_bundle(dir: &Path) -> Result<(State, SecretKey)> {
         let state = State::load(dir)?;
-        let secret = match &state.identity {
-            Some(binding) => load_bound_secret(dir, binding)?,
-            None => read_secret(&dir.join(LEGACY_SECRET_NAME))?,
-        };
+        let secret = load_bound_secret(dir, state.identity.as_ref().context("missing identity")?)?;
         Ok((state, secret))
     }
 
-    fn member_without_invite() -> State {
-        State {
-            role: Role::Member,
-            topic: TopicId::from_bytes(rand::random()).to_string(),
-            invite: None,
-            identity: None,
-        }
+    #[test]
+    fn fresh_state_advertises_self_and_has_no_invite() {
+        let state = State::new_topic();
+        assert!(state.advertise_self);
+        assert!(state.invite.is_none());
+        state.validate().unwrap();
     }
 
     #[test]
     fn save_new_does_not_replace_existing_state_or_identity_without_force() {
         let dir = test_dir();
-        let original = State::new_seed();
+        let original = State::new_topic();
         original.save_new(&dir, false).unwrap();
         let config_before = fs::read(dir.join("config.json")).unwrap();
 
-        let error = State::new_seed().save_new(&dir, false).unwrap_err();
+        let error = State::new_topic().save_new(&dir, false).unwrap_err();
 
         assert!(error.to_string().contains("state already exists"));
         assert_eq!(fs::read(dir.join("config.json")).unwrap(), config_before);
@@ -431,11 +381,11 @@ mod tests {
     #[test]
     fn active_state_lock_rejects_forced_identity_replacement() {
         let dir = test_dir();
-        State::new_seed().save_new(&dir, false).unwrap();
+        State::new_topic().save_new(&dir, false).unwrap();
         let config_before = fs::read(dir.join("config.json")).unwrap();
         let lock = StateLock::acquire(&dir).unwrap();
 
-        let error = State::new_seed().save_new(&dir, true).unwrap_err();
+        let error = State::new_topic().save_new(&dir, true).unwrap_err();
 
         assert!(error.to_string().contains("state is in use"));
         assert_eq!(fs::read(dir.join("config.json")).unwrap(), config_before);
@@ -444,83 +394,58 @@ mod tests {
     }
 
     #[test]
-    fn legacy_state_migrates_without_changing_state_or_public_key() {
+    fn unsupported_state_and_missing_identity_are_rejected() {
         let dir = test_dir();
         prepare_state_dir(&dir).unwrap();
-        let state = State::new_seed();
-        let secret = SecretKey::generate();
+        let unsupported = serde_json::json!({
+            "topic":TopicId::from_bytes([1; 32]).to_string(), "invite":null
+        });
         fs::write(
-            dir.join(LEGACY_SECRET_NAME),
-            HEXLOWER.encode(&secret.to_bytes()),
+            dir.join("config.json"),
+            serde_json::to_vec(&unsupported).unwrap(),
         )
         .unwrap();
-        atomic_write(
-            &dir,
-            "config.json",
-            &serde_json::to_vec_pretty(&state).unwrap(),
-            0o600,
-        )
-        .unwrap();
+        assert!(format!("{:#}", State::load(&dir).unwrap_err()).contains("advertise_self"));
 
+        let state_with_deprecated_field = serde_json::json!({
+            "advertise_self":true,
+            "topic":TopicId::from_bytes([1; 32]).to_string(),
+            "invite":null,
+            "deprecated":true
+        });
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&state_with_deprecated_field).unwrap(),
+        )
+        .unwrap();
+        assert!(format!("{:#}", State::load(&dir).unwrap_err()).contains("unknown field"));
+
+        let current_without_identity = serde_json::json!({
+            "advertise_self":true,
+            "topic":TopicId::from_bytes([1; 32]).to_string(),
+            "invite":null
+        });
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&current_without_identity).unwrap(),
+        )
+        .unwrap();
         let lock = StateLock::acquire(&dir).unwrap();
-        let (migrated, loaded_secret) = State::load_locked(&dir, &lock).unwrap();
-
-        assert_eq!(migrated.role, state.role);
-        assert_eq!(migrated.topic, state.topic);
-        assert_eq!(migrated.invite, state.invite);
-        assert_eq!(loaded_secret.public(), secret.public());
-        assert!(migrated.identity.is_some());
-        assert!(dir.join(LEGACY_SECRET_NAME).exists());
+        assert!(State::load_locked(&dir, &lock)
+            .unwrap_err()
+            .to_string()
+            .contains("identity binding missing"));
         drop(lock);
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_migration_rejects_symlink_without_chmodding_target() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-
-        let dir = test_dir();
-        prepare_state_dir(&dir).unwrap();
-        let external =
-            std::env::temp_dir().join(format!("meshmsg-external-secret-{}", rand::random::<u64>()));
-        fs::write(
-            &external,
-            HEXLOWER.encode(&SecretKey::generate().to_bytes()),
-        )
-        .unwrap();
-        fs::set_permissions(&external, fs::Permissions::from_mode(0o644)).unwrap();
-        symlink(&external, dir.join(LEGACY_SECRET_NAME)).unwrap();
-        let state = State::new_seed();
-        atomic_write(
-            &dir,
-            "config.json",
-            &serde_json::to_vec_pretty(&state).unwrap(),
-            0o600,
-        )
-        .unwrap();
-
-        let lock = StateLock::acquire(&dir).unwrap();
-        let error = State::load_locked(&dir, &lock).unwrap_err();
-
-        assert!(format!("{error:#}").contains("open"));
-        assert_eq!(
-            fs::metadata(&external).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
-        assert!(State::load(&dir).unwrap().identity.is_none());
-        drop(lock);
-        fs::remove_dir_all(dir).unwrap();
-        fs::remove_file(external).unwrap();
     }
 
     #[test]
     fn failed_replacement_after_identity_install_keeps_old_commit_loadable() {
         let dir = test_dir();
-        let old = State::new_seed();
+        let old = State::new_topic();
         let old_peer = old.save_new(&dir, false).unwrap();
 
-        let error = State::new_seed()
+        let error = State::new_topic()
             .save_new_inner(&dir, true, true)
             .unwrap_err();
         let (loaded, secret) = load_bundle(&dir).unwrap();
@@ -534,7 +459,7 @@ mod tests {
     #[test]
     fn expected_public_key_mismatch_is_rejected() {
         let dir = test_dir();
-        State::new_seed().save_new(&dir, false).unwrap();
+        State::new_topic().save_new(&dir, false).unwrap();
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
         value["identity"]["public_key"] = SecretKey::generate().public().to_string().into();
@@ -554,7 +479,7 @@ mod tests {
     #[test]
     fn malformed_generation_and_missing_selected_secret_are_rejected() {
         let dir = test_dir();
-        State::new_seed().save_new(&dir, false).unwrap();
+        State::new_topic().save_new(&dir, false).unwrap();
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
         value["identity"]["generation"] = "../secret.key".into();
@@ -596,28 +521,13 @@ mod tests {
     }
 
     #[test]
-    fn seed_only_commands_reject_member_state() {
-        let error = member_without_invite().ensure_role(Role::Seed).unwrap_err();
-        assert!(error.to_string().contains("requires Seed state"));
-    }
-
-    #[test]
-    fn member_state_requires_an_invite() {
-        assert!(member_without_invite()
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("must contain"));
-    }
-
-    #[test]
     fn configured_invite_must_match_state_topic() {
         let invite = Invite {
             topic: TopicId::from_bytes(rand::random()),
-            seeds: vec![iroh::EndpointAddr::new(SecretKey::generate().public())],
+            bootstrap_peers: vec![iroh::EndpointAddr::new(SecretKey::generate().public())],
         };
         let state = State {
-            role: Role::Seed,
+            advertise_self: false,
             topic: TopicId::from_bytes(rand::random()).to_string(),
             invite: Some(invite.to_string()),
             identity: None,
@@ -631,9 +541,42 @@ mod tests {
     }
 
     #[test]
+    fn nonadvertising_state_requires_an_invite() {
+        let state = State {
+            advertise_self: false,
+            topic: TopicId::from_bytes(rand::random()).to_string(),
+            invite: None,
+            identity: None,
+        };
+        assert!(state
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("advertise"));
+    }
+
+    #[test]
+    fn advertising_state_rejects_a_full_invite_without_its_identity() {
+        let invite = Invite {
+            topic: TopicId::from_bytes(rand::random()),
+            bootstrap_peers: (0..crate::invite::MAX_BOOTSTRAP_PEERS)
+                .map(|_| iroh::EndpointAddr::new(SecretKey::generate().public()))
+                .collect(),
+        };
+        let listed_identity = invite.bootstrap_peers[0].id;
+        let state = State::from_invite(invite.to_string(), &invite, true);
+
+        state.validate_for_identity(listed_identity).unwrap();
+        let error = state
+            .validate_for_identity(SecretKey::generate().public())
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot advertise self"));
+    }
+
+    #[test]
     fn state_save_preserves_identity_binding_and_is_atomic() {
         let dir = test_dir();
-        State::new_seed().save_new(&dir, false).unwrap();
+        State::new_topic().save_new(&dir, false).unwrap();
         let state_lock = StateLock::acquire(&dir).unwrap();
         let (mut state, secret) = load_bundle(&dir).unwrap();
         let identity = state.identity.clone().unwrap();
@@ -657,7 +600,7 @@ mod tests {
     fn state_files_retain_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = test_dir();
-        State::new_seed().save_new(&dir, false).unwrap();
+        State::new_topic().save_new(&dir, false).unwrap();
         let state = State::load(&dir).unwrap();
         let generation = state.identity.unwrap().generation;
         assert_eq!(

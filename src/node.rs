@@ -1,5 +1,5 @@
 use crate::{
-    config::{prepare_state_dir, Role, State, StateLock},
+    config::{prepare_state_dir, State, StateLock},
     invite::Invite,
 };
 use anyhow::{Context, Result};
@@ -128,10 +128,10 @@ async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
     let mut bootstrap = Vec::new();
     if let Some(token) = &state.invite {
         let invite: Invite = token.parse()?;
-        for seed in invite.seeds {
-            if seed.id != endpoint.id() {
-                bootstrap.push(seed.id);
-                lookup.add_endpoint_info(seed);
+        for peer in invite.bootstrap_peers {
+            if peer.id != endpoint.id() {
+                bootstrap.push(peer.id);
+                lookup.add_endpoint_info(peer);
             }
         }
     }
@@ -636,27 +636,13 @@ fn shutdown_signals() -> Result<mpsc::Receiver<()>> {
     Ok(receiver)
 }
 
-pub async fn run_seed_daemon(dir: &Path, json: bool) -> Result<()> {
-    // Fail fast with a role-specific error, then validate again after acquiring
-    // daemon ownership to close the concurrent forced-replacement gap.
-    State::load(dir)?.ensure_role(Role::Seed)?;
-    run_daemon_with_role(dir, json, Some(Role::Seed)).await
-}
-
 pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
-    run_daemon_with_role(dir, json, None).await
-}
-
-async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role>) -> Result<()> {
     // Install service-manager/console signal handling before startup becomes visible.
     let mut shutdown = shutdown_signals()?;
     // Claim local ownership before reading the identity, starting networking, or mutating state.
     let state_lock = StateLock::acquire(dir)?;
     let (mut state, secret) = State::load_locked(dir, &state_lock)?;
-    state.validate()?;
-    if let Some(expected_role) = expected_role {
-        state.ensure_role(expected_role)?;
-    }
+    state.validate_for_identity(secret.public())?;
     let startup = tokio::select! {
         result = tokio::time::timeout(STARTUP_TIMEOUT, start(&state, secret)) => result,
         _ = shutdown.recv() => return Ok(()),
@@ -666,7 +652,7 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
         Ok(Err(error)) => {
             startup_error(json, "topic_join", &error.to_string());
             return Err(error)
-                .context("start gossip topic; verify the invite and seed reachability");
+                .context("start gossip topic; verify the invite and bootstrap-peer reachability");
         }
         Err(_) => {
             startup_error(
@@ -675,7 +661,7 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
                 "startup timed out while joining the gossip topic",
             );
             anyhow::bail!(
-                "startup timed out after {}s while joining the gossip topic; verify that at least one configured seed is reachable",
+                "startup timed out after {}s while joining the gossip topic; verify that at least one configured bootstrap peer is reachable",
                 STARTUP_TIMEOUT.as_secs()
             );
         }
@@ -700,18 +686,21 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
         );
     }
 
-    if state.role == Role::Seed {
+    if state.advertise_self {
         let mut invite = match &state.invite {
             Some(token) => token.parse::<Invite>()?,
             None => Invite {
                 topic: state.topic_id()?,
-                seeds: Vec::new(),
+                bootstrap_peers: Vec::new(),
             },
         };
-        invite.upsert_seed(node.endpoint.addr())?;
+        invite.upsert_bootstrap_peer(node.endpoint.addr())?;
         state.invite = Some(invite.to_string());
         state.save(dir, &state_lock)?;
     }
+
+    let (has_invite, bootstrap_peer_count, self_advertised) =
+        invite_details(&state, node.endpoint.id())?;
 
     // Expose IPC only after networking is ready, so clients never connect to a
     // socket whose daemon is still blocked during bootstrap.
@@ -719,9 +708,10 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
     let peer = node.endpoint.id().to_string();
     let started = serde_json::json!({
         "type":"daemon_started", "peer":peer, "topic":state.topic,
-        "role":state.role, "socket":local_endpoint(dir),
-        "local_endpoint":local_endpoint(dir), "endpoint_online":true,
-        "topic_joined":node.receiver.is_joined()
+        "advertises_self":state.advertise_self, "has_invite":has_invite,
+        "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
+        "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
+        "endpoint_online":true, "topic_joined":node.receiver.is_joined()
     });
     event(json, started);
 
@@ -765,11 +755,12 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
                         .iter().any(|status| status.is_connected());
                     let neighbors = node.receiver.neighbors().count();
                     let _ = reply.send(serde_json::json!({
-                        "type":"status", "running":true, "role":state.role, "peer":peer,
-                        "topic":state.topic, "configured_seed":state.invite.is_some(),
-                        "neighbors":neighbors, "socket":local_endpoint(dir),
-                        "local_endpoint":local_endpoint(dir), "endpoint_online":endpoint_online,
-                        "topic_joined":node.receiver.is_joined()
+                        "type":"status", "running":true, "peer":peer, "topic":state.topic,
+                        "advertises_self":state.advertise_self, "has_invite":has_invite,
+                        "bootstrap_peer_count":bootstrap_peer_count,
+                        "self_advertised":self_advertised, "neighbors":neighbors,
+                        "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
+                        "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined()
                     }));
                 }
                 Some(DaemonCommand::Stop) => break,
@@ -792,6 +783,15 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
     drop(event_tx);
     node.router.shutdown().await?;
     Ok(())
+}
+
+fn invite_details(state: &State, self_id: PublicKey) -> Result<(bool, usize, bool)> {
+    let Some(token) = &state.invite else {
+        return Ok((false, 0, false));
+    };
+    let invite: Invite = token.parse()?;
+    let self_advertised = invite.bootstrap_peers.iter().any(|peer| peer.id == self_id);
+    Ok((true, invite.bootstrap_peers.len(), self_advertised))
 }
 
 fn is_local_disconnect(error: &anyhow::Error) -> bool {
@@ -997,14 +997,16 @@ pub async fn status(dir: &Path, json: bool) -> Result<()> {
         println!("{value}");
     } else {
         println!(
-            "daemon: running\nrole: {}\npeer: {}\ntopic: {}\nendpoint online: {}\ntopic joined: {}\nneighbors: {}\nseed configured: {}",
-            value["role"].as_str().unwrap_or("unknown"),
+            "daemon: running\npeer: {}\ntopic: {}\nadvertises self: {}\nhas invite: {}\nbootstrap peers: {}\nself advertised: {}\nendpoint online: {}\ntopic joined: {}\nneighbors: {}",
             value["peer"].as_str().unwrap_or(""),
             value["topic"].as_str().unwrap_or(""),
+            value["advertises_self"].as_bool().unwrap_or(false),
+            value["has_invite"].as_bool().unwrap_or(false),
+            value["bootstrap_peer_count"].as_u64().unwrap_or(0),
+            value["self_advertised"].as_bool().unwrap_or(false),
             value["endpoint_online"].as_bool().unwrap_or(false),
             value["topic_joined"].as_bool().unwrap_or(false),
-            value["neighbors"].as_u64().unwrap_or(0),
-            value["configured_seed"].as_bool().unwrap_or(false)
+            value["neighbors"].as_u64().unwrap_or(0)
         );
     }
     Ok(())
@@ -1018,10 +1020,13 @@ pub async fn stop(dir: &Path, json: bool) -> Result<()> {
 
 pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
     let (state, secret) = State::load_for_doctor(dir)?;
-    state.validate()?;
+    state.validate_for_identity(secret.public())?;
+    let (has_invite, bootstrap_peer_count, self_advertised) =
+        invite_details(&state, secret.public())?;
     let value = serde_json::json!({
-        "type":"doctor", "ok":true, "peer":secret.public().to_string(),
-        "role":state.role, "topic":state.topic, "configured_seed":state.invite.is_some()
+        "type":"doctor", "ok":true, "peer":secret.public().to_string(), "topic":state.topic,
+        "advertises_self":state.advertise_self, "has_invite":has_invite,
+        "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised
     });
     if json {
         println!("{value}");
@@ -1079,9 +1084,8 @@ fn event(json: bool, value: serde_json::Value) {
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
             "daemon_started" => println!(
-                "daemon running as {} ({})\nlocal endpoint: {}",
+                "daemon running as {}\nlocal endpoint: {}",
                 value["peer"].as_str().unwrap_or(""),
-                value["role"].as_str().unwrap_or("unknown"),
                 value["local_endpoint"].as_str().unwrap_or("")
             ),
             "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
@@ -1147,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_log_message_event_suppresses_body_but_keeps_metadata_for_every_role() {
+    fn daemon_log_message_event_suppresses_body_but_keeps_metadata() {
         let secret = SecretKey::generate();
         let value = suppress_message_body(message_event(Envelope {
             from: secret.public(),
@@ -1172,13 +1176,35 @@ mod tests {
 
     #[test]
     fn startup_errors_are_structured_and_retryable() {
-        let value = startup_error_value("topic_join", "seed unavailable");
+        let value = startup_error_value("topic_join", "bootstrap peer unavailable");
 
         assert_eq!(value["type"], "startup_error");
         assert_eq!(value["phase"], "topic_join");
         assert_eq!(value["retryable"], true);
         assert!(STARTUP_TIMEOUT <= Duration::from_secs(60));
         assert!(ENDPOINT_ONLINE_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn doctor_rejects_unpublishable_advertising_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshmsg-doctor-capacity-test-{}",
+            rand::random::<u64>()
+        ));
+        let invite = Invite {
+            topic: TopicId::from_bytes([8; 32]),
+            bootstrap_peers: (0..crate::invite::MAX_BOOTSTRAP_PEERS)
+                .map(|_| iroh::EndpointAddr::new(SecretKey::generate().public()))
+                .collect(),
+        };
+        State::from_invite(invite.to_string(), &invite, true)
+            .save_new(&dir, false)
+            .unwrap();
+
+        let error = doctor(&dir, true).await.unwrap_err();
+
+        assert!(error.to_string().contains("cannot advertise self"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -3,10 +3,11 @@ mod config;
 mod invite;
 mod node;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Command, SeedCommand};
+use cli::{Cli, Command};
 use config::State;
+use invite::Invite;
 
 #[tokio::main]
 async fn main() {
@@ -25,61 +26,64 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     let dir = cli.state_dir();
     match cli.command {
-        Command::Seed { command } => match command {
-            SeedCommand::Init { force } => {
-                let state = State::new_seed();
-                let peer = state.save_new(&dir, force)?;
-                cli::print_result(
-                    cli.json,
-                    "initialized",
-                    serde_json::json!({
-                        "type": "initialized", "state_dir": dir, "peer": peer, "topic": state.topic
-                    }),
-                );
-            }
-            SeedCommand::Join { input, force } => {
-                let token = input.into_token()?;
-                let invite: invite::Invite = token.parse()?;
-                invite.ensure_room_for_new_seed()?;
-                let state = State::from_invite(config::Role::Seed, token, &invite);
-                let peer = state.save_new(&dir, force)?;
-                cli::print_result(
-                    cli.json,
-                    "seed joined",
-                    serde_json::json!({
-                        "type":"seed_joined", "state_dir":dir, "peer":peer,
-                        "topic":state.topic, "known_seeds":invite.seeds.len()
-                    }),
-                );
-            }
-            SeedCommand::Run => node::run_seed_daemon(&dir, cli.json).await?,
-            SeedCommand::Invite => {
-                let state = State::load(&dir)?;
-                state.ensure_role(config::Role::Seed)?;
-                let token = state
-                    .invite
-                    .context("seed has not run yet; run `meshmsg seed run` first")?;
-                if cli.json {
-                    println!("{}", serde_json::json!({"type":"invite", "token":token}));
-                } else {
-                    println!("{token}");
-                }
-            }
-        },
-        Command::Join { input, force } => {
-            let token = input.into_token()?;
-            let invite: invite::Invite = token.parse()?;
-            let state = State::from_invite(config::Role::Member, token, &invite);
+        Command::Init { force } => {
+            let state = State::new_topic();
             let peer = state.save_new(&dir, force)?;
+            cli::print_result(
+                cli.json,
+                "initialized",
+                serde_json::json!({
+                    "type":"initialized", "state_dir":dir, "peer":peer,
+                    "topic":state.topic, "advertises_self":true, "has_invite":false,
+                    "bootstrap_peer_count":0, "self_advertised":false
+                }),
+            );
+        }
+        Command::Join {
+            input,
+            advertise_self,
+            force,
+        } => {
+            let token = input.into_token()?;
+            let invite: Invite = token.parse()?;
+            let (state, peer, bootstrap_peer_count) =
+                save_joined_state(&dir, token, &invite, advertise_self, force)?;
             cli::print_result(
                 cli.json,
                 "joined",
                 serde_json::json!({
-                    "type":"joined", "state_dir":dir, "peer":peer, "topic":state.topic
+                    "type":"joined", "state_dir":dir, "peer":peer, "topic":state.topic,
+                    "advertises_self":advertise_self, "has_invite":true,
+                    "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":false
                 }),
             );
         }
         Command::Daemon => node::run_daemon(&dir, cli.json).await?,
+        Command::Invite => {
+            let (state, secret) = State::load_for_doctor(&dir)?;
+            state.validate()?;
+            let token = state
+                .invite
+                .context("invite is not available yet; run `meshmsg daemon` first")?;
+            let invite: Invite = token.parse()?;
+            let self_advertised = invite
+                .bootstrap_peers
+                .iter()
+                .any(|peer| peer.id == secret.public());
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type":"invite", "token":token,
+                        "advertises_self":state.advertise_self, "has_invite":true,
+                        "bootstrap_peer_count":invite.bootstrap_peers.len(),
+                        "self_advertised":self_advertised
+                    })
+                );
+            } else {
+                println!("{token}");
+            }
+        }
         Command::Stop => node::stop(&dir, cli.json).await?,
         Command::Send { input } => {
             let message = input.into_message()?;
@@ -93,4 +97,55 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-use anyhow::Context;
+fn save_joined_state(
+    dir: &std::path::Path,
+    token: String,
+    invite: &Invite,
+    advertise_self: bool,
+    force: bool,
+) -> Result<(State, String, usize)> {
+    // A newly generated identity cannot already be in this invite. Check before
+    // save_new creates an identity generation or replaces committed state.
+    if advertise_self {
+        invite.ensure_room_for_new_bootstrap_peer()?;
+    }
+    let bootstrap_peer_count = invite.bootstrap_peers.len();
+    let state = State::from_invite(token, invite, advertise_self);
+    let peer = state.save_new(dir, force)?;
+    Ok((state, peer, bootstrap_peer_count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::invite::MAX_BOOTSTRAP_PEERS;
+    use iroh::{EndpointAddr, SecretKey};
+    use iroh_gossip::proto::TopicId;
+
+    #[test]
+    fn advertising_join_preflights_capacity_before_replacing_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshmsg-join-preflight-test-{}",
+            rand::random::<u64>()
+        ));
+        State::new_topic().save_new(&dir, false).unwrap();
+        let config_before = std::fs::read(dir.join("config.json")).unwrap();
+        let files_before = std::fs::read_dir(&dir).unwrap().count();
+        let invite = Invite {
+            topic: TopicId::from_bytes([9; 32]),
+            bootstrap_peers: (0..MAX_BOOTSTRAP_PEERS)
+                .map(|_| EndpointAddr::new(SecretKey::generate().public()))
+                .collect(),
+        };
+
+        let error = save_joined_state(&dir, invite.to_string(), &invite, true, true).unwrap_err();
+
+        assert!(error.to_string().contains("maximum"));
+        assert_eq!(
+            std::fs::read(dir.join("config.json")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), files_before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

@@ -8,7 +8,7 @@ use std::{
 
 // The message body cannot fit its signed envelope if it alone exceeds the wire limit.
 const MAX_MESSAGE_INPUT_BYTES: usize = 4096;
-// Invites are normally a few KiB even at the seed limit; leave ample compatibility headroom.
+// Invites are normally a few KiB even at the bootstrap-peer limit.
 const MAX_INVITE_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser, Debug)]
@@ -66,21 +66,27 @@ pub struct MessageInput {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Initialize, run, or invite peers to a seed node
-    Seed {
-        #[command(subcommand)]
-        command: SeedCommand,
+    /// Generate a persistent identity and fresh topic
+    Init {
+        /// Replace existing state and identity
+        #[arg(long)]
+        force: bool,
     },
     /// Save configuration from an invite token
     Join {
         #[command(flatten)]
         input: InviteInput,
+        /// Publish this peer's endpoint into its stored invite after daemon startup
+        #[arg(long)]
+        advertise_self: bool,
         /// Replace existing state and identity
         #[arg(long)]
         force: bool,
     },
     /// Run the local network daemon in the foreground
     Daemon,
+    /// Print the stored invite token
+    Invite,
     /// Ask the local daemon to shut down
     Stop,
     /// Queue one message for broadcast (not a delivery acknowledgement)
@@ -96,27 +102,6 @@ pub enum Command {
     Status,
     /// Validate local state, including the expected public identity
     Doctor,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum SeedCommand {
-    /// Generate a persistent identity and topic
-    Init {
-        #[arg(long)]
-        force: bool,
-    },
-    /// Join an existing seed set while retaining a seed role
-    Join {
-        #[command(flatten)]
-        input: InviteInput,
-        /// Replace existing state and identity
-        #[arg(long)]
-        force: bool,
-    },
-    /// Run the persistent bootstrap node
-    Run,
-    /// Print the current invite token
-    Invite,
 }
 
 impl InviteInput {
@@ -204,13 +189,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_new_input_forms_parse() {
+    fn canonical_input_forms_parse() {
+        assert!(parse(&["init"]).is_ok());
         assert!(parse(&["join", "token"]).is_ok());
         assert!(parse(&["join", "--token-file", "invite.txt"]).is_ok());
-        assert!(parse(&["join", "--token-stdin"]).is_ok());
-        assert!(parse(&["seed", "join", "token"]).is_ok());
-        assert!(parse(&["seed", "join", "--token-file", "invite.txt"]).is_ok());
-        assert!(parse(&["seed", "join", "--token-stdin"]).is_ok());
+        assert!(parse(&["join", "--token-stdin", "--advertise-self"]).is_ok());
+        assert!(parse(&["daemon"]).is_ok());
+        assert!(parse(&["invite"]).is_ok());
         assert!(parse(&["send", "message"]).is_ok());
         assert!(parse(&["send", "--message-file", "message.txt"]).is_ok());
         assert!(parse(&["send", "--message-stdin"]).is_ok());
@@ -218,7 +203,7 @@ mod tests {
 
     #[test]
     fn input_source_is_required_and_sources_conflict() {
-        for arguments in [vec!["join"], vec!["seed", "join"], vec!["send"]] {
+        for arguments in [vec!["join"], vec!["send"]] {
             assert_eq!(
                 parse(&arguments).unwrap_err().kind(),
                 ErrorKind::MissingRequiredArgument

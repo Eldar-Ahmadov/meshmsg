@@ -41,5 +41,5 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: cargo build --locked
-      - name: Run 3-seed/2-client scenario
-        run: timeout 1100 bash tests/integration-3-seed-2-client.sh target/debug/meshmsg
+      - name: Run five-peer scenario
+        run: timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg

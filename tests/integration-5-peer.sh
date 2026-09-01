@@ -46,19 +46,23 @@ stop_node() {
   wait "${PIDS[$node]}" || true
   unset 'PIDS[$node]'
 }
-invite() { "$BIN" --state-dir "$ROOT/$1" --json seed invite | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'; }
+invite() { "$BIN" --state-dir "$ROOT/$1" --json invite | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'; }
 wait_log() { wait_for "$1" "$3 in $2" grep -Fq "$3" "$2"; }
 
-# Form a three-seed swarm. Retain positional compatibility while exercising safe sources.
-S1_INIT=$("$BIN" --state-dir "$ROOT/s1" --json seed init)
-S1_PEER=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["peer"])' <<<"$S1_INIT")
+# Form a five-peer swarm with three endpoint-advertising peers.
+S1_INIT=$("$BIN" --state-dir "$ROOT/s1" --json init)
+S1_PEER=$(python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["advertises_self"] and not value["has_invite"]; print(value["peer"])' <<<"$S1_INIT")
+if "$BIN" --state-dir "$ROOT/s1" invite >"$ROOT/fresh-invite.out" 2>"$ROOT/fresh-invite.err"; then
+  fail "fresh init exported an invite before daemon startup"
+fi
+grep -q 'run `meshmsg daemon` first' "$ROOT/fresh-invite.err" || fail "fresh invite error was not actionable"
 start_node s1
 I1=$(invite s1)
 printf '%s' "$I1" >"$ROOT/s2.invite"
-"$BIN" --state-dir "$ROOT/s2" seed join --token-file "$ROOT/s2.invite" >/dev/null
+"$BIN" --state-dir "$ROOT/s2" join --advertise-self --token-file "$ROOT/s2.invite" >/dev/null
 start_node s2
 I2=$(invite s2)
-"$BIN" --state-dir "$ROOT/s3" seed join "$I2" >/dev/null
+"$BIN" --state-dir "$ROOT/s3" join --advertise-self "$I2" >/dev/null
 start_node s3
 I3=$(invite s3)
 for secret in "$I1" "$I2" "$I3"; do
@@ -70,7 +74,7 @@ if grep -Fq '"invite":' "$ROOT"/*.daemon.log "$ROOT"/*.daemon.err; then
   fail "daemon startup output included an invite field"
 fi
 
-# Two resident member daemons and owner-only IPC listeners.
+# Add two non-advertising peers and owner-only IPC listeners.
 printf '%s\n' "$I3" | "$BIN" --state-dir "$ROOT/c1" join --token-stdin >/dev/null
 "$BIN" --state-dir "$ROOT/c2" join "$I3" >/dev/null
 start_node c1
@@ -79,15 +83,10 @@ start_node c2
 # in live status rather than waiting for a later NeighborUp event.
 wait_for 10 "c1 joined status" status_joined c1
 wait_for 10 "c2 joined status" status_joined c2
-# Seed-only commands reject member state before touching daemon ownership.
-if "$BIN" --state-dir "$ROOT/c1" seed invite >"$ROOT/member-seed-invite.out" 2>"$ROOT/member-seed-invite.err"; then
-  fail "member state produced a seed invite"
-fi
-grep -q 'requires Seed state' "$ROOT/member-seed-invite.err" || fail "seed invite role rejection was not actionable"
-if timeout 5 "$BIN" --state-dir "$ROOT/c1" seed run >"$ROOT/member-seed-run.out" 2>"$ROOT/member-seed-run.err"; then
-  fail "member state started through seed run"
-fi
-grep -q 'requires Seed state' "$ROOT/member-seed-run.err" || fail "seed run role rejection was not actionable"
+# Every peer can export its stored invite, while default join does not advertise itself.
+C1_INVITE=$(invite c1)
+[[ "$C1_INVITE" == "$I3" ]] || fail "non-advertising peer did not export its stored invite"
+"$BIN" --state-dir "$ROOT/c1" --json doctor | python3 -c 'import json,sys; value=json.load(sys.stdin); assert not value["advertises_self"] and value["has_invite"] and not value["self_advertised"]'
 timeout 180 "$BIN" --state-dir "$ROOT/c1" --json listen >"$ROOT/c1.listen.log" 2>"$ROOT/c1.listen.err" & L1=$!
 timeout 180 "$BIN" --state-dir "$ROOT/c2" --json listen >"$ROOT/c2.listen.log" 2>"$ROOT/c2.listen.err" & L2=$!
 wait_log 10 "$ROOT/c1.listen.log" '"type":"connected"'
@@ -100,9 +99,16 @@ printf '%s' "$M1" >"$ROOT/message.txt"
 printf '%s' "$M2" | "$BIN" --state-dir "$ROOT/c2" --json send --message-stdin | grep -q '"type":"queued"'
 wait_log 30 "$ROOT/c2.listen.log" "\"body\":\"$M1\""
 wait_log 30 "$ROOT/c1.listen.log" "\"body\":\"$M2\""
-for seed in s1 s2 s3; do
-  wait_for 30 "two suppressed messages at $seed" bash -c "test \$(grep -c '\"body_suppressed\":true' '$ROOT/$seed.daemon.log') -ge 2"
+for peer in s1 s2 s3; do
+  wait_for 30 "two suppressed messages at $peer" bash -c "test \$(grep -c '\"body_suppressed\":true' '$ROOT/$peer.daemon.log') -ge 2"
 done
+python3 - "$ROOT/s1/config.json" "$ROOT/s2/config.json" "$ROOT/s3/config.json" "$ROOT/c1/config.json" "$ROOT/c2/config.json" <<'PY'
+import json, pathlib, sys
+for index, name in enumerate(sys.argv[1:]):
+    state = json.loads(pathlib.Path(name).read_text())
+    assert set(state) == {"advertise_self", "topic", "invite", "identity"}
+    assert state["advertise_self"] is (index < 3)
+PY
 for node in s1 s2 s3 c1 c2; do
   for output in "$ROOT/$node.daemon.log" "$ROOT/$node.daemon.err"; do
     ! grep -Fq "$M1" "$output" || fail "$node daemon leaked message body to $output"
@@ -143,16 +149,16 @@ fi
 ! grep -q '"type":"queued"' "$ROOT/oversized.out" || fail "oversized message was reported queued"
 grep -q 'maximum is 4096 bytes' "$ROOT/oversized.err" || fail "oversized rejection was not actionable"
 
-# Stale socket recovery and member daemon restart.
+# Stale socket recovery and peer daemon restart.
 stop_node c1
 kill "$L1" >/dev/null 2>&1 || true; wait "$L1" >/dev/null 2>&1 || true
 echo stale >"$ROOT/c1/daemon.sock"
 start_node c1
-status_ok c1 || fail "member did not recover from stale socket"
+status_ok c1 || fail "peer did not recover from stale socket"
 timeout 180 "$BIN" --state-dir "$ROOT/c1" --json listen >"$ROOT/c1-restarted.listen.log" 2>/dev/null & L1=$!
 wait_log 10 "$ROOT/c1-restarted.listen.log" '"type":"connected"'
 
-# Stop one listed seed, restart a member, and verify failover through remaining seeds.
+# Stop one listed bootstrap peer, restart another peer, and verify failover.
 stop_node s1
 stop_node c2
 kill "$L2" >/dev/null 2>&1 || true; wait "$L2" >/dev/null 2>&1 || true
@@ -161,11 +167,11 @@ M3="integration-failover-$(date +%s%N)"
 "$BIN" --state-dir "$ROOT/c2" --json send "$M3" | grep -q '"type":"queued"'
 wait_log 30 "$ROOT/c1-restarted.listen.log" "\"body\":\"$M3\""
 
-# Restart seeds using persisted state/endpoints; seed role and invite remain valid.
+# Restart advertising peers using persisted state/endpoints; refreshed invites remain valid.
 start_node s1
 stop_node s3
 start_node s3
-"$BIN" --state-dir "$ROOT/s3" --json doctor | grep -q '"role":"seed"'
+"$BIN" --state-dir "$ROOT/s3" --json doctor | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["advertises_self"] and value["self_advertised"]'
 invite s3 >/dev/null
 
 # Re-check both output streams after restart and failover traffic as well.
@@ -177,4 +183,4 @@ for node in s1 s2 s3 c1 c2; do
 done
 
 kill "$L1" >/dev/null 2>&1 || true; wait "$L1" >/dev/null 2>&1 || true
-echo "PASS: 3 seeds + 2 clients, privacy logs, restart/failover, IPC safety, and limits"
+echo "PASS: 5 equal peers, selective endpoint advertising, privacy logs, restart/failover, IPC safety, and limits"
