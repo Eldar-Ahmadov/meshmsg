@@ -330,10 +330,13 @@ fn sid_belongs_to_current_user(candidate: windows_sys::Win32::Security::PSID) ->
 #[cfg(windows)]
 fn current_user_sid_string() -> Result<String> {
     use std::ffi::c_void;
-    use windows_sys::Win32::{
-        Foundation::{LocalFree, HANDLE, PWSTR},
-        Security::{Authorization::ConvertSidToStringSidW, TOKEN_QUERY, TOKEN_USER},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    use windows_sys::{
+        core::PWSTR,
+        Win32::{
+            Foundation::{LocalFree, HANDLE},
+            Security::{Authorization::ConvertSidToStringSidW, TOKEN_QUERY, TOKEN_USER},
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        },
     };
 
     let mut token: HANDLE = std::ptr::null_mut();
