@@ -49,11 +49,13 @@ stop_node() {
 invite() { "$BIN" --state-dir "$ROOT/$1" --json seed invite | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'; }
 wait_log() { wait_for "$1" "$3 in $2" grep -Fq "$3" "$2"; }
 
-# Form a three-seed swarm.
-"$BIN" --state-dir "$ROOT/s1" seed init >/dev/null
+# Form a three-seed swarm. Retain positional compatibility while exercising safe sources.
+S1_INIT=$("$BIN" --state-dir "$ROOT/s1" --json seed init)
+S1_PEER=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["peer"])' <<<"$S1_INIT")
 start_node s1
 I1=$(invite s1)
-"$BIN" --state-dir "$ROOT/s2" seed join "$I1" >/dev/null
+printf '%s' "$I1" >"$ROOT/s2.invite"
+"$BIN" --state-dir "$ROOT/s2" seed join --token-file "$ROOT/s2.invite" >/dev/null
 start_node s2
 I2=$(invite s2)
 "$BIN" --state-dir "$ROOT/s3" seed join "$I2" >/dev/null
@@ -69,7 +71,7 @@ if grep -Fq '"invite":' "$ROOT"/*.daemon.log "$ROOT"/*.daemon.err; then
 fi
 
 # Two resident member daemons and owner-only IPC listeners.
-"$BIN" --state-dir "$ROOT/c1" join "$I3" >/dev/null
+printf '%s\n' "$I3" | "$BIN" --state-dir "$ROOT/c1" join --token-stdin >/dev/null
 "$BIN" --state-dir "$ROOT/c2" join "$I3" >/dev/null
 start_node c1
 start_node c2
@@ -93,8 +95,9 @@ wait_log 10 "$ROOT/c2.listen.log" '"type":"connected"'
 
 M1="integration-c1-$(date +%s%N)"
 M2="integration-c2-$(date +%s%N)"
-"$BIN" --state-dir "$ROOT/c1" --json send "$M1" | grep -q '"type":"queued"'
-"$BIN" --state-dir "$ROOT/c2" --json send "$M2" | grep -q '"type":"queued"'
+printf '%s' "$M1" >"$ROOT/message.txt"
+"$BIN" --state-dir "$ROOT/c1" --json send --message-file "$ROOT/message.txt" | grep -q '"type":"queued"'
+printf '%s' "$M2" | "$BIN" --state-dir "$ROOT/c2" --json send --message-stdin | grep -q '"type":"queued"'
 wait_log 30 "$ROOT/c2.listen.log" "\"body\":\"$M1\""
 wait_log 30 "$ROOT/c1.listen.log" "\"body\":\"$M2\""
 for seed in s1 s2 s3; do
@@ -107,6 +110,23 @@ for node in s1 s2 s3 c1 c2; do
   done
   "$BIN" --state-dir "$ROOT/$node" --json doctor | grep -q '"ok":true'
 done
+S1_DOCTOR_PEER=$("$BIN" --state-dir "$ROOT/s1" --json doctor | python3 -c 'import json,sys; print(json.load(sys.stdin)["peer"])')
+[[ "$S1_DOCTOR_PEER" == "$S1_PEER" ]] || fail "doctor peer differs from committed initialization peer"
+
+# Doctor must reject a valid but incorrect expected public key.
+cp "$ROOT/s1/config.json" "$ROOT/s1/config.json.saved"
+python3 - "$ROOT/s1/config.json" "$ROOT/s2/config.json" <<'PY'
+import json, pathlib, sys
+left, right = map(pathlib.Path, sys.argv[1:])
+state = json.loads(left.read_text())
+state["identity"]["public_key"] = json.loads(right.read_text())["identity"]["public_key"]
+left.write_text(json.dumps(state))
+PY
+if "$BIN" --state-dir "$ROOT/s1" doctor >"$ROOT/mismatch.out" 2>"$ROOT/mismatch.err"; then
+  fail "doctor accepted an expected-public-key mismatch"
+fi
+grep -q 'does not match' "$ROOT/mismatch.err" || fail "doctor mismatch error was not actionable"
+mv "$ROOT/s1/config.json.saved" "$ROOT/s1/config.json"
 
 # A duplicate daemon must fail promptly while the original remains healthy.
 if timeout 5 "$BIN" --state-dir "$ROOT/c1" daemon >"$ROOT/duplicate.out" 2>"$ROOT/duplicate.err"; then

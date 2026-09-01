@@ -28,8 +28,7 @@ async fn run() -> Result<()> {
         Command::Seed { command } => match command {
             SeedCommand::Init { force } => {
                 let state = State::new_seed();
-                state.save_new(&dir, force)?;
-                let peer = State::load_secret(&dir)?.public().to_string();
+                let peer = state.save_new(&dir, force)?;
                 cli::print_result(
                     cli.json,
                     "initialized",
@@ -38,12 +37,12 @@ async fn run() -> Result<()> {
                     }),
                 );
             }
-            SeedCommand::Join { token, force } => {
+            SeedCommand::Join { input, force } => {
+                let token = input.into_token()?;
                 let invite: invite::Invite = token.parse()?;
                 invite.ensure_room_for_new_seed()?;
                 let state = State::from_invite(config::Role::Seed, token, &invite);
-                state.save_new(&dir, force)?;
-                let peer = State::load_secret(&dir)?.public().to_string();
+                let peer = state.save_new(&dir, force)?;
                 cli::print_result(
                     cli.json,
                     "seed joined",
@@ -67,11 +66,11 @@ async fn run() -> Result<()> {
                 }
             }
         },
-        Command::Join { token, force } => {
+        Command::Join { input, force } => {
+            let token = input.into_token()?;
             let invite: invite::Invite = token.parse()?;
             let state = State::from_invite(config::Role::Member, token, &invite);
-            state.save_new(&dir, force)?;
-            let peer = State::load_secret(&dir)?.public().to_string();
+            let peer = state.save_new(&dir, force)?;
             cli::print_result(
                 cli.json,
                 "joined",
@@ -82,7 +81,10 @@ async fn run() -> Result<()> {
         }
         Command::Daemon => node::run_daemon(&dir, cli.json).await?,
         Command::Stop => node::stop(&dir, cli.json).await?,
-        Command::Send { message } => node::send_once(&dir, &message, cli.json).await?,
+        Command::Send { input } => {
+            let message = input.into_message()?;
+            node::send_once(&dir, &message, cli.json).await?
+        }
         Command::Listen => node::listen(&dir, cli.json).await?,
         Command::Chat => node::chat(&dir, cli.json).await?,
         Command::Status => node::status(&dir, cli.json).await?,

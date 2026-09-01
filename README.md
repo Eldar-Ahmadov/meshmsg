@@ -42,17 +42,17 @@ meshmsg --json seed run
 meshmsg seed invite
 ```
 
-On each client:
+On each client (stdin avoids putting the invite capability in argv or shell history):
 
 ```sh
-meshmsg join '<invite>'
+printf '%s' '<invite>' | meshmsg join --token-stdin
 meshmsg --json daemon
 ```
 
 Then use separate terminals:
 
 ```sh
-meshmsg send 'hello'
+printf '%s' 'hello' | meshmsg send --message-stdin
 meshmsg listen
 meshmsg status
 meshmsg chat
@@ -65,6 +65,30 @@ meshmsg stop
 ```
 
 `send`, `listen`, `chat`, and `status` never create another Iroh endpoint. They fail with an actionable error when the daemon is unavailable. The exclusive state lock prevents multiple processes from using one identity.
+
+## Input sources and confidentiality
+
+Join and send each require exactly one input source. Existing positional forms remain supported, but expose their contents through shell history and potentially process inspection:
+
+```sh
+meshmsg join '<invite>'
+meshmsg seed join '<invite>'
+meshmsg send 'hello'
+```
+
+Prefer explicit UTF-8 file or stdin input for sensitive values:
+
+```sh
+meshmsg join --token-file invite.txt
+meshmsg seed join --token-stdin < invite.txt
+meshmsg send --message-file message.txt
+printf '%s' 'hello' | meshmsg send --message-stdin       # sends "hello"
+printf '%s\n' 'hello' | meshmsg send --message-stdin     # sends "hello\n"
+```
+
+File and stdin flags conflict with each other and with the corresponding positional value. Stdin is read through EOF; a path of `-` means a literal file named `-`, not stdin. Invite input removes exactly one final LF (and a CR immediately before it), while message input is preserved exactly, including spaces and newlines. Empty messages are allowed; empty invite input is not. Inputs must be valid UTF-8. File and stdin reads reject invite tokens over 1 MiB and message bodies over 4096 bytes before allocating beyond those limits. Input files are not deleted or permission-modified, and invite files remain sensitive membership capabilities.
+
+These forms prevent argv and history disclosure only. Successful `send` output still includes the queued body in human and JSON output, and every swarm participant receives plaintext.
 
 ## Send semantics
 
@@ -105,20 +129,22 @@ meshmsg --json status
 
 These are local runtime states, not guarantees of end-to-end message delivery. `neighbors` is the current direct gossip-neighbor count, including the neighbor consumed during initial bootstrap. `topic_joined` is derived from that live gossip state and becomes false when no direct neighbors remain (including for a lone first seed).
 
-Validate persisted role, identity, topic, and invite invariants offline:
+Validate persisted role, identity, expected public key, topic, and invite invariants offline:
 
 ```sh
 meshmsg --json doctor
 ```
 
-Member state must contain an invite; every configured invite must parse and match the persisted topic.
+Member state must contain an invite; every configured invite must parse and match the persisted topic. Current state binds the expected public key to an immutable identity generation, so `doctor` rejects a missing, corrupt, or mismatched selected key. Legacy state is migrated automatically under the state lock by daemon startup or `doctor`, without changing its identity. If a legacy daemon is running, stop it before asking `doctor` to migrate. Identity generations not selected by `config.json` are harmless and retained to keep lock-free diagnosis crash-safe.
+
+Using an older meshmsg binary after this version has initialized, joined, migrated, or force-replaced state is unsupported. Newly initialized or joined state has no legacy `secret.key`; migration retains that file only for data compatibility, not as a safe downgrade path.
 
 ## Local daemon operation
 
 The foreground daemon:
 
 - holds an exclusive lock for state and identity;
-- uses atomic state writes;
+- transactionally replaces identity and configuration, with `config.json` as the commit record;
 - restricts the Linux state directory to `0700` and socket to `0600`;
 - uses a local-only Windows named pipe with a protected owner/System/Administrators DACL;
 - removes stale Unix sockets safely (Windows named pipes disappear when their server exits);
@@ -131,7 +157,7 @@ Application envelopes are limited to 4096 serialized bytes. Maximum body text is
 
 ## Windows daemon operation
 
-Windows builds support the same `daemon`, `seed run`, `send`, `listen`, `chat`, `status`, and `stop` commands. Keep `meshmsg daemon` or `meshmsg --json seed run` running in a dedicated PowerShell window. The default state directory inherits the current user's `%LOCALAPPDATA%` ACL; if `--state-dir` points elsewhere, ensure that directory is accessible only to the intended Windows account. There is not yet a built-in Windows Service installer or automatic startup integration; use Task Scheduler if unattended startup is required. Ctrl-C and `meshmsg stop` shut the foreground daemon down cleanly.
+Windows builds support the same `daemon`, `seed run`, `send`, `listen`, `chat`, `status`, and `stop` commands. Keep `meshmsg daemon` or `meshmsg --json seed run` running in a dedicated PowerShell window. The default state directory inherits the current user's `%LOCALAPPDATA%` ACL; if `--state-dir` points elsewhere, ensure that directory is accessible only to the intended Windows account. Transactional replacement relies on local-filesystem flush/write-through behavior; network shares or storage that ignores flushes can weaken durability. There is not yet a built-in Windows Service installer or automatic startup integration; use Task Scheduler if unattended startup is required. Ctrl-C and `meshmsg stop` shut the foreground daemon down cleanly.
 
 ## systemd user service
 

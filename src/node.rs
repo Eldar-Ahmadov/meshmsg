@@ -110,10 +110,8 @@ struct RunningNode {
     secret: SecretKey,
 }
 
-async fn start(dir: &Path) -> Result<RunningNode> {
-    let state = State::load(dir)?;
+async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
     state.validate()?;
-    let secret = State::load_secret(dir)?;
     let topic: TopicId = state.topic_id()?;
     let lookup = MemoryLookup::new();
     let endpoint = Endpoint::builder(presets::N0)
@@ -128,7 +126,7 @@ async fn start(dir: &Path) -> Result<RunningNode> {
         .accept(GOSSIP_ALPN, gossip.clone())
         .spawn();
     let mut bootstrap = Vec::new();
-    if let Some(token) = state.invite {
+    if let Some(token) = &state.invite {
         let invite: Invite = token.parse()?;
         for seed in invite.seeds {
             if seed.id != endpoint.id() {
@@ -646,13 +644,13 @@ async fn run_daemon_with_role(dir: &Path, json: bool, expected_role: Option<Role
     let mut shutdown = shutdown_signals()?;
     // Claim local ownership before reading the identity, starting networking, or mutating state.
     let state_lock = StateLock::acquire(dir)?;
-    let mut state = State::load(dir)?;
+    let (mut state, secret) = State::load_locked(dir, &state_lock)?;
     state.validate()?;
     if let Some(expected_role) = expected_role {
         state.ensure_role(expected_role)?;
     }
     let startup = tokio::select! {
-        result = tokio::time::timeout(STARTUP_TIMEOUT, start(dir)) => result,
+        result = tokio::time::timeout(STARTUP_TIMEOUT, start(&state, secret)) => result,
         _ = shutdown.recv() => return Ok(()),
     };
     let mut node = match startup {
@@ -1011,8 +1009,7 @@ pub async fn stop(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
-    let state = State::load(dir)?;
-    let secret = State::load_secret(dir)?;
+    let (state, secret) = State::load_for_doctor(dir)?;
     state.validate()?;
     let value = serde_json::json!({
         "type":"doctor", "ok":true, "peer":secret.public().to_string(),
