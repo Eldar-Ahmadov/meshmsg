@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
+      - name: Check installer syntax
+        run: bash -n install.sh
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
 

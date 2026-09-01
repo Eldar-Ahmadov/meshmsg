@@ -10,13 +10,28 @@ Daemon stdout and stderr suppress incoming message bodies by default, reducing a
 
 ## Install
 
-Build locally:
+Install the latest release on x86-64 Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Eldar-Ahmadov/meshmsg/main/install.sh | bash
+```
+
+The installer detects the local operating system and architecture, downloads the portable `x86_64-unknown-linux-musl` archive from the latest published GitHub release, verifies it against that release's `SHA256SUMS`, and then installs `meshmsg`. It uses `/usr/local/bin` when run as root and `$HOME/.local/bin` otherwise. Override the destination without running as root:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Eldar-Ahmadov/meshmsg/main/install.sh \
+  | MESHMSG_INSTALL_DIR="$HOME/bin" bash
+```
+
+Review [`install.sh`](install.sh) before piping it to a shell. Unsupported operating systems or architectures fail without downloading an archive.
+
+To build from source instead:
 
 ```sh
 cargo install --locked --path .
 ```
 
-Release archives are provided for `x86_64-unknown-linux-gnu`, portable `x86_64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`. Download a release and verify it against `SHA256SUMS`:
+Release archives are provided for `x86_64-unknown-linux-gnu`, portable `x86_64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`. To install manually, download a release and verify it against `SHA256SUMS`:
 
 ```sh
 gh release download v0.1.4 --repo Eldar-Ahmadov/meshmsg
