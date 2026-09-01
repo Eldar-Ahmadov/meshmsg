@@ -32,7 +32,9 @@ impl StateLock {
         }
         let file = options.open(&path).context("open state lock")?;
         file.try_lock_exclusive().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            let lock_contended = error.kind() == std::io::ErrorKind::WouldBlock
+                || (cfg!(windows) && error.raw_os_error() == Some(33));
+            if lock_contended {
                 anyhow::anyhow!("state is in use by a running meshmsg daemon")
             } else {
                 anyhow::Error::new(error).context("lock meshmsg state")

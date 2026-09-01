@@ -328,6 +328,45 @@ fn sid_belongs_to_current_user(candidate: windows_sys::Win32::Security::PSID) ->
 }
 
 #[cfg(windows)]
+fn current_user_sid_string() -> Result<String> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, HANDLE, PWSTR},
+        Security::{Authorization::ConvertSidToStringSidW, TOKEN_QUERY, TOKEN_USER},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    anyhow::ensure!(
+        opened != 0,
+        "open current process token: {}",
+        std::io::Error::last_os_error()
+    );
+    let token = WindowsHandle(token);
+    let user = token_user_buffer(token.0)?;
+    let sid = unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    let mut text: PWSTR = std::ptr::null_mut();
+    let converted = unsafe { ConvertSidToStringSidW(sid, &mut text) };
+    anyhow::ensure!(
+        converted != 0,
+        "format current user SID: {}",
+        std::io::Error::last_os_error()
+    );
+    let length = unsafe {
+        let mut length = 0;
+        while *text.add(length) != 0 {
+            length += 1;
+        }
+        length
+    };
+    let value = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+        .context("current user SID is not valid UTF-16")?;
+    unsafe { LocalFree(text.cast::<c_void>()) };
+    Ok(value)
+}
+
+#[cfg(windows)]
 fn process_belongs_to_current_user(process_id: u32) -> Result<bool> {
     use windows_sys::Win32::{
         Foundation::HANDLE,
@@ -419,12 +458,14 @@ fn create_pipe_server(name: &str, first: bool) -> Result<NamedPipeServer> {
         },
     };
 
-    // Protect the pipe DACL and grant access only to its owner, LocalSystem,
-    // and administrators. PIPE_REJECT_REMOTE_CLIENTS additionally excludes
-    // network clients.
-    let mut sddl: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)\0"
-        .encode_utf16()
-        .collect();
+    // Make the current user the owner and grant access only to that user,
+    // LocalSystem, and administrators. PIPE_REJECT_REMOTE_CLIENTS additionally
+    // excludes network clients.
+    let user_sid = current_user_sid_string()?;
+    let mut sddl: Vec<u16> =
+        format!("O:{user_sid}D:P(A;;GA;;;{user_sid})(A;;GA;;;SY)(A;;GA;;;BA)\0")
+            .encode_utf16()
+            .collect();
     let mut descriptor = ptr::null_mut();
     let converted = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
