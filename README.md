@@ -1,6 +1,6 @@
 # meshmsg
 
-`meshmsg` 0.1.3 is a small peer-to-peer messaging CLI built on [Iroh Gossip](https://github.com/n0-computer/iroh-gossip). Every node is an equal gossip peer with a persistent identity and network connection. CLI commands talk to the foreground daemon over owner-only local IPC (a Unix socket on Linux or a named pipe on Windows); there is no central message broker.
+`meshmsg` 0.1.4 is a small peer-to-peer messaging CLI built on [Iroh Gossip](https://github.com/n0-computer/iroh-gossip). Every node is an equal gossip peer with a persistent identity and network connection. CLI commands talk to the foreground daemon over owner-only local IPC (a Unix socket on Linux or a named pipe on Windows); there is no central message broker.
 
 ## Trust and privacy model
 
@@ -19,7 +19,7 @@ cargo install --locked --path .
 Release archives are provided for `x86_64-unknown-linux-gnu`, portable `x86_64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`. Download a release and verify it against `SHA256SUMS`:
 
 ```sh
-gh release download v0.1.3 --repo Eldar-Ahmadov/meshmsg
+gh release download v0.1.4 --repo Eldar-Ahmadov/meshmsg
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
