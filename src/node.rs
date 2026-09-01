@@ -232,13 +232,21 @@ struct LocalListener {
 #[cfg(windows)]
 impl LocalListener {
     async fn accept(&mut self) -> Result<LocalServerStream> {
-        let server = self.pending.take().context("named pipe listener missing")?;
-        server
+        // This future is polled inside `tokio::select!`, so it must remain
+        // cancellation-safe. Keep the pending server in `self` while waiting;
+        // taking it before `.await` would leave the listener empty whenever a
+        // different select branch wins.
+        self.pending
+            .as_ref()
+            .context("named pipe listener missing")?
             .connect()
             .await
             .context("accept local daemon client")?;
-        self.pending = Some(create_pipe_server(&self.pipe_name, false)?);
-        Ok(server)
+        let next = create_pipe_server(&self.pipe_name, false)?;
+        Ok(self
+            .pending
+            .replace(next)
+            .context("named pipe listener missing")?)
     }
 }
 
@@ -1355,6 +1363,29 @@ mod tests {
         let mut received = [0; 4];
         server.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"ping");
+        drop(state_lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_accept_survives_cancellation() {
+        let dir = std::env::temp_dir().join(format!("meshmsg-ipc-test-{}", rand::random::<u64>()));
+        let state_lock = StateLock::acquire(&dir).unwrap();
+        let (mut listener, _guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(10), listener.accept()).await;
+        assert!(cancelled.is_err());
+        assert!(listener.pending.is_some());
+
+        let (server, client) = tokio::join!(listener.accept(), connect_daemon(&dir));
+        let mut server = server.unwrap();
+        let mut client = client.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut received = [0; 4];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"ping");
+
         drop(state_lock);
         std::fs::remove_dir_all(dir).unwrap();
     }
