@@ -177,14 +177,21 @@ struct LocalEndpointGuard {
     path: PathBuf,
     device: u64,
     inode: u64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 #[cfg(unix)]
 impl Drop for LocalEndpointGuard {
     fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
-            if metadata.dev() == self.device && metadata.ino() == self.inode {
+            if metadata.dev() == self.device
+                && metadata.ino() == self.inode
+                && metadata.ctime() == self.changed_seconds
+                && metadata.ctime_nsec() == self.changed_nanoseconds
+                && metadata.file_type().is_socket()
+            {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
@@ -395,6 +402,8 @@ async fn bind_local_endpoint(
             path,
             device: metadata.dev(),
             inode: metadata.ino(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
         },
     ))
 }
