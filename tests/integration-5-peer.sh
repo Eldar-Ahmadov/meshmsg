@@ -32,6 +32,10 @@ status_joined() {
   "$BIN" --state-dir "$ROOT/$1" --json status | python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["topic_joined"] and value["neighbors"] >= 1'
 }
+status_not_joined() {
+  "$BIN" --state-dir "$ROOT/$1" --json status | python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert not value["topic_joined"] and value["neighbors"] == 0'
+}
 start_node() {
   local node=$1
   RUST_LOG=meshmsg=trace timeout 1100 "$BIN" --state-dir "$ROOT/$node" --json daemon >"$ROOT/$node.daemon.log" 2>"$ROOT/$node.daemon.err" &
@@ -174,13 +178,27 @@ start_node s3
 "$BIN" --state-dir "$ROOT/s3" --json doctor | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["advertises_self"] and value["self_advertised"]'
 invite s3 >/dev/null
 
-# Re-check both output streams after restart and failover traffic as well.
+# Isolate a running peer, restore one configured bootstrap peer, and verify the
+# isolated daemon rejoins without being restarted itself.
+stop_node s1
+stop_node s2
+stop_node s3
+stop_node c2
+wait_for 30 "c1 to lose all gossip neighbors" status_not_joined c1
+start_node s1
+wait_for 30 "c1 to rejoin after connectivity restoration" status_joined c1
+M4="integration-rejoin-$(date +%s%N)"
+"$BIN" --state-dir "$ROOT/s1" --json send "$M4" | grep -q '"type":"queued"'
+wait_log 30 "$ROOT/c1-restarted.listen.log" "\"body\":\"$M4\""
+
+# Re-check both output streams after restart, failover, and rejoin traffic.
 for node in s1 s2 s3 c1 c2; do
   for output in "$ROOT/$node.daemon.log" "$ROOT/$node.daemon.err"; do
     ! grep -Fq "$M3" "$output" || fail "$node daemon leaked failover message body to $output"
+    ! grep -Fq "$M4" "$output" || fail "$node daemon leaked rejoin message body to $output"
     ! grep -Fq '"invite":' "$output" || fail "$node daemon leaked an invite field to $output"
   done
 done
 
 kill "$L1" >/dev/null 2>&1 || true; wait "$L1" >/dev/null 2>&1 || true
-echo "PASS: 5 equal peers, selective endpoint advertising, privacy logs, restart/failover, IPC safety, and limits"
+echo "PASS: 5 equal peers, selective endpoint advertising, privacy logs, restart/failover/rejoin, IPC safety, and limits"

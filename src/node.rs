@@ -46,6 +46,10 @@ const MAX_IPC_EVENT_SIZE: usize = MAX_ENVELOPE_SIZE * 6 + 1024;
 const IPC_EVENT_CAPACITY: usize = 256;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Re-issue the gossip join after connectivity loss. `join_peers` only queues a
+/// connection attempt, so repeating it also covers attempts made while the
+/// network interface is still unavailable.
+const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -108,6 +112,7 @@ struct RunningNode {
     sender: GossipSender,
     receiver: GossipReceiver,
     secret: SecretKey,
+    bootstrap_peers: Vec<PublicKey>,
 }
 
 async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
@@ -138,7 +143,7 @@ async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
     let subscription = if bootstrap.is_empty() {
         gossip.subscribe(topic, vec![]).await?
     } else {
-        gossip.subscribe_and_join(topic, bootstrap).await?
+        gossip.subscribe_and_join(topic, bootstrap.clone()).await?
     };
     let (sender, receiver) = subscription.split();
     Ok(RunningNode {
@@ -147,6 +152,7 @@ async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
         sender,
         receiver,
         secret,
+        bootstrap_peers: bootstrap,
     })
 }
 
@@ -717,6 +723,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
 
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
+    let mut rejoin = tokio::time::interval(REJOIN_INTERVAL);
+    rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -775,6 +783,14 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     }
                 }
                 None => break,
+            },
+            _ = rejoin.tick(), if !node.bootstrap_peers.is_empty() => {
+                if !node.receiver.is_joined() {
+                    node.sender
+                        .join_peers(node.bootstrap_peers.clone())
+                        .await
+                        .context("retry gossip bootstrap peers after connectivity loss")?;
+                }
             },
             _ = shutdown.recv() => break,
         }
