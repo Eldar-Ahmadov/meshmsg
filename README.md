@@ -102,6 +102,7 @@ The canonical top-level commands are:
 - `daemon`
 - `invite`
 - `send`, `listen`, `chat`, `status`, `stop`, and `doctor`
+- `bench-send` and `bench-receive`
 
 There are no compatibility command aliases or nested initialization/run command groups.
 
@@ -137,6 +138,46 @@ A successful send reports `queued`, for example:
 ```
 
 `queued` means the local gossip implementation accepted the broadcast request. It is not a delivery acknowledgement and does not guarantee that any remote peer received or persisted the message.
+
+## Benchmarking a three-node swarm
+
+Benchmark commands use the existing daemon and topic. Benchmark bodies are ordinary signed plaintext messages, so every topic participant can read them and they consume the same network and subscriber resources as chat traffic. Use an isolated topic when possible.
+
+Choose one explicit 128-bit hexadecimal run ID, then start a receiver on nodes B and C before starting node A:
+
+```sh
+# Nodes B and C (wait for bench_receive_started in JSON output)
+meshmsg --json bench-receive \
+  --run-id 0123456789abcdef0123456789abcdef \
+  --duration-secs 15 --expected 1000 | tee bench-receive.ndjson
+
+# Node A: 100 messages/s for 10 seconds, with 512-byte bodies
+meshmsg --json bench-send \
+  --run-id 0123456789abcdef0123456789abcdef \
+  --rate 100 --duration-secs 10 --payload-bytes 512 > bench-send.ndjson
+```
+
+Run each rate several times and increase it gradually, for example 10, 25, 50, 100, 200, then 500 messages/s. Compare A's `bench_send_summary` with both `bench_receive_summary` records. Reverse the sender and also test simultaneous senders in separate runs when that reflects the intended workload. Only one send benchmark may be active on a given daemon.
+
+`bench-send` defaults to 100 messages/s for 10 seconds with 256-byte bodies and generates a random run ID when omitted. For coordinated receivers, always supply the run ID explicitly. Rates are limited to 1–10,000 messages/s, durations to 1–86,400 seconds, and a run to 10,000,000 planned messages. `--payload-bytes` is the exact complete benchmark body size, including its 106-byte metadata header. The maximum is below 4096 because the signed envelope must also fit; invalid sizes are rejected before sending rather than truncated.
+
+The sender keeps one local IPC connection open and schedules from a monotonic clock without catch-up bursts. Its summary includes planned, attempted, locally queued, failed, schedule-missed, body/envelope bytes, and achieved rates. `delivery_acknowledged` is always false. A schedule miss identifies local sender/daemon saturation, not network loss.
+
+`bench-receive` keeps one subscription open, filters by run ID, and bounds sequence tracking to a 10,000,000-message bitmap. It reports unique and missing messages (when expected is supplied or learned), a sample of at most 100 missing sequence numbers, duplicates, first-seen out-of-order messages, body throughput, and bounded latency percentiles. Latency is a signed-message, one-way wall-clock observation; clocks are not synchronized, so negative or implausible samples are excluded and counted as `clock_invalid`. It is not RTT or network-only latency.
+
+Both local IPC lag and gossip-receiver lag appear in the summary. If `lag.incomplete` is true, sequence gaps cannot be attributed solely to the network. Gossip replication also means payload bytes are not wire bytes: topology, protocol framing, signatures, retransmission, and fan-out can make actual interface traffic much larger. Use OS network counters alongside these summaries for wire throughput.
+
+Both commands emit one started record and one summary record in `--json` NDJSON mode. Representative records are:
+
+```json
+{"type":"bench_send_started","schema_version":1,"run_id":"0123456789abcdef0123456789abcdef","rate":100,"duration_secs":10,"payload_bytes":512,"planned":1000,"delivery_acknowledged":false}
+{"type":"bench_send_summary","schema_version":1,"run_id":"0123456789abcdef0123456789abcdef","rate":100,"duration_secs":10,"payload_bytes":512,"planned":1000,"attempted":1000,"queued":1000,"failed":0,"schedule_missed":0,"queued_body_bytes":512000,"queued_envelope_bytes":610000,"elapsed_ms":10000,"achieved_messages_per_second":100.0,"achieved_body_bytes_per_second":51200.0,"completion_reason":"deadline","first_error":null,"delivery_acknowledged":false}
+{"type":"bench_receive_started","schema_version":1,"run_id":"0123456789abcdef0123456789abcdef","duration_secs":15,"expected":1000}
+{"type":"bench_receive_summary","schema_version":1,"run_id":"0123456789abcdef0123456789abcdef","completion_reason":"deadline","elapsed_ms":15000,"expected":1000,"complete":true,"measurement_valid":true,"unique":1000,"missing":0,"missing_sequence_sample":[],"duplicates":0,"out_of_order":0,"highest_sequence":999,"body_bytes":512000,"achieved_messages_per_second":66.67,"achieved_body_bytes_per_second":34133.33,"latency":{"observations":1000,"samples":1000,"sampled":false,"clock_invalid":0,"p50_ms":12,"p95_ms":30,"p99_ms":45},"lag":{"local_events":0,"local_dropped":0,"gossip_events":0,"incomplete":false},"peer_up":0,"peer_down":0,"ignored_messages":0,"malformed_messages":0}
+```
+
+Send completion reasons are `deadline`, `interrupted`, `daemon_stopped`, or `send_failed`; `first_error` is a string only for `send_failed` and otherwise null. Receive completion reasons are `deadline`, `interrupted`, or `daemon_stopped`. For a receiver with no valid matching message and no `--expected`, `expected`, `missing`, and `highest_sequence` are null. Latency percentiles are null when there are no valid samples. `complete` means all expected sequences were observed. `measurement_valid` additionally requires no local/gossip lag and no malformed matching messages. `latency.sampled` means the percentiles use a bounded deterministic reservoir rather than every valid observation. Ctrl-C produces an `interrupted` summary; a daemon disconnect produces a partial summary followed by a nonzero exit.
+
 
 ## Startup, status, and diagnosis
 

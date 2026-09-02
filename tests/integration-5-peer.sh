@@ -103,6 +103,35 @@ printf '%s' "$M1" >"$ROOT/message.txt"
 printf '%s' "$M2" | "$BIN" --state-dir "$ROOT/c2" --json send --message-stdin | grep -q '"type":"queued"'
 wait_log 30 "$ROOT/c2.listen.log" "\"body\":\"$M1\""
 wait_log 30 "$ROOT/c1.listen.log" "\"body\":\"$M2\""
+
+# A benchmark uses one persistent sender operation and filtered receiver subscriptions.
+BENCH_RUN=0123456789abcdef0123456789abcdef
+"$BIN" --state-dir "$ROOT/c1" --json bench-receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c1.bench.log" & B1=$!
+"$BIN" --state-dir "$ROOT/c2" --json bench-receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c2.bench.log" & B2=$!
+wait_log 10 "$ROOT/c1.bench.log" '"type":"bench_receive_started"'
+wait_log 10 "$ROOT/c2.bench.log" '"type":"bench_receive_started"'
+"$BIN" --state-dir "$ROOT/s1" --json bench-send --run-id "$BENCH_RUN" --rate 5 --duration-secs 1 --payload-bytes 128 >"$ROOT/s1.bench.log" & BS=$!
+wait_log 10 "$ROOT/s1.bench.log" '"type":"bench_send_started"'
+status_ok s1 || fail "daemon did not answer status during benchmark send"
+wait "$BS"
+wait "$B1"
+wait "$B2"
+python3 - "$ROOT/s1.bench.log" "$ROOT/c1.bench.log" "$ROOT/c2.bench.log" <<'PY'
+import json, pathlib, sys
+sender = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+assert [value["type"] for value in sender] == ["bench_send_started", "bench_send_summary"]
+assert sender[-1]["planned"] == sender[-1]["attempted"] == sender[-1]["queued"] == 5
+assert sender[-1]["failed"] == 0 and sender[-1]["delivery_acknowledged"] is False
+for path in sys.argv[2:]:
+    receiver = [json.loads(line) for line in pathlib.Path(path).read_text().splitlines()]
+    assert [value["type"] for value in receiver] == ["bench_receive_started", "bench_receive_summary"]
+    summary = receiver[-1]
+    assert summary["run_id"] == "0123456789abcdef0123456789abcdef"
+    assert summary["expected"] == summary["unique"] == 5
+    assert summary["missing"] == 0 and summary["complete"]
+    assert not summary["lag"]["incomplete"]
+PY
+
 for peer in s1 s2 s3; do
   wait_for 30 "two suppressed messages at $peer" bash -c "test \$(grep -c '\"body_suppressed\":true' '$ROOT/$peer.daemon.log') -ge 2"
 done
@@ -117,6 +146,7 @@ for node in s1 s2 s3 c1 c2; do
   for output in "$ROOT/$node.daemon.log" "$ROOT/$node.daemon.err"; do
     ! grep -Fq "$M1" "$output" || fail "$node daemon leaked message body to $output"
     ! grep -Fq "$M2" "$output" || fail "$node daemon leaked message body to $output"
+    ! grep -Fq "$BENCH_RUN" "$output" || fail "$node daemon leaked benchmark body to $output"
   done
   "$BIN" --state-dir "$ROOT/$node" --json doctor | grep -q '"ok":true'
 done
@@ -201,4 +231,4 @@ for node in s1 s2 s3 c1 c2; do
 done
 
 kill "$L1" >/dev/null 2>&1 || true; wait "$L1" >/dev/null 2>&1 || true
-echo "PASS: 5 equal peers, selective endpoint advertising, privacy logs, restart/failover/rejoin, IPC safety, and limits"
+echo "PASS: 5 equal peers, benchmarking, selective endpoint advertising, privacy logs, restart/failover/rejoin, IPC safety, and limits"

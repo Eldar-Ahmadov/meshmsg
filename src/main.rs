@@ -90,6 +90,27 @@ async fn run() -> Result<()> {
             node::send_once(&dir, &message, cli.json).await?
         }
         Command::Listen => node::listen(&dir, cli.json).await?,
+        Command::BenchSend { args } => {
+            node::bench_send(
+                &dir,
+                args.run_id,
+                args.rate,
+                args.duration_secs,
+                args.payload_bytes,
+                cli.json,
+            )
+            .await?
+        }
+        Command::BenchReceive { args } => {
+            node::bench_receive(
+                &dir,
+                args.run_id,
+                args.duration_secs,
+                args.expected,
+                cli.json,
+            )
+            .await?
+        }
         Command::Chat => node::chat(&dir, cli.json).await?,
         Command::Status => node::status(&dir, cli.json).await?,
         Command::Doctor => node::doctor(&dir, cli.json).await?,

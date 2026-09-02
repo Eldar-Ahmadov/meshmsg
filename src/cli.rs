@@ -64,6 +64,42 @@ pub struct MessageInput {
     pub message_stdin: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct BenchSendArgs {
+    /// 128-bit hexadecimal run identifier (generated when omitted)
+    #[arg(long, value_parser = parse_run_id)]
+    pub run_id: Option<String>,
+    /// Sustained messages per second
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    pub rate: u32,
+    /// Test duration in seconds
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    pub duration_secs: u64,
+    /// Exact benchmark body size in bytes
+    #[arg(long, default_value_t = 256)]
+    pub payload_bytes: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct BenchReceiveArgs {
+    /// 128-bit hexadecimal run identifier emitted by bench-send
+    #[arg(long, value_parser = parse_run_id)]
+    pub run_id: String,
+    /// Observation duration in seconds
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    pub duration_secs: u64,
+    /// Expected sequence count; otherwise learned from the first valid message
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=10_000_000))]
+    pub expected: Option<u64>,
+}
+
+fn parse_run_id(value: &str) -> std::result::Result<String, String> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("run ID must contain exactly 32 hexadecimal characters".into());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Generate a persistent identity and fresh topic
@@ -96,6 +132,16 @@ pub enum Command {
     },
     /// Stream incoming messages
     Listen,
+    /// Generate a sustained, sequenced benchmark load through one daemon connection
+    BenchSend {
+        #[command(flatten)]
+        args: BenchSendArgs,
+    },
+    /// Measure delivery for one benchmark run through one subscription
+    BenchReceive {
+        #[command(flatten)]
+        args: BenchReceiveArgs,
+    },
     /// Send lines from stdin while receiving messages
     Chat,
     /// Show live daemon configuration and connectivity
@@ -199,6 +245,57 @@ mod tests {
         assert!(parse(&["send", "message"]).is_ok());
         assert!(parse(&["send", "--message-file", "message.txt"]).is_ok());
         assert!(parse(&["send", "--message-stdin"]).is_ok());
+        assert!(parse(&["bench-send"]).is_ok());
+        assert!(parse(&[
+            "bench-send",
+            "--run-id",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "--rate",
+            "500",
+            "--duration-secs",
+            "2",
+            "--payload-bytes",
+            "512",
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "bench-receive",
+            "--run-id",
+            "0123456789abcdef0123456789abcdef",
+            "--expected",
+            "1000",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn benchmark_arguments_are_strictly_bounded() {
+        for arguments in [
+            vec!["bench-send", "--rate", "0"],
+            vec!["bench-send", "--rate", "10001"],
+            vec!["bench-send", "--duration-secs", "0"],
+            vec!["bench-send", "--duration-secs", "86401"],
+            vec!["bench-send", "--run-id", "abc"],
+            vec!["bench-receive", "--run-id", "abc"],
+            vec![
+                "bench-receive",
+                "--run-id",
+                "0123456789abcdef0123456789abcdef",
+                "--expected",
+                "0",
+            ],
+        ] {
+            assert!(parse(&arguments).is_err(), "accepted {arguments:?}");
+        }
+
+        let cli = parse(&["bench-send", "--run-id", "ABCDEFABCDEFABCDEFABCDEFABCDEFAB"]).unwrap();
+        let Command::BenchSend { args } = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(
+            args.run_id.as_deref(),
+            Some("abcdefabcdefabcdefabcdefabcdefab")
+        );
     }
 
     #[test]
