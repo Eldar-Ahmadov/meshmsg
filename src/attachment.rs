@@ -511,8 +511,11 @@ fn rename_directory_no_replace(staging: &Path, destination: &Path) -> Result<()>
             .context("destination path contains a null byte")?;
         // renameat2 with RENAME_NOREPLACE is atomic and never replaces even an
         // empty directory created between validation and installation.
+        // Use the syscall entry point because musl does not export renameat2
+        // as a linkable libc symbol on all supported toolchains.
         let result = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 staging_c.as_ptr(),
                 libc::AT_FDCWD,
