@@ -1158,10 +1158,36 @@ struct PinnedBlobInfo {
     offer_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+    name: String,
+    kind: &'static str,
     hash: String,
     format: &'static str,
     status: &'static str,
     size: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PinnedBlobTag {
+    direction: &'static str,
+    offer_id: String,
+    provider: Option<String>,
+    name: String,
+    kind: AttachmentKind,
+}
+
+fn attachment_kind_name(kind: AttachmentKind) -> &'static str {
+    match kind {
+        AttachmentKind::File => "file",
+        AttachmentKind::DirectoryTarV1 => "directory_tar_v1",
+    }
+}
+
+fn parse_attachment_kind(value: &str) -> Option<AttachmentKind> {
+    match value {
+        "file" => Some(AttachmentKind::File),
+        "directory_tar_v1" => Some(AttachmentKind::DirectoryTarV1),
+        _ => None,
+    }
 }
 
 fn valid_offer_id(value: &str) -> bool {
@@ -1171,17 +1197,64 @@ fn valid_offer_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn parse_pinned_blob_tag(name: &[u8]) -> Option<(&'static str, Option<String>, String)> {
+fn decode_tag_name(value: &str) -> Option<String> {
+    let decoded = BASE64URL_NOPAD.decode(value.as_bytes()).ok()?;
+    let name = String::from_utf8(decoded).ok()?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn encode_tag_name(value: &str) -> String {
+    BASE64URL_NOPAD.encode(value.as_bytes())
+}
+
+fn outbound_blob_tag(offer_id: &str, kind: AttachmentKind, name: &str) -> String {
+    format!(
+        "{OUTBOUND_BLOB_TAG_PREFIX}{offer_id}/{}/{}",
+        attachment_kind_name(kind),
+        encode_tag_name(name)
+    )
+}
+
+fn inbound_blob_tag(
+    provider: PublicKey,
+    offer_id: &str,
+    kind: AttachmentKind,
+    name: &str,
+) -> String {
+    format!(
+        "{INBOUND_BLOB_TAG_PREFIX}{provider}/{offer_id}/{}/{}",
+        attachment_kind_name(kind),
+        encode_tag_name(name)
+    )
+}
+
+fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
     let name = std::str::from_utf8(name).ok()?;
-    if let Some(offer_id) = name.strip_prefix(OUTBOUND_BLOB_TAG_PREFIX) {
-        return valid_offer_id(offer_id).then(|| ("outgoing", None, offer_id.to_owned()));
-    }
-    let remainder = name.strip_prefix(INBOUND_BLOB_TAG_PREFIX)?;
-    let (provider, offer_id) = remainder.split_once('/')?;
-    if provider.is_empty() || !valid_offer_id(offer_id) {
+    let (direction, provider, remainder) =
+        if let Some(remainder) = name.strip_prefix(OUTBOUND_BLOB_TAG_PREFIX) {
+            ("outgoing", None, remainder)
+        } else {
+            let remainder = name.strip_prefix(INBOUND_BLOB_TAG_PREFIX)?;
+            let (provider, remainder) = remainder.split_once('/')?;
+            if provider.is_empty() {
+                return None;
+            }
+            ("incoming", Some(provider.to_owned()), remainder)
+        };
+    let mut parts = remainder.split('/');
+    let offer_id = parts.next()?;
+    let kind = parse_attachment_kind(parts.next()?)?;
+    let name = decode_tag_name(parts.next()?)?;
+    if parts.next().is_some() || !valid_offer_id(offer_id) {
         return None;
     }
-    Some(("incoming", Some(provider.to_owned()), offer_id.to_owned()))
+    Some(PinnedBlobTag {
+        direction,
+        offer_id: offer_id.to_owned(),
+        provider,
+        name,
+        kind,
+    })
 }
 
 async fn list_pinned_blobs(store: &Store) -> Result<Vec<PinnedBlobInfo>> {
@@ -1195,7 +1268,7 @@ async fn list_pinned_blobs(store: &Store) -> Result<Vec<PinnedBlobInfo>> {
         let Ok(tag) = tag else {
             continue;
         };
-        let Some((direction, provider, offer_id)) = parse_pinned_blob_tag(tag.name.as_ref()) else {
+        let Some(parsed) = parse_pinned_blob_tag(tag.name.as_ref()) else {
             continue;
         };
         let (status, size) = match store.blobs().status(tag.hash).await {
@@ -1209,9 +1282,11 @@ async fn list_pinned_blobs(store: &Store) -> Result<Vec<PinnedBlobInfo>> {
             BlobFormat::HashSeq => "hash_seq",
         };
         blobs.push(PinnedBlobInfo {
-            direction,
-            offer_id,
-            provider,
+            direction: parsed.direction,
+            offer_id: parsed.offer_id,
+            provider: parsed.provider,
+            name: parsed.name,
+            kind: attachment_kind_name(parsed.kind),
             hash: tag.hash.to_string(),
             format,
             status,
@@ -1267,7 +1342,12 @@ async fn share_attachment(
     .context("attachment staging task failed")??;
     let (size, staged) = staged;
     let offer_id = generated_run_id();
-    let tag_name = format!("{OUTBOUND_BLOB_TAG_PREFIX}{offer_id}");
+    let kind = if directory {
+        AttachmentKind::DirectoryTarV1
+    } else {
+        AttachmentKind::File
+    };
+    let tag_name = outbound_blob_tag(&offer_id, kind, &name);
     let imported = store
         .blobs()
         .add_path(staged.path())
@@ -1280,11 +1360,7 @@ async fn share_attachment(
         let ticket = BlobTicket::new(endpoint.addr(), imported.hash(), imported.format());
         let offer = AttachmentOffer {
             offer_id,
-            kind: if directory {
-                AttachmentKind::DirectoryTarV1
-            } else {
-                AttachmentKind::File
-            },
+            kind,
             name,
             size,
             ticket: ticket.to_string(),
@@ -1495,11 +1571,7 @@ async fn download_attachment(
             .context("extraction task failed")??;
         }
     }
-    let tag_name = format!(
-        "{INBOUND_BLOB_TAG_PREFIX}{}/{}",
-        ticket.addr().id,
-        offer.offer_id
-    );
+    let tag_name = inbound_blob_tag(ticket.addr().id, &offer.offer_id, offer.kind, &offer.name);
     store
         .tags()
         .set(tag_name.as_bytes(), ticket.hash_and_format())
@@ -2580,8 +2652,10 @@ fn event(json: bool, value: serde_json::Value) {
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "?".to_owned());
                         println!(
-                            "{}  {}  {}  {}  {}  {} bytes  {}",
+                            "{}  {}  {}  {}  {}  {}  {}  {} bytes  {}",
                             terminal_safe(blob["direction"].as_str().unwrap_or("unknown")),
+                            terminal_safe(blob["name"].as_str().unwrap_or("?")),
+                            terminal_safe(blob["kind"].as_str().unwrap_or("?")),
                             terminal_safe(blob["offer_id"].as_str().unwrap_or("")),
                             terminal_safe(blob["provider"].as_str().unwrap_or("-")),
                             terminal_safe(blob["format"].as_str().unwrap_or("unknown")),
@@ -2657,22 +2731,45 @@ mod tests {
     }
 
     #[test]
-    fn pinned_blob_tags_are_parsed_defensively() {
+    fn pinned_blob_tags_preserve_names_and_kinds() {
         let id = "0123456789abcdef0123456789abcdef";
+        let provider = SecretKey::generate().public();
+        let name = "résumé 2026.pdf";
         assert_eq!(
-            parse_pinned_blob_tag(format!("meshmsg/out/v1/{id}").as_bytes()),
-            Some(("outgoing", None, id.to_owned()))
+            parse_pinned_blob_tag(outbound_blob_tag(id, AttachmentKind::File, name).as_bytes()),
+            Some(PinnedBlobTag {
+                direction: "outgoing",
+                offer_id: id.to_owned(),
+                provider: None,
+                name: name.to_owned(),
+                kind: AttachmentKind::File,
+            })
         );
         assert_eq!(
-            parse_pinned_blob_tag(format!("meshmsg/in/v1/provider/{id}").as_bytes()),
-            Some(("incoming", Some("provider".to_owned()), id.to_owned()))
+            parse_pinned_blob_tag(
+                inbound_blob_tag(provider, id, AttachmentKind::DirectoryTarV1, "results.tar")
+                    .as_bytes()
+            ),
+            Some(PinnedBlobTag {
+                direction: "incoming",
+                offer_id: id.to_owned(),
+                provider: Some(provider.to_string()),
+                name: "results.tar".to_owned(),
+                kind: AttachmentKind::DirectoryTarV1,
+            })
         );
+    }
+
+    #[test]
+    fn malformed_pinned_blob_tags_are_ignored() {
         for invalid in [
             "meshmsg/out/v1/",
-            "meshmsg/out/v1/0123456789ABCDEF0123456789ABCDEF",
-            "meshmsg/out/v2/0123456789abcdef0123456789abcdef",
-            "meshmsg/in/v1//0123456789abcdef0123456789abcdef",
-            "meshmsg/in/v1/provider/0123456789abcdef0123456789abcdef/extra",
+            "meshmsg/out/v1/0123456789ABCDEF0123456789ABCDEF/file/bmFtZQ",
+            "meshmsg/out/v1/0123456789abcdef0123456789abcdef/unknown/bmFtZQ",
+            "meshmsg/out/v1/0123456789abcdef0123456789abcdef/file/not+base64",
+            "meshmsg/in/v1//0123456789abcdef0123456789abcdef/file/bmFtZQ",
+            "meshmsg/in/v1/provider/0123456789abcdef0123456789abcdef/file/bmFtZQ/extra",
+            "meshmsg/out/v2/0123456789abcdef0123456789abcdef/file/bmFtZQ",
             "other/out/v1/0123456789abcdef0123456789abcdef",
         ] {
             assert_eq!(parse_pinned_blob_tag(invalid.as_bytes()), None, "{invalid}");

@@ -67,7 +67,7 @@ FILE_SHARE=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/provider" --json share sour
 FILE_OFFER=$(json_field '"offer"' <<<"$FILE_SHARE")
 FILE_TICKET=$(json_field '"ticket"' <<<"$FILE_SHARE")
 FILE_ID=$(json_field '"offer_id"' <<<"$FILE_SHARE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["status"] == "complete"' "$FILE_ID" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["name"] == "source.txt" and b["kind"] == "file" and b["status"] == "complete"' "$FILE_ID" \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
   || fail "provider offer listing did not include shared file"
 python3 -c 'import json,sys; assert json.load(sys.stdin)["blobs"] == []' \
@@ -86,7 +86,7 @@ if (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" download "$FILE_OFFER" --o
   fail "download overwrote an existing file"
 fi
 grep -q 'output already exists' "$ROOT/clobber.err" || fail "overwrite refusal was not actionable"
-python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and all(x["direction"] == "incoming" and x["status"] == "complete" for x in b)' \
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {x["name"] for x in b} == {"raw-ticket.txt", "source.txt"} and all(x["direction"] == "incoming" and x["kind"] == "file" and x["status"] == "complete" for x in b)' \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "receiver listing did not include downloaded blobs"
 
@@ -98,7 +98,7 @@ DIR_SHARE=$("$BIN" --state-dir "$ROOT/provider" --json share "$ROOT/source-dir")
 DIR_OFFER=$(json_field '"offer"' <<<"$DIR_SHARE")
 stop_node provider
 start_node provider
-python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and all(x["direction"] == "outgoing" and x["status"] == "complete" for x in b)' \
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {(x["name"], x["kind"]) for x in b} == {("source.txt", "file"), ("source-dir.tar", "directory_tar_v1")} and all(x["direction"] == "outgoing" and x["status"] == "complete" for x in b)' \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
   || fail "provider offer listing did not survive restart"
 "$BIN" --state-dir "$ROOT/receiver" --json download "$DIR_OFFER" --output "$ROOT/received-dir" \
@@ -106,6 +106,9 @@ python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2
 cmp "$ROOT/source-dir/a.txt" "$ROOT/received-dir/a.txt" || fail "top-level archive file differs"
 cmp "$ROOT/source-dir/nested/b.txt" "$ROOT/received-dir/nested/b.txt" || fail "nested archive file differs"
 [[ -d "$ROOT/received-dir/empty" ]] || fail "empty directory was not preserved"
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert any(x["name"] == "source-dir.tar" and x["kind"] == "directory_tar_v1" for x in b)' \
+  <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
+  || fail "receiver listing did not preserve downloaded directory name and kind"
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true

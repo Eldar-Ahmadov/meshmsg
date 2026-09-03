@@ -27,7 +27,7 @@ meshmsg offers
 meshmsg --json offers
 ```
 
-This is a best-effort storage view. `outgoing` entries were successfully shared by this node; `incoming` entries were successfully downloaded from a peer. The command reports the offer ID, provider ID when retained by an incoming tag, content hash, format, local status, and known size. Existing tags do not retain original names, kinds, signed offer tokens, timestamps, output paths, or offers that were seen but never downloaded.
+This is a best-effort storage view. `outgoing` entries were successfully shared by this node; `incoming` entries were successfully downloaded from a peer. Tags retain the offered filename and kind, and the command also reports the offer ID, provider ID when available, content hash, format, local status, and known size. Tags do not retain signed offer tokens, timestamps, output paths, or offers that were seen but never downloaded.
 
 ## Acceptance and overwrite behavior
 
