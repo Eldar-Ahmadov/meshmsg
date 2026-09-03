@@ -12,7 +12,10 @@ use rustix::fs::{openat, Dir, Mode, OFlags, CWD};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(windows)]
-use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::windows::{
+    ffi::OsStrExt as _,
+    fs::{MetadataExt as _, OpenOptionsExt as _},
+};
 #[cfg(unix)]
 use std::{ffi::CString, os::unix::fs::OpenOptionsExt as _};
 
@@ -524,10 +527,33 @@ fn rename_directory_no_replace(staging: &Path, destination: &Path) -> Result<()>
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(windows)]
     {
-        // Windows rename refuses an existing destination directory. Other
-        // supported filesystems must provide the same behavior for this path.
+        use std::iter;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+        let staging_wide: Vec<u16> = staging
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        let destination_wide: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        // Unlike std::fs::rename on Windows, omitting MOVEFILE_REPLACE_EXISTING
+        // fails atomically when the destination already exists.
+        let result = unsafe { MoveFileExW(staging_wide.as_ptr(), destination_wide.as_ptr(), 0) };
+        if result == 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("install extracted directory {}", destination.display()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    {
         fs::rename(staging, destination)
             .with_context(|| format!("install extracted directory {}", destination.display()))
     }
