@@ -1,4 +1,5 @@
 mod attachment;
+mod bench_tui;
 mod cli;
 mod config;
 mod invite;
@@ -19,12 +20,19 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+    let is_bench_tui = matches!(&cli.command, Command::BenchTui);
+    anyhow::ensure!(
+        !(is_bench_tui && cli.json),
+        "--json cannot be used with bench-tui; use bench-send or bench-receive for NDJSON"
+    );
+    if !is_bench_tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let dir = cli.state_dir();
     match cli.command {
         Command::Init { force } => {
@@ -117,6 +125,7 @@ async fn run() -> Result<()> {
             )
             .await?
         }
+        Command::BenchTui => bench_tui::run(&dir).await?,
         Command::Chat => node::chat(&dir, cli.json).await?,
         Command::Status => node::status(&dir, cli.json).await?,
         Command::Doctor => node::doctor(&dir, cli.json).await?,

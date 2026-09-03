@@ -2,6 +2,8 @@
 
 Benchmark commands use the existing daemon and topic. Benchmark bodies are ordinary signed plaintext messages: every participant can read them, and they consume the same network and subscriber resources as chat. Prefer an isolated topic.
 
+For an interactive setup, live progress, and result screen, run `meshmsg bench-tui` in a terminal. Select sender or receiver, edit the fields, and press Enter. The sender defaults to 100 messages/s for 10 seconds with 256-byte bodies and a generated run ID; the receiver defaults to a 15-second window and permits an optional expected count. `q`, Escape, or Ctrl-C stops an active run while retaining its final summary. `--json` is intentionally incompatible with `bench-tui`; use the commands below for automation.
+
 ## Running a three-node test
 
 Choose one 128-bit hexadecimal run ID. Start receivers on nodes B and C before the sender on node A:
@@ -33,6 +35,8 @@ Limits:
 
 The sender keeps one IPC connection open and schedules from a monotonic clock without catch-up bursts. Its summary includes planned, attempted, locally queued, failed, schedule-missed, body/envelope bytes, and achieved rates. `delivery_acknowledged` is always false. Schedule misses indicate local sender or daemon saturation, not network loss.
 
+JSON mode may emit bounded-cadence `bench_send_progress` records between the started record and terminal summary. These records have `schema_version: 1` and snapshot the same attempted, queued, failed, schedule-missed, byte, elapsed, and achieved-rate counters. They are local queue and scheduler observations, not delivery acknowledgements. Progress is best-effort and stale snapshots may be dropped when the output consumer is blocked; started and final records are retained.
+
 Completion reasons are `deadline`, `interrupted`, `daemon_stopped`, and `send_failed`.
 
 ## Receiver semantics
@@ -44,6 +48,8 @@ Latency is a one-way signed-message wall-clock observation. Clocks are not synch
 Both local IPC lag and Gossip receiver lag appear in the summary. If `lag.incomplete` is true, sequence gaps cannot be attributed solely to the network. Payload bytes are not wire bytes: topology, framing, signatures, retransmission, and fan-out add overhead.
 
 Receiver completion reasons are `deadline`, `interrupted`, and `daemon_stopped`. Without a valid matching message or `--expected`, expected, missing, and highest sequence are null. `complete` means all expected sequences were seen; `measurement_valid` additionally requires no local/Gossip lag and no malformed matching messages.
+
+JSON mode emits best-effort `bench_receive_progress` snapshots at most four times per second. These `schema_version: 1` records include unique, missing-so-far (null while expected is unknown), duplicates, out-of-order, throughput, bounded latency percentiles, malformed counts, and lag/clock indicators. A lagged measurement is labeled incomplete: observed gaps must not be described as network loss when local IPC or Gossip lag prevents attribution. Started and final summary schemas retain their existing meanings.
 
 ## Representative output
 

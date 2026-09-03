@@ -10,7 +10,7 @@ The canonical top-level commands are:
 - `invite`
 - `send`, `listen`, `chat`, `status`, `stop`, and `doctor`
 - `share <path>`, `offers`, and `download <offer-or-ticket> --output <path>`
-- `bench-send` and `bench-receive`
+- `bench-send`, `bench-receive`, and interactive `bench-tui`
 
 Run `meshmsg <command> --help` for command-specific options.
 

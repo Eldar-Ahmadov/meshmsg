@@ -60,6 +60,14 @@ meshmsg stop
 
 See the [Usage reference](docs/usage.md) for all commands, invite behavior, input sources, status, diagnosis, and JSON automation.
 
+Run an interactive benchmark setup and live monitor against the existing daemon with:
+
+```sh
+meshmsg bench-tui
+```
+
+See [Benchmarking](docs/benchmarking.md) for measurement semantics, coordinated multi-node runs, and NDJSON output.
+
 ## Attachments
 
 Files and deterministic directory snapshots are announced through signed Gossip offers and transferred with Iroh Blobs. Receiving an offer never downloads it automatically.

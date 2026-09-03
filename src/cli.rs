@@ -157,6 +157,8 @@ pub enum Command {
         #[command(flatten)]
         args: BenchReceiveArgs,
     },
+    /// Configure and monitor a benchmark in an interactive terminal
+    BenchTui,
     /// Send lines from stdin while receiving messages
     Chat,
     /// Show live daemon configuration and connectivity
@@ -264,6 +266,7 @@ mod tests {
         assert!(parse(&["offers"]).is_ok());
         assert!(parse(&["download", "offer-token", "--output", "file.txt"]).is_ok());
         assert!(parse(&["bench-send"]).is_ok());
+        assert!(parse(&["bench-tui"]).is_ok());
         assert!(parse(&[
             "bench-send",
             "--run-id",
