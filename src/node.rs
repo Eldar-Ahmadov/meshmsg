@@ -77,6 +77,9 @@ const ATTACHMENT_OFFER_VERSION: u8 = 1;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DOWNLOAD_PROGRESS_STEP: u64 = 8 * 1024 * 1024;
+const BLOB_TAG_PREFIX: &[u8] = b"meshmsg/";
+const OUTBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/out/v1/";
+const INBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/in/v1/";
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -429,6 +432,7 @@ enum IpcRequest {
     BenchSend { config: BenchConfig },
     Subscribe,
     Status,
+    Offers,
     Share { path: PathBuf },
     Download { offer: String, output: PathBuf },
     Stop,
@@ -446,6 +450,9 @@ enum DaemonCommand {
         reply: oneshot::Sender<std::result::Result<usize, String>>,
     },
     Status {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    Offers {
         reply: oneshot::Sender<serde_json::Value>,
     },
     Share {
@@ -1116,6 +1123,11 @@ where
             commands.send(DaemonCommand::Status { reply }).await?;
             write_value(&mut stream, &response.await?).await?;
         }
+        IpcRequest::Offers => {
+            let (reply, response) = oneshot::channel();
+            commands.send(DaemonCommand::Offers { reply }).await?;
+            write_value(&mut stream, &response.await?).await?;
+        }
         IpcRequest::Share { path } => {
             let (reply, response) = oneshot::channel();
             commands.send(DaemonCommand::Share { path, reply }).await?;
@@ -1138,6 +1150,82 @@ where
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct PinnedBlobInfo {
+    direction: &'static str,
+    offer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    hash: String,
+    format: &'static str,
+    status: &'static str,
+    size: Option<u64>,
+}
+
+fn valid_offer_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_pinned_blob_tag(name: &[u8]) -> Option<(&'static str, Option<String>, String)> {
+    let name = std::str::from_utf8(name).ok()?;
+    if let Some(offer_id) = name.strip_prefix(OUTBOUND_BLOB_TAG_PREFIX) {
+        return valid_offer_id(offer_id).then(|| ("outgoing", None, offer_id.to_owned()));
+    }
+    let remainder = name.strip_prefix(INBOUND_BLOB_TAG_PREFIX)?;
+    let (provider, offer_id) = remainder.split_once('/')?;
+    if provider.is_empty() || !valid_offer_id(offer_id) {
+        return None;
+    }
+    Some(("incoming", Some(provider.to_owned()), offer_id.to_owned()))
+}
+
+async fn list_pinned_blobs(store: &Store) -> Result<Vec<PinnedBlobInfo>> {
+    let mut tags = store
+        .tags()
+        .list_prefix(BLOB_TAG_PREFIX)
+        .await
+        .context("list attachment blob tags")?;
+    let mut blobs = Vec::new();
+    while let Some(tag) = tags.next().await {
+        let Ok(tag) = tag else {
+            continue;
+        };
+        let Some((direction, provider, offer_id)) = parse_pinned_blob_tag(tag.name.as_ref()) else {
+            continue;
+        };
+        let (status, size) = match store.blobs().status(tag.hash).await {
+            Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => ("complete", Some(size)),
+            Ok(iroh_blobs::api::proto::BlobStatus::Partial { size }) => ("partial", size),
+            Ok(iroh_blobs::api::proto::BlobStatus::NotFound) => ("missing", None),
+            Err(_) => ("unknown", None),
+        };
+        let format = match tag.format {
+            BlobFormat::Raw => "raw",
+            BlobFormat::HashSeq => "hash_seq",
+        };
+        blobs.push(PinnedBlobInfo {
+            direction,
+            offer_id,
+            provider,
+            hash: tag.hash.to_string(),
+            format,
+            status,
+            size,
+        });
+    }
+    blobs.sort_by(|left, right| {
+        (&left.direction, &left.provider, &left.offer_id).cmp(&(
+            &right.direction,
+            &right.provider,
+            &right.offer_id,
+        ))
+    });
+    Ok(blobs)
 }
 
 async fn share_attachment(
@@ -1179,7 +1267,7 @@ async fn share_attachment(
     .context("attachment staging task failed")??;
     let (size, staged) = staged;
     let offer_id = generated_run_id();
-    let tag_name = format!("meshmsg/out/v1/{offer_id}");
+    let tag_name = format!("{OUTBOUND_BLOB_TAG_PREFIX}{offer_id}");
     let imported = store
         .blobs()
         .add_path(staged.path())
@@ -1407,7 +1495,11 @@ async fn download_attachment(
             .context("extraction task failed")??;
         }
     }
-    let tag_name = format!("meshmsg/in/v1/{}/{}", ticket.addr().id, offer.offer_id);
+    let tag_name = format!(
+        "{INBOUND_BLOB_TAG_PREFIX}{}/{}",
+        ticket.addr().id,
+        offer.offer_id
+    );
     store
         .tags()
         .set(tag_name.as_bytes(), ticket.hash_and_format())
@@ -1600,6 +1692,17 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
                         "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined()
                     }));
+                }
+                Some(DaemonCommand::Offers { reply }) => {
+                    let response = match list_pinned_blobs(&node.blob_store).await {
+                        Ok(blobs) => serde_json::json!({
+                            "type":"offers", "schema_version":1, "blobs":blobs
+                        }),
+                        Err(error) => serde_json::json!({
+                            "type":"error", "code":"offers_failed", "message":error.to_string()
+                        }),
+                    };
+                    let _ = reply.send(response);
                 }
                 Some(DaemonCommand::Share { path, reply }) => {
                     let store = node.blob_store.clone();
@@ -1867,6 +1970,13 @@ pub async fn share(dir: &Path, path: &Path, json: bool) -> Result<()> {
         },
     )
     .await?;
+    ensure_success(&value)?;
+    event(json, value);
+    Ok(())
+}
+
+pub async fn offers(dir: &Path, json: bool) -> Result<()> {
+    let value = send_request(dir, &IpcRequest::Offers).await?;
     ensure_success(&value)?;
     event(json, value);
     Ok(())
@@ -2459,6 +2569,29 @@ fn event(json: bool, value: serde_json::Value) {
                 "queued locally (delivery not acknowledged): {}",
                 terminal_safe(value["body"].as_str().unwrap_or(""))
             ),
+            "offers" => {
+                let blobs = value["blobs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                if blobs.is_empty() {
+                    println!("no pinned attachment blobs");
+                } else {
+                    for blob in blobs {
+                        let size = blob["size"]
+                            .as_u64()
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "?".to_owned());
+                        println!(
+                            "{}  {}  {}  {}  {}  {} bytes  {}",
+                            terminal_safe(blob["direction"].as_str().unwrap_or("unknown")),
+                            terminal_safe(blob["offer_id"].as_str().unwrap_or("")),
+                            terminal_safe(blob["provider"].as_str().unwrap_or("-")),
+                            terminal_safe(blob["format"].as_str().unwrap_or("unknown")),
+                            terminal_safe(blob["status"].as_str().unwrap_or("unknown")),
+                            size,
+                            terminal_safe(blob["hash"].as_str().unwrap_or(""))
+                        );
+                    }
+                }
+            }
             "attachment_shared" => println!(
                 "shared {} ({} bytes)\noffer: {}\ndelivery acknowledged: no",
                 terminal_safe(value["name"].as_str().unwrap_or("attachment")),
@@ -2521,6 +2654,30 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<_> = expected.iter().copied().collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pinned_blob_tags_are_parsed_defensively() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_pinned_blob_tag(format!("meshmsg/out/v1/{id}").as_bytes()),
+            Some(("outgoing", None, id.to_owned()))
+        );
+        assert_eq!(
+            parse_pinned_blob_tag(format!("meshmsg/in/v1/provider/{id}").as_bytes()),
+            Some(("incoming", Some("provider".to_owned()), id.to_owned()))
+        );
+        for invalid in [
+            "meshmsg/out/v1/",
+            "meshmsg/out/v1/0123456789ABCDEF0123456789ABCDEF",
+            "meshmsg/out/v2/0123456789abcdef0123456789abcdef",
+            "meshmsg/in/v1//0123456789abcdef0123456789abcdef",
+            "meshmsg/in/v1/provider/0123456789abcdef0123456789abcdef/extra",
+            "other/out/v1/0123456789abcdef0123456789abcdef",
+        ] {
+            assert_eq!(parse_pinned_blob_tag(invalid.as_bytes()), None, "{invalid}");
+        }
+        assert_eq!(parse_pinned_blob_tag(&[0xff]), None);
     }
 
     fn sample_offer(provider: PublicKey) -> AttachmentOffer {

@@ -91,6 +91,7 @@ async fn run() -> Result<()> {
             node::send_once(&dir, &message, cli.json).await?
         }
         Command::Share { path } => node::share(&dir, &path, cli.json).await?,
+        Command::Offers => node::offers(&dir, cli.json).await?,
         Command::Download { offer, output } => {
             node::download(&dir, &offer, &output, cli.json).await?
         }

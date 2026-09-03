@@ -135,6 +135,8 @@ pub enum Command {
         /// File or directory to share
         path: PathBuf,
     },
+    /// List locally pinned incoming and outgoing attachment blobs
+    Offers,
     /// Download an explicitly accepted attachment offer
     Download {
         /// Signed offer token printed by share/listen, or an iroh blob ticket (file only)
@@ -259,6 +261,7 @@ mod tests {
         assert!(parse(&["send", "--message-file", "message.txt"]).is_ok());
         assert!(parse(&["send", "--message-stdin"]).is_ok());
         assert!(parse(&["share", "file.txt"]).is_ok());
+        assert!(parse(&["offers"]).is_ok());
         assert!(parse(&["download", "offer-token", "--output", "file.txt"]).is_ok());
         assert!(parse(&["bench-send"]).is_ok());
         assert!(parse(&[

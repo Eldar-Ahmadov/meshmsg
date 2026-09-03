@@ -20,6 +20,15 @@ meshmsg download '<signed-directory-offer>' --output ./received-results
 
 Copy the `offer` value from the `share` or `listen` JSON output. A raw Iroh `BlobTicket` is also accepted for interoperability, but is treated only as a file and has no meshmsg-signed name, kind, or declared size.
 
+List attachment blobs currently pinned in the local store:
+
+```sh
+meshmsg offers
+meshmsg --json offers
+```
+
+This is a best-effort storage view. `outgoing` entries were successfully shared by this node; `incoming` entries were successfully downloaded from a peer. The command reports the offer ID, provider ID when retained by an incoming tag, content hash, format, local status, and known size. Existing tags do not retain original names, kinds, signed offer tokens, timestamps, output paths, or offers that were seen but never downloaded.
+
 ## Acceptance and overwrite behavior
 
 Downloads are always explicit. The output path is required and must not exist.

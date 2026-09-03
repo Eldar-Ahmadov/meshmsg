@@ -51,6 +51,13 @@ INVITE=$("$BIN" --state-dir "$ROOT/provider" --json invite | json_field '"token"
 "$BIN" --state-dir "$ROOT/receiver" join "$INVITE" >/dev/null
 start_node receiver
 
+python3 -c 'import json,sys; assert json.load(sys.stdin) == {"type":"offers","schema_version":1,"blobs":[]}' \
+  <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
+  || fail "fresh provider had pinned attachment blobs"
+python3 -c 'import json,sys; assert json.load(sys.stdin) == {"type":"offers","schema_version":1,"blobs":[]}' \
+  <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
+  || fail "fresh receiver had pinned attachment blobs"
+
 # A received gossip offer is informational and never creates an output by itself.
 timeout 180 "$BIN" --state-dir "$ROOT/receiver" --json listen >"$ROOT/receiver.listen.log" 2>"$ROOT/receiver.listen.err" &
 LISTENER=$!
@@ -59,6 +66,13 @@ printf 'attachment integration payload\n' >"$ROOT/source.txt"
 FILE_SHARE=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/provider" --json share source.txt)
 FILE_OFFER=$(json_field '"offer"' <<<"$FILE_SHARE")
 FILE_TICKET=$(json_field '"ticket"' <<<"$FILE_SHARE")
+FILE_ID=$(json_field '"offer_id"' <<<"$FILE_SHARE")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["status"] == "complete"' "$FILE_ID" \
+  <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
+  || fail "provider offer listing did not include shared file"
+python3 -c 'import json,sys; assert json.load(sys.stdin)["blobs"] == []' \
+  <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
+  || fail "received but undownloaded offer was listed as pinned"
 wait_for 30 "file offer" grep -Fq '"type":"attachment_offer"' "$ROOT/receiver.listen.log"
 [[ ! -e "$ROOT/receiver/source.txt" ]] || fail "receiver automatically exported an offered file"
 
@@ -72,6 +86,9 @@ if (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" download "$FILE_OFFER" --o
   fail "download overwrote an existing file"
 fi
 grep -q 'output already exists' "$ROOT/clobber.err" || fail "overwrite refusal was not actionable"
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and all(x["direction"] == "incoming" and x["status"] == "complete" for x in b)' \
+  <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
+  || fail "receiver listing did not include downloaded blobs"
 
 # A directory snapshot remains available after the provider daemon restarts.
 mkdir -p "$ROOT/source-dir/nested" "$ROOT/source-dir/empty"
@@ -81,6 +98,9 @@ DIR_SHARE=$("$BIN" --state-dir "$ROOT/provider" --json share "$ROOT/source-dir")
 DIR_OFFER=$(json_field '"offer"' <<<"$DIR_SHARE")
 stop_node provider
 start_node provider
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and all(x["direction"] == "outgoing" and x["status"] == "complete" for x in b)' \
+  <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
+  || fail "provider offer listing did not survive restart"
 "$BIN" --state-dir "$ROOT/receiver" --json download "$DIR_OFFER" --output "$ROOT/received-dir" \
   | grep -q '"type":"download_complete"'
 cmp "$ROOT/source-dir/a.txt" "$ROOT/received-dir/a.txt" || fail "top-level archive file differs"
@@ -89,4 +109,4 @@ cmp "$ROOT/source-dir/nested/b.txt" "$ROOT/received-dir/nested/b.txt" || fail "n
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: signed/raw manual file transfer, no-clobber, deterministic directory extraction, and provider-restart pinning"
+echo "PASS: transfers, no-clobber, deterministic extraction, persistent pins, and best-effort blob listing"

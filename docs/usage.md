@@ -9,7 +9,7 @@ The canonical top-level commands are:
 - `daemon`
 - `invite`
 - `send`, `listen`, `chat`, `status`, `stop`, and `doctor`
-- `share <path>` and `download <offer-or-ticket> --output <path>`
+- `share <path>`, `offers`, and `download <offer-or-ticket> --output <path>`
 - `bench-send` and `bench-receive`
 
 Run `meshmsg <command> --help` for command-specific options.
@@ -127,6 +127,7 @@ meshmsg --json invite
 meshmsg --json listen
 meshmsg --json send 'hello'
 meshmsg --json share ./report.pdf
+meshmsg --json offers
 meshmsg --json download '<signed-offer>' --output ./report-copy.pdf
 ```
 
