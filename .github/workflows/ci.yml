@@ -45,3 +45,5 @@ jobs:
       - run: cargo build --locked
       - name: Run five-peer scenario
         run: timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
+      - name: Run attachment transfer scenario
+        run: timeout 600 bash tests/integration-attachments.sh target/debug/meshmsg

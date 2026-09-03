@@ -1,8 +1,8 @@
 [package]
 name = "meshmsg"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
-description = "Small peer-to-peer messaging CLI built on Iroh Gossip"
+description = "Small peer-to-peer messaging and file-sharing CLI built on Iroh"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
