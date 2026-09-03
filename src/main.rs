@@ -1,3 +1,4 @@
+mod attachment;
 mod cli;
 mod config;
 mod invite;
@@ -88,6 +89,10 @@ async fn run() -> Result<()> {
         Command::Send { input } => {
             let message = input.into_message()?;
             node::send_once(&dir, &message, cli.json).await?
+        }
+        Command::Share { path } => node::share(&dir, &path, cli.json).await?,
+        Command::Download { offer, output } => {
+            node::download(&dir, &offer, &output, cli.json).await?
         }
         Command::Listen => node::listen(&dir, cli.json).await?,
         Command::BenchSend { args } => {

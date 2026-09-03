@@ -102,6 +102,7 @@ The canonical top-level commands are:
 - `daemon`
 - `invite`
 - `send`, `listen`, `chat`, `status`, `stop`, and `doctor`
+- `share <path>` and `download <offer-or-ticket> --output <path>`
 - `bench-send` and `bench-receive`
 
 There are no compatibility command aliases or nested initialization/run command groups.
@@ -138,6 +139,37 @@ A successful send reports `queued`, for example:
 ```
 
 `queued` means the local gossip implementation accepted the broadcast request. It is not a delivery acknowledgement and does not guarantee that any remote peer received or persisted the message.
+
+## Attachments
+
+Attachments are opt-in. `share` snapshots one regular file or one directory, pins that snapshot in the daemon's persistent blob store, signs a versioned offer with the existing node identity, and broadcasts the offer as an ordinary gossip payload. Receiving an offer never downloads it. Copy the `offer` token from `share` or `listen` and accept it explicitly:
+
+```sh
+meshmsg --json share ./report.pdf
+meshmsg download '<signed-offer>' --output ./received-report.pdf
+
+# Directories are deterministic tar snapshots and extract to a new directory.
+meshmsg share ./results
+meshmsg download '<signed-directory-offer>' --output ./received-results
+```
+
+The output path is always explicit and must not exist. File installation and directory installation refuse overwrites, including a destination created concurrently. File installation uses a same-filesystem hard link from a staging file; filesystems that do not support hard links reject the operation rather than falling back to an overwrite-prone move. Directory extraction occurs in a sibling staging directory and is renamed into place only after validation succeeds.
+
+Directory offers use `directory_tar_v1`. Archive order, metadata, and modes are normalized for reproducible snapshots. Sharing rejects symbolic links, special files, non-UTF-8 or non-portable components, more than 10,000 entries, paths deeper than 64 components, and oversized paths. Regular source files are opened without following links, but a source being concurrently modified can still make a share fail and is not a transactional filesystem snapshot. Extraction accepts only regular files and directories and rejects absolute/traversal paths, links, special entries, duplicates, case collisions, and file/directory collisions.
+
+Both files and archive blobs are limited to 1 GiB. Before transferring a missing blob, the downloader fetches and cryptographically verifies its size against the content hash, then rejects an oversized blob or a size that differs from a signed offer. Transfers time out after one hour, at most two share/download operations run concurrently per daemon, and download progress events are rate-bounded to each additional 8 MiB (plus completion). A raw Iroh `BlobTicket` can be supplied instead of a signed offer for interoperability, but it is treated only as a file; it has no meshmsg-signed name, kind, or declared-size metadata. The same verified 1 GiB preflight still applies.
+
+Blob data and named pins live under `blobs-v1/<node-public-key>` in the state directory. Successful outgoing shares use `meshmsg/out/v1/...` pins and successful downloads use `meshmsg/in/v1/...` pins, survive daemon restarts, and currently have no automatic expiry or removal command. Failed exports/extractions are not named as incoming pins, though unpinned partial data can remain until the store garbage-collects it. Treat signed offers as reusable capabilities to fetch plaintext from the named provider; attachment contents are not end-to-end encrypted.
+
+Representative JSON records are:
+
+```json
+{"type":"attachment_shared","schema_version":1,"from":"<peer-id>","offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"ticket":"<blob-ticket>","offer":"<signed-offer>","delivery_acknowledged":false}
+{"type":"attachment_offer","schema_version":1,"from":"<peer-id>","timestamp_ms":1700000000000,"offer_id":"<id>","kind":"directory_tar_v1","name":"results.tar","size":4096,"ticket":"<blob-ticket>","offer":"<signed-offer>"}
+{"type":"download_complete","schema_version":1,"offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"from":"<peer-id>","output":"./received-report.pdf"}
+```
+
+New clients decode the typed attachment prefix while continuing to decode existing signed text envelopes as messages. Older clients that accept the signed envelope format see an attachment payload as prefixed text rather than downloading anything.
 
 ## Benchmarking a three-node swarm
 
@@ -215,6 +247,8 @@ The foreground daemon:
 - authenticates the connected pipe server's process owner on Windows;
 - removes stale Unix sockets safely;
 - bounds IPC frames and subscriber queues;
+- persists attachment blobs and pins on the same Iroh endpoint/router used for gossip;
+- limits concurrent attachment work and aborts tracked async transfer tasks during shutdown;
 - reports lag when a local or gossip receiver drops events;
 - retries configured bootstrap peers after connectivity loss until a gossip neighbor returns;
 - suppresses incoming bodies from unattended logs;
@@ -275,6 +309,8 @@ meshmsg --json status
 meshmsg --json invite
 meshmsg --json listen
 meshmsg --json send 'hello'
+meshmsg --json share ./report.pdf
+meshmsg --json download '<signed-offer>' --output ./report-copy.pdf
 ```
 
 `listen` and `chat` receive complete messages through owner-only IPC. Slow subscribers receive a `lagged` event when their bounded queue drops events.

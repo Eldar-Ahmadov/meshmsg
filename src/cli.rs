@@ -130,7 +130,20 @@ pub enum Command {
         #[command(flatten)]
         input: MessageInput,
     },
-    /// Stream incoming messages
+    /// Share a file or a directory snapshot with the topic
+    Share {
+        /// File or directory to share
+        path: PathBuf,
+    },
+    /// Download an explicitly accepted attachment offer
+    Download {
+        /// Signed offer token printed by share/listen, or an iroh blob ticket (file only)
+        offer: String,
+        /// Destination path; existing paths are never overwritten
+        #[arg(long, short = 'o', value_name = "PATH")]
+        output: PathBuf,
+    },
+    /// Stream incoming messages and attachment offers
     Listen,
     /// Generate a sustained, sequenced benchmark load through one daemon connection
     BenchSend {
@@ -245,6 +258,8 @@ mod tests {
         assert!(parse(&["send", "message"]).is_ok());
         assert!(parse(&["send", "--message-file", "message.txt"]).is_ok());
         assert!(parse(&["send", "--message-stdin"]).is_ok());
+        assert!(parse(&["share", "file.txt"]).is_ok());
+        assert!(parse(&["download", "offer-token", "--output", "file.txt"]).is_ok());
         assert!(parse(&["bench-send"]).is_ok());
         assert!(parse(&[
             "bench-send",
@@ -266,6 +281,20 @@ mod tests {
             "1000",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn attachment_commands_require_their_explicit_arguments() {
+        for arguments in [
+            vec!["share"],
+            vec!["download", "offer-token"],
+            vec!["download", "--output", "file.txt"],
+        ] {
+            assert_eq!(
+                parse(&arguments).unwrap_err().kind(),
+                ErrorKind::MissingRequiredArgument
+            );
+        }
     }
 
     #[test]

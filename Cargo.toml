@@ -15,14 +15,19 @@ futures-util = "0.3"
 fs2 = "0.4"
 libc = "0.2"
 iroh = "1"
+iroh-blobs = { version = "=0.103.0", default-features = false, features = ["fs-store"] }
 iroh-gossip = "0.101"
 postcard = { version = "1", features = ["alloc", "use-std"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde-byte-array = "0.1"
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tar = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 sha2 = "0.11"

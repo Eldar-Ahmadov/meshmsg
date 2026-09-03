@@ -1,13 +1,28 @@
 use crate::{
+    attachment::{self, AttachmentKind, AttachmentOffer, MAX_ATTACHMENT_BYTES},
     config::{prepare_state_dir, State, StateLock},
     invite::Invite,
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use data_encoding::BASE64URL_NOPAD;
+use futures_util::{StreamExt, TryStreamExt};
 use iroh::{
     address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint, PublicKey,
     SecretKey, Watcher,
+};
+use iroh_blobs::{
+    api::{
+        downloader::{DownloadProgressItem, Downloader},
+        Store,
+    },
+    get::request::get_verified_size,
+    store::{
+        fs::{options::Options as FsStoreOptions, FsStore},
+        GcConfig,
+    },
+    ticket::BlobTicket,
+    BlobFormat, BlobsProtocol,
 };
 use iroh_gossip::{
     api::{Event, GossipReceiver, GossipSender},
@@ -16,11 +31,9 @@ use iroh_gossip::{
 };
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
-#[cfg(unix)]
-use std::path::PathBuf;
 use std::{
     io::BufRead as _,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -35,7 +48,7 @@ use tokio::net::windows::named_pipe::{
 use tokio::net::{UnixListener, UnixStream};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::{broadcast, mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot, Semaphore},
 };
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
@@ -59,6 +72,11 @@ const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection attempt, so repeating it also covers attempts made while the
 /// network interface is still unavailable.
 const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
+const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
+const ATTACHMENT_OFFER_VERSION: u8 = 1;
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const DOWNLOAD_PROGRESS_STEP: u64 = 8 * 1024 * 1024;
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -207,6 +225,12 @@ fn validate_bench_config(config: &BenchConfig) -> Result<u64> {
     Ok(total)
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct AttachmentWire {
+    version: u8,
+    offer: AttachmentOffer,
+}
+
 impl Envelope {
     fn encode(secret: &SecretKey, body: String) -> Result<Bytes> {
         Self::encode_at(secret, body, unix_timestamp_ms()?)
@@ -250,6 +274,85 @@ impl Envelope {
     }
 }
 
+fn attachment_body(offer: &AttachmentOffer) -> Result<String> {
+    let encoded = postcard::to_stdvec(&AttachmentWire {
+        version: ATTACHMENT_OFFER_VERSION,
+        offer: offer.clone(),
+    })?;
+    Ok(format!(
+        "{ATTACHMENT_PREFIX}{}",
+        BASE64URL_NOPAD.encode(&encoded)
+    ))
+}
+
+fn parse_attachment_body(body: &str) -> Result<Option<AttachmentOffer>> {
+    let Some(encoded) = body.strip_prefix(ATTACHMENT_PREFIX) else {
+        return Ok(None);
+    };
+    let bytes = BASE64URL_NOPAD
+        .decode(encoded.as_bytes())
+        .context("decode attachment offer")?;
+    let (wire, remainder): (AttachmentWire, &[u8]) =
+        postcard::take_from_bytes(&bytes).context("parse attachment offer")?;
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "attachment offer contains trailing bytes"
+    );
+    anyhow::ensure!(
+        wire.version == ATTACHMENT_OFFER_VERSION,
+        "unsupported attachment offer version"
+    );
+    attachment::validate_display_name(&wire.offer.name)?;
+    anyhow::ensure!(
+        wire.offer.size <= MAX_ATTACHMENT_BYTES,
+        "attachment exceeds the configured size limit"
+    );
+    anyhow::ensure!(
+        wire.offer.offer_id.len() == 32
+            && wire
+                .offer
+                .offer_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "invalid attachment offer ID"
+    );
+    let ticket: BlobTicket = wire
+        .offer
+        .ticket
+        .parse()
+        .context("parse attachment ticket")?;
+    anyhow::ensure!(
+        ticket.format() == BlobFormat::Raw,
+        "unsupported attachment blob format"
+    );
+    Ok(Some(wire.offer))
+}
+
+fn parse_signed_offer_token(token: &str) -> Result<(AttachmentOffer, BlobTicket)> {
+    let bytes = BASE64URL_NOPAD
+        .decode(token.as_bytes())
+        .context("decode signed attachment offer")?;
+    let envelope = Envelope::decode(&bytes)?;
+    let offer =
+        parse_attachment_body(&envelope.body)?.context("token is not an attachment offer")?;
+    let ticket: BlobTicket = offer.ticket.parse().context("parse attachment ticket")?;
+    anyhow::ensure!(
+        ticket.addr().id == envelope.from,
+        "attachment provider does not match its signature"
+    );
+    Ok((offer, ticket))
+}
+
+fn offer_event(envelope: Envelope, encoded: &[u8], offer: AttachmentOffer) -> serde_json::Value {
+    serde_json::json!({
+        "type":"attachment_offer", "schema_version":1,
+        "from":envelope.from.to_string(), "timestamp_ms":envelope.timestamp_ms,
+        "offer_id":offer.offer_id, "kind":offer.kind,
+        "name":offer.name, "size":offer.size, "ticket":offer.ticket,
+        "offer":BASE64URL_NOPAD.encode(encoded)
+    })
+}
+
 struct RunningNode {
     endpoint: Endpoint,
     router: Router,
@@ -257,9 +360,12 @@ struct RunningNode {
     receiver: GossipReceiver,
     secret: SecretKey,
     bootstrap_peers: Vec<PublicKey>,
+    blob_store: Store,
+    downloader: Downloader,
+    lookup: MemoryLookup,
 }
 
-async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
+async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<RunningNode> {
     state.validate()?;
     let topic: TopicId = state.topic_id()?;
     let lookup = MemoryLookup::new();
@@ -271,8 +377,21 @@ async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
     let gossip = Gossip::builder()
         .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
         .spawn(endpoint.clone());
+    let blob_root = state_dir.join("blobs-v1").join(secret.public().to_string());
+    let mut blob_options = FsStoreOptions::new(&blob_root);
+    blob_options.gc = Some(GcConfig {
+        interval: BLOB_GC_INTERVAL,
+        add_protected: None,
+    });
+    let fs_store = FsStore::load_with_opts(blob_root.join("blobs.db"), blob_options)
+        .await
+        .context("open persistent attachment store")?;
+    let blob_store: Store = fs_store.into();
+    let downloader = blob_store.downloader(&endpoint);
+    let blobs = BlobsProtocol::new(&blob_store, None);
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
+        .accept(iroh_blobs::ALPN, blobs)
         .spawn();
     let mut bootstrap = Vec::new();
     if let Some(token) = &state.invite {
@@ -297,6 +416,9 @@ async fn start(state: &State, secret: SecretKey) -> Result<RunningNode> {
         receiver,
         secret,
         bootstrap_peers: bootstrap,
+        blob_store,
+        downloader,
+        lookup,
     })
 }
 
@@ -307,6 +429,8 @@ enum IpcRequest {
     BenchSend { config: BenchConfig },
     Subscribe,
     Status,
+    Share { path: PathBuf },
+    Download { offer: String, output: PathBuf },
     Stop,
 }
 
@@ -322,6 +446,15 @@ enum DaemonCommand {
         reply: oneshot::Sender<std::result::Result<usize, String>>,
     },
     Status {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    Share {
+        path: PathBuf,
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    Download {
+        offer: String,
+        output: PathBuf,
         reply: oneshot::Sender<serde_json::Value>,
     },
     Stop,
@@ -983,12 +1116,309 @@ where
             commands.send(DaemonCommand::Status { reply }).await?;
             write_value(&mut stream, &response.await?).await?;
         }
+        IpcRequest::Share { path } => {
+            let (reply, response) = oneshot::channel();
+            commands.send(DaemonCommand::Share { path, reply }).await?;
+            write_value(&mut stream, &response.await?).await?;
+        }
+        IpcRequest::Download { offer, output } => {
+            let (reply, response) = oneshot::channel();
+            commands
+                .send(DaemonCommand::Download {
+                    offer,
+                    output,
+                    reply,
+                })
+                .await?;
+            write_value(&mut stream, &response.await?).await?;
+        }
         IpcRequest::Stop => {
             write_value(&mut stream, &serde_json::json!({"type":"stopping"})).await?;
             commands.send(DaemonCommand::Stop).await?;
         }
     }
     Ok(())
+}
+
+async fn share_attachment(
+    store: Store,
+    endpoint: Endpoint,
+    secret: SecretKey,
+    sender: GossipSender,
+    state_dir: PathBuf,
+    path: PathBuf,
+) -> Result<serde_json::Value> {
+    let metadata = tokio::fs::symlink_metadata(&path)
+        .await
+        .with_context(|| format!("inspect shared path {}", path.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "symbolic links cannot be shared"
+    );
+    let directory = metadata.is_dir();
+    anyhow::ensure!(
+        directory || metadata.is_file(),
+        "shared path must be a regular file or directory"
+    );
+    let name = attachment::file_name(&path, directory)?;
+    let staging = attachment::staging_file_near(
+        &state_dir.join("attachment-stage"),
+        if directory { ".tar" } else { ".blob" },
+    )?;
+    let source = path.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        let staged = attachment::StagedFile::new(staging);
+        let size = if directory {
+            attachment::create_deterministic_tar(&source, staged.path())?
+        } else {
+            attachment::copy_bounded(&source, staged.path())?
+        };
+        Ok::<_, anyhow::Error>((size, staged))
+    })
+    .await
+    .context("attachment staging task failed")??;
+    let (size, staged) = staged;
+    let offer_id = generated_run_id();
+    let tag_name = format!("meshmsg/out/v1/{offer_id}");
+    let imported = store
+        .blobs()
+        .add_path(staged.path())
+        .temp_tag()
+        .await
+        .context("import attachment with a temporary pin")?;
+    drop(staged);
+
+    let publish_result = async {
+        let ticket = BlobTicket::new(endpoint.addr(), imported.hash(), imported.format());
+        let offer = AttachmentOffer {
+            offer_id,
+            kind: if directory {
+                AttachmentKind::DirectoryTarV1
+            } else {
+                AttachmentKind::File
+            },
+            name,
+            size,
+            ticket: ticket.to_string(),
+        };
+        let body = attachment_body(&offer)?;
+        let encoded = Envelope::encode(&secret, body)?;
+        sender
+            .broadcast(encoded.clone())
+            .await
+            .context("broadcast attachment offer")?;
+        store
+            .tags()
+            .set(tag_name.as_bytes(), imported.hash_and_format())
+            .await
+            .context("pin published attachment")?;
+        store.sync_db().await.context("persist attachment tag")?;
+        Ok(serde_json::json!({
+            "type":"attachment_shared", "schema_version":1,
+            "from":secret.public().to_string(), "offer_id":offer.offer_id,
+            "kind":offer.kind, "name":offer.name, "size":offer.size,
+            "ticket":offer.ticket, "offer":BASE64URL_NOPAD.encode(&encoded),
+            "delivery_acknowledged":false
+        }))
+    }
+    .await;
+
+    match publish_result {
+        Ok(value) => Ok(value),
+        Err(publish_error) => {
+            store
+                .tags()
+                .delete(tag_name.as_bytes())
+                .await
+                .with_context(|| format!("roll back attachment pin after: {publish_error}"))?;
+            store
+                .sync_db()
+                .await
+                .with_context(|| format!("persist pin rollback after: {publish_error}"))?;
+            Err(publish_error)
+        }
+    }
+}
+
+fn validate_declared_attachment_size(declared_size: Option<u64>, actual_size: u64) -> Result<()> {
+    if let Some(declared_size) = declared_size {
+        anyhow::ensure!(
+            actual_size == declared_size,
+            "provider size does not match the signed offer"
+        );
+    }
+    Ok(())
+}
+
+async fn download_attachment(
+    store: Store,
+    downloader: Downloader,
+    endpoint: Endpoint,
+    lookup: MemoryLookup,
+    events: broadcast::Sender<serde_json::Value>,
+    offer_token: String,
+    output: PathBuf,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        !output.exists(),
+        "output already exists: {}",
+        output.display()
+    );
+    let parsed_signed = parse_signed_offer_token(&offer_token);
+    let (offer, ticket, declared_size) = match parsed_signed {
+        Ok((offer, ticket)) => {
+            let declared_size = Some(offer.size);
+            (offer, ticket, declared_size)
+        }
+        Err(signed_error) => {
+            let ticket: BlobTicket = offer_token.parse().map_err(|_| signed_error)?;
+            anyhow::ensure!(
+                ticket.format() == BlobFormat::Raw,
+                "only raw blob tickets are supported"
+            );
+            let name = output
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("attachment")
+                .to_owned();
+            (
+                AttachmentOffer {
+                    offer_id: generated_run_id(),
+                    kind: AttachmentKind::File,
+                    name,
+                    size: 0,
+                    ticket: ticket.to_string(),
+                },
+                ticket,
+                None,
+            )
+        }
+    };
+    lookup.add_endpoint_info(ticket.addr().clone());
+    // Protect complete or partial content from periodic GC until installation
+    // and creation of the durable inbound pin have both completed.
+    let _download_pin = store
+        .tags()
+        .temp_tag(ticket.hash_and_format())
+        .await
+        .context("temporarily pin attachment download")?;
+    let existing_size = match store.blobs().status(ticket.hash()).await? {
+        iroh_blobs::api::proto::BlobStatus::Complete { size } => Some(size),
+        _ => None,
+    };
+    let size = if let Some(size) = existing_size {
+        size
+    } else {
+        let connection = tokio::time::timeout(
+            ENDPOINT_ONLINE_TIMEOUT,
+            endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
+        )
+        .await
+        .context("attachment size check timed out")?
+        .context("connect to attachment provider")?;
+        let (verified_size, _) = tokio::time::timeout(
+            ENDPOINT_ONLINE_TIMEOUT,
+            get_verified_size(&connection, &ticket.hash()),
+        )
+        .await
+        .context("attachment size check timed out")?
+        .context("verify attachment size")?;
+        anyhow::ensure!(
+            verified_size <= MAX_ATTACHMENT_BYTES,
+            "attachment exceeds the configured size limit"
+        );
+        validate_declared_attachment_size(declared_size, verified_size)?;
+        let download = downloader.download(ticket.hash_and_format(), Some(ticket.addr().id));
+        let mut progress = download
+            .stream()
+            .await
+            .context("start attachment download")?;
+        let transfer = async {
+            let mut next_report = DOWNLOAD_PROGRESS_STEP;
+            while let Some(item) = progress.next().await {
+                match item {
+                    DownloadProgressItem::Error(error) => {
+                        anyhow::bail!("attachment download failed: {error}")
+                    }
+                    DownloadProgressItem::DownloadError => {
+                        anyhow::bail!("attachment download failed")
+                    }
+                    DownloadProgressItem::Progress(received_bytes)
+                        if received_bytes >= next_report || received_bytes == verified_size =>
+                    {
+                        let _ = events.send(serde_json::json!({
+                            "type":"download_progress", "schema_version":1,
+                            "received_bytes":received_bytes.min(verified_size),
+                            "total_bytes":verified_size, "output":output
+                        }));
+                        next_report = received_bytes
+                            .saturating_div(DOWNLOAD_PROGRESS_STEP)
+                            .saturating_add(1)
+                            .saturating_mul(DOWNLOAD_PROGRESS_STEP);
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout(TRANSFER_TIMEOUT, transfer)
+            .await
+            .context("attachment download timed out")??;
+        match store.blobs().status(ticket.hash()).await? {
+            iroh_blobs::api::proto::BlobStatus::Complete { size } => size,
+            _ => anyhow::bail!("download did not produce a complete blob"),
+        }
+    };
+    anyhow::ensure!(
+        size <= MAX_ATTACHMENT_BYTES,
+        "download exceeds the configured size limit"
+    );
+    validate_declared_attachment_size(declared_size, size)
+        .context("validate downloaded attachment size")?;
+
+    let staging = attachment::StagedFile::new(attachment::staging_file_near(&output, ".download")?);
+    let export_store = store.clone();
+    let export_hash = ticket.hash();
+    let staging = tokio::spawn(async move {
+        export_store
+            .blobs()
+            .export(export_hash, staging.path())
+            .await
+            .context("export downloaded attachment")?;
+        Ok::<_, anyhow::Error>(staging)
+    })
+    .await
+    .context("attachment export task failed")??;
+    match offer.kind {
+        AttachmentKind::File => {
+            let output_for_task = output.clone();
+            tokio::task::spawn_blocking(move || {
+                attachment::install_staged_file_no_clobber(staging, &output_for_task)
+            })
+            .await
+            .context("install task failed")??;
+        }
+        AttachmentKind::DirectoryTarV1 => {
+            let output_for_task = output.clone();
+            tokio::task::spawn_blocking(move || {
+                attachment::extract_staged_tar_no_clobber(staging, &output_for_task)
+            })
+            .await
+            .context("extraction task failed")??;
+        }
+    }
+    let tag_name = format!("meshmsg/in/v1/{}/{}", ticket.addr().id, offer.offer_id);
+    store
+        .tags()
+        .set(tag_name.as_bytes(), ticket.hash_and_format())
+        .await?;
+    store.sync_db().await?;
+    Ok(serde_json::json!({
+        "type":"download_complete", "schema_version":1,
+        "offer_id":offer.offer_id, "kind":offer.kind,
+        "name":offer.name, "size":size, "from":ticket.addr().id.to_string(),
+        "output":output
+    }))
 }
 
 fn shutdown_signals() -> Result<mpsc::Receiver<()>> {
@@ -1026,7 +1456,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let (mut state, secret) = State::load_locked(dir, &state_lock)?;
     state.validate_for_identity(secret.public())?;
     let startup = tokio::select! {
-        result = tokio::time::timeout(STARTUP_TIMEOUT, start(&state, secret)) => result,
+        result = tokio::time::timeout(STARTUP_TIMEOUT, start(&state, secret, dir)) => result,
         _ = shutdown.recv() => return Ok(()),
     };
     let mut node = match startup {
@@ -1100,6 +1530,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
     let benchmark_busy = Arc::new(AtomicBool::new(false));
+    let transfer_limit = Arc::new(Semaphore::new(2));
+    let mut transfer_tasks = tokio::task::JoinSet::new();
     let mut rejoin = tokio::time::interval(REJOIN_INTERVAL);
     rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1169,6 +1601,51 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined()
                     }));
                 }
+                Some(DaemonCommand::Share { path, reply }) => {
+                    let store = node.blob_store.clone();
+                    let endpoint = node.endpoint.clone();
+                    let secret = node.secret.clone();
+                    let sender = node.sender.clone();
+                    let state_dir = dir.to_path_buf();
+                    let limit = transfer_limit.clone();
+                    let events = event_tx.clone();
+                    transfer_tasks.spawn(async move {
+                        let response = match limit.acquire_owned().await {
+                            Ok(_permit) => match share_attachment(store, endpoint, secret, sender, state_dir, path).await {
+                                Ok(value) => value,
+                                Err(error) => serde_json::json!({"type":"error", "code":"share_failed", "message":error.to_string()}),
+                            },
+                            Err(_) => serde_json::json!({"type":"error", "code":"daemon_stopping", "message":"daemon is stopping"}),
+                        };
+                        if response["type"] == "attachment_shared" {
+                            let _ = events.send(response.clone());
+                        }
+                        let _ = reply.send(response);
+                    });
+                }
+                Some(DaemonCommand::Download { offer, output, reply }) => {
+                    let store = node.blob_store.clone();
+                    let downloader = node.downloader.clone();
+                    let endpoint = node.endpoint.clone();
+                    let lookup = node.lookup.clone();
+                    let limit = transfer_limit.clone();
+                    let events = event_tx.clone();
+                    transfer_tasks.spawn(async move {
+                        let started = serde_json::json!({"type":"download_started", "schema_version":1, "output":output});
+                        let _ = events.send(started);
+                        let response = match limit.acquire_owned().await {
+                            Ok(_permit) => match download_attachment(store, downloader, endpoint, lookup, events.clone(), offer, output).await {
+                                Ok(value) => value,
+                                Err(error) => serde_json::json!({"type":"error", "code":"download_failed", "message":error.to_string()}),
+                            },
+                            Err(_) => serde_json::json!({"type":"error", "code":"daemon_stopping", "message":"daemon is stopping"}),
+                        };
+                        if response["type"] == "download_complete" {
+                            let _ = events.send(response.clone());
+                        }
+                        let _ = reply.send(response);
+                    });
+                }
                 Some(DaemonCommand::Stop) => break,
                 None => break,
             },
@@ -1190,10 +1667,18 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         .context("retry gossip bootstrap peers after connectivity loss")?;
                 }
             },
+            completed = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("attachment task error: {error}");
+                }
+            },
             _ = shutdown.recv() => break,
         }
     }
 
+    transfer_limit.close();
+    transfer_tasks.abort_all();
+    while transfer_tasks.join_next().await.is_some() {}
     drop(event_tx);
     node.router.shutdown().await?;
     Ok(())
@@ -1222,10 +1707,29 @@ fn is_local_disconnect(error: &anyhow::Error) -> bool {
     })
 }
 
+fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Value {
+    match parse_attachment_body(&envelope.body) {
+        Ok(Some(offer)) => match offer.ticket.parse::<BlobTicket>() {
+            Ok(ticket) if ticket.addr().id == envelope.from => {
+                offer_event(envelope, encoded, offer)
+            }
+            Ok(_) => {
+                serde_json::json!({"type":"error", "code":"invalid_attachment_offer", "message":"attachment provider does not match its signature"})
+            }
+            Err(error) => {
+                serde_json::json!({"type":"error", "code":"invalid_attachment_offer", "message":error.to_string()})
+            }
+        },
+        // The prefix predates typed attachments as valid signed message text.
+        // Only a fully valid typed payload opts into attachment semantics.
+        Ok(None) | Err(_) => message_event(envelope),
+    }
+}
+
 fn network_event(value: Event) -> Vec<serde_json::Value> {
     match value {
         Event::Received(message) => vec![match Envelope::decode(&message.content) {
-            Ok(msg) => message_event(msg),
+            Ok(envelope) => received_envelope_event(envelope, &message.content),
             Err(error) => {
                 serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()})
             }
@@ -1258,13 +1762,20 @@ fn message_event(msg: Envelope) -> serde_json::Value {
 }
 
 fn suppress_message_body(value: serde_json::Value) -> serde_json::Value {
-    if value["type"] != "message" {
-        return value;
+    if value["type"] == "message" {
+        return serde_json::json!({
+            "type":"message", "from":value["from"], "timestamp_ms":value["timestamp_ms"],
+            "body_bytes":value["body"].as_str().map(str::len).unwrap_or(0), "body_suppressed":true
+        });
     }
-    serde_json::json!({
-        "type":"message", "from":value["from"], "timestamp_ms":value["timestamp_ms"],
-        "body_bytes":value["body"].as_str().map(str::len).unwrap_or(0), "body_suppressed":true
-    })
+    if value["type"] == "attachment_offer" {
+        return serde_json::json!({
+            "type":"attachment_offer", "from":value["from"],
+            "timestamp_ms":value["timestamp_ms"], "size":value["size"],
+            "details_suppressed":true
+        });
+    }
+    value
 }
 
 #[cfg(unix)]
@@ -1330,6 +1841,43 @@ pub async fn send_once(dir: &Path, body: &str, json: bool) -> Result<()> {
         dir,
         &IpcRequest::Send {
             body: body.to_owned(),
+        },
+    )
+    .await?;
+    ensure_success(&value)?;
+    event(json, value);
+    Ok(())
+}
+
+fn caller_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("read current directory")?
+            .join(path))
+    }
+}
+
+pub async fn share(dir: &Path, path: &Path, json: bool) -> Result<()> {
+    let value = send_request(
+        dir,
+        &IpcRequest::Share {
+            path: caller_path(path)?,
+        },
+    )
+    .await?;
+    ensure_success(&value)?;
+    event(json, value);
+    Ok(())
+}
+
+pub async fn download(dir: &Path, offer: &str, output: &Path, json: bool) -> Result<()> {
+    let value = send_request(
+        dir,
+        &IpcRequest::Download {
+            offer: offer.to_owned(),
+            output: caller_path(output)?,
         },
     )
     .await?;
@@ -1911,6 +2459,35 @@ fn event(json: bool, value: serde_json::Value) {
                 "queued locally (delivery not acknowledged): {}",
                 terminal_safe(value["body"].as_str().unwrap_or(""))
             ),
+            "attachment_shared" => println!(
+                "shared {} ({} bytes)\noffer: {}\ndelivery acknowledged: no",
+                terminal_safe(value["name"].as_str().unwrap_or("attachment")),
+                value["size"].as_u64().unwrap_or(0),
+                value["offer"].as_str().unwrap_or("")
+            ),
+            "attachment_offer" if value["details_suppressed"].as_bool() == Some(true) => println!(
+                "attachment offer from {} ({} bytes; details suppressed)",
+                value["from"].as_str().unwrap_or("peer"),
+                value["size"].as_u64().unwrap_or(0)
+            ),
+            "attachment_offer" => println!(
+                "{} shared {} ({} bytes)\ndownload with: meshmsg download '{}' --output PATH",
+                value["from"].as_str().unwrap_or("peer"),
+                terminal_safe(value["name"].as_str().unwrap_or("attachment")),
+                value["size"].as_u64().unwrap_or(0),
+                value["offer"].as_str().unwrap_or("")
+            ),
+            "download_started" => println!("attachment download started"),
+            "download_progress" => println!(
+                "attachment download: {} / {} bytes",
+                value["received_bytes"].as_u64().unwrap_or(0),
+                value["total_bytes"].as_u64().unwrap_or(0)
+            ),
+            "download_complete" => println!(
+                "downloaded {} bytes to {}",
+                value["size"].as_u64().unwrap_or(0),
+                value["output"].as_str().unwrap_or("")
+            ),
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
             "daemon_started" => println!(
@@ -1944,6 +2521,84 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<_> = expected.iter().copied().collect();
         assert_eq!(actual, expected);
+    }
+
+    fn sample_offer(provider: PublicKey) -> AttachmentOffer {
+        AttachmentOffer {
+            offer_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            kind: AttachmentKind::File,
+            name: "report.txt".to_owned(),
+            size: 6,
+            ticket: BlobTicket::new(
+                iroh::EndpointAddr::new(provider),
+                iroh_blobs::Hash::new(b"report"),
+                BlobFormat::Raw,
+            )
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn signed_attachment_offer_round_trips_and_rejects_tampering() {
+        let secret = SecretKey::generate();
+        let offer = sample_offer(secret.public());
+        let encoded = Envelope::encode_at(&secret, attachment_body(&offer).unwrap(), 42).unwrap();
+        let token = BASE64URL_NOPAD.encode(&encoded);
+
+        let (decoded, ticket) = parse_signed_offer_token(&token).unwrap();
+        assert_eq!(decoded, offer);
+        assert_eq!(ticket.addr().id, secret.public());
+
+        let mut tampered = encoded.to_vec();
+        let last = tampered.last_mut().unwrap();
+        *last ^= 1;
+        assert!(parse_signed_offer_token(&BASE64URL_NOPAD.encode(&tampered)).is_err());
+    }
+
+    #[test]
+    fn attachment_wire_rejects_provider_mismatch_version_and_trailing_bytes() {
+        let signer = SecretKey::generate();
+        let other = SecretKey::generate();
+        let mismatched = sample_offer(other.public());
+        let encoded =
+            Envelope::encode_at(&signer, attachment_body(&mismatched).unwrap(), 42).unwrap();
+        assert!(parse_signed_offer_token(&BASE64URL_NOPAD.encode(&encoded)).is_err());
+
+        let version = postcard::to_stdvec(&AttachmentWire {
+            version: ATTACHMENT_OFFER_VERSION + 1,
+            offer: sample_offer(signer.public()),
+        })
+        .unwrap();
+        let body = format!("{ATTACHMENT_PREFIX}{}", BASE64URL_NOPAD.encode(&version));
+        assert!(parse_attachment_body(&body).is_err());
+
+        let mut trailing = postcard::to_stdvec(&AttachmentWire {
+            version: ATTACHMENT_OFFER_VERSION,
+            offer: sample_offer(signer.public()),
+        })
+        .unwrap();
+        trailing.push(0);
+        let body = format!("{ATTACHMENT_PREFIX}{}", BASE64URL_NOPAD.encode(&trailing));
+        assert!(parse_attachment_body(&body).is_err());
+    }
+
+    #[test]
+    fn ordinary_and_malformed_prefixed_signed_text_remain_messages() {
+        let secret = SecretKey::generate();
+        for body in ["legacy text", "meshmsg-attachment-v1:not-an-offer"] {
+            let encoded = Envelope::encode_at(&secret, body.to_owned(), 42).unwrap();
+            let envelope = Envelope::decode(&encoded).unwrap();
+            let event = received_envelope_event(envelope, &encoded);
+            assert_eq!(event["type"], "message");
+            assert_eq!(event["body"], body);
+        }
+    }
+
+    #[test]
+    fn signed_zero_size_is_validated_but_raw_ticket_size_is_unspecified() {
+        validate_declared_attachment_size(Some(0), 0).unwrap();
+        assert!(validate_declared_attachment_size(Some(0), 1).is_err());
+        validate_declared_attachment_size(None, 1).unwrap();
     }
 
     #[test]
