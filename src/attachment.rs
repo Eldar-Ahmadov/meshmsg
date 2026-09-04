@@ -19,7 +19,7 @@ use std::os::windows::{
 #[cfg(unix)]
 use std::{ffi::CString, os::unix::fs::OpenOptionsExt as _};
 
-pub const MAX_ATTACHMENT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ARCHIVE_DEPTH: usize = 64;
 const MAX_COMPONENT_BYTES: usize = 100;
@@ -180,6 +180,7 @@ fn collect_entries(
     current: &Path,
     entries: &mut Vec<SourceEntry>,
     total: &mut u64,
+    max_attachment_bytes: u64,
     #[cfg(windows)] directory_locks: &mut Vec<File>,
 ) -> Result<()> {
     // Denying FILE_SHARE_DELETE on each no-follow directory handle prevents
@@ -225,6 +226,7 @@ fn collect_entries(
                 &path,
                 entries,
                 total,
+                max_attachment_bytes,
                 #[cfg(windows)]
                 directory_locks,
             )?;
@@ -233,9 +235,9 @@ fn collect_entries(
                 .checked_add(metadata.len())
                 .context("directory size overflow")?;
             anyhow::ensure!(
-                *total <= MAX_ATTACHMENT_BYTES,
+                *total <= max_attachment_bytes,
                 "directory contents exceed the {}-byte limit",
-                MAX_ATTACHMENT_BYTES
+                max_attachment_bytes
             );
             entries.push(SourceEntry {
                 source: path,
@@ -257,6 +259,7 @@ fn append_directory_from_handle(
     prefix: &Path,
     count: &mut usize,
     total: &mut u64,
+    max_attachment_bytes: u64,
 ) -> Result<()> {
     let mut names = Dir::read_from(directory)
         .context("read shared directory handle")?
@@ -290,14 +293,21 @@ fn append_directory_from_handle(
         if metadata.is_dir() {
             let mut header = normalized_header(&archive_path, 0, true)?;
             builder.append_data(&mut header, &archive_path, io::empty())?;
-            append_directory_from_handle(builder, &child, &relative_path, count, total)?;
+            append_directory_from_handle(
+                builder,
+                &child,
+                &relative_path,
+                count,
+                total,
+                max_attachment_bytes,
+            )?;
         } else if metadata.is_file() {
             let size = metadata.len();
             *total = total.checked_add(size).context("directory size overflow")?;
             anyhow::ensure!(
-                *total <= MAX_ATTACHMENT_BYTES,
+                *total <= max_attachment_bytes,
                 "directory contents exceed the {}-byte limit",
-                MAX_ATTACHMENT_BYTES
+                max_attachment_bytes
             );
             let mut header = normalized_header(&archive_path, size, false)?;
             builder.append_data(&mut header, &archive_path, &mut child)?;
@@ -357,7 +367,11 @@ fn normalized_header(path: &str, size: u64, directory: bool) -> Result<tar::Head
     Ok(header)
 }
 
-pub fn create_deterministic_tar(source: &Path, output: &Path) -> Result<u64> {
+pub fn create_deterministic_tar(
+    source: &Path,
+    output: &Path,
+    max_attachment_bytes: u64,
+) -> Result<u64> {
     let output_file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -379,7 +393,14 @@ pub fn create_deterministic_tar(source: &Path, output: &Path) -> Result<u64> {
         );
         let mut count = 0;
         let mut total = 0;
-        append_directory_from_handle(&mut builder, &root, Path::new(""), &mut count, &mut total)?;
+        append_directory_from_handle(
+            &mut builder,
+            &root,
+            Path::new(""),
+            &mut count,
+            &mut total,
+            max_attachment_bytes,
+        )?;
     }
 
     #[cfg(not(unix))]
@@ -398,6 +419,7 @@ pub fn create_deterministic_tar(source: &Path, output: &Path) -> Result<u64> {
             source,
             &mut entries,
             &mut total,
+            max_attachment_bytes,
             #[cfg(windows)]
             &mut directory_locks,
         )?;
@@ -428,9 +450,9 @@ pub fn create_deterministic_tar(source: &Path, output: &Path) -> Result<u64> {
     file.sync_all()?;
     let size = file.metadata()?.len();
     anyhow::ensure!(
-        size <= MAX_ATTACHMENT_BYTES,
+        size <= max_attachment_bytes,
         "archive exceeds the {}-byte limit",
-        MAX_ATTACHMENT_BYTES
+        max_attachment_bytes
     );
     Ok(size)
 }
@@ -585,7 +607,11 @@ fn register_archive_path(
     Ok(())
 }
 
-pub fn extract_tar_no_clobber(archive_path: &Path, destination: &Path) -> Result<()> {
+pub fn extract_tar_no_clobber(
+    archive_path: &Path,
+    destination: &Path,
+    max_attachment_bytes: u64,
+) -> Result<()> {
     anyhow::ensure!(
         !destination.exists(),
         "output already exists: {}",
@@ -625,7 +651,7 @@ pub fn extract_tar_no_clobber(archive_path: &Path, destination: &Path) -> Result
             let size = entry.header().size().context("read archive entry size")?;
             total = total.checked_add(size).context("archive size overflow")?;
             anyhow::ensure!(
-                total <= MAX_ATTACHMENT_BYTES,
+                total <= max_attachment_bytes,
                 "archive contents exceed the extraction limit"
             );
             if let Some(parent) = target.parent() {
@@ -652,8 +678,12 @@ pub fn extract_tar_no_clobber(archive_path: &Path, destination: &Path) -> Result
 }
 
 /// Extracts an owned download staging archive and cleans it on every exit path.
-pub fn extract_staged_tar_no_clobber(staging: StagedFile, destination: &Path) -> Result<()> {
-    extract_tar_no_clobber(staging.path(), destination)
+pub fn extract_staged_tar_no_clobber(
+    staging: StagedFile,
+    destination: &Path,
+    max_attachment_bytes: u64,
+) -> Result<()> {
+    extract_tar_no_clobber(staging.path(), destination, max_attachment_bytes)
 }
 
 pub fn file_name(path: &Path, directory: bool) -> Result<String> {
@@ -670,12 +700,12 @@ pub fn file_name(path: &Path, directory: bool) -> Result<String> {
     Ok(name)
 }
 
-pub fn copy_bounded(source: &Path, destination: &Path) -> Result<u64> {
+pub fn copy_bounded(source: &Path, destination: &Path, max_attachment_bytes: u64) -> Result<u64> {
     let (mut input, metadata) = open_regular_file_no_follow(source)?;
     anyhow::ensure!(
-        metadata.len() <= MAX_ATTACHMENT_BYTES,
+        metadata.len() <= max_attachment_bytes,
         "file exceeds the {}-byte limit",
-        MAX_ATTACHMENT_BYTES
+        max_attachment_bytes
     );
     let mut output = OpenOptions::new()
         .create_new(true)
@@ -683,13 +713,13 @@ pub fn copy_bounded(source: &Path, destination: &Path) -> Result<u64> {
         .open(destination)
         .context("create staging file")?;
     let copied = io::copy(
-        &mut Read::by_ref(&mut input).take(MAX_ATTACHMENT_BYTES + 1),
+        &mut Read::by_ref(&mut input).take(max_attachment_bytes.saturating_add(1)),
         &mut output,
     )?;
     anyhow::ensure!(
-        copied <= MAX_ATTACHMENT_BYTES,
+        copied <= max_attachment_bytes,
         "file exceeds the {}-byte limit",
-        MAX_ATTACHMENT_BYTES
+        max_attachment_bytes
     );
     anyhow::ensure!(copied == metadata.len(), "file changed while being staged");
     anyhow::ensure!(
@@ -724,8 +754,8 @@ mod tests {
         fs::create_dir(two.join("empty")).unwrap();
         let out_one = temp_dir("tar-out-one").join("one.tar");
         let out_two = temp_dir("tar-out-two").join("two.tar");
-        create_deterministic_tar(&one, &out_one).unwrap();
-        create_deterministic_tar(&two, &out_two).unwrap();
+        create_deterministic_tar(&one, &out_one, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
+        create_deterministic_tar(&two, &out_two, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
         assert_eq!(fs::read(out_one).unwrap(), fs::read(out_two).unwrap());
         let _ = fs::remove_dir_all(one);
         let _ = fs::remove_dir_all(two);
@@ -748,7 +778,9 @@ mod tests {
         builder.append(&header, b"x".as_slice()).unwrap();
         builder.finish().unwrap();
         let destination = root.join("out");
-        assert!(extract_tar_no_clobber(&tar_path, &destination).is_err());
+        assert!(
+            extract_tar_no_clobber(&tar_path, &destination, DEFAULT_MAX_ATTACHMENT_BYTES,).is_err()
+        );
         assert!(!destination.exists());
         assert!(!root.parent().unwrap().join("x.txt").exists());
         let _ = fs::remove_dir_all(root);
@@ -759,7 +791,12 @@ mod tests {
         let root = temp_dir("existing-output");
         let destination = root.join("out");
         fs::write(&destination, b"keep").unwrap();
-        assert!(extract_tar_no_clobber(&root.join("missing.tar"), &destination).is_err());
+        assert!(extract_tar_no_clobber(
+            &root.join("missing.tar"),
+            &destination,
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        )
+        .is_err());
         assert_eq!(fs::read(destination).unwrap(), b"keep");
         let _ = fs::remove_dir_all(root);
     }
@@ -833,7 +870,7 @@ mod tests {
         fs::create_dir(root.join(&directory)).unwrap();
         fs::write(root.join(directory).join(file), b"data").unwrap();
         let output = temp_dir("long-archive-output").join("out.tar");
-        assert!(create_deterministic_tar(&root, &output).is_err());
+        assert!(create_deterministic_tar(&root, &output, DEFAULT_MAX_ATTACHMENT_BYTES).is_err());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(output);
     }
@@ -844,13 +881,16 @@ mod tests {
         let archive_path = root.join("extension.tar");
         let mut header = tar::Header::new_gnu();
         header.set_path("pax").unwrap();
-        header.set_size(MAX_ATTACHMENT_BYTES);
+        header.set_size(DEFAULT_MAX_ATTACHMENT_BYTES);
         header.set_mode(0o644);
         header.set_entry_type(tar::EntryType::XHeader);
         header.set_cksum();
         fs::write(&archive_path, header.as_bytes()).unwrap();
         let destination = root.join("out");
-        assert!(extract_tar_no_clobber(&archive_path, &destination).is_err());
+        assert!(
+            extract_tar_no_clobber(&archive_path, &destination, DEFAULT_MAX_ATTACHMENT_BYTES,)
+                .is_err()
+        );
         assert!(!destination.exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -889,11 +929,26 @@ mod tests {
         let destination = root.join("destination");
         fs::write(&staging, b"not a tar archive").unwrap();
 
-        assert!(
-            extract_staged_tar_no_clobber(StagedFile::new(staging.clone()), &destination).is_err()
-        );
+        assert!(extract_staged_tar_no_clobber(
+            StagedFile::new(staging.clone()),
+            &destination,
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        )
+        .is_err());
         assert!(!staging.exists());
         assert!(!destination.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_copy_uses_the_configured_size_limit() {
+        let root = temp_dir("copy-limit");
+        let source = root.join("source");
+        fs::write(&source, b"1234").unwrap();
+
+        let error = copy_bounded(&source, &root.join("output"), 3).unwrap_err();
+
+        assert!(error.to_string().contains("3-byte limit"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -907,13 +962,18 @@ mod tests {
         let link = root.join("link");
         fs::write(&target, b"secret").unwrap();
         symlink(&target, &link).unwrap();
-        assert!(copy_bounded(&link, &root.join("output")).is_err());
+        assert!(copy_bounded(&link, &root.join("output"), DEFAULT_MAX_ATTACHMENT_BYTES,).is_err());
         assert!(!root.join("output").exists());
 
         let tree = root.join("tree");
         fs::create_dir(&tree).unwrap();
         symlink(&target, tree.join("nested-link")).unwrap();
-        assert!(create_deterministic_tar(&tree, &root.join("tree.tar")).is_err());
+        assert!(create_deterministic_tar(
+            &tree,
+            &root.join("tree.tar"),
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        )
+        .is_err());
         let _ = fs::remove_dir_all(root);
     }
 }

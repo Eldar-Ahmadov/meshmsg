@@ -102,7 +102,9 @@ async fn run() -> Result<()> {
                 println!("alias disabled");
             }
         }
-        Command::Daemon => node::run_daemon(&dir, cli.json).await?,
+        Command::Daemon {
+            max_attachment_bytes,
+        } => node::run_daemon(&dir, cli.json, max_attachment_bytes).await?,
         Command::Web { listen, origin } => web::run(&dir, listen, origin).await?,
         Command::Invite => {
             let (state, secret) = State::load_for_doctor(&dir)?;

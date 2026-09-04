@@ -56,12 +56,14 @@ Regular source files are opened without following links. A directory share is a 
 
 ## Limits and persistence
 
-- Maximum file or archive blob: 1 GiB
+- Default maximum file or archive blob: 4 GiB
 - Maximum concurrent attachment operations per daemon: 2; excess shares fail with `share_busy` and excess downloads fail with `download_busy` before a task or `download_started` event is created
 - Transfer timeout: 1 hour
 - Download progress event interval: each additional 8 MiB, plus completion
 
-Before transferring missing content, the downloader verifies its size against the content hash, rejects oversized blobs, and compares the result with the size in a signed offer.
+Configure the per-daemon attachment limit with `meshmsg daemon --max-attachment-bytes <BYTES>` or the `MESHMSG_MAX_ATTACHMENT_BYTES` environment variable. The value must be greater than zero and applies to both shares and downloads. The daemon's JSON startup and status records expose the active value as `max_attachment_bytes`.
+
+Before transferring missing content, the downloader verifies its size against the content hash, rejects blobs larger than the local daemon's configured limit, and compares the result with the size in a signed offer.
 
 Blob data and named pins live under `blobs-v1/<node-public-key>` in the state directory. Outgoing content is named and synced before its offer is broadcast, so an observed offer is already available. An ordinarily returned pre-broadcast failure attempts to remove and sync the named pin. Forced task cancellation or process termination can interrupt publication or cleanup and may therefore leave a conservative pin even when no offer was sent. Once broadcast is attempted, an error has an unknown delivery outcome and the pin is deliberately retained so any peer that may have observed the offer can still fetch it. Successful outgoing shares use `meshmsg/out/v1/...` pins and successful downloads use `meshmsg/in/v1/...` pins. They survive daemon restarts and currently have no automatic expiry or removal command. Unpinned partial data can remain until store garbage collection.
 

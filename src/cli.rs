@@ -1,3 +1,4 @@
+use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use std::{
@@ -162,7 +163,16 @@ pub enum Command {
         command: AliasCommand,
     },
     /// Run the local network daemon in the foreground
-    Daemon,
+    Daemon {
+        /// Maximum size of a shared or downloaded attachment, in bytes
+        #[arg(
+            long,
+            env = "MESHMSG_MAX_ATTACHMENT_BYTES",
+            default_value_t = DEFAULT_MAX_ATTACHMENT_BYTES,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        max_attachment_bytes: u64,
+    },
     /// Serve the broadcast web UI over local IPC (no application authentication)
     Web {
         /// Loopback HTTP listener; expose only through Tailscale Serve, never Funnel
@@ -402,6 +412,28 @@ mod tests {
         ])
         .is_ok());
         assert!(parse(&["web", "--listen", "not-an-address"]).is_err());
+    }
+
+    #[test]
+    fn daemon_attachment_limit_defaults_to_four_gib_and_is_configurable() {
+        let cli = parse(&["daemon"]).unwrap();
+        let Command::Daemon {
+            max_attachment_bytes,
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(max_attachment_bytes, 4 * 1024 * 1024 * 1024);
+
+        let cli = parse(&["daemon", "--max-attachment-bytes", "12345"]).unwrap();
+        let Command::Daemon {
+            max_attachment_bytes,
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(max_attachment_bytes, 12_345);
+        assert!(parse(&["daemon", "--max-attachment-bytes", "0"]).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::{
     alias::AliasConfig,
-    attachment::{self, AttachmentKind, AttachmentOffer, MAX_ATTACHMENT_BYTES},
+    attachment::{self, AttachmentKind, AttachmentOffer},
     config::{prepare_state_dir, State, StateLock},
     direct::{
         self, DirectHandler, Directory, IncomingDirect, PresenceSourceLimiter, DIRECT_ALPN,
@@ -331,10 +331,6 @@ fn parse_attachment_body(body: &str) -> Result<Option<AttachmentOffer>> {
         "unsupported attachment offer version"
     );
     attachment::validate_display_name(&wire.offer.name)?;
-    anyhow::ensure!(
-        wire.offer.size <= MAX_ATTACHMENT_BYTES,
-        "attachment exceeds the configured size limit"
-    );
     anyhow::ensure!(
         wire.offer.offer_id.len() == 32
             && wire
@@ -1467,6 +1463,7 @@ async fn share_attachment(
     sender: GossipSender,
     state_dir: PathBuf,
     path: PathBuf,
+    max_attachment_bytes: u64,
 ) -> Result<serde_json::Value> {
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
@@ -1489,9 +1486,9 @@ async fn share_attachment(
     let staged = tokio::task::spawn_blocking(move || {
         let staged = attachment::StagedFile::new(staging);
         let size = if directory {
-            attachment::create_deterministic_tar(&source, staged.path())?
+            attachment::create_deterministic_tar(&source, staged.path(), max_attachment_bytes)?
         } else {
-            attachment::copy_bounded(&source, staged.path())?
+            attachment::copy_bounded(&source, staged.path(), max_attachment_bytes)?
         };
         Ok::<_, anyhow::Error>((size, staged))
     })
@@ -1584,15 +1581,26 @@ fn validate_declared_attachment_size(declared_size: Option<u64>, actual_size: u6
     Ok(())
 }
 
-async fn download_attachment(
+struct DownloadResources {
     store: Store,
     downloader: Downloader,
     endpoint: Endpoint,
     lookup: MemoryLookup,
+}
+
+async fn download_attachment(
+    resources: DownloadResources,
     events: broadcast::Sender<serde_json::Value>,
     offer_token: String,
     output: PathBuf,
+    max_attachment_bytes: u64,
 ) -> Result<serde_json::Value> {
+    let DownloadResources {
+        store,
+        downloader,
+        endpoint,
+        lookup,
+    } = resources;
     anyhow::ensure!(
         !output.exists(),
         "output already exists: {}",
@@ -1628,6 +1636,12 @@ async fn download_attachment(
             )
         }
     };
+    if let Some(declared_size) = declared_size {
+        anyhow::ensure!(
+            declared_size <= max_attachment_bytes,
+            "attachment exceeds the configured size limit of {max_attachment_bytes} bytes"
+        );
+    }
     lookup.add_endpoint_info(ticket.addr().clone());
     // Protect complete or partial content from periodic GC until installation
     // and creation of the durable inbound pin have both completed.
@@ -1658,8 +1672,8 @@ async fn download_attachment(
         .context("attachment size check timed out")?
         .context("verify attachment size")?;
         anyhow::ensure!(
-            verified_size <= MAX_ATTACHMENT_BYTES,
-            "attachment exceeds the configured size limit"
+            verified_size <= max_attachment_bytes,
+            "attachment exceeds the configured size limit of {max_attachment_bytes} bytes"
         );
         validate_declared_attachment_size(declared_size, verified_size)?;
         let download = downloader.download(ticket.hash_and_format(), Some(ticket.addr().id));
@@ -1704,8 +1718,8 @@ async fn download_attachment(
         }
     };
     anyhow::ensure!(
-        size <= MAX_ATTACHMENT_BYTES,
-        "download exceeds the configured size limit"
+        size <= max_attachment_bytes,
+        "download exceeds the configured size limit of {max_attachment_bytes} bytes"
     );
     validate_declared_attachment_size(declared_size, size)
         .context("validate downloaded attachment size")?;
@@ -1735,7 +1749,11 @@ async fn download_attachment(
         AttachmentKind::DirectoryTarV1 => {
             let output_for_task = output.clone();
             tokio::task::spawn_blocking(move || {
-                attachment::extract_staged_tar_no_clobber(staging, &output_for_task)
+                attachment::extract_staged_tar_no_clobber(
+                    staging,
+                    &output_for_task,
+                    max_attachment_bytes,
+                )
             })
             .await
             .context("extraction task failed")??;
@@ -1836,7 +1854,11 @@ fn emit_peer_transitions(
     }
 }
 
-pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
+pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Result<()> {
+    anyhow::ensure!(
+        max_attachment_bytes > 0,
+        "maximum attachment size must be greater than zero"
+    );
     // Install service-manager/console signal handling before startup becomes visible.
     let mut shutdown = shutdown_signals()?;
     // Claim local ownership before reading the identity, starting networking, or mutating state.
@@ -1917,7 +1939,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
         "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
         "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
         "endpoint_online":true, "topic_joined":node.receiver.is_joined(),
-        "alias":alias_config.effective(), "alias_enabled":alias_config.enabled()
+        "alias":alias_config.effective(), "alias_enabled":alias_config.enabled(),
+        "max_attachment_bytes":max_attachment_bytes
     });
     event(json, started);
 
@@ -2078,7 +2101,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY]
+                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY],
+                        "max_attachment_bytes":max_attachment_bytes
                     }));
                 }
                 Some(DaemonCommand::Peers { reply }) => {
@@ -2141,7 +2165,15 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     let events = event_tx.clone();
                     transfer_tasks.spawn(async move {
                         let _permit = permit;
-                        let response = match share_attachment(store, endpoint, secret, sender, state_dir, path).await {
+                        let response = match share_attachment(
+                            store,
+                            endpoint,
+                            secret,
+                            sender,
+                            state_dir,
+                            path,
+                            max_attachment_bytes,
+                        ).await {
                             Ok(value) => value,
                             Err(error) => serde_json::json!({"type":"error", "code":"share_failed", "message":error.to_string()}),
                         };
@@ -2170,7 +2202,18 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         let _permit = permit;
                         let started = serde_json::json!({"type":"download_started", "schema_version":1, "output":output});
                         let _ = events.send(started);
-                        let response = match download_attachment(store, downloader, endpoint, lookup, events.clone(), offer, output).await {
+                        let response = match download_attachment(
+                            DownloadResources {
+                                store,
+                                downloader,
+                                endpoint,
+                                lookup,
+                            },
+                            events.clone(),
+                            offer,
+                            output,
+                            max_attachment_bytes,
+                        ).await {
                             Ok(value) => value,
                             Err(error) => serde_json::json!({"type":"error", "code":"download_failed", "message":error.to_string()}),
                         };

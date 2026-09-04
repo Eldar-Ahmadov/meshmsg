@@ -31,6 +31,13 @@ meshmsg --json daemon
 
 Fresh state has `advertise_self=true` but no invite. After the endpoint becomes online, the daemon atomically stores an invite containing its endpoint. Until that first successful daemon startup, `meshmsg invite` intentionally fails.
 
+The attachment limit defaults to 4 GiB. Configure it for each daemon invocation with bytes or an environment variable:
+
+```sh
+meshmsg --json daemon --max-attachment-bytes 8589934592
+MESHMSG_MAX_ATTACHMENT_BYTES=8589934592 meshmsg --json daemon
+```
+
 Export the invite from another terminal:
 
 ```sh
