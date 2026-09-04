@@ -75,7 +75,7 @@ Files and deterministic directory snapshots are announced through signed Gossip 
 ```sh
 meshmsg --json share ./report.pdf
 meshmsg offers
-meshmsg download '<signed-offer>' --output ./received-report.pdf
+printf '%s' '<signed-offer>' | meshmsg download --offer-stdin --output ./received-report.pdf
 
 meshmsg --json share ./results
 meshmsg download '<signed-directory-offer>' --output ./received-results

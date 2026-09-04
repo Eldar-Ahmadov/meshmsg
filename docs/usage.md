@@ -9,7 +9,7 @@ The canonical top-level commands are:
 - `daemon`
 - `invite`
 - `send`, `listen`, `chat`, `status`, `stop`, and `doctor`
-- `share <path>`, `offers`, and `download <offer-or-ticket> --output <path>`
+- `share <path>`, `offers`, and `download <offer source> --output <path>`
 - `bench-send`, `bench-receive`, and interactive `bench-tui`
 
 Run `meshmsg <command> --help` for command-specific options.
@@ -77,11 +77,12 @@ A successful send reports `queued`:
 
 ## Input sources
 
-Join and send each require exactly one input source. Positional values are convenient but visible in shell history and potentially process listings:
+Join, send, and download each require exactly one input source. Positional values are convenient but visible in shell history and potentially process listings:
 
 ```sh
 meshmsg join '<invite>'
 meshmsg send 'hello'
+meshmsg download '<signed-offer>' --output ./report.pdf
 ```
 
 Prefer file or stdin input for sensitive values:
@@ -91,9 +92,10 @@ meshmsg join --token-file invite.txt
 meshmsg join --advertise-self --token-stdin < invite.txt
 meshmsg send --message-file message.txt
 printf '%s' 'hello' | meshmsg send --message-stdin
+printf '%s' '<signed-offer>' | meshmsg download --offer-stdin --output ./report.pdf
 ```
 
-File and stdin flags conflict with each other and with the positional value. Stdin is read through EOF; `-` is a literal filename, not stdin. Invite input removes one final LF and an optional preceding CR. Message input is preserved exactly. Inputs must be UTF-8. Invite input is limited to 1 MiB and message bodies to 4096 bytes.
+File and stdin flags conflict with each other and with the positional value. Stdin is read through EOF; `-` is a literal filename, not stdin. Invite and attachment-offer input remove one final LF and an optional preceding CR. Message input is preserved exactly. Inputs must be UTF-8. Invite and attachment-offer input are limited to 1 MiB and message bodies to 4096 bytes.
 
 These forms prevent argv and history disclosure only. Messages remain plaintext to every topic participant.
 

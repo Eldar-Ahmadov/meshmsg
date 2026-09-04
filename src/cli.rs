@@ -8,8 +8,8 @@ use std::{
 
 // The message body cannot fit its signed envelope if it alone exceeds the wire limit.
 const MAX_MESSAGE_INPUT_BYTES: usize = 4096;
-// Invites are normally a few KiB even at the bootstrap-peer limit.
-const MAX_INVITE_INPUT_BYTES: usize = 1024 * 1024;
+// Plaintext capabilities are normally only a few KiB.
+const MAX_CAPABILITY_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,6 +62,21 @@ pub struct MessageInput {
     /// Read the exact message body from stdin through EOF
     #[arg(long)]
     pub message_stdin: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    ArgGroup::new("offer_source")
+        .required(true)
+        .multiple(false)
+        .args(["offer", "offer_stdin"])
+))]
+pub struct OfferInput {
+    /// Signed offer or blob ticket (visible in shell history and process listings; prefer stdin)
+    pub offer: Option<String>,
+    /// Read the signed offer or blob ticket from stdin through EOF
+    #[arg(long)]
+    pub offer_stdin: bool,
 }
 
 #[derive(Args, Debug)]
@@ -139,8 +154,8 @@ pub enum Command {
     Offers,
     /// Download an explicitly accepted attachment offer
     Download {
-        /// Signed offer token printed by share/listen, or an iroh blob ticket (file only)
-        offer: String,
+        #[command(flatten)]
+        input: OfferInput,
         /// Destination path; existing paths are never overwritten
         #[arg(long, short = 'o', value_name = "PATH")]
         output: PathBuf,
@@ -171,8 +186,10 @@ impl InviteInput {
     pub fn into_token(self) -> Result<String> {
         let mut token = match (self.token, self.token_file, self.token_stdin) {
             (Some(token), None, false) => token,
-            (None, Some(path), false) => read_file(&path, "invite token", MAX_INVITE_INPUT_BYTES)?,
-            (None, None, true) => read_stdin("invite token", MAX_INVITE_INPUT_BYTES)?,
+            (None, Some(path), false) => {
+                read_file(&path, "invite token", MAX_CAPABILITY_INPUT_BYTES)?
+            }
+            (None, None, true) => read_stdin("invite token", MAX_CAPABILITY_INPUT_BYTES)?,
             _ => bail!("exactly one invite token input source is required"),
         };
         if token.ends_with('\n') {
@@ -194,6 +211,24 @@ impl MessageInput {
             (None, None, true) => read_stdin("message body", MAX_MESSAGE_INPUT_BYTES),
             _ => bail!("exactly one message input source is required"),
         }
+    }
+}
+
+impl OfferInput {
+    pub fn into_offer(self) -> Result<String> {
+        let mut offer = match (self.offer, self.offer_stdin) {
+            (Some(offer), false) => offer,
+            (None, true) => read_stdin("attachment offer", MAX_CAPABILITY_INPUT_BYTES)?,
+            _ => bail!("exactly one attachment offer input source is required"),
+        };
+        if offer.ends_with('\n') {
+            offer.pop();
+            if offer.ends_with('\r') {
+                offer.pop();
+            }
+        }
+        anyhow::ensure!(!offer.is_empty(), "attachment offer input is empty");
+        Ok(offer)
     }
 }
 
@@ -265,6 +300,7 @@ mod tests {
         assert!(parse(&["share", "file.txt"]).is_ok());
         assert!(parse(&["offers"]).is_ok());
         assert!(parse(&["download", "offer-token", "--output", "file.txt"]).is_ok());
+        assert!(parse(&["download", "--offer-stdin", "--output", "file.txt"]).is_ok());
         assert!(parse(&["bench-send"]).is_ok());
         assert!(parse(&["bench-tui"]).is_ok());
         assert!(parse(&[
@@ -348,6 +384,13 @@ mod tests {
             vec!["send", "message", "--message-file", "message.txt"],
             vec!["send", "message", "--message-stdin"],
             vec!["send", "--message-file", "message.txt", "--message-stdin"],
+            vec![
+                "download",
+                "offer-token",
+                "--offer-stdin",
+                "--output",
+                "file.txt",
+            ],
         ] {
             assert_eq!(
                 parse(&arguments).unwrap_err().kind(),
@@ -360,6 +403,14 @@ mod tests {
     fn repeated_source_flags_are_rejected() {
         assert!(parse(&["join", "--token-stdin", "--token-stdin"]).is_err());
         assert!(parse(&["send", "--message-file", "one", "--message-file", "two"]).is_err());
+        assert!(parse(&[
+            "download",
+            "--offer-stdin",
+            "--offer-stdin",
+            "--output",
+            "file.txt"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -391,6 +442,27 @@ mod tests {
             token_stdin: false,
         }
         .into_token()
+        .unwrap_err()
+        .to_string()
+        .contains("empty"));
+    }
+
+    #[test]
+    fn offer_normalizes_one_line_ending_and_rejects_empty_input() {
+        for (input, expected) in [("offer\n", "offer"), ("offer\r\n", "offer")] {
+            let value = OfferInput {
+                offer: Some(input.into()),
+                offer_stdin: false,
+            }
+            .into_offer()
+            .unwrap();
+            assert_eq!(value, expected);
+        }
+        assert!(OfferInput {
+            offer: Some("\n".into()),
+            offer_stdin: false,
+        }
+        .into_offer()
         .unwrap_err()
         .to_string()
         .contains("empty"));

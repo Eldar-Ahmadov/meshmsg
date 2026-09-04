@@ -79,7 +79,8 @@ wait_for 30 "file offer" grep -Fq '"type":"attachment_offer"' "$ROOT/receiver.li
 (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket.txt) \
   | grep -q '"type":"download_complete"'
 cmp "$ROOT/source.txt" "$ROOT/raw-ticket.txt" || fail "raw-ticket download differs"
-(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_OFFER" --output received.txt) \
+printf '%s\n' "$FILE_OFFER" \
+  | (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download --offer-stdin --output received.txt) \
   | grep -q '"type":"download_complete"'
 cmp "$ROOT/source.txt" "$ROOT/received.txt" || fail "signed-offer download differs"
 if (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" download "$FILE_OFFER" --output received.txt) >"$ROOT/clobber.out" 2>"$ROOT/clobber.err"; then

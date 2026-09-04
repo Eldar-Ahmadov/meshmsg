@@ -100,7 +100,8 @@ async fn run() -> Result<()> {
         }
         Command::Share { path } => node::share(&dir, &path, cli.json).await?,
         Command::Offers => node::offers(&dir, cli.json).await?,
-        Command::Download { offer, output } => {
+        Command::Download { input, output } => {
+            let offer = input.into_offer()?;
             node::download(&dir, &offer, &output, cli.json).await?
         }
         Command::Listen => node::listen(&dir, cli.json).await?,

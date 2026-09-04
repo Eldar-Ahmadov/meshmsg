@@ -8,7 +8,7 @@ Share one regular file:
 
 ```sh
 meshmsg --json share ./report.pdf
-meshmsg download '<signed-offer>' --output ./received-report.pdf
+printf '%s' '<signed-offer>' | meshmsg download --offer-stdin --output ./received-report.pdf
 ```
 
 Share a directory as a deterministic tar snapshot:
@@ -18,7 +18,7 @@ meshmsg --json share ./results
 meshmsg download '<signed-directory-offer>' --output ./received-results
 ```
 
-Copy the `offer` value from the `share` or `listen` JSON output. A raw Iroh `BlobTicket` is also accepted for interoperability, but is treated only as a file and has no meshmsg-signed name, kind, or declared size.
+Copy the `offer` value from the `share` or `listen` JSON output. `--offer-stdin` avoids exposing this reusable plaintext capability in argv and shell history. A raw Iroh `BlobTicket` is also accepted for interoperability, but is treated only as a file and has no meshmsg-signed name, kind, or declared size.
 
 List attachment blobs currently pinned in the local store:
 
