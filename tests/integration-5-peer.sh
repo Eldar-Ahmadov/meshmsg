@@ -119,12 +119,16 @@ wait "$B2"
 python3 - "$ROOT/s1.bench.log" "$ROOT/c1.bench.log" "$ROOT/c2.bench.log" <<'PY'
 import json, pathlib, sys
 sender = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
-assert [value["type"] for value in sender] == ["bench_send_started", "bench_send_summary"]
+assert sender[0]["type"] == "bench_send_started"
+assert sender[-1]["type"] == "bench_send_summary"
+assert all(value["type"] == "bench_send_progress" for value in sender[1:-1])
 assert sender[-1]["planned"] == sender[-1]["attempted"] == sender[-1]["queued"] == 5
 assert sender[-1]["failed"] == 0 and sender[-1]["delivery_acknowledged"] is False
 for path in sys.argv[2:]:
     receiver = [json.loads(line) for line in pathlib.Path(path).read_text().splitlines()]
-    assert [value["type"] for value in receiver] == ["bench_receive_started", "bench_receive_summary"]
+    assert receiver[0]["type"] == "bench_receive_started"
+    assert receiver[-1]["type"] == "bench_receive_summary"
+    assert all(value["type"] == "bench_receive_progress" for value in receiver[1:-1])
     summary = receiver[-1]
     assert summary["run_id"] == "0123456789abcdef0123456789abcdef"
     assert summary["expected"] == summary["unique"] == 5
