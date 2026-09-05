@@ -7,12 +7,17 @@ The canonical top-level commands are:
 - `init [--force]`
 - `join [--advertise-self] [--force] <invite source>`
 - `daemon`
+- `web [--listen 127.0.0.1:8787] [--origin https://host.tailnet.ts.net]`
 - `invite`
 - `send`, `listen`, `chat`, `status`, `stop`, and `doctor`
 - `share <path>`, `offers`, and `download <offer source> --output <path>`
 - `bench-send`, `bench-receive`, and interactive `bench-tui`
 
 Run `meshmsg <command> --help` for command-specific options.
+
+## Mobile web broadcast
+
+`meshmsg web` serves a separate loopback-only HTTP process bridging the chosen state directory's daemon IPC. It exposes only text broadcast, status and a live feed; it never starts or stops the daemon. Remote access requires operator-managed Tailscale Serve (never Funnel) and an explicit HTTPS `--origin`. There is no app authentication. See [Mobile web UI](web.md) for the full setup, bounds and failure semantics.
 
 ## Starting and joining a topic
 

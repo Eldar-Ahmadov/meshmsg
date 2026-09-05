@@ -2,6 +2,10 @@ use crate::{
     attachment::{self, AttachmentKind, AttachmentOffer, MAX_ATTACHMENT_BYTES},
     config::{prepare_state_dir, State, StateLock},
     invite::Invite,
+    ipc::{
+        read_frame, read_subscription, send_request, subscribe, write_request, write_value,
+        BenchConfig, IpcRequest, MAX_IPC_REQUEST_SIZE,
+    },
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -47,9 +51,12 @@ use tokio::net::windows::named_pipe::{
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{broadcast, mpsc, oneshot, Semaphore},
 };
+
+#[cfg(test)]
+use crate::ipc::MAX_IPC_EVENT_SIZE;
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 /// Maximum serialized application envelope accepted for broadcast.
@@ -57,9 +64,6 @@ const MAX_ENVELOPE_SIZE: usize = 4096;
 /// Iroh's limit includes its own framing, so reserve explicit protocol headroom.
 const GOSSIP_PROTOCOL_HEADROOM: usize = 512;
 const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADROOM;
-// JSON can escape each accepted body byte as six ASCII bytes (for example, `\\u0000`).
-const MAX_IPC_REQUEST_SIZE: usize = MAX_ENVELOPE_SIZE * 6 + 1024;
-const MAX_IPC_EVENT_SIZE: usize = MAX_ENVELOPE_SIZE * 6 + 1024;
 const IPC_EVENT_CAPACITY: usize = 256;
 const BENCH_MAGIC: &str = "meshmsg-bench-v1";
 const MAX_BENCH_MESSAGES: u64 = 10_000_000;
@@ -91,14 +95,6 @@ struct Envelope {
     timestamp_ms: u64,
     body: String,
     signature: Signature,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BenchConfig {
-    run_id: String,
-    rate: u32,
-    duration_secs: u64,
-    payload_bytes: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -440,19 +436,6 @@ async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<Run
     })
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-enum IpcRequest {
-    Send { body: String },
-    BenchSend { config: BenchConfig },
-    Subscribe,
-    Status,
-    Offers,
-    Share { path: PathBuf },
-    Download { offer: String, output: PathBuf },
-    Stop,
-}
-
 enum DaemonCommand {
     Send {
         body: String,
@@ -514,11 +497,46 @@ struct LocalEndpointGuard;
 #[cfg(unix)]
 type LocalServerStream = UnixStream;
 #[cfg(unix)]
-type LocalClientStream = UnixStream;
+pub(crate) type LocalClientStream = UnixStream;
 #[cfg(windows)]
 type LocalServerStream = NamedPipeServer;
 #[cfg(windows)]
-type LocalClientStream = NamedPipeClient;
+pub(crate) type LocalClientStream = NamedPipeClient;
+
+// Read EOF alone does not end a Unix subscription: clients may shut down only
+// their write half and keep receiving events. Check full closure without writing
+// protocol bytes, and only poll after EOF so ordinary subscribers incur no cost.
+trait SubscriptionStream: AsyncRead + AsyncWrite + Unpin {
+    fn subscription_closed_after_eof(&self) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+#[cfg(unix)]
+impl SubscriptionStream for UnixStream {
+    fn subscription_closed_after_eof(&self) -> Result<bool> {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        let mut fds = [PollFd::new(self, PollFlags::empty())];
+        match poll(&mut fds, Some(&Timespec::default())) {
+            Ok(_) => {
+                let flags = fds[0].revents();
+                anyhow::ensure!(
+                    !flags.contains(PollFlags::NVAL),
+                    "invalid subscription socket"
+                );
+                Ok(flags.intersects(PollFlags::HUP | PollFlags::ERR))
+            }
+            Err(rustix::io::Errno::INTR) => Ok(false),
+            Err(error) => Err(error).context("poll subscription socket closure"),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl SubscriptionStream for NamedPipeServer {}
+
+#[cfg(test)]
+impl SubscriptionStream for tokio::io::DuplexStream {}
 
 #[cfg(unix)]
 struct LocalListener(UnixListener);
@@ -836,44 +854,6 @@ async fn bind_local_endpoint(
     ))
 }
 
-async fn read_frame<S>(stream: &mut S, maximum: usize) -> Result<Vec<u8>>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut frame = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        let read = stream.read(&mut byte).await.context("read daemon socket")?;
-        anyhow::ensure!(read != 0, "daemon socket closed before a complete response");
-        if byte[0] == b'\n' {
-            break;
-        }
-        anyhow::ensure!(
-            frame.len() < maximum,
-            "local IPC frame exceeds {maximum} bytes"
-        );
-        frame.push(byte[0]);
-    }
-    Ok(frame)
-}
-
-async fn write_value<S>(stream: &mut S, value: &serde_json::Value) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let mut encoded = serde_json::to_vec(value)?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_IPC_EVENT_SIZE,
-        "local IPC event exceeds {MAX_IPC_EVENT_SIZE} bytes"
-    );
-    encoded.push(b'\n');
-    stream
-        .write_all(&encoded)
-        .await
-        .context("write daemon socket")?;
-    Ok(())
-}
-
 struct BenchmarkLease(Arc<AtomicBool>);
 
 impl Drop for BenchmarkLease {
@@ -1128,7 +1108,7 @@ async fn handle_local_client<S>(
     benchmark_busy: Arc<AtomicBool>,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: SubscriptionStream,
 {
     let frame = read_frame(&mut stream, MAX_IPC_REQUEST_SIZE).await?;
     let request: IpcRequest =
@@ -1136,20 +1116,38 @@ where
     match request {
         IpcRequest::Subscribe => {
             write_value(&mut stream, &connected).await?;
+            let mut read_closed = false;
             loop {
-                match events.recv().await {
-                    Ok(value) => write_value(&mut stream, &value).await?,
-                    Err(broadcast::error::RecvError::Lagged(count)) => {
-                        write_value(
-                            &mut stream,
-                            &serde_json::json!({
-                                "type":"lagged", "source":"local", "dropped":count,
-                                "message":format!("local listener missed {count} events")
-                            }),
-                        )
-                        .await?;
+                let mut disconnect = [0_u8; 1];
+                tokio::select! {
+                    read = stream.read(&mut disconnect), if !read_closed => {
+                        anyhow::ensure!(read? == 0, "unexpected data after subscribe");
+                        read_closed = true;
+                        if stream.subscription_closed_after_eof()? {
+                            break;
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    // EOF stays readable forever. Avoid a busy loop while still
+                    // reclaiming quiet web subscriptions after a full close.
+                    _ = tokio::time::sleep(Duration::from_millis(250)), if read_closed => {
+                        if stream.subscription_closed_after_eof()? {
+                            break;
+                        }
+                    }
+                    value = events.recv() => match value {
+                        Ok(value) => write_value(&mut stream, &value).await?,
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            write_value(
+                                &mut stream,
+                                &serde_json::json!({
+                                    "type":"lagged", "source":"local", "dropped":count,
+                                    "message":format!("local listener missed {count} events")
+                                }),
+                            )
+                            .await?;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
                 }
             }
         }
@@ -1763,10 +1761,13 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
             }
             command = command_rx.recv() => match command {
                 Some(DaemonCommand::Send { body, reply }) => {
-                    let response = match Envelope::encode(&node.secret, body.clone()) {
-                        Ok(envelope) => match node.sender.broadcast(envelope).await {
-                            Ok(()) => queued_event(&peer, body),
-                            Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
+                    let response = match unix_timestamp_ms() {
+                        Ok(timestamp_ms) => match Envelope::encode_at(&node.secret, body.clone(), timestamp_ms) {
+                            Ok(envelope) => match node.sender.broadcast(envelope).await {
+                                Ok(()) => queued_event(&peer, body, timestamp_ms),
+                                Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
+                            },
+                            Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
                         },
                         Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
                     };
@@ -1965,9 +1966,9 @@ fn network_event(value: Event) -> Vec<serde_json::Value> {
     }
 }
 
-fn queued_event(peer: &str, body: String) -> serde_json::Value {
+fn queued_event(peer: &str, body: String, timestamp_ms: u64) -> serde_json::Value {
     serde_json::json!({
-        "type":"queued", "from":peer, "body":body,
+        "type":"queued", "from":peer, "timestamp_ms":timestamp_ms, "body":body,
         "delivery_acknowledged":false
     })
 }
@@ -1997,7 +1998,7 @@ fn suppress_message_body(value: serde_json::Value) -> serde_json::Value {
 }
 
 #[cfg(unix)]
-async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
+pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
     UnixStream::connect(dir.join(SOCKET_NAME))
         .await
         .with_context(|| {
@@ -2009,7 +2010,7 @@ async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
 }
 
 #[cfg(windows)]
-async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
+pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
     let endpoint = local_endpoint(dir);
     for attempt in 0..20 {
         match ClientOptions::new().open(&endpoint) {
@@ -2029,19 +2030,6 @@ async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
         }
     }
     unreachable!("named pipe connection retry loop always returns")
-}
-
-async fn send_request(dir: &Path, request: &IpcRequest) -> Result<serde_json::Value> {
-    let mut stream = connect_daemon(dir).await?;
-    let mut encoded = serde_json::to_vec(request)?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_IPC_REQUEST_SIZE,
-        "local IPC request is too large"
-    );
-    encoded.push(b'\n');
-    stream.write_all(&encoded).await?;
-    let frame = read_frame(&mut stream, MAX_IPC_EVENT_SIZE).await?;
-    serde_json::from_slice(&frame).context("invalid response from local daemon")
 }
 
 fn ensure_success(value: &serde_json::Value) -> Result<()> {
@@ -2116,17 +2104,6 @@ fn generated_run_id() -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-async fn write_request<S: AsyncWrite + Unpin>(stream: &mut S, request: &IpcRequest) -> Result<()> {
-    let mut encoded = serde_json::to_vec(request)?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_IPC_REQUEST_SIZE,
-        "local IPC request is too large"
-    );
-    encoded.push(b'\n');
-    stream.write_all(&encoded).await?;
-    Ok(())
 }
 
 fn print_bench_value(json: bool, value: &serde_json::Value) {
@@ -2785,31 +2762,6 @@ pub(crate) async fn bench_receive_tui(
     cancellation: oneshot::Receiver<()>,
 ) -> Result<()> {
     bench_receive_events(dir, run_id, duration_secs, expected, events, cancellation).await
-}
-
-async fn subscribe(dir: &Path) -> Result<BufReader<LocalClientStream>> {
-    let mut stream = connect_daemon(dir).await?;
-    let mut request = serde_json::to_vec(&IpcRequest::Subscribe)?;
-    request.push(b'\n');
-    stream.write_all(&request).await?;
-    Ok(BufReader::new(stream))
-}
-
-async fn read_subscription(
-    reader: &mut BufReader<LocalClientStream>,
-) -> Result<Option<serde_json::Value>> {
-    let mut line = Vec::new();
-    let read = reader.read_until(b'\n', &mut line).await?;
-    if read == 0 {
-        return Ok(None);
-    }
-    anyhow::ensure!(
-        line.len() <= MAX_IPC_EVENT_SIZE + 1,
-        "daemon event is too large"
-    );
-    Ok(Some(
-        serde_json::from_slice(&line).context("invalid daemon event")?,
-    ))
 }
 
 pub async fn listen(dir: &Path, json: bool) -> Result<()> {
@@ -3708,10 +3660,13 @@ mod tests {
     }
 
     #[test]
-    fn queued_event_does_not_claim_delivery() {
-        let value = queued_event("peer", "hello".to_owned());
+    fn queued_event_has_canonical_send_metadata_and_does_not_claim_delivery() {
+        let value = queued_event("peer", "hello".to_owned(), 1_700_000_000_000);
 
         assert_eq!(value["type"], "queued");
+        assert_eq!(value["from"], "peer");
+        assert_eq!(value["body"], "hello");
+        assert_eq!(value["timestamp_ms"], 1_700_000_000_000_u64);
         assert_eq!(value["delivery_acknowledged"], false);
         assert!(value.get("sent").is_none());
     }
@@ -4053,6 +4008,86 @@ mod tests {
         assert_eq!(summary["first_error"], "scripted broadcast failure");
         task.await.unwrap().unwrap();
         assert!(command_rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_subscriber_receives_events_after_write_half_close() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (events, receiver) = broadcast::channel(1);
+        let mut task = tokio::spawn(handle_local_client(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        write_request(&mut client, &IpcRequest::Subscribe)
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let connected = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_frame(&mut client, MAX_IPC_EVENT_SIZE),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&connected).unwrap()["type"],
+            "connected"
+        );
+        // Stay quiet across multiple closure polls before publishing an event.
+        assert!(tokio::time::timeout(Duration::from_millis(600), &mut task)
+            .await
+            .is_err());
+        let event = serde_json::json!({"type":"message", "body":"after half-close"});
+        events.send(event.clone()).unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_frame(&mut client, MAX_IPC_EVENT_SIZE),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&received).unwrap(),
+            event
+        );
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.receiver_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_subscriber_exits_when_client_closes_on_a_quiet_topic() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        write_request(&mut client, &IpcRequest::Subscribe)
+            .await
+            .unwrap();
+        read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(events.receiver_count(), 0);
     }
 
     #[tokio::test]

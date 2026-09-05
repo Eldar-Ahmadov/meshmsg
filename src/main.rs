@@ -3,7 +3,9 @@ mod bench_tui;
 mod cli;
 mod config;
 mod invite;
+mod ipc;
 mod node;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -68,6 +70,7 @@ async fn run() -> Result<()> {
             );
         }
         Command::Daemon => node::run_daemon(&dir, cli.json).await?,
+        Command::Web { listen, origin } => web::run(&dir, listen, origin).await?,
         Command::Invite => {
             let (state, secret) = State::load_for_doctor(&dir)?;
             state.validate()?;

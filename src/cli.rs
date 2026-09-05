@@ -136,6 +136,15 @@ pub enum Command {
     },
     /// Run the local network daemon in the foreground
     Daemon,
+    /// Serve the broadcast web UI over local IPC (no application authentication)
+    Web {
+        /// Loopback HTTP listener; expose only through Tailscale Serve, never Funnel
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: std::net::SocketAddr,
+        /// Exact public HTTPS origin, e.g. https://host.tailnet-name.ts.net (no trailing slash)
+        #[arg(long)]
+        origin: Option<String>,
+    },
     /// Print the stored invite token
     Invite,
     /// Ask the local daemon to shut down
@@ -323,6 +332,24 @@ mod tests {
             "1000",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn web_defaults_to_loopback_and_accepts_an_explicit_https_origin() {
+        let Command::Web { listen, origin } = parse(&["web"]).unwrap().command else {
+            panic!("wrong command")
+        };
+        assert_eq!(listen.to_string(), "127.0.0.1:8787");
+        assert!(origin.is_none());
+        assert!(parse(&[
+            "web",
+            "--listen",
+            "127.0.0.1:9898",
+            "--origin",
+            "https://node.example.ts.net"
+        ])
+        .is_ok());
+        assert!(parse(&["web", "--listen", "not-an-address"]).is_err());
     }
 
     #[test]

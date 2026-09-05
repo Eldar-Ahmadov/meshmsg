@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>meshmsg · Broadcast</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<main>
+<header class="masthead">
+<div>
+<h1>meshmsg</h1>
+<p class="eyebrow">Live topic console</p>
+</div>
+<div class="connection-state">
+<p id="connection" role="status">Connecting live feed…</p>
+<p>Private tailnet · no app login</p>
+</div>
+</header>
+<section class="daemon" aria-labelledby="identity-heading">
+<div>
+<h2 id="identity-heading">Local daemon</h2>
+<p id="status" role="status">Checking daemon…</p>
+</div>
+<details><summary>Sending identity</summary><p id="identity">Unknown until daemon connects</p></details>
+</section>
+<section class="stream" aria-labelledby="feed-heading">
+<div class="feed-heading"><div><p class="eyebrow">Now</p><h2 id="feed-heading">Live feed</h2></div><button id="clear" class="quiet" type="button">Clear</button></div>
+<p id="gap" role="status"></p>
+<ol id="feed" aria-label="Messages, newest first" aria-live="polite" aria-relevant="additions"></ol>
+</section>
+<section class="compose" aria-labelledby="compose-heading">
+<h2 id="compose-heading">Broadcast</h2>
+<form id="composer">
+<label class="visually-hidden" for="draft">Message to this daemon's topic</label>
+<div class="compose-row">
+<textarea id="draft" rows="2" placeholder="Message the topic…" required aria-describedby="size send-help" spellcheck="true"></textarea>
+<button id="broadcast" type="submit">Send</button>
+</div>
+<div class="compose-meta"><p id="size">0 / 4096 UTF-8 bytes</p><p id="send-help">Queues locally; not delivery acknowledgement. Never retried automatically.</p></div>
+</form>
+<p id="outcome" role="status" aria-live="polite"></p>
+</section>
+<noscript>JavaScript is required to use the broadcast UI.</noscript>
+</main>
+</body>
+</html>

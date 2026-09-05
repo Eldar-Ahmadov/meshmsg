@@ -68,6 +68,12 @@ meshmsg bench-tui
 
 See [Benchmarking](docs/benchmarking.md) for measurement semantics, coordinated multi-node runs, and NDJSON output.
 
+## Mobile web broadcast
+
+Run `meshmsg web` alongside the existing daemon, then open `http://127.0.0.1:8787/`. For phone access, use **Tailscale Serve, never Funnel**, with an explicitly configured HTTPS `--origin`. There is no app authentication: tailnet access rules are the remote access boundary. The UI queues text broadcasts locally (not delivery acknowledgements) and shows a bounded live feed without history.
+
+See [Mobile web UI](docs/web.md) for setup, security boundaries, reconnect behavior, and operations.
+
 ## Attachments
 
 Files and deterministic directory snapshots are announced through signed Gossip offers and transferred with Iroh Blobs. Receiving an offer never downloads it automatically.
@@ -87,6 +93,7 @@ Downloads are explicit, size-limited, content-verified, persistent across provid
 
 - [Installation](docs/installation.md)
 - [Usage reference](docs/usage.md)
+- [Mobile web UI](docs/web.md)
 - [Attachments](docs/attachments.md)
 - [Operations and security](docs/operations.md)
 - [Benchmarking](docs/benchmarking.md)
@@ -99,6 +106,9 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked
+node tests/web-ui.cjs
+python3 tests/integration-web.py target/debug/meshmsg
+python3 tests/integration-web-peer.py target/debug/meshmsg
 bash tests/integration-5-peer.sh target/debug/meshmsg
 bash tests/integration-attachments.sh target/debug/meshmsg
 ```

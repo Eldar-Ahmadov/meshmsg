@@ -8,6 +8,10 @@ Signatures authenticate peer keys, but meshmsg has no end-to-end encryption, acc
 
 Daemon logs suppress incoming message bodies, recording sender, timestamp, and byte count. Owner-only local `listen` and `chat` subscribers still receive complete bodies. Log suppression is operational hygiene, not a privacy boundary against the machine operator or another topic member.
 
+## Web access boundary
+
+The optional `meshmsg web` process has **no app authentication**. It binds only loopback and must be exposed remotely only through **Tailscale Serve, never Funnel**, with tailnet access rules restricted to trusted users/devices. Those users can read the feed and broadcast as the daemon's identity. Host/Origin checks and CSP are browser defenses, not authentication against an authorized or local client. Web shutdown does not stop the daemon or remove an operator-managed Serve route. See [Mobile web UI operations](web.md) for explicit origin configuration, limits, recovery and exposure checks.
+
 ## Daemon behavior
 
 The foreground daemon:
