@@ -43,6 +43,14 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: cargo build --locked
+      - name: Check web JavaScript syntax
+        run: timeout 30 node --check src/web/app.js
+      - name: Run web UI checks
+        run: timeout 60 node tests/web-ui.cjs
+      - name: Run web HTTP scenario
+        run: timeout 180 python3 tests/integration-web.py target/debug/meshmsg
+      - name: Run web peer scenario
+        run: timeout 600 python3 tests/integration-web-peer.py target/debug/meshmsg
       - name: Run five-peer scenario
         run: timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
       - name: Run attachment transfer scenario

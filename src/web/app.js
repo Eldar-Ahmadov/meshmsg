@@ -9,6 +9,11 @@ let reconnectTimer = null;
 let reconnectDelay = 1000;
 let statusBusy = false;
 
+function prependEntry(item) {
+  feed.prepend(item);
+  while (feed.children.length > 100) feed.lastElementChild.remove();
+}
+
 function addEntry(label, body, timestampMs, kind) {
   const item = document.createElement('li');
   if (kind) item.className = kind;
@@ -21,8 +26,64 @@ function addEntry(label, body, timestampMs, kind) {
     text.textContent = body;
     item.append(text);
   }
-  feed.prepend(item);
-  while (feed.children.length > 100) feed.lastElementChild.remove();
+  prependEntry(item);
+}
+
+function attachmentType(kind) {
+  if (kind === 'file') return 'File';
+  if (kind === 'directory_tar_v1') return 'Directory';
+  return 'Attachment';
+}
+
+function attachmentSize(size) {
+  if (!Number.isFinite(size) || size < 0) return null;
+  const units = ['B', 'KiB', 'MiB', 'GiB'];
+  let amount = size;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || amount >= 10 ? 0 : 1;
+  return `${amount.toFixed(digits).replace(/\.0$/, '')} ${units[unit]}`;
+}
+
+function addAttachment(value) {
+  const outgoing = value.type === 'attachment_shared';
+  const directory = value.kind === 'directory_tar_v1';
+  const item = document.createElement('li');
+  item.className = `attachment ${outgoing ? 'outgoing' : 'incoming'}`;
+
+  const meta = document.createElement('small');
+  const timestamp = Number.isFinite(value.timestamp_ms) ? new Date(value.timestamp_ms) : new Date();
+  meta.textContent = `${timestamp.toLocaleTimeString()} · ${outgoing ? 'Shared by' : 'From'} ${value.from || 'Unknown peer'}`;
+  item.append(meta);
+
+  const summary = document.createElement('div');
+  summary.className = 'attachment-summary';
+  const icon = document.createElement('span');
+  icon.className = `attachment-icon ${directory ? 'folder' : 'file'}`;
+  icon.setAttribute('aria-hidden', 'true');
+  summary.append(icon);
+  const description = document.createElement('div');
+  description.className = 'attachment-description';
+  const name = document.createElement('p');
+  name.className = 'attachment-name';
+  name.textContent = value.name || 'Unnamed attachment';
+  description.append(name);
+  const details = document.createElement('p');
+  details.className = 'attachment-details';
+  const size = attachmentSize(value.size);
+  details.textContent = size ? `${attachmentType(value.kind)} · ${size}` : attachmentType(value.kind);
+  description.append(details);
+  summary.append(description);
+  item.append(summary);
+
+  const status = document.createElement('p');
+  status.className = 'attachment-status';
+  status.textContent = outgoing ? 'Offer shared · delivery not acknowledged' : 'Offer received';
+  item.append(status);
+  prependEntry(item);
 }
 
 function connection(message, connected) {
@@ -94,6 +155,10 @@ function connect() {
       case 'queued':
         addEntry(`Queued locally by ${value.from} · not delivered`, value.body, value.timestamp_ms, 'queued');
         break;
+      case 'attachment_offer':
+      case 'attachment_shared':
+        addAttachment(value);
+        break;
       case 'peer_up':
       case 'peer_down':
         addEntry(`${value.type === 'peer_up' ? 'Peer joined' : 'Peer left'}: ${value.peer}`, undefined, undefined, 'peer');
@@ -113,6 +178,12 @@ function connect() {
 
 draft.addEventListener('input', () => {
   byId('size').textContent = `${encoder.encode(draft.value).length} / 4096 UTF-8 bytes (envelope may reduce limit)`;
+});
+draft.addEventListener('keydown', (event) => {
+  if (event.ctrlKey && event.key === 'Enter') {
+    event.preventDefault();
+    byId('composer').requestSubmit();
+  }
 });
 byId('composer').addEventListener('submit', async (event) => {
   event.preventDefault();

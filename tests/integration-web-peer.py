@@ -113,6 +113,45 @@ def main():
                 local = event(feed)
                 assert local['type'] == 'queued' and local['body'] == local_cli
 
+            attachment_path = root / 'web-attachment.txt'
+            attachment_path.write_text('real web attachment metadata\n')
+            shared = cli('one', 'share', str(attachment_path))
+            assert shared['type'] == 'attachment_shared' and isinstance(shared['timestamp_ms'], int)
+            safe_shared = None
+            for feed, _ in feeds:
+                local = event(feed)
+                assert set(local) == {'type', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
+                assert local == {
+                    'type': 'attachment_shared', 'direction': 'outgoing', 'from': shared['from'],
+                    'timestamp_ms': shared['timestamp_ms'], 'name': 'web-attachment.txt',
+                    'kind': 'file', 'size': attachment_path.stat().st_size}
+                if safe_shared is None:
+                    safe_shared = local
+                else:
+                    assert local == safe_shared
+            wait_for(lambda: '"type":"attachment_offer"' in pathlib.Path(peer_log.name).read_text()
+                     and 'web-attachment.txt' in pathlib.Path(peer_log.name).read_text(),
+                     'attachment offer received on distinct peer', 30)
+
+            reverse_attachment_path = root / 'reverse-attachment.txt'
+            reverse_attachment_path.write_text('reverse real attachment metadata\n')
+            reverse_shared = cli('two', 'share', str(reverse_attachment_path))
+            safe_offer = None
+            for feed, _ in feeds:
+                while True:
+                    incoming = event(feed)
+                    if incoming['type'] == 'attachment_offer' and incoming['name'] == 'reverse-attachment.txt':
+                        break
+                assert set(incoming) == {'type', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
+                assert incoming == {
+                    'type': 'attachment_offer', 'direction': 'incoming', 'from': reverse_shared['from'],
+                    'timestamp_ms': reverse_shared['timestamp_ms'], 'name': 'reverse-attachment.txt',
+                    'kind': 'file', 'size': reverse_attachment_path.stat().st_size}
+                if safe_offer is None:
+                    safe_offer = incoming
+                else:
+                    assert incoming == safe_offer
+
             reverse = marker + '-reverse'
             assert cli('two', 'send', reverse)['type'] == 'queued'
             for feed, _ in feeds:
@@ -137,7 +176,7 @@ def main():
             web.send_signal(signal.SIGINT)
             assert web.wait(timeout=5) == 0
             assert running('one') and running('two')
-            print('PASS: real web and local CLI sends reached both simultaneous SSE feeds as canonical queued events; web POST sender/timestamp matched receipt on a distinct peer; reverse peer send reached both feeds; daemon offline/restart handled; stopping web leaves both daemons running')
+            print('PASS: real web and local CLI sends reached both simultaneous SSE feeds as canonical queued events; local and incoming real attachment metadata reached both feeds without capabilities; web POST sender/timestamp matched receipt on a distinct peer; reverse peer send reached both feeds; daemon offline/restart handled; stopping web leaves both daemons running')
         except BaseException:
             for log in logs:
                 log.flush()

@@ -246,10 +246,6 @@ struct AttachmentWire {
 }
 
 impl Envelope {
-    fn encode(secret: &SecretKey, body: String) -> Result<Bytes> {
-        Self::encode_at(secret, body, unix_timestamp_ms()?)
-    }
-
     fn encode_at(secret: &SecretKey, body: String, timestamp_ms: u64) -> Result<Bytes> {
         let signed = postcard::to_stdvec(&(secret.public(), timestamp_ms, &body))?;
         let value = Self {
@@ -1407,7 +1403,8 @@ async fn share_attachment(
             ticket: ticket.to_string(),
         };
         let body = attachment_body(&offer)?;
-        let encoded = Envelope::encode(&secret, body)?;
+        let timestamp_ms = unix_timestamp_ms()?;
+        let encoded = Envelope::encode_at(&secret, body, timestamp_ms)?;
         sender
             .broadcast(encoded.clone())
             .await
@@ -1420,7 +1417,8 @@ async fn share_attachment(
         store.sync_db().await.context("persist attachment tag")?;
         Ok(serde_json::json!({
             "type":"attachment_shared", "schema_version":1,
-            "from":secret.public().to_string(), "offer_id":offer.offer_id,
+            "from":secret.public().to_string(), "timestamp_ms":timestamp_ms,
+            "offer_id":offer.offer_id,
             "kind":offer.kind, "name":offer.name, "size":offer.size,
             "ticket":offer.ticket, "offer":BASE64URL_NOPAD.encode(&encoded),
             "delivery_acknowledged":false

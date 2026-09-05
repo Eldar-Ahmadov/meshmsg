@@ -67,6 +67,9 @@ FILE_SHARE=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/provider" --json share sour
 FILE_OFFER=$(json_field '"offer"' <<<"$FILE_SHARE")
 FILE_TICKET=$(json_field '"ticket"' <<<"$FILE_SHARE")
 FILE_ID=$(json_field '"offer_id"' <<<"$FILE_SHARE")
+FILE_TIMESTAMP=$(json_field '"timestamp_ms"' <<<"$FILE_SHARE")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "attachment_shared" and isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["delivery_acknowledged"] is False' \
+  <<<"$FILE_SHARE" || fail "shared attachment JSON omitted its canonical timestamp or existing fields"
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["name"] == "source.txt" and b["kind"] == "file" and b["status"] == "complete"' "$FILE_ID" \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
   || fail "provider offer listing did not include shared file"
@@ -74,6 +77,9 @@ python3 -c 'import json,sys; assert json.load(sys.stdin)["blobs"] == []' \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "received but undownloaded offer was listed as pinned"
 wait_for 30 "file offer" grep -Fq '"type":"attachment_offer"' "$ROOT/receiver.listen.log"
+python3 -c 'import json,sys; events=[json.loads(line) for line in open(sys.argv[1])]; offer=next(v for v in events if v.get("type") == "attachment_offer" and v.get("offer_id") == sys.argv[2]); assert offer["timestamp_ms"] == int(sys.argv[3]) and offer["name"] == "source.txt" and offer["kind"] == "file"' \
+  "$ROOT/receiver.listen.log" "$FILE_ID" "$FILE_TIMESTAMP" \
+  || fail "local attachment_shared timestamp/metadata did not match the received offer"
 [[ ! -e "$ROOT/receiver/source.txt" ]] || fail "receiver automatically exported an offered file"
 
 (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket.txt) \
@@ -97,6 +103,8 @@ printf alpha >"$ROOT/source-dir/a.txt"
 printf beta >"$ROOT/source-dir/nested/b.txt"
 DIR_SHARE=$("$BIN" --state-dir "$ROOT/provider" --json share "$ROOT/source-dir")
 DIR_OFFER=$(json_field '"offer"' <<<"$DIR_SHARE")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["kind"] == "directory_tar_v1"' \
+  <<<"$DIR_SHARE" || fail "shared directory JSON omitted its canonical timestamp or kind"
 stop_node provider
 start_node provider
 python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {(x["name"], x["kind"]) for x in b} == {("source.txt", "file"), ("source-dir.tar", "directory_tar_v1")} and all(x["direction"] == "outgoing" and x["status"] == "complete" for x in b)' \
@@ -113,4 +121,4 @@ python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert any(x["name
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: transfers, no-clobber, deterministic extraction, persistent pins, and best-effort blob listing"
+echo "PASS: canonical shared/received offer timestamps and metadata, transfers, no-clobber, deterministic extraction, persistent pins, and best-effort blob listing"

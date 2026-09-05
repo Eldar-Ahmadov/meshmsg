@@ -77,7 +77,10 @@ class Handler(socketserver.StreamRequestHandler):
                     emit(queued)
             elif value['command'] == 'subscribe':
                 emit({'type': 'connected', 'peer': 'fake-peer'})
-                emit({'type': 'attachment_offer', 'token': 'private-token'})
+                emit({'type': 'attachment_offer', 'from': 'other-peer', 'timestamp_ms': 2,
+                      'name': '<incoming>.txt', 'kind': 'file', 'size': 1536,
+                      'offer_id': 'private-id', 'offer': 'private-token',
+                      'ticket': 'private-ticket', 'path': 'private-path', 'output': 'private-output'})
                 emit({'type': 'message', 'from': 'other-peer', 'body': '<img src=x onerror=alert(1)>\ndata: injected', 'timestamp_ms': 1})
                 emit({'type': 'lagged', 'dropped': 3})
                 with self.server.lock:
@@ -196,9 +199,41 @@ def main():
                 for response in [feed, other_tab]:
                     assert response.status == 200
                     assert next_event(response)['type'] == 'connected'
+                    assert next_event(response) == {
+                        'type': 'attachment_offer', 'direction': 'incoming', 'from': 'other-peer',
+                        'timestamp_ms': 2, 'name': '<incoming>.txt', 'kind': 'file', 'size': 1536}
                     value = next_event(response)
                     assert value['type'] == 'message' and '\ndata: injected' in value['body']
                     assert next_event(response)['type'] == 'lagged'
+                deadline = time.monotonic() + 5
+                while True:
+                    with daemon.lock:
+                        if len(daemon.subscribers) == 2:
+                            break
+                    assert time.monotonic() < deadline, 'fake daemon subscriptions were not active'
+                    time.sleep(.01)
+
+                shared = {'type': 'attachment_shared', 'from': 'fake-peer', 'timestamp_ms': 3,
+                          'name': 'shared-directory.tar', 'kind': 'directory_tar_v1', 'size': 4096,
+                          'offer_id': 'private-id', 'offer': 'private-token',
+                          'ticket': 'private-ticket', 'path': 'private-path', 'output': 'private-output',
+                          'delivery_acknowledged': True}
+                daemon.broadcast(shared)
+                for response in [feed, other_tab]:
+                    assert next_event(response) == {
+                        'type': 'attachment_shared', 'direction': 'outgoing', 'from': 'fake-peer',
+                        'timestamp_ms': 3, 'name': 'shared-directory.tar',
+                        'kind': 'directory_tar_v1', 'size': 4096}
+
+                incoming = {'type': 'attachment_offer', 'from': 'another-peer', 'timestamp_ms': 4,
+                            'name': 'incoming-directory.tar', 'kind': 'directory_tar_v1', 'size': 8192,
+                            'offer_id': 'private-id', 'offer': 'private-token', 'ticket': 'private-ticket'}
+                daemon.broadcast(incoming)
+                for response in [feed, other_tab]:
+                    assert next_event(response) == {
+                        'type': 'attachment_offer', 'direction': 'incoming', 'from': 'another-peer',
+                        'timestamp_ms': 4, 'name': 'incoming-directory.tar',
+                        'kind': 'directory_tar_v1', 'size': 8192}
 
                 time.sleep(1.05)
                 synced = 'sent-from-another-web-tab'
@@ -264,7 +299,7 @@ def main():
                     client.connect(str(root / 'daemon.sock'))
                     client.sendall(b'{"command":"status"}\n')
                     assert json.loads(client.recv(4096))['running'] is True
-                print('PASS: HTTP security/allowlist/assets, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends synchronized to simultaneous SSE feeds, SSE filtering/framing/capacity/cleanup, offline/restart, independent web shutdown')
+                print('PASS: HTTP security/allowlist/assets, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends and safe incoming/outgoing attachment metadata synchronized to simultaneous SSE feeds, attachment capabilities/paths filtered, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
             finally:
                 for response, conn in streams:
                     response.close()

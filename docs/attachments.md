@@ -71,10 +71,12 @@ New clients decode typed, versioned attachment payloads while continuing to acce
 
 ## JSON events
 
+The optional web UI shows live-only, read-only cards for incoming and locally shared attachments. It forwards only direction/sender, timestamp, filename, kind, and known size; it exposes no signed offer token, blob ticket, path/output, transfer control, offers API, or attachment mutation endpoint.
+
 Representative records:
 
 ```json
-{"type":"attachment_shared","schema_version":1,"from":"<peer-id>","offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"ticket":"<blob-ticket>","offer":"<signed-offer>","delivery_acknowledged":false}
+{"type":"attachment_shared","schema_version":1,"from":"<peer-id>","timestamp_ms":1700000000000,"offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"ticket":"<blob-ticket>","offer":"<signed-offer>","delivery_acknowledged":false}
 {"type":"attachment_offer","schema_version":1,"from":"<peer-id>","timestamp_ms":1700000000000,"offer_id":"<id>","kind":"directory_tar_v1","name":"results.tar","size":4096,"ticket":"<blob-ticket>","offer":"<signed-offer>"}
 {"type":"download_complete","schema_version":1,"offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"from":"<peer-id>","output":"./received-report.pdf"}
 ```

@@ -41,8 +41,20 @@ summary { cursor: pointer; }
 #feed { display: grid; gap: .65rem; list-style: none; padding: 0; margin: 0; }
 #feed li { padding: .8rem .9rem; overflow-wrap: anywhere; border-left: 2px solid var(--purple); background: var(--panel); }
 #feed li.queued { background: var(--panel-strong); }
+#feed li.attachment { padding: .85rem 1rem; border-left-color: #8060aa; background: var(--panel-strong); }
+#feed li.attachment.incoming { border-left-color: var(--green); }
 #feed small { display: block; color: var(--purple); font-size: .74rem; font-weight: 700; letter-spacing: .02em; }
 #feed p { margin: .35rem 0 0; white-space: pre-wrap; color: #f5e9bb; }
+.attachment-summary { display: flex; align-items: center; gap: .85rem; margin-top: .7rem; min-width: 0; }
+.attachment-description { min-width: 0; }
+.attachment-icon { position: relative; display: block; flex: 0 0 auto; width: 2rem; height: 2.35rem; border: 2px solid #9a72c7; border-radius: .18rem; opacity: .9; }
+.attachment-icon.file::after { position: absolute; top: -2px; right: -2px; width: .65rem; height: .65rem; content: ""; border-bottom: 2px solid #9a72c7; border-left: 2px solid #9a72c7; background: var(--panel-strong); }
+.attachment-icon.folder { width: 2.5rem; height: 1.75rem; margin-top: .35rem; }
+.attachment-icon.folder::before { position: absolute; top: -.48rem; left: -.12rem; width: 1.05rem; height: .48rem; content: ""; border: 2px solid #9a72c7; border-bottom: 0; border-radius: .18rem .18rem 0 0; background: var(--panel-strong); }
+#feed .attachment-name { margin: 0; overflow-wrap: anywhere; color: #fff0b7; font-size: 1.05rem; font-weight: 700; line-height: 1.25; }
+#feed .attachment-details { margin-top: .15rem; color: var(--muted); font-size: .82rem; }
+#feed .attachment-status { margin-top: .75rem; color: var(--muted); font-size: .78rem; }
+#feed .attachment.incoming .attachment-status { color: #83d794; }
 button { min-height: 44px; padding: .62rem 1rem; cursor: pointer; border: 1px solid #a985d1; border-radius: .25rem; background: #8c64b9; color: #000000; font-weight: 700; }
 button.quiet { min-height: 36px; padding: .35rem .6rem; border-color: var(--line); background: transparent; color: var(--muted); font-size: .78rem; }
 button:disabled { cursor: wait; opacity: .55; }
@@ -69,5 +81,7 @@ textarea::placeholder { color: #92876f; }
   .compose-meta { display: block; }
   #send-help { margin-top: .15rem; }
   #broadcast { min-width: 4.8rem; padding-right: .7rem; padding-left: .7rem; }
+  #feed li.attachment { padding-right: .8rem; padding-left: .8rem; }
+  .attachment-summary { gap: .7rem; }
 }
 @media (prefers-reduced-transparency: reduce) { .compose { background: #070512; backdrop-filter: none; } }

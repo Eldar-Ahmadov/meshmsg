@@ -31,12 +31,14 @@ assert.match(composerCss, /overflow-y:\s*auto/);
 assert.match(cssBlock('main'), /padding:[^;]*var\(--composer-space\)/);
 
 class Element extends EventTarget {
-  constructor() { super(); this.children = []; this.textContent = ''; this.value = ''; }
+  constructor() { super(); this.children = []; this.attributes = {}; this.textContent = ''; this.value = ''; }
   append(child) { child.parent = this; this.children.push(child); }
+  setAttribute(name, value) { this.attributes[name] = value; }
   prepend(child) { child.parent = this; this.children.unshift(child); }
   get lastElementChild() { return this.children.at(-1); }
   remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
   replaceChildren() { this.children = []; }
+  requestSubmit() { this.dispatchEvent(new Event('submit', { cancelable: true })); }
 }
 class Document extends EventTarget {
   constructor() { super(); this.elements = new Map(); this.hidden = false; }
@@ -86,11 +88,45 @@ function submit(body) {
   assert.equal(sent.length, 1);
   assert.equal(el('draft').value, '');
   assert.match(el('outcome').textContent, /Queued locally.*NOT delivered.*daemon event/);
+
+  el('draft').value = 'keyboard send';
+  const shortcut = new Event('keydown', { cancelable: true });
+  Object.defineProperties(shortcut, { ctrlKey: { value: true }, key: { value: 'Enter' } });
+  el('draft').dispatchEvent(shortcut);
+  await settle();
+  assert.equal(sent.length, 2);
+  assert.equal(sent.at(-1).body, 'keyboard send');
+  assert.equal(shortcut.defaultPrevented, true);
   assert.equal(el('feed').children.length, 0, 'POST response created a duplicate optimistic entry');
   source.emit({ type: 'queued', from: 'local-peer', body: 'hello <script>text only</script>', timestamp_ms: 1700000000000, delivery_acknowledged: false });
   assert.equal(el('feed').children.length, 1);
   assert.equal(el('feed').children[0].children[1].textContent, 'hello <script>text only</script>');
   assert.match(el('feed').children[0].children[0].textContent, /Queued locally by local-peer.*not delivered/);
+
+  source.emit({
+    type: 'attachment_offer', direction: 'incoming', from: '<peer>',
+    timestamp_ms: 1700000000100, name: '<img src=x onerror=alert(1)>',
+    kind: 'file', size: 1536, offer: 'must-not-arrive', ticket: 'must-not-arrive'
+  });
+  let card = el('feed').children[0];
+  assert.equal(card.className, 'attachment incoming');
+  assert.equal(card.children[0].textContent, `${new Date(1700000000100).toLocaleTimeString()} · From <peer>`);
+  assert.equal(card.children[1].children[0].attributes['aria-hidden'], 'true');
+  assert.equal(card.children[1].children[1].children[0].textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(card.children[1].children[1].children[1].textContent, 'File · 1.5 KiB');
+  assert.equal(card.children[2].textContent, 'Offer received');
+
+  source.emit({
+    type: 'attachment_shared', direction: 'outgoing', from: 'local-peer',
+    timestamp_ms: 1700000000200, name: 'results.tar', kind: 'directory_tar_v1', size: 4096
+  });
+  card = el('feed').children[0];
+  assert.equal(card.className, 'attachment outgoing');
+  assert.match(card.children[0].textContent, /Shared by local-peer/);
+  assert.equal(card.children[1].children[0].className, 'attachment-icon folder');
+  assert.equal(card.children[1].children[1].children[0].textContent, 'results.tar');
+  assert.equal(card.children[1].children[1].children[1].textContent, 'Directory · 4 KiB');
+  assert.equal(card.children[2].textContent, 'Offer shared · delivery not acknowledged');
 
   sendReply = async () => ({ ok: false, json: async () => ({ outcome: 'not_sent', message: 'Wait one second.' }) });
   submit('failed draft');
@@ -101,7 +137,7 @@ function submit(body) {
   sendReply = async () => { throw new Error('reply lost'); };
   submit('uncertain draft');
   await settle();
-  assert.equal(sent.length, 3);
+  assert.equal(sent.length, 4);
   assert.equal(el('draft').value, 'uncertain draft');
   assert.match(el('outcome').textContent, /Outcome unknown.*No automatic retry/);
 
@@ -110,7 +146,7 @@ function submit(body) {
   submit('pending draft');
   assert.equal(el('broadcast').disabled, true);
   el('composer').dispatchEvent(new Event('submit', { cancelable: true }));
-  assert.equal(sent.length, 4, 'double tap sent twice');
+  assert.equal(sent.length, 5, 'double tap sent twice');
   el('draft').value = 'new edits while submitting';
   resolve({ ok: true, json: async () => ({ type: 'queued' }) });
   await settle();
@@ -119,7 +155,7 @@ function submit(body) {
 
   submit('二'.repeat(1366));
   await settle();
-  assert.equal(sent.length, 4, 'oversized UTF-8 body sent');
+  assert.equal(sent.length, 5, 'oversized UTF-8 body sent');
   for (let i = 0; i < 110; i++) source.emit({ type: 'message', from: '<peer>', body: `<img onerror=alert(1)> ${i}`, timestamp_ms: 1700000000000 + i });
   assert.equal(el('feed').children.length, 100);
   assert.equal(el('feed').children[0].children[1].textContent, '<img onerror=alert(1)> 109');
@@ -136,9 +172,9 @@ function submit(body) {
   assert.equal(EventSource.instances.length, 2);
   EventSource.instances.at(-1).onerror();
   await settle();
-  assert.equal(sent.length, 4, 'reconnection retried a send');
+  assert.equal(sent.length, 5, 'reconnection retried a send');
   assert.match(el('gap').textContent, /NOT retried/);
   el('clear').dispatchEvent(new Event('click'));
   assert.equal(el('feed').children.length, 0);
-  console.log('PASS: accessible live feed, AA primary button contrast, bounded composer, canonical daemon queued event without optimistic duplicate, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
+  console.log('PASS: accessible live feed, AA primary button contrast, bounded composer, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

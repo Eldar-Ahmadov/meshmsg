@@ -223,6 +223,16 @@ fn public_event(value: Value) -> Option<Value> {
             "type":"queued", "from":value["from"], "body":value["body"],
             "timestamp_ms":value["timestamp_ms"], "delivery_acknowledged":false
         })),
+        "attachment_offer" => Some(json!({
+            "type":"attachment_offer", "direction":"incoming", "from":value["from"],
+            "timestamp_ms":value["timestamp_ms"], "name":value["name"],
+            "kind":value["kind"], "size":value["size"]
+        })),
+        "attachment_shared" => Some(json!({
+            "type":"attachment_shared", "direction":"outgoing", "from":value["from"],
+            "timestamp_ms":value["timestamp_ms"], "name":value["name"],
+            "kind":value["kind"], "size":value["size"]
+        })),
         "lagged" => Some(
             json!({"type":"lagged", "message":"Feed gap: daemon dropped events. No history or replay is available."}),
         ),
@@ -543,9 +553,37 @@ mod tests {
     }
 
     #[test]
-    fn only_text_events_are_exposed_and_sse_newlines_are_escaped() {
-        assert!(public_event(json!({"type":"attachment_offer", "token":"secret"})).is_none());
+    fn only_safe_live_metadata_is_exposed_and_sse_newlines_are_escaped() {
         assert!(public_event(json!({"type":"download_progress", "path":"secret"})).is_none());
+        let incoming = public_event(json!({
+            "type":"attachment_offer", "from":"peer", "timestamp_ms":42,
+            "name":"<report>.pdf", "kind":"file", "size":1234,
+            "offer_id":"private-id", "offer":"signed-secret", "ticket":"blob-secret",
+            "path":"private-path", "output":"private-output"
+        }))
+        .unwrap();
+        assert_eq!(
+            incoming,
+            json!({
+                "type":"attachment_offer", "direction":"incoming", "from":"peer",
+                "timestamp_ms":42, "name":"<report>.pdf", "kind":"file", "size":1234
+            })
+        );
+        let outgoing = public_event(json!({
+            "type":"attachment_shared", "from":"local", "timestamp_ms":43,
+            "name":"folder.tar", "kind":"directory_tar_v1", "size":5678,
+            "offer":"signed-secret", "ticket":"blob-secret", "delivery_acknowledged":true
+        }))
+        .unwrap();
+        assert_eq!(
+            outgoing,
+            json!({
+                "type":"attachment_shared", "direction":"outgoing", "from":"local",
+                "timestamp_ms":43, "name":"folder.tar", "kind":"directory_tar_v1", "size":5678
+            })
+        );
+        assert!(!incoming.to_string().contains("secret"));
+        assert!(!outgoing.to_string().contains("secret"));
         let value = public_event(json!({"type":"message", "body":"<script>\ndata: injected\n", "from":"peer", "private":"secret"})).unwrap();
         let frame = String::from_utf8(sse_frame(&value).to_vec()).unwrap();
         assert_eq!(frame.lines().count(), 2);
