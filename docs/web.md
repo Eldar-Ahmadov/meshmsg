@@ -62,7 +62,7 @@ Actual Tailscale proxy/header handling and mobile browser behavior must be check
 
 ## UI semantics and recovery
 
-- **Identity/status:** daemon identity, endpoint availability, topic join state, and neighbor count. None proves delivery. The web UI omits local paths and invites.
+- **Identity/status:** the chat header keeps a compact live-connection and direct-peer summary. Its accessible cog link opens the read-only `/settings` status page, which shows daemon availability, endpoint availability, topic join state, neighbor count, and daemon identity with a manual refresh control. None proves delivery. The web UI omits local paths, invites, capabilities, and operational controls.
 - **Broadcast:** submits exactly once. A successful response means **queued locally, not delivered or acknowledged**. The UI permits at most 4096 UTF-8 body bytes; the signed envelope overhead can make the daemon's actual accepted body smaller. The daemon remains authoritative.
 - **Rejected:** invalid input, a throttle/capacity response, or explicit daemon rejection leaves the draft intact. Correct it and submit manually if appropriate.
 - **Outcome unknown:** connection failures, lost/unexpected replies, and timeouts might happen after a send was queued. The draft stays intact. Check with peers before manually resending; duplicates are possible. Neither server nor UI retries a send. Even an offline connect failure is conservatively reported unknown for a send.
@@ -76,7 +76,7 @@ Only these routes exist:
 
 | Route | Purpose |
 | --- | --- |
-| `GET /`, `/app.css`, `/app.js` | Embedded UI assets |
+| `GET /`, `/settings`, `/app.css`, `/app.js`, `/settings.js` | Embedded chat/status UI and assets |
 | `POST /api/request` | Exactly `{"command":"status"}` or `{"command":"send","body":"text"}`; unknown commands/fields rejected |
 | `GET /api/events` | One local IPC `subscribe` connection streamed as SSE, including incoming messages, local queued sends, and safe read-only incoming/shared attachment metadata |
 

@@ -151,12 +151,17 @@ def main():
                         time.sleep(.05)
 
                 code, headers, html = request('GET', '/')
-                assert code == 200 and b'Broadcast' in html
+                assert code == 200 and b'Broadcast' in html and b'href="/settings"' in html
+                assert b'Local daemon' not in html
                 assert "script-src 'self'" in headers['content-security-policy']
                 assert 'unsafe-inline' not in headers['content-security-policy']
                 assert headers['cache-control'] == 'no-store'
                 assert 'access-control-allow-origin' not in headers
-                for path in ['/app.js', '/app.css']:
+                code, settings_headers, settings_html = request('GET', '/settings')
+                assert code == 200 and b'MESHMSG STATUS' in settings_html and b'href="/"' in settings_html
+                assert settings_headers['content-security-policy'] == headers['content-security-policy']
+                assert all(private not in settings_html.lower() for private in [b'state dir', b'invite', b'offer', b'token', b'ticket'])
+                for path in ['/app.js', '/app.css', '/settings.js']:
                     assert request('GET', path)[0] == 200
                 for path in ['/config.json', '/../config.json', '/api/request?command=stop']:
                     assert request('GET', path)[0] == 404

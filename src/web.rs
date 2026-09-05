@@ -341,6 +341,11 @@ async fn route(
             "text/html; charset=utf-8",
             include_str!("web/index.html"),
         ),
+        (&Method::GET, "/settings") => response(
+            StatusCode::OK,
+            "text/html; charset=utf-8",
+            include_str!("web/settings.html"),
+        ),
         (&Method::GET, "/app.css") => response(
             StatusCode::OK,
             "text/css; charset=utf-8",
@@ -350,6 +355,11 @@ async fn route(
             StatusCode::OK,
             "text/javascript; charset=utf-8",
             include_str!("web/app.js"),
+        ),
+        (&Method::GET, "/settings.js") => response(
+            StatusCode::OK,
+            "text/javascript; charset=utf-8",
+            include_str!("web/settings.js"),
         ),
         (&Method::GET, "/api/events") => events(state).await,
         (&Method::POST, "/api/request") => {
@@ -610,10 +620,21 @@ mod tests {
     #[test]
     fn embedded_ui_uses_text_rendering_and_restrictive_csp() {
         let js = include_str!("web/app.js");
-        assert!(!js.contains("innerHTML"));
-        assert!(!js.contains("localStorage"));
-        assert!(js.contains("textContent"));
+        let settings_js = include_str!("web/settings.js");
+        let index = include_str!("web/index.html");
+        let settings = include_str!("web/settings.html");
+        for source in [js, settings_js] {
+            assert!(!source.contains("innerHTML"));
+            assert!(!source.contains("localStorage"));
+            assert!(source.contains("textContent"));
+        }
         assert!(js.contains("feed.children.length > 100"));
+        assert!(index.contains("href=\"/settings\""));
+        assert!(!index.contains("Local daemon"));
+        assert!(settings.contains("MESHMSG STATUS"));
+        for private in ["state dir", "invite", "offer", "token", "ticket"] {
+            assert!(!settings.to_ascii_lowercase().contains(private));
+        }
         let response = response(StatusCode::OK, "text/html", "test");
         assert_eq!(response.headers()["content-security-policy"], CSP);
         assert!(!CSP.contains("unsafe-inline"));

@@ -5,9 +5,22 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 const html = fs.readFileSync('src/web/index.html', 'utf8');
+const settingsHtml = fs.readFileSync('src/web/settings.html', 'utf8');
 const css = fs.readFileSync('src/web/app.css', 'utf8');
 const js = fs.readFileSync('src/web/app.js', 'utf8');
+const settingsJs = fs.readFileSync('src/web/settings.js', 'utf8');
 assert.match(html, /<ol id="feed"[^>]*aria-live="polite"[^>]*aria-relevant="additions"/);
+assert.match(html, /<a class="settings-link" href="\/settings" aria-label="[^"]+">/);
+assert.doesNotMatch(html, /Local daemon|Sending identity/);
+assert.match(settingsHtml, /<h1>MESHMSG STATUS<\/h1>/);
+assert.match(settingsHtml, /<button id="status-refresh"[^>]*aria-label="Refresh status"/);
+assert.match(settingsHtml, /<p id="status-message" role="status" aria-live="polite">/);
+for (const privateLabel of ['state dir', 'invite', 'offer', 'token', 'ticket']) {
+  assert.ok(!settingsHtml.toLowerCase().includes(privateLabel), `status page exposed ${privateLabel}`);
+}
+const mobileCss = css.slice(css.indexOf('@media (max-width: 38rem)'), css.indexOf('@media (prefers-reduced-transparency'));
+assert.match(mobileCss, /\.compose h2, \.compose-meta \{ display: none; \}/);
+assert.doesNotMatch(mobileCss, /#outcome[^}]*display:\s*none/);
 
 function cssBlock(selector) {
   const match = css.match(new RegExp(`(?:^|\\n)${selector} \\{([^}]*)\\}`));
@@ -31,7 +44,9 @@ assert.match(composerCss, /overflow-y:\s*auto/);
 assert.match(cssBlock('main'), /padding:[^;]*var\(--composer-space\)/);
 
 class Element extends EventTarget {
-  constructor() { super(); this.children = []; this.attributes = {}; this.textContent = ''; this.value = ''; }
+  constructor() { super(); this.children = []; this.attributes = {}; this._textContent = ''; this.textContentWrites = []; this.value = ''; }
+  get textContent() { return this._textContent; }
+  set textContent(value) { this._textContent = value; this.textContentWrites.push(value); }
   append(child) { child.parent = this; this.children.push(child); }
   setAttribute(name, value) { this.attributes[name] = value; }
   prepend(child) { child.parent = this; this.children.unshift(child); }
@@ -81,7 +96,7 @@ function submit(body) {
 
 (async () => {
   await settle();
-  assert.match(el('status').textContent, /Daemon running/);
+  assert.equal(el('status').textContent, '1 direct peer');
   const source = EventSource.instances.at(-1);
   submit('hello <script>text only</script>');
   await settle();
@@ -176,5 +191,42 @@ function submit(body) {
   assert.match(el('gap').textContent, /NOT retried/);
   el('clear').dispatchEvent(new Event('click'));
   assert.equal(el('feed').children.length, 0);
-  console.log('PASS: accessible live feed, AA primary button contrast, bounded composer, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
+
+  const statusDocument = new Document();
+  const statusRequests = [];
+  let statusInterval;
+  const statusContext = vm.createContext({
+    document: statusDocument, window: new EventTarget(), Event, AbortController, console,
+    setTimeout: (fn) => { timers.set(++timerId, fn); return timerId; },
+    clearTimeout: (id) => timers.delete(id), setInterval: (fn) => { statusInterval = fn; },
+    fetch: async (_, options) => {
+      statusRequests.push(JSON.parse(options.body));
+      return { ok: true, json: async () => ({
+        type: 'status', running: true, endpoint_online: true, topic_joined: true,
+        neighbors: 2, peer: '<safe-text-peer>', socket: '/private', invite: 'private-token'
+      }) };
+    }
+  });
+  vm.runInContext(settingsJs, statusContext);
+  await settle();
+  const statusEl = (id) => statusDocument.getElementById(id);
+  assert.deepEqual(statusRequests, [{ command: 'status' }]);
+  assert.equal(statusEl('daemon-value').textContent, 'Running');
+  assert.equal(statusEl('endpoint-value').textContent, 'Online');
+  assert.equal(statusEl('topic-value').textContent, 'Joined');
+  assert.equal(statusEl('neighbors-value').textContent, '2');
+  assert.equal(statusEl('peer-value').textContent, '<safe-text-peer>');
+  assert.ok(![...statusDocument.elements.values()].some((element) => /private-token|\/private/.test(element.textContent)));
+  statusEl('status-message').textContentWrites = [];
+  await statusInterval();
+  assert.equal(statusRequests.length, 2);
+  assert.deepEqual(statusEl('status-message').textContentWrites, [], 'unchanged periodic status was announced');
+  statusEl('status-refresh').dispatchEvent(new Event('click'));
+  await settle();
+  assert.equal(statusRequests.length, 3);
+  assert.deepEqual(statusEl('status-message').textContentWrites, [
+    'Refreshing status…', 'Status refreshed. Read-only; peer count is not delivery proof.'
+  ]);
+
+  console.log('PASS: accessible live feed and status route, silent unchanged periodic polling, mobile 38rem compose metadata hiding without outcome hiding, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

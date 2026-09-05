@@ -14,18 +14,16 @@
 <h1>meshmsg</h1>
 <p class="eyebrow">Live topic console</p>
 </div>
+<div class="masthead-actions">
 <div class="connection-state">
 <p id="connection" role="status">Connecting live feed…</p>
-<p>Private tailnet · no app login</p>
+<p id="status" role="status">Checking peer summary…</p>
+</div>
+<a class="settings-link" href="/settings" aria-label="Open meshmsg status">
+<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9.6 2h4.8l.6 2.4c.5.2 1 .5 1.4.8l2.3-.7 2.4 4.1-1.8 1.7a8 8 0 0 1 0 1.6l1.8 1.7-2.4 4.1-2.3-.7c-.4.3-.9.6-1.4.8l-.6 2.4H9.6L9 17.8c-.5-.2-1-.5-1.4-.8l-2.3.7-2.4-4.1 1.8-1.7a8 8 0 0 1 0-1.6L2.9 8.6l2.4-4.1 2.3.7c.4-.3.9-.6 1.4-.8L9.6 2Z"/><circle cx="12" cy="11.2" r="3"/></svg>
+</a>
 </div>
 </header>
-<section class="daemon" aria-labelledby="identity-heading">
-<div>
-<h2 id="identity-heading">Local daemon</h2>
-<p id="status" role="status">Checking daemon…</p>
-</div>
-<details><summary>Sending identity</summary><p id="identity">Unknown until daemon connects</p></details>
-</section>
 <section class="stream" aria-labelledby="feed-heading">
 <div class="feed-heading"><div><p class="eyebrow">Now</p><h2 id="feed-heading">Live feed</h2></div><button id="clear" class="quiet" type="button">Clear</button></div>
 <p id="gap" role="status"></p>
@@ -36,7 +34,7 @@
 <form id="composer">
 <label class="visually-hidden" for="draft">Message to this daemon's topic</label>
 <div class="compose-row">
-<textarea id="draft" rows="2" placeholder="Message the topic…" required aria-describedby="size send-help" spellcheck="true"></textarea>
+<textarea id="draft" rows="2" placeholder="Message the topic…" required aria-describedby="size send-help outcome" spellcheck="true"></textarea>
 <button id="broadcast" type="submit">Send</button>
 </div>
 <div class="compose-meta"><p id="size">0 / 4096 UTF-8 bytes</p><p id="send-help">Ctrl+Enter to send. Queues locally; not delivery acknowledgement. Never retried automatically.</p></div>

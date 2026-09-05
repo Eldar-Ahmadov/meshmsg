@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>meshmsg · Status</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/settings.js" defer></script>
+</head>
+<body>
+<main class="status-page">
+<header class="status-masthead">
+<a class="back-link" href="/" aria-label="Back to chat"><span aria-hidden="true">←</span><span>Chat</span></a>
+<h1>MESHMSG STATUS</h1>
+<button id="status-refresh" class="icon-button" type="button" aria-label="Refresh status">
+<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+</button>
+</header>
+<section class="status-panel" aria-labelledby="status-details-heading">
+<h2 id="status-details-heading" class="visually-hidden">Daemon status details</h2>
+<dl class="status-list">
+<div><dt>Daemon</dt><dd id="daemon-value">Checking…</dd></div>
+<div><dt>Endpoint</dt><dd id="endpoint-value">Checking…</dd></div>
+<div><dt>Topic</dt><dd id="topic-value">Checking…</dd></div>
+<div><dt>Direct peers</dt><dd id="neighbors-value">Checking…</dd></div>
+<div class="identity-row"><dt>Peer ID</dt><dd id="peer-value">Checking…</dd></div>
+</dl>
+<p id="status-message" role="status" aria-live="polite">Checking daemon…</p>
+</section>
+<noscript>JavaScript is required to check daemon status.</noscript>
+</main>
+</body>
+</html>

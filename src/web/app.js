@@ -111,11 +111,10 @@ async function refreshStatus() {
   try {
     const { ok, value } = await request({ command: 'status' });
     if (!ok || value.type !== 'status') throw new Error('offline');
-    byId('identity').textContent = value.peer || 'Unknown';
-    byId('status').textContent = `Daemon running · endpoint ${value.endpoint_online ? 'online' : 'offline'} · topic ${value.topic_joined ? 'joined' : 'not joined'} · ${value.neighbors ?? '?'} neighbors (not delivery proof)`;
+    const peers = Number.isInteger(value.neighbors) && value.neighbors >= 0 ? value.neighbors : '?';
+    byId('status').textContent = `${peers} direct ${peers === 1 ? 'peer' : 'peers'}`;
   } catch (_) {
-    byId('status').textContent = 'Daemon unavailable or web connection lost. Start/restart the daemon separately.';
-    byId('identity').textContent = 'Unconfirmed while offline';
+    byId('status').textContent = 'Peer summary unavailable';
   } finally { statusBusy = false; }
 }
 
@@ -146,7 +145,6 @@ function connect() {
       case 'connected':
         reconnectDelay = 1000;
         connection('Connected · live only', true);
-        byId('identity').textContent = value.peer || 'Unknown';
         refreshStatus();
         break;
       case 'message':
