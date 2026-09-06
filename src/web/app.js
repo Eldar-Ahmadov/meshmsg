@@ -7,8 +7,9 @@ let sending = false;
 let source = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
-let statusBusy = false;
-let peersBusy = false;
+const snapshotTimeoutMs = 8000;
+let statusRequest = null;
+let peerStateGeneration = 0;
 let peerDirectoryReady = false;
 let directoryEpoch = null;
 let directoryRevision = null;
@@ -111,18 +112,24 @@ async function request(value) {
 }
 
 async function refreshStatus() {
-  if (statusBusy || document.hidden) return;
-  statusBusy = true;
+  if (statusRequest || document.hidden) return;
+  const requestState = { generation: peerStateGeneration };
+  statusRequest = requestState;
   try {
     const { ok, value } = await request({ command: 'status' });
     if (!ok || value.type !== 'status') throw new Error('offline');
-    if (!peerDirectoryReady) {
+    if (requestState.generation === peerStateGeneration && !document.hidden
+        && !peerDirectoryReady) {
       const peers = Number.isInteger(value.neighbors) && value.neighbors >= 0 ? value.neighbors : '?';
       byId('status').textContent = `${peers} direct ${peers === 1 ? 'peer' : 'peers'}`;
     }
   } catch (_) {
-    byId('status').textContent = 'Peer summary unavailable';
-  } finally { statusBusy = false; }
+    if (requestState.generation === peerStateGeneration && !document.hidden) {
+      byId('status').textContent = 'Peer summary unavailable';
+    }
+  } finally {
+    if (statusRequest === requestState) statusRequest = null;
+  }
 }
 
 function updatePeerSummary() {
@@ -130,7 +137,30 @@ function updatePeerSummary() {
   byId('status').textContent = `${count} current ${count === 1 ? 'peer' : 'peers'}`;
 }
 
+function invalidatePeers() {
+  peerStateGeneration += 1;
+  // Do not let a request from the superseded connection/visibility generation
+  // block a fresh status request. Its eventual result is ignored above.
+  statusRequest = null;
+  currentPeers.clear();
+  directoryEpoch = null;
+  directoryRevision = null;
+  peerDirectoryReady = false;
+  byId('status').textContent = 'Peer directory unavailable';
+}
+
+function validSnapshot(value) {
+  return value.schema_version === 2
+    && typeof value.directory_epoch === 'string'
+    && Number.isInteger(value.directory_revision) && value.directory_revision >= 0
+    && value.self && typeof value.self.public_key === 'string'
+    && Array.isArray(value.peers)
+    && value.peers.every((peer) => peer && typeof peer.public_key === 'string'
+      && peer.online === true);
+}
+
 function replacePeers(value) {
+  if (!validSnapshot(value)) return false;
   directoryEpoch = value.directory_epoch;
   directoryRevision = value.directory_revision;
   currentPeers.clear();
@@ -143,106 +173,110 @@ function replacePeers(value) {
   }
   peerDirectoryReady = true;
   updatePeerSummary();
+  return true;
 }
 
 function updatePeer(value, expired) {
   if (value.directory_epoch !== directoryEpoch || value.directory_revision !== directoryRevision + 1) {
-    gap('Peer directory changed or an event was missed; refreshing authoritative state.');
-    refreshPeers();
-    return;
+    gap('Peer directory changed or an event was missed; reconnecting for authoritative state.');
+    return false;
   }
   directoryRevision = value.directory_revision;
   const peer = value && value.peer;
-  if (!peer || typeof peer.public_key !== 'string') return;
+  if (!peer || typeof peer.public_key !== 'string'
+      || peer.online !== !expired) return false;
   if (expired) currentPeers.delete(peer.public_key);
   else currentPeers.set(peer.public_key, peer);
   peerDirectoryReady = true;
   updatePeerSummary();
   const alias = typeof peer.alias === 'string' ? ` (${peer.alias})` : '';
   addEntry(`${expired ? 'Peer expired' : value.type === 'peer_discovered' ? 'Peer discovered' : 'Peer updated'}: ${peer.public_key}${alias}`, undefined, undefined, 'peer');
-}
-
-async function refreshPeers() {
-  if (peersBusy || document.hidden) return;
-  peersBusy = true;
-  try {
-    const { ok, value } = await request({ command: 'peers' });
-    if (!ok || value.type !== 'peers_snapshot') throw new Error('unavailable');
-    replacePeers(value);
-  } catch (_) {
-    currentPeers.clear();
-    directoryEpoch = null;
-    directoryRevision = null;
-    peerDirectoryReady = false;
-    byId('status').textContent = 'Peer directory unavailable';
-  } finally { peersBusy = false; }
+  return true;
 }
 
 function gap(message) {
   byId('gap').textContent = message;
 }
 
-function reconnect() {
+function reconnect(expectedSource) {
+  // Closed EventSources can still dispatch queued callbacks. Only the current
+  // subscription may alter connection state or schedule its replacement.
+  if (expectedSource !== undefined && expectedSource !== source) return;
+  if (source && source.snapshotTimer) clearTimeout(source.snapshotTimer);
   if (source) source.close();
   source = null;
+  invalidatePeers();
   connection('Live feed disconnected · reconnecting', false);
   gap('Feed gap possible. Messages during disconnection cannot be replayed. Sends are NOT retried.');
   if (reconnectTimer || document.hidden) return;
-  reconnectTimer = setTimeout(() => {
+  const delay = Math.min(reconnectDelay + Math.random() * 500, 15000);
+  const timer = setTimeout(() => {
+    if (reconnectTimer !== timer) return;
     reconnectTimer = null;
     connect();
-  }, reconnectDelay + Math.random() * 500);
+  }, delay);
+  reconnectTimer = timer;
   reconnectDelay = Math.min(reconnectDelay * 2, 15000);
 }
 
 function connect() {
   if (source || document.hidden) return;
-  source = new EventSource('/api/events');
-  source.onmessage = (event) => {
+  const nextSource = new EventSource('/api/events');
+  let connected = false;
+  let initialized = false;
+  nextSource.snapshotTimer = setTimeout(() => reconnect(nextSource), snapshotTimeoutMs);
+  source = nextSource;
+  nextSource.onmessage = (event) => {
+    if (source !== nextSource) return;
     let value;
-    try { value = JSON.parse(event.data); } catch (_) { reconnect(); return; }
+    try { value = JSON.parse(event.data); } catch (_) { reconnect(nextSource); return; }
     switch (value.type) {
       case 'connected':
-        reconnectDelay = 1000;
-        connection('Connected · live only', true);
+        if (connected || initialized) { reconnect(nextSource); break; }
+        connected = true;
+        connection('Connected · synchronizing peers', true);
         refreshStatus();
         break;
       case 'message':
         addEntry(`From ${value.from}`, value.body, value.timestamp_ms, 'message');
         break;
       case 'queued':
-        addEntry(`Queued locally by ${value.from} · not delivered`, value.body, value.timestamp_ms, 'queued');
+        addEntry(`Queued locally by ${value.from} · delivery unconfirmed`, value.body, value.timestamp_ms, 'queued');
         break;
       case 'attachment_offer':
       case 'attachment_shared':
         addAttachment(value);
         break;
       case 'peers_snapshot':
-        replacePeers(value);
+        if (!connected || initialized || !replacePeers(value)) {
+          reconnect(nextSource);
+          break;
+        }
+        initialized = true;
+        clearTimeout(nextSource.snapshotTimer);
+        nextSource.snapshotTimer = null;
+        reconnectDelay = 1000;
+        connection('Connected · live only', true);
         break;
       case 'peer_discovered':
       case 'peer_updated':
-        updatePeer(value, false);
+        if (!initialized || !updatePeer(value, false)) reconnect(nextSource);
         break;
       case 'peer_expired':
-        updatePeer(value, true);
-        break;
-      case 'peer_up':
-      case 'peer_down':
-        addEntry(`${value.type === 'peer_up' ? 'Peer joined' : 'Peer left'}: ${value.peer}`, undefined, undefined, 'peer');
+        if (!initialized || !updatePeer(value, true)) reconnect(nextSource);
         break;
       case 'lagged':
         gap(value.message);
-        addEntry('Feed gap · messages dropped; refreshing peer directory', undefined, undefined, 'gap');
-        refreshPeers();
+        addEntry('Feed gap · messages dropped; reconnecting for peer directory', undefined, undefined, 'gap');
+        reconnect(nextSource);
         break;
       case 'offline':
         byId('status').textContent = 'Daemon offline or restarting.';
-        reconnect();
+        reconnect(nextSource);
         break;
     }
   };
-  source.onerror = reconnect;
+  nextSource.onerror = () => reconnect(nextSource);
 }
 
 draft.addEventListener('input', () => {
@@ -268,7 +302,7 @@ byId('composer').addEventListener('submit', async (event) => {
   try {
     const { ok, value } = await request({ command: 'send', body });
     if (ok && value.type === 'queued') {
-      byId('outcome').textContent = 'Queued locally — NOT delivered or acknowledged. The live feed uses the daemon event; feed gaps are not replayed.';
+      byId('outcome').textContent = 'Queued locally — delivery unconfirmed and not acknowledged. The live feed uses the daemon event; feed gaps are not replayed.';
       // The daemon's queued event is the one canonical feed entry in every tab.
       // Never erase edits made while the submission was in flight.
       if (draft.value === body) {
@@ -290,10 +324,12 @@ byId('composer').addEventListener('submit', async (event) => {
 byId('clear').addEventListener('click', () => feed.replaceChildren());
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
+    if (source && source.snapshotTimer) clearTimeout(source.snapshotTimer);
     if (source) source.close();
     source = null;
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+    invalidatePeers();
     connection('Live feed paused while hidden', false);
     gap('Feed gap: this tab was hidden or the phone slept. No history or replay.');
   } else { refreshStatus(); connect(); }

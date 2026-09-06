@@ -72,17 +72,27 @@ class EventSource {
 const document = new Document();
 const window = new EventTarget();
 const timers = new Map();
+const scheduledTimerIds = [];
 let timerId = 0;
+const deterministicMath = Object.create(Math);
+deterministicMath.random = () => 0;
 const sent = [];
 let peersRequests = 0;
+let statusReply = async () => ({ ok: true, json: async () => ({ type: 'status', peer: 'local-peer', running: true, endpoint_online: true, topic_joined: true, neighbors: 1 }) });
 let sendReply = async () => ({ ok: true, json: async () => ({ type: 'queued' }) });
 const context = vm.createContext({
   document, window, EventSource, Event, TextEncoder, AbortController, console,
-  setTimeout: (fn) => { timers.set(++timerId, fn); return timerId; },
-  clearTimeout: (id) => timers.delete(id), setInterval: () => {},
+  Math: deterministicMath,
+  setTimeout: (fn, delay) => {
+    const id = ++timerId;
+    scheduledTimerIds.push(id);
+    timers.set(id, { fn, delay, cancelled: false });
+    return id;
+  },
+  clearTimeout: (id) => { const timer = timers.get(id); if (timer) timer.cancelled = true; }, setInterval: () => {},
   fetch: async (_, options) => {
     const request = JSON.parse(options.body);
-    if (request.command === 'status') return { ok: true, json: async () => ({ type: 'status', peer: 'local-peer', running: true, endpoint_online: true, topic_joined: true, neighbors: 1 }) };
+    if (request.command === 'status') return statusReply();
     if (request.command === 'peers') {
       peersRequests += 1;
       return { ok: true, json: async () => ({
@@ -99,6 +109,14 @@ const context = vm.createContext({
 vm.runInContext(js, context);
 const el = (id) => document.getElementById(id);
 const settle = () => new Promise(setImmediate);
+function runTimer(id, { stale = false } = {}) {
+  const timer = timers.get(id);
+  assert.ok(timer, `timer ${id} was not recorded`);
+  assert.ok(stale || !timer.cancelled, `timer ${id} was cancelled`);
+  timer.cancelled = true;
+  timer.fn();
+}
+const activeTimers = () => [...timers].filter(([, timer]) => !timer.cancelled);
 function submit(body) {
   el('draft').value = body;
   el('composer').dispatchEvent(new Event('submit', { cancelable: true }));
@@ -107,8 +125,8 @@ function submit(body) {
 (async () => {
   await settle();
   assert.equal(el('status').textContent, '1 direct peer');
-  const source = EventSource.instances.at(-1);
-  source.emit({
+  let source = EventSource.instances.at(-1);
+  const snapshot = {
     type: 'peers_snapshot', schema_version: 2, generated_at_ms: 1700000000000,
     directory_epoch: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', directory_revision: 0,
     self: { public_key: 'local-peer', alias: 'local', online: true },
@@ -116,7 +134,31 @@ function submit(body) {
       { public_key: 'peer-a', alias: null, online: true, last_seen_ms: 1, expires_at_ms: 2 },
       { public_key: 'peer-b', alias: 'bravo', online: true, last_seen_ms: 1, expires_at_ms: 2 }
     ]
+  };
+  source.emit(snapshot);
+  assert.equal(source.closed, true, 'snapshot before connected was accepted');
+  assert.equal(el('status').textContent, 'Peer directory unavailable');
+  let reconnectTimerId = scheduledTimerIds.at(-1);
+  assert.equal(timers.get(reconnectTimerId).delay, 1000);
+  runTimer(reconnectTimerId);
+
+  source = EventSource.instances.at(-1);
+  source.emit({ type: 'connected' });
+  source.emit({
+    type: 'peer_discovered', schema_version: 2,
+    directory_epoch: snapshot.directory_epoch, directory_revision: 1,
+    peer: { public_key: 'too-early', alias: null, online: true }
   });
+  assert.equal(source.closed, true, 'pre-snapshot lifecycle event was accepted');
+  assert.equal(el('status').textContent, 'Peer directory unavailable');
+  reconnectTimerId = scheduledTimerIds.at(-1);
+  assert.equal(timers.get(reconnectTimerId).delay, 2000, 'connected reset backoff before a snapshot');
+  runTimer(reconnectTimerId);
+
+  source = EventSource.instances.at(-1);
+  source.emit({ type: 'connected' });
+  assert.equal(el('status').textContent, 'Peer directory unavailable');
+  source.emit(snapshot);
   assert.equal(el('status').textContent, '2 current peers');
   source.emit({
     type: 'peer_discovered', schema_version: 2,
@@ -144,7 +186,7 @@ function submit(body) {
   await settle();
   assert.equal(sent.length, 1);
   assert.equal(el('draft').value, '');
-  assert.match(el('outcome').textContent, /Queued locally.*NOT delivered.*daemon event/);
+  assert.match(el('outcome').textContent, /Queued locally.*delivery unconfirmed.*not acknowledged.*daemon event/);
 
   el('draft').value = 'keyboard send';
   const shortcut = new Event('keydown', { cancelable: true });
@@ -158,7 +200,11 @@ function submit(body) {
   source.emit({ type: 'queued', from: 'local-peer', body: 'hello <script>text only</script>', timestamp_ms: 1700000000000, delivery_acknowledged: false });
   assert.equal(el('feed').children.length, 1);
   assert.equal(el('feed').children[0].children[1].textContent, 'hello <script>text only</script>');
-  assert.match(el('feed').children[0].children[0].textContent, /Queued locally by local-peer.*not delivered/);
+  assert.match(el('feed').children[0].children[0].textContent, /Queued locally by local-peer.*delivery unconfirmed/);
+  const feedLength = el('feed').children.length;
+  source.emit({ type: 'peer_up', peer: '<low-level-neighbor>' });
+  source.emit({ type: 'peer_down', peer: '<low-level-neighbor>' });
+  assert.equal(el('feed').children.length, feedLength, 'low-level neighbor events were displayed');
 
   source.emit({
     type: 'attachment_offer', direction: 'incoming', from: '<peer>',
@@ -217,21 +263,82 @@ function submit(body) {
   assert.equal(el('feed').children.length, 100);
   assert.equal(el('feed').children[0].children[1].textContent, '<img onerror=alert(1)> 109');
   assert.equal(el('feed').children[0].children[0].textContent, `${new Date(1700000000109).toLocaleTimeString()} · From <peer>`);
+  let resolveStaleStatus;
+  statusReply = () => new Promise((resolveStatus) => { resolveStaleStatus = resolveStatus; });
+  window.dispatchEvent(new Event('online'));
+  await settle();
   source.emit({ type: 'lagged', message: 'Feed gap: dropped messages.' });
   assert.match(el('gap').textContent, /Feed gap/);
+  assert.equal(source.closed, true);
+  assert.equal(el('status').textContent, 'Peer directory unavailable', 'lag left stale peers current');
+  assert.equal(peersRequests, 0, 'lag recovery raced the event stream with an HTTP snapshot');
+  reconnectTimerId = scheduledTimerIds.at(-1);
+  assert.equal(timers.get(reconnectTimerId).delay, 1000, 'authoritative snapshot did not reset backoff');
+  resolveStaleStatus({ ok: true, json: async () => ({ type: 'status', neighbors: 99 }) });
+  statusReply = async () => ({ ok: true, json: async () => ({ type: 'status', neighbors: 1 }) });
   await settle();
-  assert.equal(peersRequests, 1, 'lagged feed did not request an authoritative peer snapshot');
-  assert.equal(el('status').textContent, '1 current peer');
+  assert.equal(el('status').textContent, 'Peer directory unavailable', 'stale status response overwrote lag invalidation');
+  runTimer(reconnectTimerId);
+  const recoveredSource = EventSource.instances.at(-1);
+  const staleRecoveredSnapshotTimer = recoveredSource.snapshotTimer;
+  assert.notEqual(recoveredSource, source);
+  recoveredSource.emit({ type: 'connected' });
+  recoveredSource.emit({
+    type: 'peers_snapshot', schema_version: 2, generated_at_ms: 1700000001100,
+    directory_epoch: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', directory_revision: 11,
+    self: { public_key: 'local-peer', alias: 'local', online: true },
+    peers: [
+      { public_key: 'revision-11-a', alias: null, online: true },
+      { public_key: 'revision-11-b', alias: null, online: true }
+    ]
+  });
+  assert.equal(el('status').textContent, '2 current peers');
+  await settle();
+  source.emit({
+    type: 'peers_snapshot', schema_version: 2, generated_at_ms: 1700000001000,
+    directory_epoch: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', directory_revision: 10,
+    self: { public_key: 'local-peer', alias: 'local', online: true },
+    peers: [{ public_key: 'stale-revision-10', alias: null, online: true }]
+  });
+  assert.equal(el('status').textContent, '2 current peers', 'delayed revision 10 replaced revision 11');
+  source.onerror();
+  assert.equal(activeTimers().length, 0, 'stale EventSource callback scheduled a reconnect');
   assert.equal(sent.length, 5, 'peer snapshot recovery was treated as a send');
 
+  let resolveHiddenStatus;
+  statusReply = () => new Promise((resolveStatus) => { resolveHiddenStatus = resolveStatus; });
+  window.dispatchEvent(new Event('online'));
+  await settle();
   document.hidden = true;
   document.dispatchEvent(new Event('visibilitychange'));
-  assert.equal(source.closed, true);
+  assert.equal(recoveredSource.closed, true);
+  assert.equal(el('status').textContent, 'Peer directory unavailable', 'hidden tab left stale peers current');
   assert.match(el('gap').textContent, /phone slept/);
+  resolveHiddenStatus({ ok: true, json: async () => ({ type: 'status', neighbors: 77 }) });
+  statusReply = async () => ({ ok: true, json: async () => ({ type: 'status', neighbors: 1 }) });
+  await settle();
+  assert.equal(el('status').textContent, 'Peer directory unavailable', 'stale status response overwrote hide invalidation');
   document.hidden = false;
   document.dispatchEvent(new Event('visibilitychange'));
-  assert.equal(EventSource.instances.length, 2);
-  EventSource.instances.at(-1).onerror();
+  assert.equal(EventSource.instances.length, 5);
+  await settle();
+  recoveredSource.onerror();
+  assert.equal(activeTimers().length, 1, 'hidden/closed EventSource callback disturbed the current subscription');
+  const timedOutSource = EventSource.instances.at(-1);
+  runTimer(staleRecoveredSnapshotTimer, { stale: true });
+  assert.equal(EventSource.instances.at(-1), timedOutSource, 'cancelled stale snapshot timer replaced the newer source');
+  assert.equal(activeTimers().length, 1, 'cancelled stale snapshot timer disturbed current timers');
+  runTimer(timedOutSource.snapshotTimer);
+  assert.equal(timedOutSource.closed, true, 'startup snapshot timeout did not close the source');
+  assert.equal(el('status').textContent, 'Peer directory unavailable');
+  reconnectTimerId = scheduledTimerIds.at(-1);
+  assert.equal(timers.get(reconnectTimerId).delay, 1000);
+  timedOutSource.onerror();
+  assert.equal(activeTimers().length, 1, 'timed-out EventSource callback scheduled another reconnect');
+  runTimer(reconnectTimerId);
+  const newestSource = EventSource.instances.at(-1);
+  runTimer(reconnectTimerId, { stale: true });
+  assert.equal(EventSource.instances.at(-1), newestSource, 'stale reconnect timer replaced the newer source');
   await settle();
   assert.equal(sent.length, 5, 'reconnection retried a send');
   assert.match(el('gap').textContent, /NOT retried/);
@@ -243,8 +350,8 @@ function submit(body) {
   let statusInterval;
   const statusContext = vm.createContext({
     document: statusDocument, window: new EventTarget(), Event, AbortController, console,
-    setTimeout: (fn) => { timers.set(++timerId, fn); return timerId; },
-    clearTimeout: (id) => timers.delete(id), setInterval: (fn) => { statusInterval = fn; },
+    setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay, cancelled: false }); return id; },
+    clearTimeout: (id) => { const timer = timers.get(id); if (timer) timer.cancelled = true; }, setInterval: (fn) => { statusInterval = fn; },
     fetch: async (_, options) => {
       statusRequests.push(JSON.parse(options.body));
       return { ok: true, json: async () => ({
@@ -274,5 +381,5 @@ function submit(body) {
     'Refreshing status…', 'Status refreshed. Read-only; peer count is not delivery proof.'
   ]);
 
-  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, authoritative lag recovery, silent unchanged periodic polling, mobile 38rem compose metadata hiding without outcome hiding, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
+  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, atomic lag recovery without stale snapshot/callback rollback, silent unchanged periodic polling, mobile 38rem compose metadata hiding without outcome hiding, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

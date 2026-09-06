@@ -87,7 +87,6 @@ async fn run() -> Result<()> {
                 }
                 AliasCommand::Set { alias } => AliasConfig::set(&dir, &alias)?,
                 AliasCommand::Clear => AliasConfig::clear(&dir)?,
-                AliasCommand::Disable => AliasConfig::disable(&dir)?,
                 AliasCommand::ResetHostname => AliasConfig::reset_hostname(&dir)?,
             };
             let value = serde_json::json!({

@@ -85,6 +85,10 @@ python3 -c 'import json,sys; events=[json.loads(line) for line in open(sys.argv[
 (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket.txt) \
   | grep -q '"type":"download_complete"'
 cmp "$ROOT/source.txt" "$ROOT/raw-ticket.txt" || fail "raw-ticket download differs"
+printf '%s\n' "$FILE_OFFER" >"$ROOT/signed-offer.txt"
+(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download --offer-file signed-offer.txt --output received-from-file.txt) \
+  | grep -q '"type":"download_complete"'
+cmp "$ROOT/source.txt" "$ROOT/received-from-file.txt" || fail "offer-file download differs"
 printf '%s\n' "$FILE_OFFER" \
   | (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download --offer-stdin --output received.txt) \
   | grep -q '"type":"download_complete"'

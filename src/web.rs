@@ -361,10 +361,6 @@ fn public_event(value: Value) -> Option<Value> {
         "lagged" => Some(
             json!({"type":"lagged", "message":"Feed gap: daemon dropped events. No history or replay is available."}),
         ),
-        event_type @ ("peer_up" | "peer_down") => {
-            let peer = public_key(&value["peer"])?;
-            Some(json!({"type":event_type, "peer":peer}))
-        }
         _ => None,
     }
 }
@@ -382,9 +378,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
         let _permit = permit;
         let opened = timeout(IPC_TIMEOUT, async {
             let mut reader = ipc::subscribe(&state.dir).await?;
-            let first = ipc::read_subscription(&mut reader)
-                .await?
-                .context("daemon closed")?;
+            let first = reader.read().await?.context("daemon closed")?;
             anyhow::ensure!(
                 first["type"] == "connected",
                 "invalid subscription handshake"
@@ -407,7 +401,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
         loop {
             // Keep the read future alive across heartbeats: canceling a partial IPC
             // line would silently corrupt framing when the daemon resumes writing.
-            let read = ipc::read_subscription(&mut reader);
+            let read = reader.read();
             tokio::pin!(read);
             let value = loop {
                 tokio::select! {
@@ -741,12 +735,12 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(connected, json!({"type":"connected"}));
-        for malformed in [
-            json!({"type":"peer_up", "peer":[{"endpoint":"private-route"}]}),
+        for low_level_neighbor_event in [
+            json!({"type":"peer_up", "peer":"2su5Z4MwjA5XsXQFa4c8sEqi2zS6SLLXv4k7Fv9VwK8"}),
             json!({"type":"peer_down", "peer":"10.0.0.1:443"}),
-            json!({"type":"peer_up", "peer":"not-a-canonical-public-key"}),
+            json!({"type":"peer_up", "peer":[{"endpoint":"private-route"}]}),
         ] {
-            assert!(public_event(malformed).is_none());
+            assert!(public_event(low_level_neighbor_event).is_none());
         }
         let malformed_status = public_status(&json!({
             "type":"status", "peer":{"endpoint":"private-route", "body":"secret"},

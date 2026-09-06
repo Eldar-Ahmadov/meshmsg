@@ -82,6 +82,101 @@ pub(crate) async fn send_request(dir: &Path, request: &IpcRequest) -> Result<ser
     serde_json::from_slice(&frame).context("invalid response from local daemon")
 }
 
+fn json_kind(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(serde_json::Value::Null) => "null",
+        Some(serde_json::Value::Bool(_)) => "boolean",
+        Some(serde_json::Value::Number(_)) => "number",
+        Some(serde_json::Value::String(_)) => "string",
+        Some(serde_json::Value::Array(_)) => "array",
+        Some(serde_json::Value::Object(_)) => "object",
+    }
+}
+
+const MAX_DIAGNOSTIC_CHARS: usize = 80;
+
+fn diagnostic_string(value: Option<&serde_json::Value>, fallback: &str) -> String {
+    match value.and_then(serde_json::Value::as_str) {
+        Some(text) => {
+            let mut chars = text.chars();
+            let mut quoted = String::from("\"");
+            for character in chars.by_ref().take(MAX_DIAGNOSTIC_CHARS) {
+                match character {
+                    '\"' => quoted.push_str("\\\""),
+                    '\\' => quoted.push_str("\\\\"),
+                    '\u{8}' => quoted.push_str("\\b"),
+                    '\u{c}' => quoted.push_str("\\f"),
+                    '\n' => quoted.push_str("\\n"),
+                    '\r' => quoted.push_str("\\r"),
+                    '\t' => quoted.push_str("\\t"),
+                    control if control.is_control() => {
+                        use std::fmt::Write as _;
+                        write!(quoted, "\\u{:04x}", control as u32).unwrap();
+                    }
+                    visible => quoted.push(visible),
+                }
+            }
+            quoted.push('\"');
+            if chars.next().is_some() {
+                quoted.push('…');
+            }
+            quoted
+        }
+        None => fallback.to_owned(),
+    }
+}
+
+fn observed_string(value: Option<&serde_json::Value>) -> String {
+    diagnostic_string(value, json_kind(value))
+}
+
+pub(crate) fn daemon_error_message(value: &serde_json::Value) -> String {
+    diagnostic_string(value.get("message"), "unknown error")
+}
+
+/// Validate the common response envelope before command-specific code consumes it.
+/// A missing schema version is intentional for the original, unversioned IPC replies.
+/// Diagnostics include only bounded, escaped discriminators and never serialize
+/// the complete response, which may contain message or token data.
+pub(crate) fn validate_response(
+    value: &serde_json::Value,
+    expected_type: &str,
+    expected_schema_version: Option<u64>,
+) -> Result<()> {
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+        anyhow::bail!("daemon rejected request: {}", daemon_error_message(value));
+    }
+    let response_type = value.get("type");
+    anyhow::ensure!(
+        response_type.and_then(serde_json::Value::as_str) == Some(expected_type),
+        "daemon returned unexpected response type (expected {expected_type}, observed {})",
+        observed_string(response_type)
+    );
+    if let Some(version) = expected_schema_version {
+        let observed_version = value.get("schema_version");
+        anyhow::ensure!(
+            observed_version.and_then(serde_json::Value::as_u64) == Some(version),
+            "daemon returned unsupported {expected_type} response version (expected {version}, observed {})",
+            observed_version
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(|| observed_string(observed_version), |value| value.to_string())
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn send_request_checked(
+    dir: &Path,
+    request: &IpcRequest,
+    expected_type: &str,
+    expected_schema_version: Option<u64>,
+) -> Result<serde_json::Value> {
+    let value = send_request(dir, request).await?;
+    validate_response(&value, expected_type, expected_schema_version)?;
+    Ok(value)
+}
+
 pub(crate) async fn write_request<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request: &IpcRequest,
@@ -96,57 +191,140 @@ pub(crate) async fn write_request<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-pub(crate) async fn subscribe(dir: &Path) -> Result<BufReader<LocalClientStream>> {
+pub(crate) struct SubscriptionReader<S> {
+    reader: BufReader<S>,
+    frame: Vec<u8>,
+}
+
+impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
+    pub(crate) fn new(stream: S) -> Self {
+        Self {
+            reader: BufReader::new(stream),
+            frame: Vec::new(),
+        }
+    }
+
+    pub(crate) fn get_mut(&mut self) -> &mut S {
+        self.reader.get_mut()
+    }
+
+    /// Reads one event while retaining any bytes consumed if this future is
+    /// cancelled by a competing `select!` branch.
+    pub(crate) async fn read(&mut self) -> Result<Option<serde_json::Value>> {
+        let limit = MAX_IPC_EVENT_SIZE + 2;
+        anyhow::ensure!(self.frame.len() < limit, "daemon event is too large");
+        let remaining = limit - self.frame.len();
+        let read = (&mut self.reader)
+            .take(remaining as u64)
+            .read_until(b'\n', &mut self.frame)
+            .await?;
+        if read == 0 && self.frame.is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.frame.len() <= MAX_IPC_EVENT_SIZE + 1,
+            "daemon event is too large"
+        );
+        anyhow::ensure!(self.frame.ends_with(b"\n"), "incomplete daemon event");
+        let value = serde_json::from_slice(&self.frame).context("invalid daemon event")?;
+        self.frame.clear();
+        Ok(Some(value))
+    }
+}
+
+pub(crate) async fn subscribe(dir: &Path) -> Result<SubscriptionReader<LocalClientStream>> {
     let mut stream = connect_daemon(dir).await?;
     let mut request = serde_json::to_vec(&IpcRequest::Subscribe)?;
     request.push(b'\n');
     stream.write_all(&request).await?;
-    Ok(BufReader::new(stream))
-}
-
-pub(crate) async fn read_subscription<S: AsyncRead + Unpin>(
-    reader: &mut BufReader<S>,
-) -> Result<Option<serde_json::Value>> {
-    let mut line = Vec::new();
-    let read = reader
-        .take((MAX_IPC_EVENT_SIZE + 2) as u64)
-        .read_until(b'\n', &mut line)
-        .await?;
-    if read == 0 {
-        return Ok(None);
-    }
-    anyhow::ensure!(
-        line.len() <= MAX_IPC_EVENT_SIZE + 1,
-        "daemon event is too large"
-    );
-    anyhow::ensure!(line.ends_with(b"\n"), "incomplete daemon event");
-    Ok(Some(
-        serde_json::from_slice(&line).context("invalid daemon event")?,
-    ))
+    Ok(SubscriptionReader::new(stream))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn command_response_validation_rejects_errors_wrong_types_and_versions() {
+        let error = validate_response(
+            &serde_json::json!({
+                "type":"error", "message":"useful\n\u{1b}[31m", "body":"secret"
+            }),
+            "queued",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("useful\\n\\u001b[31m"));
+        assert!(!error.contains('\n'));
+        assert!(!error.contains("secret"));
+
+        let c1 = observed_string(Some(&serde_json::json!("left\u{009b}right")));
+        assert_eq!(c1, "\"left\\u009bright\"");
+        assert!(!c1.chars().any(char::is_control));
+
+        let long_observed = observed_string(Some(&serde_json::json!(
+            "x".repeat(MAX_DIAGNOSTIC_CHARS + 1)
+        )));
+        assert_eq!(long_observed, format!("\"{}\"…", "x".repeat(80)));
+
+        let long_message = "x".repeat(MAX_DIAGNOSTIC_CHARS + 500);
+        let long_error = validate_response(
+            &serde_json::json!({"type":"error", "message":long_message}),
+            "queued",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(long_error.ends_with('…'));
+        assert!(long_error.len() < 250);
+
+        for value in [
+            serde_json::json!({"type":"unexpected"}),
+            serde_json::json!({"type":"status"}),
+            serde_json::json!({"message":"success-shaped but untyped"}),
+        ] {
+            assert!(validate_response(&value, "queued", None).is_err());
+        }
+        let wrong_version = validate_response(
+            &serde_json::json!({"type":"offers", "schema_version":2, "body":"secret"}),
+            "offers",
+            Some(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_version.contains("expected 1, observed 2"));
+        assert!(!wrong_version.contains("secret"));
+        let wrong_type = validate_response(
+            &serde_json::json!({"type":"wrong\nforged", "body":"secret"}),
+            "offers",
+            Some(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_type.contains("observed \"wrong\\nforged\""));
+        assert!(!wrong_type.contains("secret"));
+        validate_response(
+            &serde_json::json!({"type":"offers", "schema_version":1}),
+            "offers",
+            Some(1),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn subscription_preserves_frames_and_handles_clean_eof() {
         let data = b"{\"type\":\"connected\"}\n{\"type\":\"message\",\"body\":\"a\\nb\"}\n";
-        let mut reader = BufReader::new(&data[..]);
-        assert_eq!(
-            read_subscription(&mut reader).await.unwrap().unwrap()["type"],
-            "connected"
-        );
-        assert_eq!(
-            read_subscription(&mut reader).await.unwrap().unwrap()["body"],
-            "a\nb"
-        );
-        assert!(read_subscription(&mut reader).await.unwrap().is_none());
+        let mut reader = SubscriptionReader::new(&data[..]);
+        assert_eq!(reader.read().await.unwrap().unwrap()["type"], "connected");
+        assert_eq!(reader.read().await.unwrap().unwrap()["body"], "a\nb");
+        assert!(reader.read().await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn subscription_rejects_incomplete_and_oversized_frames_before_eof() {
-        let mut incomplete = BufReader::new(&b"{\"type\":\"connected\"}"[..]);
-        assert!(read_subscription(&mut incomplete)
+        let mut incomplete = SubscriptionReader::new(&b"{\"type\":\"connected\"}"[..]);
+        assert!(incomplete
+            .read()
             .await
             .unwrap_err()
             .to_string()
@@ -157,14 +335,32 @@ mod tests {
             .await
             .unwrap();
         // Writer deliberately stays open. The bound must not depend on EOF/newline.
-        let error = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            read_subscription(&mut BufReader::new(reader)),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+        let mut reader = SubscriptionReader::new(reader);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(error.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn subscription_retains_partial_frame_when_select_cancels_read() {
+        let (mut writer, stream) = tokio::io::duplex(64);
+        let mut reader = SubscriptionReader::new(stream);
+        writer.write_all(b"{\"type\":\"mes").await.unwrap();
+
+        tokio::select! {
+            result = reader.read() => panic!("partial frame unexpectedly completed: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+
+        writer
+            .write_all(b"sage\",\"body\":\"ok\"}\n")
+            .await
+            .unwrap();
+        let event = reader.read().await.unwrap().unwrap();
+        assert_eq!(event["type"], "message");
+        assert_eq!(event["body"], "ok");
     }
 
     #[tokio::test]

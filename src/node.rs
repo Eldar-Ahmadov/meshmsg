@@ -8,8 +8,9 @@ use crate::{
     },
     invite::Invite,
     ipc::{
-        read_frame, read_subscription, send_request, subscribe, write_request, write_value,
-        BenchConfig, IpcRequest, MAX_IPC_REQUEST_SIZE, PRIVATE_SEND_CAPABILITY,
+        daemon_error_message, read_frame, send_request_checked, subscribe, write_request,
+        write_value, BenchConfig, IpcRequest, SubscriptionReader, MAX_IPC_REQUEST_SIZE,
+        PRIVATE_SEND_CAPABILITY,
     },
     peers::{
         self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
@@ -59,8 +60,8 @@ use tokio::net::windows::named_pipe::{
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::{broadcast, mpsc, oneshot, Semaphore},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
 };
 
 #[cfg(test)]
@@ -94,6 +95,11 @@ const ATTACHMENT_OFFER_VERSION: u8 = 1;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DOWNLOAD_PROGRESS_STEP: u64 = 8 * 1024 * 1024;
+const MAX_OFFER_LIST_ENTRIES: usize = 512;
+/// Also bound malformed tags and per-item store errors encountered while looking ahead.
+const MAX_OFFER_LIST_SCANNED: usize = 4096;
+const MAX_ENCODED_TAG_NAME_BYTES: usize = 134;
+const MAX_ENCODED_PUBLIC_KEY_BYTES: usize = 64;
 const BLOB_TAG_PREFIX: &[u8] = b"meshmsg/";
 const OUTBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/out/v1/";
 const INBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/in/v1/";
@@ -1313,9 +1319,15 @@ fn valid_offer_id(value: &str) -> bool {
 }
 
 fn decode_tag_name(value: &str) -> Option<String> {
+    // A valid display name is at most 100 UTF-8 bytes. Reject oversized input
+    // before the decoder allocates in proportion to untrusted tag metadata.
+    if value.len() > MAX_ENCODED_TAG_NAME_BYTES {
+        return None;
+    }
     let decoded = BASE64URL_NOPAD.decode(value.as_bytes()).ok()?;
     let name = String::from_utf8(decoded).ok()?;
-    (!name.is_empty()).then_some(name)
+    attachment::validate_display_name(&name).ok()?;
+    Some(name)
 }
 
 fn encode_tag_name(value: &str) -> String {
@@ -1351,10 +1363,11 @@ fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
         } else {
             let remainder = name.strip_prefix(INBOUND_BLOB_TAG_PREFIX)?;
             let (provider, remainder) = remainder.split_once('/')?;
-            if provider.is_empty() {
+            if provider.len() > MAX_ENCODED_PUBLIC_KEY_BYTES {
                 return None;
             }
-            ("incoming", Some(provider.to_owned()), remainder)
+            let provider = provider.parse::<PublicKey>().ok()?.to_string();
+            ("incoming", Some(provider), remainder)
         };
     let mut parts = remainder.split('/');
     let offer_id = parts.next()?;
@@ -1372,20 +1385,45 @@ fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
     })
 }
 
-async fn list_pinned_blobs(store: &Store) -> Result<Vec<PinnedBlobInfo>> {
+async fn list_pinned_blobs(store: &Store) -> Result<(Vec<PinnedBlobInfo>, bool, usize)> {
     let mut tags = store
         .tags()
         .list_prefix(BLOB_TAG_PREFIX)
         .await
         .context("list attachment blob tags")?;
-    let mut blobs = Vec::new();
-    while let Some(tag) = tags.next().await {
-        let Ok(tag) = tag else {
-            continue;
+    // iroh-blobs' fs tag table is a BTree range and list_prefix preserves that
+    // order. Consume only a bounded prefix, including one valid lookahead.
+    let mut selected = Vec::new();
+    let mut scanned = 0;
+    let mut item_errors = 0;
+    let mut has_more = false;
+    while scanned < MAX_OFFER_LIST_SCANNED {
+        let Some(item) = tags.next().await else { break };
+        scanned += 1;
+        let tag = match item {
+            Ok(tag) => tag,
+            Err(_) => {
+                item_errors += 1;
+                has_more = true;
+                continue;
+            }
         };
-        let Some(parsed) = parse_pinned_blob_tag(tag.name.as_ref()) else {
+        if parse_pinned_blob_tag(tag.name.as_ref()).is_none() {
             continue;
-        };
+        }
+        if selected.len() == MAX_OFFER_LIST_ENTRIES {
+            has_more = true;
+            break;
+        }
+        selected.push(tag);
+    }
+    if scanned == MAX_OFFER_LIST_SCANNED {
+        has_more = true;
+    }
+
+    let mut blobs = Vec::with_capacity(selected.len());
+    for tag in selected {
+        let parsed = parse_pinned_blob_tag(tag.name.as_ref()).expect("selected tag was validated");
         let (status, size) = match store.blobs().status(tag.hash).await {
             Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => ("complete", Some(size)),
             Ok(iroh_blobs::api::proto::BlobStatus::Partial { size }) => ("partial", size),
@@ -1408,14 +1446,18 @@ async fn list_pinned_blobs(store: &Store) -> Result<Vec<PinnedBlobInfo>> {
             size,
         });
     }
-    blobs.sort_by(|left, right| {
-        (&left.direction, &left.provider, &left.offer_id).cmp(&(
-            &right.direction,
-            &right.provider,
-            &right.offer_id,
-        ))
-    });
-    Ok(blobs)
+    Ok((blobs, has_more, item_errors))
+}
+
+fn try_admit_transfer(
+    limit: &Arc<Semaphore>,
+    busy_code: &'static str,
+    busy_message: &'static str,
+) -> Result<OwnedSemaphorePermit, serde_json::Value> {
+    limit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| serde_json::json!({"type":"error", "code":busy_code, "message":busy_message}))
 }
 
 async fn share_attachment(
@@ -1471,6 +1513,7 @@ async fn share_attachment(
         .context("import attachment with a temporary pin")?;
     drop(staged);
 
+    let mut broadcast_attempted = false;
     let publish_result = async {
         let ticket = BlobTicket::new(endpoint.addr(), imported.hash(), imported.format());
         let offer = AttachmentOffer {
@@ -1483,16 +1526,23 @@ async fn share_attachment(
         let body = attachment_body(&offer)?;
         let timestamp_ms = unix_timestamp_ms()?;
         let encoded = Envelope::encode_at(&secret, body, timestamp_ms)?;
-        sender
-            .broadcast(encoded.clone())
-            .await
-            .context("broadcast attachment offer")?;
         store
             .tags()
             .set(tag_name.as_bytes(), imported.hash_and_format())
             .await
-            .context("pin published attachment")?;
-        store.sync_db().await.context("persist attachment tag")?;
+            .context("pin attachment before publication")?;
+        store
+            .sync_db()
+            .await
+            .context("persist attachment tag before publication")?;
+        // Once broadcast is attempted its outcome can be unknown: an error
+        // does not prove that no peer observed the offer. Never roll back the
+        // durable pin from this point onward.
+        broadcast_attempted = true;
+        sender
+            .broadcast(encoded.clone())
+            .await
+            .context("broadcast attachment offer after durable pin")?;
         Ok(serde_json::json!({
             "type":"attachment_shared", "schema_version":1,
             "from":secret.public().to_string(), "timestamp_ms":timestamp_ms,
@@ -1507,15 +1557,18 @@ async fn share_attachment(
     match publish_result {
         Ok(value) => Ok(value),
         Err(publish_error) => {
-            store
-                .tags()
-                .delete(tag_name.as_bytes())
-                .await
-                .with_context(|| format!("roll back attachment pin after: {publish_error}"))?;
-            store
-                .sync_db()
-                .await
-                .with_context(|| format!("persist pin rollback after: {publish_error}"))?;
+            if !broadcast_attempted {
+                store
+                    .tags()
+                    .delete(tag_name.as_bytes())
+                    .await
+                    .with_context(|| {
+                        format!("roll back unpublished attachment pin after: {publish_error}")
+                    })?;
+                store.sync_db().await.with_context(|| {
+                    format!("persist unpublished pin rollback after: {publish_error}")
+                })?;
+            }
             Err(publish_error)
         }
     }
@@ -1872,6 +1925,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
     let benchmark_busy = Arc::new(AtomicBool::new(false));
     let transfer_limit = Arc::new(Semaphore::new(2));
+    let offer_list_limit = Arc::new(Semaphore::new(1));
     let direct_limit = Arc::new(Semaphore::new(DIRECT_CONCURRENCY));
     let topic = state.topic_id()?;
     let mut directory = Directory::new(node.presence_lookup.clone());
@@ -1892,6 +1946,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     presence_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut presence_sources = PresenceSourceLimiter::default();
     let mut transfer_tasks = tokio::task::JoinSet::new();
+    let mut offer_list_tasks = tokio::task::JoinSet::new();
     let mut rejoin = tokio::time::interval(REJOIN_INTERVAL);
     rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -2035,31 +2090,60 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     ));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
-                    let response = match list_pinned_blobs(&node.blob_store).await {
-                        Ok(blobs) => serde_json::json!({
-                            "type":"offers", "schema_version":1, "blobs":blobs
-                        }),
-                        Err(error) => serde_json::json!({
-                            "type":"error", "code":"offers_failed", "message":error.to_string()
-                        }),
+                    let permit = match try_admit_transfer(
+                        &offer_list_limit, "offers_busy", "attachment listing already in progress"
+                    ) {
+                        Ok(permit) => permit,
+                        Err(response) => {
+                            let _ = reply.send(response);
+                            continue;
+                        }
                     };
-                    let _ = reply.send(response);
+                    let store = node.blob_store.clone();
+                    offer_list_tasks.spawn(async move {
+                        let _permit = permit;
+                        let response = match list_pinned_blobs(&store).await {
+                            Ok((blobs, has_more, item_errors)) => {
+                                let mut response = serde_json::json!({
+                                    "type":"offers", "schema_version":1, "blobs":blobs
+                                });
+                                if has_more {
+                                    response["truncated"] = true.into();
+                                    response["has_more"] = true.into();
+                                }
+                                if item_errors > 0 {
+                                    response["item_errors"] = item_errors.into();
+                                }
+                                response
+                            }
+                            Err(error) => serde_json::json!({
+                                "type":"error", "code":"offers_failed", "message":error.to_string()
+                            }),
+                        };
+                        let _ = reply.send(response);
+                    });
                 }
                 Some(DaemonCommand::Share { path, reply }) => {
+                    let permit = match try_admit_transfer(
+                        &transfer_limit, "share_busy", "attachment transfer capacity reached"
+                    ) {
+                        Ok(permit) => permit,
+                        Err(response) => {
+                            let _ = reply.send(response);
+                            continue;
+                        }
+                    };
                     let store = node.blob_store.clone();
                     let endpoint = node.endpoint.clone();
                     let secret = node.secret.clone();
                     let sender = node.sender.clone();
                     let state_dir = dir.to_path_buf();
-                    let limit = transfer_limit.clone();
                     let events = event_tx.clone();
                     transfer_tasks.spawn(async move {
-                        let response = match limit.acquire_owned().await {
-                            Ok(_permit) => match share_attachment(store, endpoint, secret, sender, state_dir, path).await {
-                                Ok(value) => value,
-                                Err(error) => serde_json::json!({"type":"error", "code":"share_failed", "message":error.to_string()}),
-                            },
-                            Err(_) => serde_json::json!({"type":"error", "code":"daemon_stopping", "message":"daemon is stopping"}),
+                        let _permit = permit;
+                        let response = match share_attachment(store, endpoint, secret, sender, state_dir, path).await {
+                            Ok(value) => value,
+                            Err(error) => serde_json::json!({"type":"error", "code":"share_failed", "message":error.to_string()}),
                         };
                         if response["type"] == "attachment_shared" {
                             let _ = events.send(response.clone());
@@ -2068,21 +2152,27 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     });
                 }
                 Some(DaemonCommand::Download { offer, output, reply }) => {
+                    let permit = match try_admit_transfer(
+                        &transfer_limit, "download_busy", "attachment transfer capacity reached"
+                    ) {
+                        Ok(permit) => permit,
+                        Err(response) => {
+                            let _ = reply.send(response);
+                            continue;
+                        }
+                    };
                     let store = node.blob_store.clone();
                     let downloader = node.downloader.clone();
                     let endpoint = node.endpoint.clone();
                     let lookup = node.lookup.clone();
-                    let limit = transfer_limit.clone();
                     let events = event_tx.clone();
                     transfer_tasks.spawn(async move {
+                        let _permit = permit;
                         let started = serde_json::json!({"type":"download_started", "schema_version":1, "output":output});
                         let _ = events.send(started);
-                        let response = match limit.acquire_owned().await {
-                            Ok(_permit) => match download_attachment(store, downloader, endpoint, lookup, events.clone(), offer, output).await {
-                                Ok(value) => value,
-                                Err(error) => serde_json::json!({"type":"error", "code":"download_failed", "message":error.to_string()}),
-                            },
-                            Err(_) => serde_json::json!({"type":"error", "code":"daemon_stopping", "message":"daemon is stopping"}),
+                        let response = match download_attachment(store, downloader, endpoint, lookup, events.clone(), offer, output).await {
+                            Ok(value) => value,
+                            Err(error) => serde_json::json!({"type":"error", "code":"download_failed", "message":error.to_string()}),
                         };
                         if response["type"] == "download_complete" {
                             let _ = events.send(response.clone());
@@ -2173,14 +2263,22 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     eprintln!("attachment task error: {error}");
                 }
             },
+            completed = offer_list_tasks.join_next(), if !offer_list_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("attachment listing task error: {error}");
+                }
+            },
             _ = shutdown.recv() => break,
         }
     }
 
     transfer_limit.close();
+    offer_list_limit.close();
     direct_limit.close();
     transfer_tasks.abort_all();
+    offer_list_tasks.abort_all();
     while transfer_tasks.join_next().await.is_some() {}
+    while offer_list_tasks.join_next().await.is_some() {}
     drop(event_tx);
     node.router.shutdown().await?;
     Ok(())
@@ -2334,10 +2432,7 @@ pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
 
 fn ensure_success(value: &serde_json::Value) -> Result<()> {
     if value["type"] == "error" {
-        anyhow::bail!(
-            "daemon rejected request: {}",
-            value["message"].as_str().unwrap_or("unknown error")
-        );
+        anyhow::bail!("daemon rejected request: {}", daemon_error_message(value));
     }
     Ok(())
 }
@@ -2410,32 +2505,33 @@ pub async fn send_once(dir: &Path, to: Option<&str>, body: &str, json: bool) -> 
     let value = if let Some(to) = to {
         // Negotiate without the body first. A daemon swap after this check is
         // still safe because private_send is never interpreted as broadcast.
-        let status = send_request(dir, &IpcRequest::Status).await?;
-        ensure_success(&status)?;
+        let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
         anyhow::ensure!(
             advertises_private_send(&status),
             "daemon does not advertise safe private-send IPC; upgrade and restart the daemon (message was not submitted)"
         );
-        let value = send_request(
+        let value = send_request_checked(
             dir,
             &IpcRequest::PrivateSend {
                 to: to.to_owned(),
                 body: body.to_owned(),
             },
+            "private_accepted",
+            Some(1),
         )
         .await?;
-        ensure_success(&value)?;
         validate_private_acceptance(&value, body.len())?;
         value
     } else {
-        let value = send_request(
+        let value = send_request_checked(
             dir,
             &IpcRequest::Send {
                 body: body.to_owned(),
             },
+            "queued",
+            None,
         )
         .await?;
-        ensure_success(&value)?;
         value
     };
     event(json, value);
@@ -2453,14 +2549,15 @@ fn caller_path(path: &Path) -> Result<PathBuf> {
 }
 
 pub async fn share(dir: &Path, path: &Path, json: bool) -> Result<()> {
-    let value = send_request(
+    let value = send_request_checked(
         dir,
         &IpcRequest::Share {
             path: caller_path(path)?,
         },
+        "attachment_shared",
+        Some(1),
     )
     .await?;
-    ensure_success(&value)?;
     event(json, value);
     Ok(())
 }
@@ -2469,42 +2566,40 @@ pub async fn peers(dir: &Path, json: bool) -> Result<()> {
     // Negotiate before sending a command that legacy daemons do not know. A
     // daemon swap remains safe because `peers` is a distinct, fieldless command
     // and all IPC enums reject unknown fields.
-    let status = send_request(dir, &IpcRequest::Status).await?;
-    ensure_success(&status)?;
+    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
     anyhow::ensure!(
         advertises_capability(&status, PEER_DIRECTORY_CAPABILITY),
         "daemon does not advertise peer-directory IPC; upgrade and restart the daemon"
     );
-    let value = send_request(dir, &IpcRequest::Peers)
-        .await
-        .context("request peer directory; the daemon may need to be upgraded and restarted")?;
-    ensure_success(&value)?;
-    anyhow::ensure!(
-        value["type"] == "peers_snapshot"
-            && value["schema_version"] == peer_api::PEER_SCHEMA_VERSION,
-        "daemon returned an unsupported peer-directory response"
-    );
+    let value = send_request_checked(
+        dir,
+        &IpcRequest::Peers,
+        "peers_snapshot",
+        Some(peer_api::PEER_SCHEMA_VERSION.into()),
+    )
+    .await
+    .context("request peer directory; the daemon may need to be upgraded and restarted")?;
     event(json, value);
     Ok(())
 }
 
 pub async fn offers(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request(dir, &IpcRequest::Offers).await?;
-    ensure_success(&value)?;
+    let value = send_request_checked(dir, &IpcRequest::Offers, "offers", Some(1)).await?;
     event(json, value);
     Ok(())
 }
 
 pub async fn download(dir: &Path, offer: &str, output: &Path, json: bool) -> Result<()> {
-    let value = send_request(
+    let value = send_request_checked(
         dir,
         &IpcRequest::Download {
             offer: offer.to_owned(),
             output: caller_path(output)?,
         },
+        "download_complete",
+        Some(1),
     )
     .await?;
-    ensure_success(&value)?;
     event(json, value);
     Ok(())
 }
@@ -2644,8 +2739,9 @@ async fn bench_send_events(
             },
         )
         .await?;
-        let mut reader = BufReader::new(stream);
-        let started = read_subscription(&mut reader)
+        let mut reader = SubscriptionReader::new(stream);
+        let started = reader
+            .read()
             .await?
             .context("local daemon stopped before benchmark start")?;
         Result::<_>::Ok((reader, started))
@@ -2665,7 +2761,7 @@ async fn bench_send_events(
     let mut interrupted_deadline = None;
     let summary = loop {
         let value = tokio::select! {
-            value = read_subscription(&mut reader) => match benchmark_subscription_value(
+            value = reader.read() => match benchmark_subscription_value(
                 value,
                 "local daemon stopped before benchmark summary",
                 "read benchmark summary from local daemon",
@@ -3086,7 +3182,8 @@ async fn bench_receive_events(
     let mut stats = BenchReceiveStats::new(run_id.clone(), expected)?;
     let startup = async {
         let mut reader = subscribe(dir).await?;
-        let connected = read_subscription(&mut reader)
+        let connected = reader
+            .read()
             .await?
             .context("local daemon stopped before benchmark receiver connected")?;
         Result::<_>::Ok((reader, connected))
@@ -3112,7 +3209,7 @@ async fn bench_receive_events(
     let mut daemon_error = None;
     loop {
         tokio::select! {
-            value = read_subscription(&mut reader) => match benchmark_subscription_value(
+            value = reader.read() => match benchmark_subscription_value(
                 value,
                 "local daemon stopped during benchmark receive",
                 "read benchmark events from local daemon",
@@ -3178,7 +3275,7 @@ pub async fn listen(dir: &Path, json: bool) -> Result<()> {
     let mut reader = subscribe(dir).await?;
     loop {
         tokio::select! {
-            value = read_subscription(&mut reader) => match value? {
+            value = reader.read() => match value? {
                 Some(value) => event(json, value),
                 None => anyhow::bail!("local daemon stopped; restart it with `meshmsg daemon`"),
             },
@@ -3202,12 +3299,11 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
         tokio::select! {
             line = rx.recv() => match line {
                 Some(body) => {
-                    let value = send_request(dir, &IpcRequest::Send { body }).await?;
-                    ensure_success(&value)?;
+                    send_request_checked(dir, &IpcRequest::Send { body }, "queued", None).await?;
                 }
                 None => break,
             },
-            value = read_subscription(&mut reader) => match value? {
+            value = reader.read() => match value? {
                 Some(value) => event(json, value),
                 None => anyhow::bail!("local daemon stopped; restart it with `meshmsg daemon`"),
             },
@@ -3218,7 +3314,7 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub async fn status(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request(dir, &IpcRequest::Status).await?;
+    let value = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
     if json {
         println!("{value}");
     } else {
@@ -3242,7 +3338,7 @@ pub async fn status(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub async fn stop(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request(dir, &IpcRequest::Stop).await?;
+    let value = send_request_checked(dir, &IpcRequest::Stop, "stopping", None).await?;
     event(json, value);
     Ok(())
 }
@@ -3292,6 +3388,20 @@ fn terminal_safe(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn offer_listing_warnings(value: &serde_json::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if value["truncated"].as_bool() == Some(true) {
+        warnings
+            .push("WARNING: attachment listing truncated; more pinned blobs may exist".to_owned());
+    }
+    if let Some(errors) = value["item_errors"].as_u64() {
+        warnings.push(format!(
+            "WARNING: {errors} attachment tag(s) could not be read"
+        ));
+    }
+    warnings
 }
 
 fn event(json: bool, value: serde_json::Value) {
@@ -3350,6 +3460,9 @@ fn event(json: bool, value: serde_json::Value) {
                             terminal_safe(blob["hash"].as_str().unwrap_or(""))
                         );
                     }
+                }
+                for warning in offer_listing_warnings(&value) {
+                    println!("{warning}");
                 }
             }
             "attachment_shared" => println!(
@@ -3461,6 +3574,16 @@ mod tests {
     }
 
     #[test]
+    fn attachment_admission_is_fail_fast_even_when_limit_is_closed() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = try_admit_transfer(&limit, "share_busy", "capacity reached").unwrap();
+        let busy = try_admit_transfer(&limit, "download_busy", "capacity reached").unwrap_err();
+        assert_eq!(busy["code"], "download_busy");
+        drop(permit);
+        assert!(try_admit_transfer(&limit, "download_busy", "capacity reached").is_ok());
+    }
+
+    #[test]
     fn pinned_blob_tags_preserve_names_and_kinds() {
         let id = "0123456789abcdef0123456789abcdef";
         let provider = SecretKey::generate().public();
@@ -3505,6 +3628,17 @@ mod tests {
             assert_eq!(parse_pinned_blob_tag(invalid.as_bytes()), None, "{invalid}");
         }
         assert_eq!(parse_pinned_blob_tag(&[0xff]), None);
+
+        let oversized_name = format!(
+            "meshmsg/out/v1/0123456789abcdef0123456789abcdef/file/{}",
+            "A".repeat(MAX_ENCODED_TAG_NAME_BYTES + 1)
+        );
+        assert_eq!(parse_pinned_blob_tag(oversized_name.as_bytes()), None);
+        let oversized_provider = format!(
+            "meshmsg/in/v1/{}/0123456789abcdef0123456789abcdef/file/bmFtZQ",
+            "a".repeat(MAX_ENCODED_PUBLIC_KEY_BYTES + 1)
+        );
+        assert_eq!(parse_pinned_blob_tag(oversized_provider.as_bytes()), None);
     }
 
     fn sample_offer(provider: PublicKey) -> AttachmentOffer {
@@ -4242,6 +4376,73 @@ mod tests {
         let escaped = terminal_safe("hello\n\u{1b}]0;owned\u{7}");
         assert_eq!(escaped, "hello\\n\\u{1b}]0;owned\\u{7}");
         assert!(!escaped.chars().any(char::is_control));
+    }
+
+    #[tokio::test]
+    async fn actual_blob_store_listing_caps_valid_ordered_tags() {
+        let dir =
+            std::env::temp_dir().join(format!("meshmsg-offers-test-{}", rand::random::<u64>()));
+        let options = FsStoreOptions::new(&dir);
+        let store: Store = FsStore::load_with_opts(dir.join("blobs.db"), options)
+            .await
+            .unwrap()
+            .into();
+        let hash = iroh_blobs::Hash::new(b"listing test");
+        for index in (0..=MAX_OFFER_LIST_ENTRIES).rev() {
+            let tag = outbound_blob_tag(
+                &format!("{index:032x}"),
+                AttachmentKind::File,
+                &format!("file-{index}"),
+            );
+            store
+                .tags()
+                .set(tag.as_bytes(), iroh_blobs::HashAndFormat::raw(hash))
+                .await
+                .unwrap();
+        }
+        // A malformed tag is ignored by the real parser and does not consume the valid cap.
+        store
+            .tags()
+            .set(
+                b"meshmsg/out/v1/not-an-offer/file/bmFtZQ",
+                iroh_blobs::HashAndFormat::raw(hash),
+            )
+            .await
+            .unwrap();
+
+        let (blobs, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+        assert_eq!(blobs.len(), MAX_OFFER_LIST_ENTRIES);
+        assert!(has_more);
+        assert_eq!(item_errors, 0);
+        assert_eq!(blobs[0].offer_id, format!("{:032x}", 0));
+        assert_eq!(
+            blobs.last().unwrap().offer_id,
+            format!("{:032x}", MAX_OFFER_LIST_ENTRIES - 1)
+        );
+        assert!(
+            serde_json::to_vec(&serde_json::json!({
+                "type":"offers", "schema_version":1, "blobs":blobs,
+                "truncated":true, "has_more":true
+            }))
+            .unwrap()
+            .len()
+                <= MAX_IPC_EVENT_SIZE
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn human_offer_warnings_announce_truncation_and_item_errors() {
+        assert_eq!(
+            offer_listing_warnings(&serde_json::json!({
+                "type":"offers", "truncated":true, "item_errors":2
+            })),
+            vec![
+                "WARNING: attachment listing truncated; more pinned blobs may exist",
+                "WARNING: 2 attachment tag(s) could not be read",
+            ]
+        );
     }
 
     #[test]

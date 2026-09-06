@@ -1,4 +1,4 @@
-use crate::config::{prepare_state_dir, State, StateLock};
+use crate::config::{atomic_write, State, StateLock};
 use anyhow::{Context, Result};
 use iroh::PublicKey;
 use serde::{Deserialize, Serialize};
@@ -116,37 +116,9 @@ impl AliasConfig {
     }
 
     fn save_unlocked(&self, dir: &Path) -> Result<()> {
-        prepare_state_dir(dir)?;
-        let path = dir.join(ALIAS_CONFIG_NAME);
-        let temporary = dir.join(format!(
-            ".{ALIAS_CONFIG_NAME}.tmp-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        let result = (|| -> Result<()> {
-            let mut options = fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(&temporary)
-                .context("create temporary alias.json")?;
-            serde_json::to_writer_pretty(&mut file, self).context("write alias.json")?;
-            use std::io::Write as _;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            atomic_replace(&temporary, &path).context("install alias.json")?;
-            #[cfg(unix)]
-            fs::File::open(dir)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result
+        let mut contents = serde_json::to_vec_pretty(self).context("write alias.json")?;
+        contents.push(b'\n');
+        atomic_write(dir, ALIAS_CONFIG_NAME, &contents, 0o600).context("install alias.json")
     }
 
     fn mutate(dir: &Path, update: impl FnOnce(&mut Self) -> Result<()>) -> Result<Self> {
@@ -180,10 +152,6 @@ impl AliasConfig {
         })
     }
 
-    pub(crate) fn disable(dir: &Path) -> Result<Self> {
-        Self::clear(dir)
-    }
-
     pub(crate) fn reset_hostname(dir: &Path) -> Result<Self> {
         let hostname = short_hostname()?;
         Self::mutate(dir, move |config| {
@@ -192,38 +160,6 @@ impl AliasConfig {
             config.enabled = true;
             Ok(())
         })
-    }
-}
-
-#[cfg(unix)]
-fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 
@@ -314,8 +250,7 @@ mod tests {
         let cleared = AliasConfig::clear(&dir).unwrap();
         assert_eq!(cleared.hostname(), Some("captured-host"));
         assert_eq!(cleared.effective(), None);
-        let disabled = AliasConfig::disable(&dir).unwrap();
-        assert!(!disabled.enabled());
+        assert!(!cleared.enabled());
         assert_eq!(AliasConfig::load(&dir).unwrap().effective(), None);
         #[cfg(unix)]
         {

@@ -69,11 +69,14 @@ pub struct MessageInput {
     ArgGroup::new("offer_source")
         .required(true)
         .multiple(false)
-        .args(["offer", "offer_stdin"])
+        .args(["offer", "offer_file", "offer_stdin"])
 ))]
 pub struct OfferInput {
-    /// Signed offer or blob ticket (visible in shell history and process listings; prefer stdin)
+    /// Signed offer or blob ticket (visible in shell history and process listings; prefer a file or stdin)
     pub offer: Option<String>,
+    /// Read the signed offer or blob ticket from this UTF-8 file
+    #[arg(long, value_name = "PATH")]
+    pub offer_file: Option<PathBuf>,
     /// Read the signed offer or blob ticket from stdin through EOF
     #[arg(long)]
     pub offer_stdin: bool,
@@ -122,9 +125,8 @@ pub enum AliasCommand {
     /// Set and enable a custom alias (ASCII letters, digits, and hyphens)
     Set { alias: String },
     /// Clear and disable alias advertising (public-key direct messages remain available)
+    #[command(alias = "disable")]
     Clear,
-    /// Synonym for clear
-    Disable,
     /// Capture the current short OS hostname and enable it as the default alias
     ResetHostname,
 }
@@ -137,7 +139,7 @@ pub enum Command {
         #[arg(long)]
         force: bool,
         /// Do not capture or advertise a hostname alias
-        #[arg(long = "no-default-alias", visible_alias = "no-alias")]
+        #[arg(long = "no-default-alias", alias = "no-alias")]
         no_alias: bool,
     },
     /// Save configuration from an invite token
@@ -151,7 +153,7 @@ pub enum Command {
         #[arg(long)]
         force: bool,
         /// Do not capture or advertise a hostname alias
-        #[arg(long = "no-default-alias", visible_alias = "no-alias")]
+        #[arg(long = "no-default-alias", alias = "no-alias")]
         no_alias: bool,
     },
     /// Show or change this node's advertised alias (daemon must be stopped to change it)
@@ -255,9 +257,12 @@ impl MessageInput {
 
 impl OfferInput {
     pub fn into_offer(self) -> Result<String> {
-        let mut offer = match (self.offer, self.offer_stdin) {
-            (Some(offer), false) => offer,
-            (None, true) => read_stdin("attachment offer", MAX_CAPABILITY_INPUT_BYTES)?,
+        let mut offer = match (self.offer, self.offer_file, self.offer_stdin) {
+            (Some(offer), None, false) => offer,
+            (None, Some(path), false) => {
+                read_file(&path, "attachment offer", MAX_CAPABILITY_INPUT_BYTES)?
+            }
+            (None, None, true) => read_stdin("attachment offer", MAX_CAPABILITY_INPUT_BYTES)?,
             _ => bail!("exactly one attachment offer input source is required"),
         };
         if offer.ends_with('\n') {
@@ -348,6 +353,14 @@ mod tests {
         assert!(parse(&["offers"]).is_ok());
         assert!(parse(&["peers"]).is_ok());
         assert!(parse(&["download", "offer-token", "--output", "file.txt"]).is_ok());
+        assert!(parse(&[
+            "download",
+            "--offer-file",
+            "offer.txt",
+            "--output",
+            "file.txt"
+        ])
+        .is_ok());
         assert!(parse(&["download", "--offer-stdin", "--output", "file.txt"]).is_ok());
         assert!(parse(&["bench-send"]).is_ok());
         assert!(parse(&["bench-tui"]).is_ok());
@@ -457,6 +470,14 @@ mod tests {
                 "--output",
                 "file.txt",
             ],
+            vec![
+                "download",
+                "--offer-file",
+                "offer.txt",
+                "--offer-stdin",
+                "--output",
+                "file.txt",
+            ],
         ] {
             assert_eq!(
                 parse(&arguments).unwrap_err().kind(),
@@ -473,6 +494,16 @@ mod tests {
             "download",
             "--offer-stdin",
             "--offer-stdin",
+            "--output",
+            "file.txt"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "download",
+            "--offer-file",
+            "one",
+            "--offer-file",
+            "two",
             "--output",
             "file.txt"
         ])
@@ -518,6 +549,7 @@ mod tests {
         for (input, expected) in [("offer\n", "offer"), ("offer\r\n", "offer")] {
             let value = OfferInput {
                 offer: Some(input.into()),
+                offer_file: None,
                 offer_stdin: false,
             }
             .into_offer()
@@ -526,6 +558,7 @@ mod tests {
         }
         assert!(OfferInput {
             offer: Some("\n".into()),
+            offer_file: None,
             offer_stdin: false,
         }
         .into_offer()

@@ -9,14 +9,17 @@ cargo test --locked --all-targets
 cargo build --locked
 node --check src/web/app.js
 node tests/web-ui.cjs
+python3 tests/integration-cli-errors.py target/debug/meshmsg
 python3 tests/integration-web.py target/debug/meshmsg
 python3 tests/integration-web-peer.py target/debug/meshmsg
+python3 tests/integration-peer-directory.py target/debug/meshmsg
+bash tests/integration-ipc-version-compat.sh target/debug/meshmsg
 bash tests/integration-5-peer.sh target/debug/meshmsg
 bash tests/integration-attachments.sh target/debug/meshmsg
 bash tests/integration-direct-messages.sh target/debug/meshmsg
 ```
 
-The web HTTP harness requires Unix sockets; the real-peer web and direct-message harnesses require working Iroh networking. The Node UI checks use a DOM mock, not a mobile browser. Neither harness changes Tailscale configuration. See [web validation limits](web.md#tests-and-validation-limits).
+The fake-daemon CLI regression and web HTTP harness require Unix sockets and run in Linux CI; they are not Windows named-pipe tests. The peer-directory, IPC-version compatibility, real-peer web, and direct-message harnesses require working Iroh networking. The Node UI checks use a DOM mock, not a mobile browser. Neither harness changes Tailscale configuration. See [web validation limits](web.md#tests-and-validation-limits).
 
 CI also runs dependency audit and policy checks.
 

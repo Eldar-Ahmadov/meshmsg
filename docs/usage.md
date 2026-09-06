@@ -6,7 +6,7 @@ The canonical top-level commands are:
 
 - `init [--force] [--no-default-alias]`
 - `join [--advertise-self] [--force] [--no-default-alias] <invite source>`
-- `alias show|set <name>|clear|disable|reset-hostname`
+- `alias show|set <name>|clear|reset-hostname`
 - `daemon`
 - `web [--listen 127.0.0.1:8787] [--origin https://host.tailnet.ts.net]`
 - `invite`
@@ -69,11 +69,10 @@ The CLI also accepts `--no-alias` as a compatibility spelling. A legacy state wi
 meshmsg alias show
 meshmsg alias set build-node-2
 meshmsg alias clear
-meshmsg alias disable
 meshmsg alias reset-hostname
 ```
 
-`set` installs a custom override and enables advertising. `clear` is a persistent privacy opt-out: it removes the custom override and disables alias advertising while retaining the old captured hostname only as local state. `disable` is a synonym for `clear`. Direct messages addressed by canonical public key remain available. Only `reset-hostname` captures the current short hostname, removes the override, and enables advertising again. Alias changes require the daemon to be stopped and take effect at its next start. `show` may be used while it runs; JSON mode distinguishes all stored values:
+`set` installs a custom override and enables advertising. `clear` is a persistent privacy opt-out: it removes the custom override and disables alias advertising while retaining the old captured hostname only as local state. The older `disable` spelling remains accepted as a compatibility alias for `clear`. Direct messages addressed by canonical public key remain available. Only `reset-hostname` captures the current short hostname, removes the override, and enables advertising again. Alias changes require the daemon to be stopped and take effect at its next start. `show` may be used while it runs; JSON mode distinguishes all stored values:
 
 ```json
 {"type":"alias","enabled":true,"hostname":"laptop","custom":"build-node-2","alias":"build-node-2"}
@@ -85,7 +84,7 @@ An alias is signed discovery metadata, not a verified person, account, or author
 
 ## Peer directory
 
-`meshmsg peers` asks the running daemon for a sanitized, point-in-time directory. Use `meshmsg --json peers` for the stable v1 schema:
+`meshmsg peers` asks the running daemon for a sanitized, point-in-time directory. Use `meshmsg --json peers` for the stable schema version 2:
 
 ```json
 {"type":"peers_snapshot","schema_version": 2,"generated_at_ms":1700000000000,"directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":7,"self":{"public_key":"<local-key>","alias":"laptop","online":true},"peers":[{"public_key":"<remote-key>","alias":"build-node-2","online":true,"last_seen_ms":1699999999000,"expires_at_ms":1700000149000}]}
@@ -103,9 +102,9 @@ Local subscriptions start with `connected`, then an atomic `peers_snapshot`, the
 {"type":"peer_expired","schema_version": 2,"directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":10,"peer":{"public_key":"<remote-key>","alias":"node-2","online":false,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
 ```
 
-These events are reconstructed from an explicit metadata allowlist, are limited to 512 encoded JSON bytes, and contain no message body or routing data. An identical periodic presence refresh advances freshness in later snapshots without emitting an event. First observation emits `peer_discovered`; an alias change emits `peer_updated`; hidden routing-only changes emit no public event; lease cleanup emits one `peer_expired`; a later valid presence emits `peer_discovered` again. The older `peer_up`/`peer_down` events remain low-level broadcast-Gossip neighbor changes and must not be used as directory online state.
+These events are reconstructed from an explicit metadata allowlist, are limited to 512 encoded JSON bytes, and contain no message body or routing data. An identical periodic presence refresh advances freshness in later snapshots without emitting an event. First observation emits `peer_discovered`; an alias change emits `peer_updated`; hidden routing-only changes emit no public event; lease cleanup emits one `peer_expired`; a later valid presence emits `peer_discovered` again. The older `peer_up`/`peer_down` events remain available to local IPC listeners for compatibility, but are low-level broadcast-Gossip neighbor changes and must not be used as directory online state. The web SSE bridge filters them out.
 
-A stateful client should use the subscription's startup snapshot, apply lifecycle events only when their `directory_epoch` matches and `directory_revision` increases without a gap, and replace all state after a gap, `lagged`, reconnect, or epoch change. The revision is a lifecycle-event cursor: silent freshness refreshes and hidden route-only updates may change a later snapshot without incrementing it. `meshmsg listen` prints the startup snapshot and live events. The web bridge refreshes its authoritative snapshot after a lag. The CLI checks the daemon's `peer_directory_v2` capability before sending the new IPC command, so an old daemon fails with an upgrade-and-restart error and no fallback or ambiguous request.
+A stateful client should use the subscription's startup snapshot, apply lifecycle events only when their `directory_epoch` matches and `directory_revision` increases without a gap, and replace all state after a gap, `lagged`, reconnect, or epoch change. The revision is a lifecycle-event cursor: silent freshness refreshes and hidden route-only updates may change a later snapshot without incrementing it. `meshmsg listen` prints the startup snapshot and live events. After a lag, disconnect, or out-of-order lifecycle event, the web UI immediately invalidates its current-peer summary and reconnects its SSE subscription; it applies no lifecycle events until the new subscription receives `connected` followed by a valid atomic startup snapshot. The CLI checks the daemon's `peer_directory_v2` capability before sending the new IPC command, so an old daemon fails with an upgrade-and-restart error and no fallback or ambiguous request.
 
 ## Messaging
 
@@ -174,6 +173,7 @@ meshmsg join --token-file invite.txt
 meshmsg join --advertise-self --token-stdin < invite.txt
 meshmsg send --message-file message.txt
 printf '%s' 'hello' | meshmsg send --message-stdin
+meshmsg download --offer-file signed-offer.txt --output ./report.pdf
 printf '%s' '<signed-offer>' | meshmsg download --offer-stdin --output ./report.pdf
 ```
 
