@@ -2480,7 +2480,8 @@ pub async fn peers(dir: &Path, json: bool) -> Result<()> {
         .context("request peer directory; the daemon may need to be upgraded and restarted")?;
     ensure_success(&value)?;
     anyhow::ensure!(
-        value["type"] == "peers_snapshot" && value["schema_version"] == 1,
+        value["type"] == "peers_snapshot"
+            && value["schema_version"] == peer_api::PEER_SCHEMA_VERSION,
         "daemon returned an unsupported peer-directory response"
     );
     event(json, value);
@@ -4632,7 +4633,7 @@ mod tests {
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
         let startup = serde_json::json!({
-            "type":"peers_snapshot", "schema_version":1,
+            "type":"peers_snapshot", "schema_version":2,
             "generated_at_ms":1, "self":{"public_key":"self", "alias":null, "online":true},
             "peers":[]
         });

@@ -816,11 +816,17 @@ impl DirectHandler {
         incoming: mpsc::Sender<IncomingDirect>,
         state_dir: &Path,
     ) -> Result<Self> {
-        let replay_path = state_dir
-            .join("direct-replay-v1")
-            .join(secret.public().to_string())
-            .join(format!("{topic}.json"));
-        let replay = PersistentReplayCache::load(replay_path, secret.public(), topic)?;
+        // Keep the state filename short for Windows MAX_PATH compatibility while
+        // binding the file contents to the full recipient and topic below.
+        let mut path_hasher = Sha256::new();
+        path_hasher.update(secret.public().as_bytes());
+        path_hasher.update(topic.as_bytes());
+        let replay_name = format!(
+            "direct-replay-v1-{}.json",
+            data_encoding::HEXLOWER.encode(&path_hasher.finalize())
+        );
+        let replay =
+            PersistentReplayCache::load(state_dir.join(replay_name), secret.public(), topic)?;
         Ok(Self {
             secret,
             topic,
