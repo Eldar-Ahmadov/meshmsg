@@ -21,7 +21,8 @@ EVENT_KEY = '971dafe5454792b588f162818f11df9c2accd649774f19a5c67360a91bacf6de'
 
 def malicious_peers_snapshot():
     return {
-        'type': 'peers_snapshot', 'schema_version': 1, 'generated_at_ms': 1000,
+        'type': 'peers_snapshot', 'schema_version': 2, 'generated_at_ms': 1000,
+        'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 0,
         'self': {
             'public_key': SELF_KEY, 'alias': 'local-node', 'online': True,
             'endpoint': 'private-self-endpoint', 'socket': 'private-socket',
@@ -87,7 +88,7 @@ class Handler(socketserver.StreamRequestHandler):
             if value['command'] == 'status':
                 emit({'type': 'status', 'running': True, 'peer': SELF_KEY, 'neighbors': 1,
                       'endpoint_online': True, 'topic_joined': True,
-                      'ipc_capabilities': ['peer_directory_v1'],
+                      'ipc_capabilities': ['peer_directory_v2'],
                       'socket': 'private-path', 'invite': 'private-token'})
             elif value['command'] == 'peers':
                 emit(malicious_peers_snapshot())
@@ -113,7 +114,8 @@ class Handler(socketserver.StreamRequestHandler):
                 emit({'type': 'private_message', 'from': 'other-peer', 'body': 'private-message-body'})
                 emit({'type': 'private_accepted', 'to': 'other-peer', 'body': 'private-accepted-body'})
                 emit({
-                    'type': 'peer_discovered', 'schema_version': 1,
+                    'type': 'peer_discovered', 'schema_version': 2,
+                    'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 1,
                     'peer': {
                         'public_key': EVENT_KEY, 'alias': 'event-node', 'online': True,
                         'last_seen_ms': 950, 'expires_at_ms': 150950,
@@ -210,7 +212,8 @@ def main():
                 assert all(key not in status for key in ['socket', 'invite', 'ipc_capabilities'])
                 code, peers = api({'command': 'peers'})
                 assert code == 200 and peers == {
-                    'type': 'peers_snapshot', 'schema_version': 1, 'generated_at_ms': 1000,
+                    'type': 'peers_snapshot', 'schema_version': 2, 'generated_at_ms': 1000,
+                    'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 0,
                     'self': {'public_key': SELF_KEY, 'alias': 'local-node', 'online': True},
                     'peers': [{
                         'public_key': REMOTE_KEY, 'alias': 'remote-node', 'online': True,
@@ -255,7 +258,8 @@ def main():
                     assert response.status == 200
                     assert next_event(response)['type'] == 'connected'
                     assert next_event(response) == {
-                        'type': 'peers_snapshot', 'schema_version': 1, 'generated_at_ms': 1000,
+                        'type': 'peers_snapshot', 'schema_version': 2, 'generated_at_ms': 1000,
+                        'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 0,
                         'self': {'public_key': SELF_KEY, 'alias': 'local-node', 'online': True},
                         'peers': [{
                             'public_key': REMOTE_KEY, 'alias': 'remote-node', 'online': True,
@@ -270,7 +274,8 @@ def main():
                     assert next_event(response)['type'] == 'lagged'
                     # The two private events are dropped; this must be the next frame.
                     assert next_event(response) == {
-                        'type': 'peer_discovered', 'schema_version': 1,
+                        'type': 'peer_discovered', 'schema_version': 2,
+                        'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 1,
                         'peer': {
                             'public_key': EVENT_KEY, 'alias': 'event-node', 'online': True,
                             'last_seen_ms': 950, 'expires_at_ms': 150950,

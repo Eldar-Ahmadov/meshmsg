@@ -304,7 +304,7 @@ fn read_secret(path: &Path) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&bytes))
 }
 
-fn atomic_write(dir: &Path, name: &str, contents: &[u8], _mode: u32) -> Result<()> {
+pub(crate) fn atomic_write(dir: &Path, name: &str, contents: &[u8], _mode: u32) -> Result<()> {
     prepare_state_dir(dir)?;
     let destination = dir.join(name);
     let temporary = temporary_path(dir, name);

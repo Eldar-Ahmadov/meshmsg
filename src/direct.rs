@@ -1,5 +1,6 @@
 use crate::{
     alias::{normalize_alias, validate_alias},
+    config::atomic_write,
     peers::{PeerTransition, PeerTransitionKind, RemotePeer, PEER_LEASE_MS},
 };
 use anyhow::{Context, Result};
@@ -16,6 +17,8 @@ use serde_byte_array::ByteArray;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -33,19 +36,139 @@ const MAX_ENDPOINT_ADDRS: usize = 8;
 pub(crate) const MAX_DYNAMIC_PRESENCE_IDENTITIES: usize = 1024;
 const MAX_PINNED_ENDPOINTS: usize = crate::invite::MAX_BOOTSTRAP_PEERS + 1;
 const PRESENCE_LIFETIME: Duration = Duration::from_millis(PEER_LEASE_MS);
-const MAX_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
+const DIRECT_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const PRESENCE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 const PRESENCE_REPLAY_LIFETIME: Duration = Duration::from_secs(450);
 const MAX_PRESENCE_TRANSPORT_SOURCES: usize = 32;
 const MAX_PRESENCE_RECORDS_PER_SOURCE: usize = 128;
 const PRESENCE_SOURCE_WINDOW: Duration = Duration::from_secs(1);
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
-const REPLAY_LIFETIME: Duration = Duration::from_secs(10 * 60);
-const MAX_REPLAY_ENTRIES: usize = 65_536;
+const REPLAY_SAFETY_MARGIN: Duration = Duration::from_secs(30);
+const REPLAY_LIFETIME: Duration =
+    Duration::from_secs(DIRECT_ACCEPTANCE_WINDOW.as_secs() * 2 + REPLAY_SAFETY_MARGIN.as_secs());
+// Whole-file atomic commits keep crash semantics simple; cap the journal so an
+// authenticated sender cannot turn each acceptance into an unbounded rewrite.
+const MAX_REPLAY_ENTRIES: usize = 4_096;
 const PRESENCE_DOMAIN: &[u8] = b"meshmsg-presence-v1";
 const MESSAGE_DOMAIN: &[u8] = b"meshmsg-direct-message-v1";
 const ACK_DOMAIN: &[u8] = b"meshmsg-direct-ack-v1";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
-type ReplayCache = Arc<Mutex<HashMap<(PublicKey, [u8; 16]), Instant>>>;
+type ReplayCache = Arc<Mutex<PersistentReplayCache>>;
+
+const _: () = assert!(REPLAY_LIFETIME.as_secs() >= DIRECT_ACCEPTANCE_WINDOW.as_secs() * 2);
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayState {
+    version: u8,
+    recipient: String,
+    topic: String,
+    entries: Vec<ReplayStateEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayStateEntry {
+    sender: String,
+    id: String,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug)]
+struct PersistentReplayCache {
+    path: PathBuf,
+    recipient: PublicKey,
+    topic: TopicId,
+    entries: HashMap<(PublicKey, [u8; 16]), u64>,
+}
+
+impl PersistentReplayCache {
+    fn load(path: PathBuf, recipient: PublicKey, topic: TopicId) -> Result<Self> {
+        let mut cache = Self {
+            path,
+            recipient,
+            topic,
+            entries: HashMap::new(),
+        };
+        match fs::read(&cache.path) {
+            Ok(bytes) => {
+                anyhow::ensure!(
+                    bytes.len() <= 1024 * 1024,
+                    "direct replay state is too large"
+                );
+                let state: ReplayState =
+                    serde_json::from_slice(&bytes).context("parse direct replay state")?;
+                anyhow::ensure!(
+                    state.version == 1,
+                    "unsupported direct replay state version"
+                );
+                anyhow::ensure!(
+                    state.recipient == recipient.to_string(),
+                    "direct replay state recipient mismatch"
+                );
+                anyhow::ensure!(
+                    state.topic == topic.to_string(),
+                    "direct replay state topic mismatch"
+                );
+                anyhow::ensure!(
+                    state.entries.len() <= MAX_REPLAY_ENTRIES,
+                    "direct replay state capacity exceeded"
+                );
+                let now = now_ms()?;
+                for entry in state.entries {
+                    let sender =
+                        PublicKey::from_str(&entry.sender).context("invalid replay sender")?;
+                    let id_bytes = data_encoding::HEXLOWER
+                        .decode(entry.id.as_bytes())
+                        .context("invalid replay id")?;
+                    let id: [u8; 16] = id_bytes
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid replay id length"))?;
+                    if entry.expires_at_ms > now {
+                        anyhow::ensure!(
+                            cache
+                                .entries
+                                .insert((sender, id), entry.expires_at_ms)
+                                .is_none(),
+                            "duplicate replay entry"
+                        );
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read direct replay state"),
+        }
+        Ok(cache)
+    }
+
+    fn persist(&self) -> Result<()> {
+        let state = ReplayState {
+            version: 1,
+            recipient: self.recipient.to_string(),
+            topic: self.topic.to_string(),
+            entries: self
+                .entries
+                .iter()
+                .map(|((sender, id), expires_at_ms)| ReplayStateEntry {
+                    sender: sender.to_string(),
+                    id: id_string(id),
+                    expires_at_ms: *expires_at_ms,
+                })
+                .collect(),
+        };
+        let dir = self
+            .path
+            .parent()
+            .context("direct replay state has no parent")?;
+        let name = self
+            .path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .context("invalid direct replay state filename")?;
+        atomic_write(dir, name, &serde_json::to_vec(&state)?, 0o600)
+            .context("persist direct replay state")
+    }
+}
 
 fn now_ms() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
@@ -182,7 +305,7 @@ impl SignedPresence {
             .sender
             .verify(&signed, &iroh::Signature::from_bytes(&record.signature))
             .context("verify presence signature")?;
-        let skew_ms = MAX_CLOCK_SKEW.as_millis() as u64;
+        let skew_ms = PRESENCE_FUTURE_SKEW.as_millis() as u64;
         anyhow::ensure!(
             record.payload.issued_ms <= at_ms.saturating_add(skew_ms),
             "presence timestamp is too far in the future"
@@ -209,6 +332,7 @@ struct DynamicDirectoryEntry {
     alias: Option<String>,
     expires: Instant,
     issued_ms: u64,
+    presence_id: [u8; 16],
     last_seen_ms: u64,
     expires_at_ms: u64,
 }
@@ -228,6 +352,7 @@ impl DynamicDirectoryEntry {
 #[derive(Debug, Clone)]
 struct PresenceReplayWatermark {
     issued_ms: u64,
+    presence_id: [u8; 16],
     forget_at: Instant,
 }
 
@@ -275,14 +400,15 @@ impl Directory {
         monotonic_now: Instant,
     ) -> Result<Option<PeerTransition>> {
         let payload = SignedPresence::decode(bytes, topic, wall_ms)?;
+        let ordering = (payload.issued_ms, payload.id);
         if self
             .dynamic
             .get(&payload.sender)
-            .is_some_and(|entry| entry.issued_ms >= payload.issued_ms)
+            .is_some_and(|entry| (entry.issued_ms, entry.presence_id) >= ordering)
             || self
                 .replay_watermarks
                 .get(&payload.sender)
-                .is_some_and(|entry| entry.issued_ms >= payload.issued_ms)
+                .is_some_and(|entry| (entry.issued_ms, entry.presence_id) >= ordering)
         {
             anyhow::bail!("presence record is not newer than the current record");
         }
@@ -300,11 +426,9 @@ impl Directory {
         let endpoint = payload.endpoint;
         let kind = match self.dynamic.get(&payload.sender) {
             None => Some(PeerTransitionKind::Discovered),
-            Some(entry) if entry.alias != payload.alias || entry.endpoint != endpoint => {
-                // Endpoint changes are semantically relevant for direct routing,
-                // but the reconstructed event deliberately does not expose them.
-                Some(PeerTransitionKind::Updated)
-            }
+            // Routing changes remain internal: only changes to public directory
+            // fields produce an externally observable lifecycle event.
+            Some(entry) if entry.alias != payload.alias => Some(PeerTransitionKind::Updated),
             Some(_) => None,
         };
         let last_seen_ms = wall_ms;
@@ -315,6 +439,7 @@ impl Directory {
             alias: payload.alias,
             expires: monotonic_now + remaining,
             issued_ms: payload.issued_ms,
+            presence_id: payload.id,
             last_seen_ms,
             expires_at_ms,
         };
@@ -350,6 +475,7 @@ impl Directory {
                     key,
                     PresenceReplayWatermark {
                         issued_ms: entry.issued_ms,
+                        presence_id: entry.presence_id,
                         forget_at: now + PRESENCE_REPLAY_LIFETIME,
                     },
                 );
@@ -555,7 +681,7 @@ impl DirectFrame {
             .verify(&signed, &iroh::Signature::from_bytes(&frame.signature))
             .context("verify private message signature")?;
         let at_ms = now_ms()?;
-        let skew_ms = MAX_CLOCK_SKEW.as_millis() as u64;
+        let skew_ms = DIRECT_ACCEPTANCE_WINDOW.as_millis() as u64;
         anyhow::ensure!(
             frame.payload.timestamp_ms <= at_ms.saturating_add(skew_ms),
             "private message timestamp is too far in the future"
@@ -688,14 +814,20 @@ impl DirectHandler {
         secret: SecretKey,
         topic: TopicId,
         incoming: mpsc::Sender<IncomingDirect>,
-    ) -> Self {
-        Self {
+        state_dir: &Path,
+    ) -> Result<Self> {
+        let replay_path = state_dir
+            .join("direct-replay-v1")
+            .join(secret.public().to_string())
+            .join(format!("{topic}.json"));
+        let replay = PersistentReplayCache::load(replay_path, secret.public(), topic)?;
+        Ok(Self {
             secret,
             topic,
             incoming,
-            replay: Arc::new(Mutex::new(HashMap::new())),
+            replay: Arc::new(Mutex::new(replay)),
             connections: Arc::new(tokio::sync::Semaphore::new(32)),
-        }
+        })
     }
 
     fn accept_message(&self, remote: PublicKey, bytes: &[u8]) -> Result<AckFrame> {
@@ -718,9 +850,11 @@ impl DirectHandler {
             .replay
             .lock()
             .map_err(|_| anyhow::anyhow!("replay cache poisoned"))?;
-        let now = Instant::now();
-        replay.retain(|_, seen| now.duration_since(*seen) < REPLAY_LIFETIME);
-        if replay.contains_key(&key) {
+        let now = now_ms()?;
+        replay
+            .entries
+            .retain(|_, expires_at_ms| *expires_at_ms > now);
+        if replay.entries.contains_key(&key) {
             // The original request was already accepted into this daemon's queue.
             // Re-acknowledge it without delivering the plaintext a second time.
             return AckFrame::new(&self.secret, &frame.payload, true, AckReason::Accepted);
@@ -728,19 +862,27 @@ impl DirectHandler {
         // Never evict a still-valid ID: doing so would permit a replay after
         // cache-pressure eviction. Capacity exhaustion fails closed until TTL
         // pruning makes room.
-        if replay.len() >= MAX_REPLAY_ENTRIES {
+        if replay.entries.len() >= MAX_REPLAY_ENTRIES {
             return AckFrame::new(&self.secret, &frame.payload, false, AckReason::Busy);
         }
+        let permit = match self.incoming.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => return AckFrame::new(&self.secret, &frame.payload, false, AckReason::Busy),
+        };
         let incoming = IncomingDirect {
             from: frame.payload.sender,
             id: frame.payload.id,
             timestamp_ms: frame.payload.timestamp_ms,
             body: frame.payload.body.clone(),
         };
-        if self.incoming.try_send(incoming).is_err() {
-            return AckFrame::new(&self.secret, &frame.payload, false, AckReason::Busy);
+        replay
+            .entries
+            .insert(key, now.saturating_add(REPLAY_LIFETIME.as_millis() as u64));
+        if let Err(error) = replay.persist() {
+            replay.entries.remove(&key);
+            return Err(error);
         }
-        replay.insert(key, now);
+        permit.send(incoming);
         AckFrame::new(&self.secret, &frame.payload, true, AckReason::Accepted)
     }
 }
@@ -866,6 +1008,80 @@ mod tests {
         let mut directory = Directory::new(MemoryLookup::new());
         directory.receive(&bytes, topic).unwrap();
         assert!(directory.receive(&bytes, topic).is_err());
+    }
+
+    #[test]
+    fn presence_order_is_total_and_future_skew_is_tightly_bounded() {
+        let secret = SecretKey::generate();
+        let topic = TopicId::from_bytes([12; 32]);
+        let wall = now_ms().unwrap();
+        let monotonic = Instant::now();
+        let mut directory = Directory::new(MemoryLookup::new());
+
+        let first = SignedPresence::encode_at(
+            &secret,
+            topic,
+            None,
+            endpoint(&secret, 8_001),
+            wall,
+            [2; 16],
+        )
+        .unwrap();
+        directory
+            .receive_at(&first, topic, wall, monotonic)
+            .unwrap();
+
+        let lower_id = SignedPresence::encode_at(
+            &secret,
+            topic,
+            None,
+            endpoint(&secret, 8_002),
+            wall,
+            [1; 16],
+        )
+        .unwrap();
+        assert!(directory
+            .receive_at(&lower_id, topic, wall, monotonic)
+            .is_err());
+
+        let higher_id = SignedPresence::encode_at(
+            &secret,
+            topic,
+            None,
+            endpoint(&secret, 8_003),
+            wall,
+            [3; 16],
+        )
+        .unwrap();
+        assert!(directory
+            .receive_at(&higher_id, topic, wall, monotonic)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            directory.resolve(&secret.public().to_string()).unwrap(),
+            endpoint(&secret, 8_003)
+        );
+
+        let at_limit = SignedPresence::encode_at(
+            &secret,
+            topic,
+            None,
+            endpoint(&secret, 8_004),
+            wall + PRESENCE_FUTURE_SKEW.as_millis() as u64,
+            [4; 16],
+        )
+        .unwrap();
+        SignedPresence::decode(&at_limit, topic, wall).unwrap();
+        let beyond_limit = SignedPresence::encode_at(
+            &secret,
+            topic,
+            None,
+            endpoint(&secret, 8_005),
+            wall + PRESENCE_FUTURE_SKEW.as_millis() as u64 + 1,
+            [5; 16],
+        )
+        .unwrap();
+        assert!(SignedPresence::decode(&beyond_limit, topic, wall).is_err());
     }
 
     #[test]
@@ -1113,7 +1329,7 @@ mod tests {
             [4; 16],
         )
         .unwrap();
-        let updated = directory
+        assert!(directory
             .receive_at(
                 &route_update,
                 topic,
@@ -1121,9 +1337,11 @@ mod tests {
                 monotonic + Duration::from_millis(1_002),
             )
             .unwrap()
-            .unwrap();
-        assert_eq!(updated.kind, PeerTransitionKind::Updated);
-        assert_eq!(updated.peer.alias.as_deref(), Some("renamed"));
+            .is_none());
+        assert_eq!(
+            directory.resolve("renamed").unwrap(),
+            endpoint(&secret, 41_002)
+        );
 
         let after_expiry = monotonic + PRESENCE_LIFETIME + Duration::from_secs(2);
         let expired = directory.cleanup_at(after_expiry);
@@ -1173,7 +1391,10 @@ mod tests {
         let receiver = SecretKey::generate();
         let topic = TopicId::from_bytes([9; 32]);
         let (tx, mut rx) = mpsc::channel(2);
-        let handler = DirectHandler::new(receiver.clone(), topic, tx);
+        let dir =
+            std::env::temp_dir().join(format!("meshmsg-replay-test-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let handler = DirectHandler::new(receiver.clone(), topic, tx, &dir).unwrap();
         let frame =
             DirectFrame::new(&sender, receiver.public(), topic, "deliver once".into()).unwrap();
         let bytes = frame.encode().unwrap();
@@ -1185,6 +1406,17 @@ mod tests {
         }
         assert_eq!(rx.try_recv().unwrap().body, "deliver once");
         assert!(rx.try_recv().is_err());
+        drop(handler);
+
+        // Restarting the handler reloads the accepted ID and re-acknowledges it
+        // without placing the plaintext into the new process queue.
+        let (restart_tx, mut restart_rx) = mpsc::channel(2);
+        let restarted = DirectHandler::new(receiver.clone(), topic, restart_tx, &dir).unwrap();
+        let ack = restarted.accept_message(sender.public(), &bytes).unwrap();
+        assert!(ack.payload.accepted);
+        assert!(restart_rx.try_recv().is_err());
+        drop(restarted);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

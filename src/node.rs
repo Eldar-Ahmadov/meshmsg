@@ -431,7 +431,8 @@ async fn start(
     let blob_store: Store = fs_store.into();
     let downloader = blob_store.downloader(&endpoint);
     let blobs = BlobsProtocol::new(&blob_store, None);
-    let direct = DirectHandler::new(secret.clone(), topic, direct_incoming);
+    let direct = DirectHandler::new(secret.clone(), topic, direct_incoming, state_dir)
+        .context("open persistent direct replay state")?;
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(PRESENCE_ALPN, presence_gossip.clone())
@@ -1743,12 +1744,16 @@ fn peer_snapshot(
     self_peer: &str,
     self_alias: Option<&str>,
     generated_at_ms: u64,
+    directory_epoch: &str,
+    directory_revision: u64,
 ) -> serde_json::Value {
     peer_api::snapshot_value(
         self_peer,
         self_alias,
         local_peer_online(node),
         generated_at_ms,
+        directory_epoch,
+        directory_revision,
         directory.peers(),
     )
 }
@@ -1757,15 +1762,21 @@ fn emit_peer_transitions(
     transitions: impl IntoIterator<Item = PeerTransition>,
     events: &broadcast::Sender<serde_json::Value>,
     json: bool,
+    directory_epoch: &str,
+    directory_revision: &mut u64,
 ) {
     for transition in transitions {
-        let value = peer_api::transition_value(transition);
+        let candidate_revision = directory_revision
+            .checked_add(1)
+            .expect("directory revision overflow");
+        let value = peer_api::transition_value(transition, directory_epoch, candidate_revision);
         // The type-level field bounds make this unreachable; keep an explicit
         // final guard so future schema changes fail closed instead of creating
         // unexpectedly large subscription events.
         if serde_json::to_vec(&value)
             .is_ok_and(|encoded| encoded.len() <= MAX_PEER_LIFECYCLE_EVENT_BYTES)
         {
+            *directory_revision = candidate_revision;
             let _ = events.send(value.clone());
             event(json, value);
         }
@@ -1864,6 +1875,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let direct_limit = Arc::new(Semaphore::new(DIRECT_CONCURRENCY));
     let topic = state.topic_id()?;
     let mut directory = Directory::new(node.presence_lookup.clone());
+    let directory_epoch = data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>());
+    let mut directory_revision = 0_u64;
     for address in &node.bootstrap_addrs {
         if directory.pin(address.clone()).is_ok() {
             // Invite validation already bounds bootstrap addresses; invalid direct
@@ -1889,12 +1902,13 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 // Expiration is authoritative in the daemon. Emit it before
                 // capturing the new subscriber's snapshot so queued events are
                 // strictly later than that snapshot.
-                emit_peer_transitions(directory.cleanup(), &event_tx, json);
+                emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
                 let commands = command_tx.clone();
                 let events = event_tx.subscribe();
                 let generated_at_ms = unix_timestamp_ms()?;
                 let startup_peers = peer_snapshot(
                     &node, &directory, &peer, alias_config.effective(), generated_at_ms,
+                    &directory_epoch, directory_revision,
                 );
                 let connected = serde_json::json!({
                     "type":"connected", "peer":peer, "endpoint_online":true,
@@ -1930,7 +1944,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     let _ = reply.send(response);
                 }
                 Some(DaemonCommand::PrivateSend { to, body, reply }) => {
-                    emit_peer_transitions(directory.cleanup(), &event_tx, json);
+                    emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
                     let address = match directory.resolve(&to) {
                         Ok(address) => address,
                         Err(error) => {
@@ -2013,10 +2027,11 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     }));
                 }
                 Some(DaemonCommand::Peers { reply }) => {
-                    emit_peer_transitions(directory.cleanup(), &event_tx, json);
+                    emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
                     let generated_at_ms = unix_timestamp_ms()?;
                     let _ = reply.send(peer_snapshot(
                         &node, &directory, &peer, alias_config.effective(), generated_at_ms,
+                        &directory_epoch, directory_revision,
                     ));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
@@ -2108,9 +2123,9 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     if presence_sources.allow(message.delivered_from) {
                         // Never let receive-time cleanup swallow an expiry. The
                         // explicit cleanup transition is emitted first.
-                        emit_peer_transitions(directory.cleanup(), &event_tx, json);
+                        emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
                         if let Ok(Some(transition)) = directory.receive(&message.content, topic) {
-                            emit_peer_transitions([transition], &event_tx, json);
+                            emit_peer_transitions([transition], &event_tx, json, &directory_epoch, &mut directory_revision);
                         }
                     }
                 }
@@ -2136,7 +2151,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 }
             },
             _ = presence_cleanup.tick() => {
-                emit_peer_transitions(directory.cleanup(), &event_tx, json);
+                emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
                 presence_sources.cleanup();
             },
             _ = rejoin.tick(), if !node.bootstrap_peers.is_empty() => {

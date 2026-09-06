@@ -86,7 +86,8 @@ const context = vm.createContext({
     if (request.command === 'peers') {
       peersRequests += 1;
       return { ok: true, json: async () => ({
-        type: 'peers_snapshot', schema_version: 1, generated_at_ms: 1700000001000,
+        type: 'peers_snapshot', schema_version: 2, generated_at_ms: 1700000001000,
+        directory_epoch: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', directory_revision: 0,
         self: { public_key: 'local-peer', alias: 'local', online: true },
         peers: [{ public_key: 'recovered-peer', alias: null, online: true, last_seen_ms: 2, expires_at_ms: 3 }]
       }) };
@@ -108,7 +109,8 @@ function submit(body) {
   assert.equal(el('status').textContent, '1 direct peer');
   const source = EventSource.instances.at(-1);
   source.emit({
-    type: 'peers_snapshot', schema_version: 1, generated_at_ms: 1700000000000,
+    type: 'peers_snapshot', schema_version: 2, generated_at_ms: 1700000000000,
+    directory_epoch: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', directory_revision: 0,
     self: { public_key: 'local-peer', alias: 'local', online: true },
     peers: [
       { public_key: 'peer-a', alias: null, online: true, last_seen_ms: 1, expires_at_ms: 2 },
@@ -117,19 +119,22 @@ function submit(body) {
   });
   assert.equal(el('status').textContent, '2 current peers');
   source.emit({
-    type: 'peer_discovered', schema_version: 1,
+    type: 'peer_discovered', schema_version: 2,
+    directory_epoch: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', directory_revision: 1,
     peer: { public_key: '<peer-c>', alias: '<text-only>', online: true, last_seen_ms: 1, expires_at_ms: 2 }
   });
   assert.equal(el('status').textContent, '3 current peers');
   assert.match(el('feed').children[0].children[0].textContent, / · Peer discovered: <peer-c> \(<text-only>\)$/);
   source.emit({
-    type: 'peer_updated', schema_version: 1,
+    type: 'peer_updated', schema_version: 2,
+    directory_epoch: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', directory_revision: 2,
     peer: { public_key: '<peer-c>', alias: '<updated>', online: true, last_seen_ms: 2, expires_at_ms: 3 }
   });
   assert.equal(el('status').textContent, '3 current peers');
   assert.match(el('feed').children[0].children[0].textContent, / · Peer updated: <peer-c> \(<updated>\)$/);
   source.emit({
-    type: 'peer_expired', schema_version: 1,
+    type: 'peer_expired', schema_version: 2,
+    directory_epoch: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', directory_revision: 3,
     peer: { public_key: '<peer-c>', alias: '<updated>', online: false, last_seen_ms: 2, expires_at_ms: 3 }
   });
   assert.equal(el('status').textContent, '2 current peers');

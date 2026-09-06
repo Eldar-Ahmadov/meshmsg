@@ -10,6 +10,8 @@ let reconnectDelay = 1000;
 let statusBusy = false;
 let peersBusy = false;
 let peerDirectoryReady = false;
+let directoryEpoch = null;
+let directoryRevision = null;
 const currentPeers = new Map();
 
 function prependEntry(item) {
@@ -129,6 +131,8 @@ function updatePeerSummary() {
 }
 
 function replacePeers(value) {
+  directoryEpoch = value.directory_epoch;
+  directoryRevision = value.directory_revision;
   currentPeers.clear();
   if (Array.isArray(value.peers)) {
     for (const peer of value.peers) {
@@ -142,6 +146,12 @@ function replacePeers(value) {
 }
 
 function updatePeer(value, expired) {
+  if (value.directory_epoch !== directoryEpoch || value.directory_revision !== directoryRevision + 1) {
+    gap('Peer directory changed or an event was missed; refreshing authoritative state.');
+    refreshPeers();
+    return;
+  }
+  directoryRevision = value.directory_revision;
   const peer = value && value.peer;
   if (!peer || typeof peer.public_key !== 'string') return;
   if (expired) currentPeers.delete(peer.public_key);
@@ -161,6 +171,8 @@ async function refreshPeers() {
     replacePeers(value);
   } catch (_) {
     currentPeers.clear();
+    directoryEpoch = null;
+    directoryRevision = null;
     peerDirectoryReady = false;
     byId('status').textContent = 'Peer directory unavailable';
   } finally { peersBusy = false; }

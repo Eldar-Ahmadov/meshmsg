@@ -216,11 +216,24 @@ fn public_remote_peer(value: &Value, expected_online: bool) -> Option<Value> {
     }))
 }
 
+fn directory_position(value: &Value) -> Option<(&str, u64)> {
+    let epoch = value["directory_epoch"].as_str()?;
+    if epoch.len() != 32
+        || !epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some((epoch, value["directory_revision"].as_u64()?))
+}
+
 fn public_peers_snapshot(value: &Value) -> Option<Value> {
-    if value["type"] != "peers_snapshot" || value["schema_version"] != 1 {
+    if value["type"] != "peers_snapshot" || value["schema_version"] != 2 {
         return None;
     }
     let generated_at_ms = value["generated_at_ms"].as_u64()?;
+    let (directory_epoch, directory_revision) = directory_position(value)?;
     let self_value = &value["self"];
     let self_key = public_key(&self_value["public_key"])?;
     let self_alias = public_alias(&self_value["alias"])?;
@@ -249,20 +262,26 @@ fn public_peers_snapshot(value: &Value) -> Option<Value> {
         remotes.push(peer);
     }
     Some(json!({
-        "type":"peers_snapshot", "schema_version":1,
+        "type":"peers_snapshot", "schema_version":2,
         "generated_at_ms":generated_at_ms,
+        "directory_epoch":directory_epoch, "directory_revision":directory_revision,
         "self":{"public_key":self_key, "alias":self_alias, "online":self_online},
         "peers":remotes
     }))
 }
 
 fn public_peer_transition(value: &Value, event_type: &str) -> Option<Value> {
-    if value["schema_version"] != 1 {
+    if value["schema_version"] != 2 {
         return None;
     }
     let expected_online = event_type != "peer_expired";
     let peer = public_remote_peer(&value["peer"], expected_online)?;
-    Some(json!({"type":event_type, "schema_version":1, "peer":peer}))
+    let (directory_epoch, directory_revision) = directory_position(value)?;
+    Some(json!({
+        "type":event_type, "schema_version":2,
+        "directory_epoch":directory_epoch, "directory_revision":directory_revision,
+        "peer":peer
+    }))
 }
 
 async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
@@ -765,7 +784,8 @@ mod tests {
         let self_key = iroh::SecretKey::generate().public().to_string();
         let remote_key = iroh::SecretKey::generate().public().to_string();
         let injected = json!({
-            "type":"peers_snapshot", "schema_version":1, "generated_at_ms":1_000,
+            "type":"peers_snapshot", "schema_version":2, "generated_at_ms":1_000,
+            "directory_epoch":"0123456789abcdef0123456789abcdef", "directory_revision":0,
             "self":{
                 "public_key":self_key, "alias":"local", "online":true,
                 "endpoint":"self-route", "socket":"private"
@@ -797,7 +817,8 @@ mod tests {
             );
         }
         let transition = public_event(json!({
-            "type":"peer_updated", "schema_version":1,
+            "type":"peer_updated", "schema_version":2,
+            "directory_epoch":"0123456789abcdef0123456789abcdef", "directory_revision":1,
             "peer":{
                 "public_key":remote_key, "alias":"renamed", "online":true,
                 "last_seen_ms":1_000, "expires_at_ms":151_000,

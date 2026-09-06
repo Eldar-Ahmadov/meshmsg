@@ -122,7 +122,7 @@ run_scenario() {
   set -e
   [[ $peers_status -ne 0 ]] || fail "current peers unexpectedly succeeded against v${version} daemon"
   [[ $peers_status -ne 124 ]] || fail "current peers hung against v${version} daemon"
-  grep -Eqi 'peer.directory|peer_directory_v1|does not support|upgrade|restart' "$base/peers.err" \
+  grep -Eqi 'peer.directory|peer_directory_v2|does not support|upgrade|restart' "$base/peers.err" \
     || fail "current peers did not return an actionable v${version} compatibility error"
   [[ ! -s "$base/peers.out" ]] || fail "current peers emitted a partial snapshot against v${version} daemon"
   status_ok "$version" sender || fail "v${version} daemon stopped responding after rejected peers request"

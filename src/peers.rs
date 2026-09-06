@@ -3,8 +3,8 @@ use serde::Serialize;
 /// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
 /// locally derived and never extends beyond this bound.
 pub(crate) const PEER_LEASE_MS: u64 = 150_000;
-pub(crate) const PEER_DIRECTORY_CAPABILITY: &str = "peer_directory_v1";
-pub(crate) const PEER_SCHEMA_VERSION: u8 = 1;
+pub(crate) const PEER_DIRECTORY_CAPABILITY: &str = "peer_directory_v2";
+pub(crate) const PEER_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -47,6 +47,8 @@ pub(crate) fn snapshot_value(
     self_alias: Option<&str>,
     self_online: bool,
     generated_at_ms: u64,
+    directory_epoch: &str,
+    directory_revision: u64,
     mut remotes: Vec<RemotePeer>,
 ) -> serde_json::Value {
     // Never depend on Gossip loopback behavior. Self has one explicit,
@@ -56,12 +58,17 @@ pub(crate) fn snapshot_value(
     serde_json::json!({
         "type":"peers_snapshot", "schema_version":PEER_SCHEMA_VERSION,
         "generated_at_ms":generated_at_ms,
+        "directory_epoch":directory_epoch, "directory_revision":directory_revision,
         "self":SelfPeer { public_key:self_peer, alias:self_alias, online:self_online },
         "peers":remotes
     })
 }
 
-pub(crate) fn transition_value(transition: PeerTransition) -> serde_json::Value {
+pub(crate) fn transition_value(
+    transition: PeerTransition,
+    directory_epoch: &str,
+    directory_revision: u64,
+) -> serde_json::Value {
     let event_type = match transition.kind {
         PeerTransitionKind::Discovered => "peer_discovered",
         PeerTransitionKind::Updated => "peer_updated",
@@ -69,6 +76,7 @@ pub(crate) fn transition_value(transition: PeerTransition) -> serde_json::Value 
     };
     serde_json::json!({
         "type":event_type, "schema_version":PEER_SCHEMA_VERSION,
+        "directory_epoch":directory_epoch, "directory_revision":directory_revision,
         "peer":transition.peer
     })
 }
@@ -94,6 +102,8 @@ mod tests {
             Some("local"),
             true,
             1_000,
+            "epoch",
+            0,
             vec![
                 remote("c", None),
                 remote("b", Some("loopback")),
@@ -101,7 +111,7 @@ mod tests {
             ],
         );
         assert_eq!(value["type"], "peers_snapshot");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["self"]["public_key"], "b");
         assert_eq!(value["self"]["alias"], "local");
         assert_eq!(value["self"]["online"], true);
@@ -126,7 +136,15 @@ mod tests {
                 expires_at_ms: 1_000 + PEER_LEASE_MS,
             })
             .collect();
-        let snapshot = snapshot_value(&"f".repeat(64), Some("self"), true, 1_000, peers);
+        let snapshot = snapshot_value(
+            &"f".repeat(64),
+            Some("self"),
+            true,
+            1_000,
+            "epoch",
+            0,
+            peers,
+        );
         assert!(
             serde_json::to_vec(&snapshot).unwrap().len() <= crate::ipc::MAX_IPC_EVENT_SIZE,
             "maximum complete peer snapshot exceeds IPC frame"
@@ -135,30 +153,39 @@ mod tests {
 
     #[test]
     fn maximum_lifecycle_event_has_a_small_fixed_bound() {
-        let value = transition_value(PeerTransition {
-            kind: PeerTransitionKind::Expired,
-            peer: RemotePeer {
-                public_key: "f".repeat(64),
-                alias: Some("a".repeat(crate::alias::MAX_ALIAS_BYTES)),
-                online: false,
-                last_seen_ms: u64::MAX,
-                expires_at_ms: u64::MAX,
+        let value = transition_value(
+            PeerTransition {
+                kind: PeerTransitionKind::Expired,
+                peer: RemotePeer {
+                    public_key: "f".repeat(64),
+                    alias: Some("a".repeat(crate::alias::MAX_ALIAS_BYTES)),
+                    online: false,
+                    last_seen_ms: u64::MAX,
+                    expires_at_ms: u64::MAX,
+                },
             },
-        });
+            "epoch",
+            1,
+        );
         assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_PEER_LIFECYCLE_EVENT_BYTES);
         assert!(value.get("body").is_none());
     }
 
     #[test]
     fn wire_objects_have_only_the_documented_sanitized_fields() {
-        let discovered = transition_value(PeerTransition {
-            kind: PeerTransitionKind::Discovered,
-            peer: remote("canonical-key", None),
-        });
+        let discovered = transition_value(
+            PeerTransition {
+                kind: PeerTransitionKind::Discovered,
+                peer: remote("canonical-key", None),
+            },
+            "epoch",
+            1,
+        );
         assert_eq!(
             discovered,
             serde_json::json!({
-                "type":"peer_discovered", "schema_version":1,
+                "type":"peer_discovered", "schema_version":2,
+                "directory_epoch":"epoch", "directory_revision":1,
                 "peer":{
                     "public_key":"canonical-key", "alias":null, "online":true,
                     "last_seen_ms":100, "expires_at_ms":200
