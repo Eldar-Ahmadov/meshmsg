@@ -1,6 +1,8 @@
 use crate::{
+    alias::AliasConfig,
     attachment::{self, AttachmentKind, AttachmentOffer, MAX_ATTACHMENT_BYTES},
     config::{prepare_state_dir, State, StateLock},
+    direct::{self, DirectHandler, Directory, IncomingDirect, DIRECT_ALPN, PRESENCE_ALPN},
     invite::Invite,
     ipc::{
         read_frame, read_subscription, send_request, subscribe, write_request, write_value,
@@ -64,6 +66,7 @@ const MAX_ENVELOPE_SIZE: usize = 4096;
 /// Iroh's limit includes its own framing, so reserve explicit protocol headroom.
 const GOSSIP_PROTOCOL_HEADROOM: usize = 512;
 const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADROOM;
+const MAX_PRESENCE_GOSSIP_MESSAGE_SIZE: usize = 2048 + GOSSIP_PROTOCOL_HEADROOM;
 const IPC_EVENT_CAPACITY: usize = 256;
 const BENCH_MAGIC: &str = "meshmsg-bench-v1";
 const MAX_BENCH_MESSAGES: u64 = 10_000_000;
@@ -77,6 +80,8 @@ const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection attempt, so repeating it also covers attempts made while the
 /// network interface is still unavailable.
 const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(30);
+const DIRECT_CONCURRENCY: usize = 8;
 const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 const ATTACHMENT_OFFER_VERSION: u8 = 1;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -368,14 +373,22 @@ struct RunningNode {
     router: Router,
     sender: GossipSender,
     receiver: GossipReceiver,
+    presence_sender: GossipSender,
+    presence_receiver: GossipReceiver,
     secret: SecretKey,
     bootstrap_peers: Vec<PublicKey>,
+    bootstrap_addrs: Vec<iroh::EndpointAddr>,
     blob_store: Store,
     downloader: Downloader,
     lookup: MemoryLookup,
 }
 
-async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<RunningNode> {
+async fn start(
+    state: &State,
+    secret: SecretKey,
+    state_dir: &Path,
+    direct_incoming: mpsc::Sender<IncomingDirect>,
+) -> Result<RunningNode> {
     state.validate()?;
     let topic: TopicId = state.topic_id()?;
     let lookup = MemoryLookup::new();
@@ -386,6 +399,13 @@ async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<Run
         .await?;
     let gossip = Gossip::builder()
         .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
+        .spawn(endpoint.clone());
+    // Isolate control-plane membership from the long-standing broadcast Gossip
+    // actor. Sharing one actor/connection pool across both topics can perturb
+    // broadcast neighbor liveness during failover and rejoin.
+    let presence_gossip = Gossip::builder()
+        .alpn(PRESENCE_ALPN)
+        .max_message_size(MAX_PRESENCE_GOSSIP_MESSAGE_SIZE)
         .spawn(endpoint.clone());
     let blob_root = state_dir.join("blobs-v1").join(secret.public().to_string());
     let mut blob_options = FsStoreOptions::new(&blob_root);
@@ -399,16 +419,21 @@ async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<Run
     let blob_store: Store = fs_store.into();
     let downloader = blob_store.downloader(&endpoint);
     let blobs = BlobsProtocol::new(&blob_store, None);
+    let direct = DirectHandler::new(secret.clone(), topic, direct_incoming);
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
+        .accept(PRESENCE_ALPN, presence_gossip.clone())
         .accept(iroh_blobs::ALPN, blobs)
+        .accept(DIRECT_ALPN, direct)
         .spawn();
     let mut bootstrap = Vec::new();
+    let mut bootstrap_addrs = Vec::new();
     if let Some(token) = &state.invite {
         let invite: Invite = token.parse()?;
         for peer in invite.bootstrap_peers {
             if peer.id != endpoint.id() {
                 bootstrap.push(peer.id);
+                bootstrap_addrs.push(peer.clone());
                 lookup.add_endpoint_info(peer);
             }
         }
@@ -419,13 +444,26 @@ async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<Run
         gossip.subscribe_and_join(topic, bootstrap.clone()).await?
     };
     let (sender, receiver) = subscription.split();
+    let presence_subscription = if bootstrap.is_empty() {
+        presence_gossip
+            .subscribe(direct::presence_topic(topic), vec![])
+            .await?
+    } else {
+        presence_gossip
+            .subscribe_and_join(direct::presence_topic(topic), bootstrap.clone())
+            .await?
+    };
+    let (presence_sender, presence_receiver) = presence_subscription.split();
     Ok(RunningNode {
         endpoint,
         router,
         sender,
         receiver,
+        presence_sender,
+        presence_receiver,
         secret,
         bootstrap_peers: bootstrap,
+        bootstrap_addrs,
         blob_store,
         downloader,
         lookup,
@@ -435,6 +473,7 @@ async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<Run
 enum DaemonCommand {
     Send {
         body: String,
+        to: Option<String>,
         reply: oneshot::Sender<serde_json::Value>,
     },
     BenchMessage {
@@ -1147,9 +1186,11 @@ where
                 }
             }
         }
-        IpcRequest::Send { body } => {
+        IpcRequest::Send { body, to } => {
             let (reply, response) = oneshot::channel();
-            commands.send(DaemonCommand::Send { body, reply }).await?;
+            commands
+                .send(DaemonCommand::Send { body, to, reply })
+                .await?;
             write_value(&mut stream, &response.await?).await?;
         }
         IpcRequest::BenchSend { config } => {
@@ -1658,8 +1699,13 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let state_lock = StateLock::acquire(dir)?;
     let (mut state, secret) = State::load_locked(dir, &state_lock)?;
     state.validate_for_identity(secret.public())?;
+    let alias_config = AliasConfig::load_for_identity(dir, secret.public())?;
+    let (direct_incoming_tx, mut direct_incoming_rx) = mpsc::channel(256);
     let startup = tokio::select! {
-        result = tokio::time::timeout(STARTUP_TIMEOUT, start(&state, secret, dir)) => result,
+        result = tokio::time::timeout(
+            STARTUP_TIMEOUT,
+            start(&state, secret, dir, direct_incoming_tx),
+        ) => result,
         _ = shutdown.recv() => return Ok(()),
     };
     let mut node = match startup {
@@ -1726,7 +1772,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
         "advertises_self":state.advertise_self, "has_invite":has_invite,
         "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
         "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
-        "endpoint_online":true, "topic_joined":node.receiver.is_joined()
+        "endpoint_online":true, "topic_joined":node.receiver.is_joined(),
+        "alias":alias_config.effective(), "alias_enabled":alias_config.enabled()
     });
     event(json, started);
 
@@ -1734,6 +1781,20 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
     let benchmark_busy = Arc::new(AtomicBool::new(false));
     let transfer_limit = Arc::new(Semaphore::new(2));
+    let direct_limit = Arc::new(Semaphore::new(DIRECT_CONCURRENCY));
+    let topic = state.topic_id()?;
+    let mut directory = Directory::default();
+    for address in &node.bootstrap_addrs {
+        if directory.pin(address.clone()).is_ok() {
+            // Invite validation already bounds bootstrap addresses; invalid direct
+            // addresses simply remain unavailable for private messaging.
+        }
+    }
+    if direct::validate_endpoint_addr(&node.endpoint.addr(), node.endpoint.id()).is_ok() {
+        directory.pin(node.endpoint.addr())?;
+    }
+    let mut presence = tokio::time::interval(PRESENCE_INTERVAL);
+    presence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut transfer_tasks = tokio::task::JoinSet::new();
     let mut rejoin = tokio::time::interval(REJOIN_INTERVAL);
     rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1746,7 +1807,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 let events = event_tx.subscribe();
                 let connected = serde_json::json!({
                     "type":"connected", "peer":peer, "endpoint_online":true,
-                    "topic_joined":node.receiver.is_joined()
+                    "topic_joined":node.receiver.is_joined(),
+                    "alias":alias_config.effective()
                 });
                 let benchmark_busy = benchmark_busy.clone();
                 tokio::spawn(async move {
@@ -1758,21 +1820,65 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 });
             }
             command = command_rx.recv() => match command {
-                Some(DaemonCommand::Send { body, reply }) => {
-                    let response = match unix_timestamp_ms() {
-                        Ok(timestamp_ms) => match Envelope::encode_at(&node.secret, body.clone(), timestamp_ms) {
-                            Ok(envelope) => match node.sender.broadcast(envelope).await {
-                                Ok(()) => queued_event(&peer, body, timestamp_ms),
-                                Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
+                Some(DaemonCommand::Send { body, to, reply }) => {
+                    if let Some(recipient) = to {
+                        let address = match directory.resolve(&recipient) {
+                            Ok(address) => address,
+                            Err(error) => {
+                                let _ = reply.send(serde_json::json!({
+                                    "type":"error", "code":"recipient_unresolved",
+                                    "message":error.to_string()
+                                }));
+                                continue;
+                            }
+                        };
+                        let permit = match direct_limit.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                let _ = reply.send(serde_json::json!({
+                                    "type":"error", "code":"private_send_busy",
+                                    "message":"private-message send capacity reached"
+                                }));
+                                continue;
+                            }
+                        };
+                        let endpoint = node.endpoint.clone();
+                        let secret = node.secret.clone();
+                        transfer_tasks.spawn(async move {
+                            let _permit = permit;
+                            let response = match direct::send(endpoint, secret, topic, address, body).await {
+                                Ok(accepted) => serde_json::json!({
+                                    "type":"private_accepted", "schema_version":1,
+                                    "to":accepted.recipient.to_string(),
+                                    "message_id":direct::id_string(&accepted.id),
+                                    "timestamp_ms":accepted.timestamp_ms,
+                                    "body_bytes":accepted.body_bytes,
+                                    "acceptance_acknowledged":true,
+                                    "durable":false, "read":false
+                                }),
+                                Err(error) => serde_json::json!({
+                                    "type":"error", "code":"private_send_failed",
+                                    "message":format!("{error:#}")
+                                }),
+                            };
+                            let _ = reply.send(response);
+                        });
+                    } else {
+                        let response = match unix_timestamp_ms() {
+                            Ok(timestamp_ms) => match Envelope::encode_at(&node.secret, body.clone(), timestamp_ms) {
+                                Ok(envelope) => match node.sender.broadcast(envelope).await {
+                                    Ok(()) => queued_event(&peer, body, timestamp_ms),
+                                    Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
+                                },
+                                Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
                             },
                             Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
-                        },
-                        Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
-                    };
-                    if response["type"] == "queued" {
-                        let _ = event_tx.send(response.clone());
+                        };
+                        if response["type"] == "queued" {
+                            let _ = event_tx.send(response.clone());
+                        }
+                        let _ = reply.send(response);
                     }
-                    let _ = reply.send(response);
                 }
                 Some(DaemonCommand::BenchMessage { body, timestamp_ms, cancel, reply }) => {
                     match Envelope::encode_at(&node.secret, body, timestamp_ms) {
@@ -1804,7 +1910,12 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         "bootstrap_peer_count":bootstrap_peer_count,
                         "self_advertised":self_advertised, "neighbors":neighbors,
                         "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
-                        "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined()
+                        "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined(),
+                        "alias":alias_config.effective(),
+                        "alias_enabled":alias_config.enabled(),
+                        "captured_hostname":alias_config.hostname(),
+                        "custom_alias":alias_config.custom(),
+                        "advertised_aliases":directory.advertised_aliases()
                     }));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
@@ -1868,6 +1979,19 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
             },
             incoming = node.receiver.try_next() => match incoming? {
                 Some(value) => {
+                    if let Event::NeighborUp(remote) = &value {
+                        // A new client may have bootstrapped through an older node that does
+                        // not know the derived presence topic. Join it directly as well.
+                        let _ = node.presence_sender.join_peers(vec![*remote]).await;
+                        if let Ok(record) = direct::encode_presence(
+                            &node.secret,
+                            topic,
+                            alias_config.effective(),
+                            node.endpoint.addr(),
+                        ) {
+                            let _ = node.presence_sender.broadcast(record).await;
+                        }
+                    }
                     let values = network_event(value);
                     for full_value in values {
                         let _ = event_tx.send(full_value.clone());
@@ -1876,12 +2000,44 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 }
                 None => break,
             },
+            incoming = node.presence_receiver.try_next() => match incoming? {
+                Some(Event::Received(message)) => {
+                    if let Ok(address) = directory.receive(&message.content, topic) {
+                        node.lookup.add_endpoint_info(address);
+                    }
+                }
+                Some(Event::NeighborUp(_) | Event::NeighborDown(_) | Event::Lagged) => {}
+                None => break,
+            },
+            incoming = direct_incoming_rx.recv() => {
+                if let Some(message) = incoming {
+                    let value = private_message_event(message);
+                    let _ = event_tx.send(value.clone());
+                    event(json, suppress_message_body(value));
+                }
+            },
+            _ = presence.tick() => {
+                if let Ok(record) = direct::encode_presence(
+                    &node.secret,
+                    topic,
+                    alias_config.effective(),
+                    node.endpoint.addr(),
+                ) {
+                    let _ = node.presence_sender.broadcast(record).await;
+                }
+            },
             _ = rejoin.tick(), if !node.bootstrap_peers.is_empty() => {
                 if !node.receiver.is_joined() {
                     node.sender
                         .join_peers(node.bootstrap_peers.clone())
                         .await
                         .context("retry gossip bootstrap peers after connectivity loss")?;
+                }
+                if !node.presence_receiver.is_joined() {
+                    node.presence_sender
+                        .join_peers(node.bootstrap_peers.clone())
+                        .await
+                        .context("retry presence bootstrap peers after connectivity loss")?;
                 }
             },
             completed = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
@@ -1894,6 +2050,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     }
 
     transfer_limit.close();
+    direct_limit.close();
     transfer_tasks.abort_all();
     while transfer_tasks.join_next().await.is_some() {}
     drop(event_tx);
@@ -1978,11 +2135,28 @@ fn message_event(msg: Envelope) -> serde_json::Value {
     })
 }
 
+fn private_message_event(msg: IncomingDirect) -> serde_json::Value {
+    serde_json::json!({
+        "type":"private_message", "schema_version":1, "private":true,
+        "from":msg.from.to_string(), "message_id":direct::id_string(&msg.id),
+        "timestamp_ms":msg.timestamp_ms, "body":msg.body,
+        "acceptance_acknowledged":true, "durable":false, "read":false
+    })
+}
+
 fn suppress_message_body(value: serde_json::Value) -> serde_json::Value {
     if value["type"] == "message" {
         return serde_json::json!({
             "type":"message", "from":value["from"], "timestamp_ms":value["timestamp_ms"],
             "body_bytes":value["body"].as_str().map(str::len).unwrap_or(0), "body_suppressed":true
+        });
+    }
+    if value["type"] == "private_message" {
+        return serde_json::json!({
+            "type":"private_message", "from":value["from"],
+            "message_id":value["message_id"], "timestamp_ms":value["timestamp_ms"],
+            "body_bytes":value["body"].as_str().map(str::len).unwrap_or(0),
+            "body_suppressed":true, "private":true
         });
     }
     if value["type"] == "attachment_offer" {
@@ -2040,11 +2214,12 @@ fn ensure_success(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-pub async fn send_once(dir: &Path, body: &str, json: bool) -> Result<()> {
+pub async fn send_once(dir: &Path, to: Option<&str>, body: &str, json: bool) -> Result<()> {
     let value = send_request(
         dir,
         &IpcRequest::Send {
             body: body.to_owned(),
+            to: to.map(str::to_owned),
         },
     )
     .await?;
@@ -2790,7 +2965,7 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
         tokio::select! {
             line = rx.recv() => match line {
                 Some(body) => {
-                    let value = send_request(dir, &IpcRequest::Send { body }).await?;
+                    let value = send_request(dir, &IpcRequest::Send { body, to: None }).await?;
                     ensure_success(&value)?;
                 }
                 None => break,
@@ -2811,9 +2986,12 @@ pub async fn status(dir: &Path, json: bool) -> Result<()> {
         println!("{value}");
     } else {
         println!(
-            "daemon: running\npeer: {}\ntopic: {}\nadvertises self: {}\nhas invite: {}\nbootstrap peers: {}\nself advertised: {}\nendpoint online: {}\ntopic joined: {}\nneighbors: {}",
+            "daemon: running\npeer: {}\ntopic: {}\nalias: {}\nalias enabled: {}\nadvertised aliases: {}\nadvertises self: {}\nhas invite: {}\nbootstrap peers: {}\nself advertised: {}\nendpoint online: {}\ntopic joined: {}\nneighbors: {}",
             value["peer"].as_str().unwrap_or(""),
             value["topic"].as_str().unwrap_or(""),
+            value["alias"].as_str().unwrap_or("(disabled)"),
+            value["alias_enabled"].as_bool().unwrap_or(false),
+            value["advertised_aliases"].as_u64().unwrap_or(0),
             value["advertises_self"].as_bool().unwrap_or(false),
             value["has_invite"].as_bool().unwrap_or(false),
             value["bootstrap_peer_count"].as_u64().unwrap_or(0),
@@ -2835,12 +3013,15 @@ pub async fn stop(dir: &Path, json: bool) -> Result<()> {
 pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
     let (state, secret) = State::load_for_doctor(dir)?;
     state.validate_for_identity(secret.public())?;
+    let alias_config = AliasConfig::load_for_identity(dir, secret.public())?;
     let (has_invite, bootstrap_peer_count, self_advertised) =
         invite_details(&state, secret.public())?;
     let value = serde_json::json!({
         "type":"doctor", "ok":true, "peer":secret.public().to_string(), "topic":state.topic,
         "advertises_self":state.advertise_self, "has_invite":has_invite,
-        "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised
+        "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
+        "alias":alias_config.effective(), "alias_enabled":alias_config.enabled(),
+        "captured_hostname":alias_config.hostname(), "custom_alias":alias_config.custom()
     });
     if json {
         println!("{value}");
@@ -2890,6 +3071,20 @@ fn event(json: bool, value: serde_json::Value) {
                 "{}: {}",
                 value["from"].as_str().unwrap_or("peer"),
                 terminal_safe(value["body"].as_str().unwrap_or(""))
+            ),
+            "private_message" if value["body_suppressed"].as_bool() == Some(true) => println!(
+                "private message from {} ({} bytes; body suppressed)",
+                value["from"].as_str().unwrap_or("peer"),
+                value["body_bytes"].as_u64().unwrap_or(0)
+            ),
+            "private_message" => println!(
+                "private from {}: {}",
+                value["from"].as_str().unwrap_or("peer"),
+                terminal_safe(value["body"].as_str().unwrap_or(""))
+            ),
+            "private_accepted" => println!(
+                "private message accepted by {} (acceptance only; not durable or read)",
+                value["to"].as_str().unwrap_or("peer")
             ),
             "queued" => println!(
                 "queued locally (delivery not acknowledged): {}",
@@ -3655,6 +3850,18 @@ mod tests {
         assert_eq!(value["body_bytes"], 12);
         assert_eq!(value["body_suppressed"], true);
         assert!(value.get("body").is_none());
+
+        let direct = suppress_message_body(private_message_event(IncomingDirect {
+            from: secret.public(),
+            id: [7; 16],
+            timestamp_ms: 43,
+            body: "dm secret".to_owned(),
+        }));
+        assert_eq!(direct["type"], "private_message");
+        assert_eq!(direct["body_bytes"], 9);
+        assert_eq!(direct["private"], true);
+        assert!(direct.get("body").is_none());
+        assert!(!direct.to_string().contains("dm secret"));
     }
 
     #[test]

@@ -14,6 +14,7 @@ data-encoding = "2"
 dirs = "6"
 futures-util = "0.3"
 http-body-util = "0.1"
+hostname = "0.4"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 fs2 = "0.4"
@@ -27,6 +28,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 serde = { version = "1", features = ["derive"] }
 serde-byte-array = "0.1"
 serde_json = "1"
+sha2 = "0.11"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tar = "0.4"
@@ -35,5 +37,4 @@ tar = "0.4"
 rustix = { version = "1", features = ["fs", "event"] }
 
 [target.'cfg(windows)'.dependencies]
-sha2 = "0.11"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }

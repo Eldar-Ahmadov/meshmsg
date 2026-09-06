@@ -196,7 +196,7 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         );
     }
     let request = match request {
-        WebRequest::Send { body } => IpcRequest::Send { body },
+        WebRequest::Send { body } => IpcRequest::Send { body, to: None },
         WebRequest::Status {} => IpcRequest::Status,
     };
     match timeout(IPC_TIMEOUT, ipc::send_request(&state.dir, &request)).await {
@@ -594,6 +594,15 @@ mod tests {
         );
         assert!(!incoming.to_string().contains("secret"));
         assert!(!outgoing.to_string().contains("secret"));
+        assert!(public_event(json!({
+            "type":"private_message", "from":"peer", "body":"dm-secret",
+            "private":true, "timestamp_ms":44
+        }))
+        .is_none());
+        assert!(public_event(json!({
+            "type":"private_accepted", "to":"peer", "body":"dm-secret"
+        }))
+        .is_none());
         let value = public_event(json!({"type":"message", "body":"<script>\ndata: injected\n", "from":"peer", "private":"secret"})).unwrap();
         let frame = String::from_utf8(sse_frame(&value).to_vec()).unwrap();
         assert_eq!(frame.lines().count(), 2);

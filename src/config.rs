@@ -1,4 +1,4 @@
-use crate::invite::Invite;
+use crate::{alias::AliasConfig, invite::Invite};
 use anyhow::{bail, Context, Result};
 use data_encoding::HEXLOWER;
 use fs2::FileExt;
@@ -166,12 +166,36 @@ impl State {
         Ok((state, secret))
     }
 
-    /// Create and durably select a new immutable identity generation.
+    /// Test/legacy helper for committing state without alias metadata.
+    #[cfg(test)]
     pub fn save_new(&self, dir: &Path, force: bool) -> Result<String> {
         self.save_new_inner(dir, force, false)
     }
 
+    /// Commit identity/state and its separately stored alias selection under
+    /// one state lock. alias.json is identity-bound, so a crash between the two
+    /// atomic renames fails closed instead of reusing a stale enabled alias.
+    pub fn save_new_with_alias(
+        &self,
+        dir: &Path,
+        force: bool,
+        alias: &mut AliasConfig,
+    ) -> Result<String> {
+        self.save_new_inner_impl(dir, force, false, Some(alias))
+    }
+
+    #[cfg(test)]
     fn save_new_inner(&self, dir: &Path, force: bool, fail_after_identity: bool) -> Result<String> {
+        self.save_new_inner_impl(dir, force, fail_after_identity, None)
+    }
+
+    fn save_new_inner_impl(
+        &self,
+        dir: &Path,
+        force: bool,
+        fail_after_identity: bool,
+        alias: Option<&mut AliasConfig>,
+    ) -> Result<String> {
         let lock = StateLock::acquire(dir)?;
         if dir.join("config.json").exists() && !force {
             bail!("state already exists (use --force to replace it)");
@@ -190,6 +214,10 @@ impl State {
             public_key: public_key.clone(),
         });
         committed.save(dir, &lock)?;
+        if let Some(alias) = alias {
+            alias.bind_identity(secret.public());
+            alias.install_locked(dir, &lock)?;
+        }
         Ok(public_key)
     }
 

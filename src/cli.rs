@@ -116,12 +116,29 @@ fn parse_run_id(value: &str) -> std::result::Result<String, String> {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum AliasCommand {
+    /// Show the captured hostname, override, and effective advertised alias
+    Show,
+    /// Set and enable a custom alias (ASCII letters, digits, and hyphens)
+    Set { alias: String },
+    /// Clear and disable alias advertising (public-key direct messages remain available)
+    Clear,
+    /// Synonym for clear
+    Disable,
+    /// Capture the current short OS hostname and enable it as the default alias
+    ResetHostname,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum Command {
     /// Generate a persistent identity and fresh topic
     Init {
         /// Replace existing state and identity
         #[arg(long)]
         force: bool,
+        /// Do not capture or advertise a hostname alias
+        #[arg(long = "no-default-alias", visible_alias = "no-alias")]
+        no_alias: bool,
     },
     /// Save configuration from an invite token
     Join {
@@ -133,6 +150,14 @@ pub enum Command {
         /// Replace existing state and identity
         #[arg(long)]
         force: bool,
+        /// Do not capture or advertise a hostname alias
+        #[arg(long = "no-default-alias", visible_alias = "no-alias")]
+        no_alias: bool,
+    },
+    /// Show or change this node's advertised alias (daemon must be stopped to change it)
+    Alias {
+        #[command(subcommand)]
+        command: AliasCommand,
     },
     /// Run the local network daemon in the foreground
     Daemon,
@@ -149,8 +174,11 @@ pub enum Command {
     Invite,
     /// Ask the local daemon to shut down
     Stop,
-    /// Queue one message for broadcast (not a delivery acknowledgement)
+    /// Broadcast a message, or send privately with authenticated acceptance acknowledgement
     Send {
+        /// Send privately to one canonical public key or uniquely advertised alias
+        #[arg(long, value_name = "RECIPIENT")]
+        to: Option<String>,
         #[command(flatten)]
         input: MessageInput,
     },
@@ -169,7 +197,7 @@ pub enum Command {
         #[arg(long, short = 'o', value_name = "PATH")]
         output: PathBuf,
     },
-    /// Stream incoming messages and attachment offers
+    /// Stream incoming broadcast/private messages and attachment offers
     Listen,
     /// Generate a sustained, sequenced benchmark load through one daemon connection
     BenchSend {
@@ -298,12 +326,20 @@ mod tests {
     #[test]
     fn canonical_input_forms_parse() {
         assert!(parse(&["init"]).is_ok());
+        assert!(parse(&["init", "--no-default-alias"]).is_ok());
+        assert!(parse(&["init", "--no-alias"]).is_ok());
         assert!(parse(&["join", "token"]).is_ok());
         assert!(parse(&["join", "--token-file", "invite.txt"]).is_ok());
         assert!(parse(&["join", "--token-stdin", "--advertise-self"]).is_ok());
         assert!(parse(&["daemon"]).is_ok());
         assert!(parse(&["invite"]).is_ok());
+        assert!(parse(&["alias", "show"]).is_ok());
+        assert!(parse(&["alias", "set", "node-1"]).is_ok());
+        assert!(parse(&["alias", "clear"]).is_ok());
+        assert!(parse(&["alias", "disable"]).is_ok());
+        assert!(parse(&["alias", "reset-hostname"]).is_ok());
         assert!(parse(&["send", "message"]).is_ok());
+        assert!(parse(&["send", "--to", "node-1", "private"]).is_ok());
         assert!(parse(&["send", "--message-file", "message.txt"]).is_ok());
         assert!(parse(&["send", "--message-stdin"]).is_ok());
         assert!(parse(&["share", "file.txt"]).is_ok());

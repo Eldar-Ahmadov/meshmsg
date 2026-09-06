@@ -21,13 +21,24 @@ pub(crate) struct BenchConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub(crate) enum IpcRequest {
-    Send { body: String },
-    BenchSend { config: BenchConfig },
+    Send {
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+    },
+    BenchSend {
+        config: BenchConfig,
+    },
     Subscribe,
     Status,
     Offers,
-    Share { path: PathBuf },
-    Download { offer: String, output: PathBuf },
+    Share {
+        path: PathBuf,
+    },
+    Download {
+        offer: String,
+        output: PathBuf,
+    },
     Stop,
 }
 
@@ -168,6 +179,7 @@ mod tests {
             &mut bytes,
             &IpcRequest::Send {
                 body: "a\nb".into(),
+                to: None,
             },
         )
         .await
@@ -176,7 +188,8 @@ mod tests {
         assert!(write_request(
             &mut bytes,
             &IpcRequest::Send {
-                body: "x".repeat(MAX_IPC_REQUEST_SIZE)
+                body: "x".repeat(MAX_IPC_REQUEST_SIZE),
+                to: None,
             }
         )
         .await

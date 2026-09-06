@@ -3,7 +3,7 @@
 `meshmsg` is a small peer-to-peer messaging CLI built on [Iroh Gossip](https://github.com/n0-computer/iroh-gossip) and [Iroh Blobs](https://docs.iroh.computer/protocols/blobs). Every node is an equal peer with a persistent identity and network connection; there is no central message broker.
 
 > [!WARNING]
-> `meshmsg` is currently a trusted plaintext swarm, not a private messenger. Anyone with the invite can join the topic, read messages and attachment offers, and send signed messages. See [Operations and security](docs/operations.md#trust-and-privacy-model).
+> Broadcast messages and attachment offers remain plaintext to everyone with the topic invite. `send --to` instead uses a separately encrypted, authenticated direct connection, but it provides no offline delivery, durable storage, or read receipt. Default aliases disclose a captured short hostname to topic participants. See [Operations and security](docs/operations.md#trust-and-privacy-model).
 
 ## Install
 
@@ -46,11 +46,15 @@ meshmsg --json daemon
 Send and receive messages through the local daemon:
 
 ```sh
-meshmsg send 'hello'
+meshmsg send 'hello'                  # unchanged topic-wide broadcast
+meshmsg send --to laptop 'private'   # unique advertised alias
+meshmsg send --to '<full-peer-key>' 'private'
 meshmsg listen
 meshmsg chat
 meshmsg status
 ```
+
+`init` and `join` capture the machine's short hostname once as the default advertised alias. Use `--no-default-alias` to opt out, or manage it later with `meshmsg alias show|set|clear|disable|reset-hostname`. A private-send success acknowledges only acceptance by the recipient daemon—not reading or durable delivery.
 
 Stop it cleanly:
 
@@ -111,6 +115,7 @@ python3 tests/integration-web.py target/debug/meshmsg
 python3 tests/integration-web-peer.py target/debug/meshmsg
 bash tests/integration-5-peer.sh target/debug/meshmsg
 bash tests/integration-attachments.sh target/debug/meshmsg
+bash tests/integration-direct-messages.sh target/debug/meshmsg
 ```
 
 Licensed under either Apache-2.0 or MIT; see [`LICENSE-APACHE`](LICENSE-APACHE) and [`LICENSE-MIT`](LICENSE-MIT).

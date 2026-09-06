@@ -1,15 +1,18 @@
+mod alias;
 mod attachment;
 mod bench_tui;
 mod cli;
 mod config;
+mod direct;
 mod invite;
 mod ipc;
 mod node;
 mod web;
 
+use alias::AliasConfig;
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{AliasCommand, Cli, Command};
 use config::State;
 use invite::Invite;
 
@@ -37,16 +40,18 @@ async fn run() -> Result<()> {
 
     let dir = cli.state_dir();
     match cli.command {
-        Command::Init { force } => {
+        Command::Init { force, no_alias } => {
+            let mut alias = AliasConfig::prepare(!no_alias)?;
             let state = State::new_topic();
-            let peer = state.save_new(&dir, force)?;
+            let peer = state.save_new_with_alias(&dir, force, &mut alias)?;
             cli::print_result(
                 cli.json,
                 "initialized",
                 serde_json::json!({
                     "type":"initialized", "state_dir":dir, "peer":peer,
                     "topic":state.topic, "advertises_self":true, "has_invite":false,
-                    "bootstrap_peer_count":0, "self_advertised":false
+                    "bootstrap_peer_count":0, "self_advertised":false,
+                    "alias":alias.effective(), "alias_enabled":alias.enabled()
                 }),
             );
         }
@@ -54,20 +59,48 @@ async fn run() -> Result<()> {
             input,
             advertise_self,
             force,
+            no_alias,
         } => {
             let token = input.into_token()?;
             let invite: Invite = token.parse()?;
+            let mut alias = AliasConfig::prepare(!no_alias)?;
             let (state, peer, bootstrap_peer_count) =
-                save_joined_state(&dir, token, &invite, advertise_self, force)?;
+                save_joined_state(&dir, token, &invite, advertise_self, force, &mut alias)?;
             cli::print_result(
                 cli.json,
                 "joined",
                 serde_json::json!({
                     "type":"joined", "state_dir":dir, "peer":peer, "topic":state.topic,
                     "advertises_self":advertise_self, "has_invite":true,
-                    "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":false
+                    "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":false,
+                    "alias":alias.effective(), "alias_enabled":alias.enabled()
                 }),
             );
+        }
+        Command::Alias { command } => {
+            let config = match command {
+                AliasCommand::Show => {
+                    let (state, secret) = State::load_for_doctor(&dir)?;
+                    state.validate_for_identity(secret.public())?;
+                    AliasConfig::load_for_identity(&dir, secret.public())?
+                }
+                AliasCommand::Set { alias } => AliasConfig::set(&dir, &alias)?,
+                AliasCommand::Clear => AliasConfig::clear(&dir)?,
+                AliasCommand::Disable => AliasConfig::disable(&dir)?,
+                AliasCommand::ResetHostname => AliasConfig::reset_hostname(&dir)?,
+            };
+            let value = serde_json::json!({
+                "type":"alias", "enabled":config.enabled(),
+                "hostname":config.hostname(), "custom":config.custom(),
+                "alias":config.effective()
+            });
+            if cli.json {
+                println!("{value}");
+            } else if let Some(alias) = config.effective() {
+                println!("{alias}");
+            } else {
+                println!("alias disabled");
+            }
         }
         Command::Daemon => node::run_daemon(&dir, cli.json).await?,
         Command::Web { listen, origin } => web::run(&dir, listen, origin).await?,
@@ -97,9 +130,9 @@ async fn run() -> Result<()> {
             }
         }
         Command::Stop => node::stop(&dir, cli.json).await?,
-        Command::Send { input } => {
+        Command::Send { to, input } => {
             let message = input.into_message()?;
-            node::send_once(&dir, &message, cli.json).await?
+            node::send_once(&dir, to.as_deref(), &message, cli.json).await?
         }
         Command::Share { path } => node::share(&dir, &path, cli.json).await?,
         Command::Offers => node::offers(&dir, cli.json).await?,
@@ -143,6 +176,7 @@ fn save_joined_state(
     invite: &Invite,
     advertise_self: bool,
     force: bool,
+    alias: &mut AliasConfig,
 ) -> Result<(State, String, usize)> {
     // A newly generated identity cannot already be in this invite. Check before
     // save_new creates an identity generation or replaces committed state.
@@ -151,7 +185,7 @@ fn save_joined_state(
     }
     let bootstrap_peer_count = invite.bootstrap_peers.len();
     let state = State::from_invite(token, invite, advertise_self);
-    let peer = state.save_new(dir, force)?;
+    let peer = state.save_new_with_alias(dir, force, alias)?;
     Ok((state, peer, bootstrap_peer_count))
 }
 
@@ -178,7 +212,9 @@ mod tests {
                 .collect(),
         };
 
-        let error = save_joined_state(&dir, invite.to_string(), &invite, true, true).unwrap_err();
+        let mut alias = AliasConfig::prepare(false).unwrap();
+        let error = save_joined_state(&dir, invite.to_string(), &invite, true, true, &mut alias)
+            .unwrap_err();
 
         assert!(error.to_string().contains("maximum"));
         assert_eq!(
