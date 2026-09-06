@@ -77,8 +77,13 @@ def main():
             wait_for(lambda: post({'command': 'status'})[0] == 200, 'web ready', 15)
 
             def assert_peer_snapshot(value):
-                assert set(value) == {'type', 'schema_version', 'generated_at_ms', 'self', 'peers'}
-                assert value['type'] == 'peers_snapshot' and value['schema_version'] == 1
+                assert set(value) == {
+                    'type', 'schema_version', 'generated_at_ms', 'directory_epoch',
+                    'directory_revision', 'self', 'peers'
+                }
+                assert value['type'] == 'peers_snapshot' and value['schema_version'] == 2
+                assert len(value['directory_epoch']) == 32
+                assert isinstance(value['directory_revision'], int)
                 assert set(value['self']) == {'public_key', 'alias', 'online'}
                 assert value['self']['public_key'] == one_peer and value['self']['online'] is True
                 assert [peer['public_key'] for peer in value['peers']] == [two_peer]
