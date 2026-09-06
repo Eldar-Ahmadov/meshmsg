@@ -52,7 +52,10 @@ meshmsg send --to '<full-peer-key>' 'private'
 meshmsg listen
 meshmsg chat
 meshmsg status
+meshmsg peers                         # sanitized current directory snapshot
 ```
+
+`meshmsg --json peers` returns a deterministic, versioned snapshot containing a separate local identity and sorted current remote public keys, optional normalized aliases, and bounded local freshness only—never endpoint routes or raw presence records. `listen` begins with the same snapshot and then emits sanitized discovery/update/expiry events.
 
 `init` and `join` capture the machine's short hostname once as the default advertised alias. Use `--no-default-alias` to opt out, or manage it later with `meshmsg alias show|set|clear|disable|reset-hostname`. A private-send success acknowledges only acceptance by the recipient daemon—not reading or durable delivery.
 

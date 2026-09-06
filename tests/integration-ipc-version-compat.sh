@@ -112,6 +112,21 @@ run_scenario() {
   LISTENER_PIDS+=("$listener_pid")
   wait_for 10 "v${version} spy listener" grep -Fq '"type":"connected"' "$listener"
 
+  # Peer-directory clients capability-check before sending the new IPC command.
+  # An old daemon must fail promptly and remain usable, never reinterpret the
+  # request or expose its endpoint-bearing status as a peer snapshot.
+  set +e
+  timeout 10 "$BIN" --state-dir "$base/sender" --json peers \
+    >"$base/peers.out" 2>"$base/peers.err"
+  local peers_status=$?
+  set -e
+  [[ $peers_status -ne 0 ]] || fail "current peers unexpectedly succeeded against v${version} daemon"
+  [[ $peers_status -ne 124 ]] || fail "current peers hung against v${version} daemon"
+  grep -Eqi 'peer.directory|peer_directory_v1|does not support|upgrade|restart' "$base/peers.err" \
+    || fail "current peers did not return an actionable v${version} compatibility error"
+  [[ ! -s "$base/peers.out" ]] || fail "current peers emitted a partial snapshot against v${version} daemon"
+  status_ok "$version" sender || fail "v${version} daemon stopped responding after rejected peers request"
+
   # A current client must negotiate before submitting private plaintext. The
   # v0.1.11 parser ignored `to` on command=send and broadcast the body; v0.1.12
   # also predates capability negotiation. Merely checking a reply is too late.
@@ -148,4 +163,4 @@ fetch_release 0.1.12 016c350a22e4d6c7d5b1d75d1982fb158e32aa3fac807b1178cd92b9b9d
 run_scenario 0.1.11
 run_scenario 0.1.12
 
-echo "PASS: private IPC fails closed against published v0.1.11/v0.1.12 daemons without broadcast, while current-to-old broadcast remains compatible"
+echo "PASS: peer-directory and private IPC fail closed against published v0.1.11/v0.1.12 daemons without hangs/broadcast, while current-to-old broadcast remains compatible"

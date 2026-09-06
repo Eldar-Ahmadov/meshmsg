@@ -14,6 +14,28 @@ import threading
 import time
 
 BIN = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/meshmsg').resolve())
+SELF_KEY = '7c9f3405d1e6ca4df5947f98bbe1301227ca6b82973940ed2d04b71ffa54b25c'
+REMOTE_KEY = '6356c835326c19e98e8b0874f03de7d90f2d7d261a00e2eeb608781bb4784718'
+EVENT_KEY = '971dafe5454792b588f162818f11df9c2accd649774f19a5c67360a91bacf6de'
+
+
+def malicious_peers_snapshot():
+    return {
+        'type': 'peers_snapshot', 'schema_version': 1, 'generated_at_ms': 1000,
+        'self': {
+            'public_key': SELF_KEY, 'alias': 'local-node', 'online': True,
+            'endpoint': 'private-self-endpoint', 'socket': 'private-socket',
+            'body': 'private-self-body',
+        },
+        'peers': [{
+            'public_key': REMOTE_KEY, 'alias': 'remote-node', 'online': True,
+            'last_seen_ms': 900, 'expires_at_ms': 150900,
+            'endpoint': 'private-remote-endpoint', 'addresses': ['10.0.0.1:1'],
+            'relay': 'private-relay', 'invite': 'private-invite',
+            'body': 'private-remote-body',
+        }],
+        'socket': 'private-top-level-socket', 'invite': 'private-top-level-invite',
+    }
 
 
 class Daemon(socketserver.ThreadingUnixStreamServer):
@@ -63,8 +85,12 @@ class Handler(socketserver.StreamRequestHandler):
                 self.wfile.flush()
 
             if value['command'] == 'status':
-                emit({'type': 'status', 'running': True, 'peer': 'fake-peer', 'neighbors': 1,
-                      'endpoint_online': True, 'topic_joined': True, 'socket': 'private-path', 'invite': 'private-token'})
+                emit({'type': 'status', 'running': True, 'peer': SELF_KEY, 'neighbors': 1,
+                      'endpoint_online': True, 'topic_joined': True,
+                      'ipc_capabilities': ['peer_directory_v1'],
+                      'socket': 'private-path', 'invite': 'private-token'})
+            elif value['command'] == 'peers':
+                emit(malicious_peers_snapshot())
             elif value['command'] == 'send':
                 if value['body'] == 'lost-reply':
                     return  # Ambiguous: command reached daemon, reply did not.
@@ -76,13 +102,26 @@ class Handler(socketserver.StreamRequestHandler):
                     self.server.broadcast(queued)
                     emit(queued)
             elif value['command'] == 'subscribe':
-                emit({'type': 'connected', 'peer': 'fake-peer'})
+                emit({'type': 'connected', 'peer': SELF_KEY})
+                emit(malicious_peers_snapshot())
                 emit({'type': 'attachment_offer', 'from': 'other-peer', 'timestamp_ms': 2,
                       'name': '<incoming>.txt', 'kind': 'file', 'size': 1536,
                       'offer_id': 'private-id', 'offer': 'private-token',
                       'ticket': 'private-ticket', 'path': 'private-path', 'output': 'private-output'})
                 emit({'type': 'message', 'from': 'other-peer', 'body': '<img src=x onerror=alert(1)>\ndata: injected', 'timestamp_ms': 1})
                 emit({'type': 'lagged', 'dropped': 3})
+                emit({'type': 'private_message', 'from': 'other-peer', 'body': 'private-message-body'})
+                emit({'type': 'private_accepted', 'to': 'other-peer', 'body': 'private-accepted-body'})
+                emit({
+                    'type': 'peer_discovered', 'schema_version': 1,
+                    'peer': {
+                        'public_key': EVENT_KEY, 'alias': 'event-node', 'online': True,
+                        'last_seen_ms': 950, 'expires_at_ms': 150950,
+                        'endpoint': 'private-event-endpoint', 'relay': 'private-event-relay',
+                        'body': 'private-event-body',
+                    },
+                    'socket': 'private-event-socket', 'body': 'private-top-event-body',
+                })
                 with self.server.lock:
                     self.server.subscribers.add(self.request)
                 self.rfile.read(1)  # Remain subscribed until web disconnects.
@@ -167,8 +206,19 @@ def main():
                     assert request('GET', path)[0] == 404
                 assert request('OPTIONS', '/api/request')[0] == 404
                 code, status = api({'command': 'status'})
-                assert code == 200 and status['peer'] == 'fake-peer'
-                assert 'socket' not in status and 'invite' not in status
+                assert code == 200 and status['peer'] == SELF_KEY
+                assert all(key not in status for key in ['socket', 'invite', 'ipc_capabilities'])
+                code, peers = api({'command': 'peers'})
+                assert code == 200 and peers == {
+                    'type': 'peers_snapshot', 'schema_version': 1, 'generated_at_ms': 1000,
+                    'self': {'public_key': SELF_KEY, 'alias': 'local-node', 'online': True},
+                    'peers': [{
+                        'public_key': REMOTE_KEY, 'alias': 'remote-node', 'online': True,
+                        'last_seen_ms': 900, 'expires_at_ms': 150900,
+                    }],
+                }
+                encoded_peers = json.dumps(peers)
+                assert all(secret not in encoded_peers for secret in ['endpoint', 'socket', 'address', 'relay', 'invite', 'private-', 'body'])
                 assert request(headers={'Host': 'test.example.ts.net', 'Origin': public, 'Content-Type': 'application/json'})[0] == 200
 
                 before = len(daemon.requests)
@@ -205,11 +255,27 @@ def main():
                     assert response.status == 200
                     assert next_event(response)['type'] == 'connected'
                     assert next_event(response) == {
+                        'type': 'peers_snapshot', 'schema_version': 1, 'generated_at_ms': 1000,
+                        'self': {'public_key': SELF_KEY, 'alias': 'local-node', 'online': True},
+                        'peers': [{
+                            'public_key': REMOTE_KEY, 'alias': 'remote-node', 'online': True,
+                            'last_seen_ms': 900, 'expires_at_ms': 150900,
+                        }],
+                    }
+                    assert next_event(response) == {
                         'type': 'attachment_offer', 'direction': 'incoming', 'from': 'other-peer',
                         'timestamp_ms': 2, 'name': '<incoming>.txt', 'kind': 'file', 'size': 1536}
                     value = next_event(response)
                     assert value['type'] == 'message' and '\ndata: injected' in value['body']
                     assert next_event(response)['type'] == 'lagged'
+                    # The two private events are dropped; this must be the next frame.
+                    assert next_event(response) == {
+                        'type': 'peer_discovered', 'schema_version': 1,
+                        'peer': {
+                            'public_key': EVENT_KEY, 'alias': 'event-node', 'online': True,
+                            'last_seen_ms': 950, 'expires_at_ms': 150950,
+                        },
+                    }
                 deadline = time.monotonic() + 5
                 while True:
                     with daemon.lock:
@@ -304,7 +370,7 @@ def main():
                     client.connect(str(root / 'daemon.sock'))
                     client.sendall(b'{"command":"status"}\n')
                     assert json.loads(client.recv(4096))['running'] is True
-                print('PASS: HTTP security/allowlist/assets, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends and safe incoming/outgoing attachment metadata synchronized to simultaneous SSE feeds, attachment capabilities/paths filtered, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
+                print('PASS: HTTP security/allowlist/assets, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
             finally:
                 for response, conn in streams:
                     response.close()

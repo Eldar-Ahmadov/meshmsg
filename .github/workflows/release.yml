@@ -51,6 +51,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --all-targets
           cargo build --locked
+          timeout 600 python3 tests/integration-peer-directory.py target/debug/meshmsg
           timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
           timeout 600 bash tests/integration-attachments.sh target/debug/meshmsg
           timeout 600 bash tests/integration-direct-messages.sh target/debug/meshmsg

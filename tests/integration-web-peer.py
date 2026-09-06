@@ -56,6 +56,8 @@ def main():
             spawn('two', 'daemon')
             wait_for(lambda: running('two'), 'second daemon startup')
             wait_for(lambda: cli('one', 'status')['neighbors'] >= 1 and cli('two', 'status')['neighbors'] >= 1, 'peer neighbors')
+            one_peer = cli('one', 'status')['peer']
+            two_peer = cli('two', 'status')['peer']
             _, peer_log = spawn('two', 'listen')
             wait_for(lambda: '"type":"connected"' in pathlib.Path(peer_log.name).read_text(), 'second peer listener', 10)
             with socket.socket() as reservation:
@@ -73,6 +75,28 @@ def main():
                 return result
 
             wait_for(lambda: post({'command': 'status'})[0] == 200, 'web ready', 15)
+
+            def assert_peer_snapshot(value):
+                assert set(value) == {'type', 'schema_version', 'generated_at_ms', 'self', 'peers'}
+                assert value['type'] == 'peers_snapshot' and value['schema_version'] == 1
+                assert set(value['self']) == {'public_key', 'alias', 'online'}
+                assert value['self']['public_key'] == one_peer and value['self']['online'] is True
+                assert [peer['public_key'] for peer in value['peers']] == [two_peer]
+                assert set(value['peers'][0]) == {
+                    'public_key', 'alias', 'online', 'last_seen_ms', 'expires_at_ms'}
+                assert value['peers'][0]['online'] is True
+                encoded = json.dumps(value)
+                assert all(private not in encoded for private in [
+                    'endpoint', 'address', 'relay', 'socket', 'invite', 'ticket', 'token', 'body'])
+
+            wait_for(
+                lambda: post({'command': 'peers'})[0] == 200
+                and len(post({'command': 'peers'})[1].get('peers', [])) == 1,
+                'web peer snapshot', 30,
+            )
+            code, web_snapshot = post({'command': 'peers'})
+            assert code == 200
+            assert_peer_snapshot(web_snapshot)
             for _ in range(2):
                 connection = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
                 connection.request('GET', '/api/events')
@@ -89,6 +113,7 @@ def main():
 
             for feed, _ in feeds:
                 assert event(feed)['type'] == 'connected'
+                assert_peer_snapshot(event(feed))
             marker = f'web-peer-receipt-{time.time_ns()}'
             code, queued = post({'command': 'send', 'body': marker})
             assert code == 200 and queued == {'type': 'queued', 'delivery_acknowledged': False}
@@ -176,7 +201,7 @@ def main():
             web.send_signal(signal.SIGINT)
             assert web.wait(timeout=5) == 0
             assert running('one') and running('two')
-            print('PASS: real web and local CLI sends reached both simultaneous SSE feeds as canonical queued events; local and incoming real attachment metadata reached both feeds without capabilities; web POST sender/timestamp matched receipt on a distinct peer; reverse peer send reached both feeds; daemon offline/restart handled; stopping web leaves both daemons running')
+            print('PASS: real sanitized peer snapshot reached HTTP and both SSE handshakes without routes; web and local CLI sends reached both feeds as canonical queued events; safe real attachment metadata reached both feeds; reverse peer send, daemon offline/restart, and independent web shutdown passed')
         except BaseException:
             for log in logs:
                 log.flush()

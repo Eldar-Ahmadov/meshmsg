@@ -8,6 +8,9 @@ let source = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
 let statusBusy = false;
+let peersBusy = false;
+let peerDirectoryReady = false;
+const currentPeers = new Map();
 
 function prependEntry(item) {
   feed.prepend(item);
@@ -111,11 +114,56 @@ async function refreshStatus() {
   try {
     const { ok, value } = await request({ command: 'status' });
     if (!ok || value.type !== 'status') throw new Error('offline');
-    const peers = Number.isInteger(value.neighbors) && value.neighbors >= 0 ? value.neighbors : '?';
-    byId('status').textContent = `${peers} direct ${peers === 1 ? 'peer' : 'peers'}`;
+    if (!peerDirectoryReady) {
+      const peers = Number.isInteger(value.neighbors) && value.neighbors >= 0 ? value.neighbors : '?';
+      byId('status').textContent = `${peers} direct ${peers === 1 ? 'peer' : 'peers'}`;
+    }
   } catch (_) {
     byId('status').textContent = 'Peer summary unavailable';
   } finally { statusBusy = false; }
+}
+
+function updatePeerSummary() {
+  const count = currentPeers.size;
+  byId('status').textContent = `${count} current ${count === 1 ? 'peer' : 'peers'}`;
+}
+
+function replacePeers(value) {
+  currentPeers.clear();
+  if (Array.isArray(value.peers)) {
+    for (const peer of value.peers) {
+      if (peer && typeof peer.public_key === 'string' && peer.online === true) {
+        currentPeers.set(peer.public_key, peer);
+      }
+    }
+  }
+  peerDirectoryReady = true;
+  updatePeerSummary();
+}
+
+function updatePeer(value, expired) {
+  const peer = value && value.peer;
+  if (!peer || typeof peer.public_key !== 'string') return;
+  if (expired) currentPeers.delete(peer.public_key);
+  else currentPeers.set(peer.public_key, peer);
+  peerDirectoryReady = true;
+  updatePeerSummary();
+  const alias = typeof peer.alias === 'string' ? ` (${peer.alias})` : '';
+  addEntry(`${expired ? 'Peer expired' : value.type === 'peer_discovered' ? 'Peer discovered' : 'Peer updated'}: ${peer.public_key}${alias}`, undefined, undefined, 'peer');
+}
+
+async function refreshPeers() {
+  if (peersBusy || document.hidden) return;
+  peersBusy = true;
+  try {
+    const { ok, value } = await request({ command: 'peers' });
+    if (!ok || value.type !== 'peers_snapshot') throw new Error('unavailable');
+    replacePeers(value);
+  } catch (_) {
+    currentPeers.clear();
+    peerDirectoryReady = false;
+    byId('status').textContent = 'Peer directory unavailable';
+  } finally { peersBusy = false; }
 }
 
 function gap(message) {
@@ -157,13 +205,24 @@ function connect() {
       case 'attachment_shared':
         addAttachment(value);
         break;
+      case 'peers_snapshot':
+        replacePeers(value);
+        break;
+      case 'peer_discovered':
+      case 'peer_updated':
+        updatePeer(value, false);
+        break;
+      case 'peer_expired':
+        updatePeer(value, true);
+        break;
       case 'peer_up':
       case 'peer_down':
         addEntry(`${value.type === 'peer_up' ? 'Peer joined' : 'Peer left'}: ${value.peer}`, undefined, undefined, 'peer');
         break;
       case 'lagged':
         gap(value.message);
-        addEntry('Feed gap · messages dropped; no replay', undefined, undefined, 'gap');
+        addEntry('Feed gap · messages dropped; refreshing peer directory', undefined, undefined, 'gap');
+        refreshPeers();
         break;
       case 'offline':
         byId('status').textContent = 'Daemon offline or restarting.';

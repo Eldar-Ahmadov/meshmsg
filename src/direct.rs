@@ -1,4 +1,7 @@
-use crate::alias::{normalize_alias, validate_alias};
+use crate::{
+    alias::{normalize_alias, validate_alias},
+    peers::{PeerTransition, PeerTransitionKind, RemotePeer, PEER_LEASE_MS},
+};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh::{
@@ -29,7 +32,7 @@ const MAX_PRESENCE_FRAME: usize = 2048;
 const MAX_ENDPOINT_ADDRS: usize = 8;
 pub(crate) const MAX_DYNAMIC_PRESENCE_IDENTITIES: usize = 1024;
 const MAX_PINNED_ENDPOINTS: usize = crate::invite::MAX_BOOTSTRAP_PEERS + 1;
-const PRESENCE_LIFETIME: Duration = Duration::from_secs(150);
+const PRESENCE_LIFETIME: Duration = Duration::from_millis(PEER_LEASE_MS);
 const MAX_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
 const PRESENCE_REPLAY_LIFETIME: Duration = Duration::from_secs(450);
 const MAX_PRESENCE_TRANSPORT_SOURCES: usize = 32;
@@ -206,6 +209,20 @@ struct DynamicDirectoryEntry {
     alias: Option<String>,
     expires: Instant,
     issued_ms: u64,
+    last_seen_ms: u64,
+    expires_at_ms: u64,
+}
+
+impl DynamicDirectoryEntry {
+    fn public(&self, key: PublicKey, online: bool) -> RemotePeer {
+        RemotePeer {
+            public_key: key.to_string(),
+            alias: self.alias.clone(),
+            online,
+            last_seen_ms: self.last_seen_ms,
+            expires_at_ms: self.expires_at_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -242,7 +259,11 @@ impl Directory {
         Ok(())
     }
 
-    pub(crate) fn receive(&mut self, bytes: &[u8], topic: TopicId) -> Result<()> {
+    pub(crate) fn receive(
+        &mut self,
+        bytes: &[u8],
+        topic: TopicId,
+    ) -> Result<Option<PeerTransition>> {
         self.receive_at(bytes, topic, now_ms()?, Instant::now())
     }
 
@@ -252,8 +273,7 @@ impl Directory {
         topic: TopicId,
         wall_ms: u64,
         monotonic_now: Instant,
-    ) -> Result<()> {
-        self.cleanup_at(monotonic_now);
+    ) -> Result<Option<PeerTransition>> {
         let payload = SignedPresence::decode(bytes, topic, wall_ms)?;
         if self
             .dynamic
@@ -278,34 +298,51 @@ impl Directory {
             .min(PRESENCE_LIFETIME);
         anyhow::ensure!(!remaining.is_zero(), "presence record is expired");
         let endpoint = payload.endpoint;
+        let kind = match self.dynamic.get(&payload.sender) {
+            None => Some(PeerTransitionKind::Discovered),
+            Some(entry) if entry.alias != payload.alias || entry.endpoint != endpoint => {
+                // Endpoint changes are semantically relevant for direct routing,
+                // but the reconstructed event deliberately does not expose them.
+                Some(PeerTransitionKind::Updated)
+            }
+            Some(_) => None,
+        };
+        let last_seen_ms = wall_ms;
+        let expires_at_ms = wall_ms.saturating_add(remaining.as_millis() as u64);
         self.replay_watermarks.remove(&payload.sender);
-        self.dynamic.insert(
-            payload.sender,
-            DynamicDirectoryEntry {
-                endpoint: endpoint.clone(),
-                alias: payload.alias,
-                expires: monotonic_now + remaining,
-                issued_ms: payload.issued_ms,
-            },
-        );
+        let entry = DynamicDirectoryEntry {
+            endpoint: endpoint.clone(),
+            alias: payload.alias,
+            expires: monotonic_now + remaining,
+            issued_ms: payload.issued_ms,
+            last_seen_ms,
+            expires_at_ms,
+        };
+        let transition = kind.map(|kind| PeerTransition {
+            kind,
+            peer: entry.public(payload.sender, true),
+        });
+        self.dynamic.insert(payload.sender, entry);
         // MemoryLookup::add_endpoint_info merges direct addresses forever. Presence
         // records are snapshots, so replace this source's record in full instead.
         self.presence_lookup.set_endpoint_info(endpoint);
-        Ok(())
+        Ok(transition)
     }
 
-    pub(crate) fn cleanup(&mut self) {
-        self.cleanup_at(Instant::now());
+    pub(crate) fn cleanup(&mut self) -> Vec<PeerTransition> {
+        self.cleanup_at(Instant::now())
     }
 
-    fn cleanup_at(&mut self, now: Instant) {
+    fn cleanup_at(&mut self, now: Instant) -> Vec<PeerTransition> {
         self.replay_watermarks
             .retain(|_, watermark| watermark.forget_at > now);
-        let expired: Vec<_> = self
+        let mut expired: Vec<_> = self
             .dynamic
             .iter()
             .filter_map(|(key, entry)| (entry.expires <= now).then_some(*key))
             .collect();
+        expired.sort_unstable_by_key(PublicKey::to_string);
+        let mut transitions = Vec::with_capacity(expired.len());
         for key in expired {
             if let Some(entry) = self.dynamic.remove(&key) {
                 self.presence_lookup.remove_endpoint_info(key);
@@ -316,12 +353,25 @@ impl Directory {
                         forget_at: now + PRESENCE_REPLAY_LIFETIME,
                     },
                 );
+                transitions.push(PeerTransition {
+                    kind: PeerTransitionKind::Expired,
+                    peer: entry.public(key, false),
+                });
             }
         }
+        transitions
+    }
+
+    pub(crate) fn peers(&self) -> Vec<RemotePeer> {
+        let now = Instant::now();
+        self.dynamic
+            .iter()
+            .filter(|(_, entry)| entry.expires > now)
+            .map(|(key, entry)| entry.public(*key, true))
+            .collect()
     }
 
     pub(crate) fn resolve(&mut self, recipient: &str) -> Result<EndpointAddr> {
-        self.cleanup();
         if let Ok(key) = PublicKey::from_str(recipient) {
             anyhow::ensure!(
                 key.to_string() == recipient,
@@ -984,6 +1034,119 @@ mod tests {
             .is_err());
         assert!(directory.dynamic.is_empty());
         assert!(presence_lookup.get_endpoint_info(secret.public()).is_none());
+    }
+
+    #[test]
+    fn directory_transitions_coalesce_refresh_update_expire_and_rediscover() {
+        let secret = SecretKey::generate();
+        let topic = TopicId::from_bytes([11; 32]);
+        let wall = now_ms().unwrap();
+        let monotonic = Instant::now();
+        let first_endpoint = endpoint(&secret, 41_001);
+
+        let first = SignedPresence::encode_at(
+            &secret,
+            topic,
+            Some("first"),
+            first_endpoint.clone(),
+            wall,
+            [1; 16],
+        )
+        .unwrap();
+        let mut directory = Directory::new(MemoryLookup::new());
+        let discovered = directory
+            .receive_at(&first, topic, wall, monotonic)
+            .unwrap()
+            .unwrap();
+        assert_eq!(discovered.kind, PeerTransitionKind::Discovered);
+        assert_eq!(discovered.peer.alias.as_deref(), Some("first"));
+
+        let refresh = SignedPresence::encode_at(
+            &secret,
+            topic,
+            Some("first"),
+            first_endpoint,
+            wall + 1,
+            [2; 16],
+        )
+        .unwrap();
+        assert!(directory
+            .receive_at(
+                &refresh,
+                topic,
+                wall + 1_000,
+                monotonic + Duration::from_millis(1_000),
+            )
+            .unwrap()
+            .is_none());
+        let refreshed = directory.peers().pop().unwrap();
+        assert_eq!(refreshed.last_seen_ms, wall + 1_000);
+        assert!(refreshed.expires_at_ms - refreshed.last_seen_ms <= PEER_LEASE_MS);
+
+        let alias_update = SignedPresence::encode_at(
+            &secret,
+            topic,
+            Some("renamed"),
+            endpoint(&secret, 41_001),
+            wall + 2,
+            [3; 16],
+        )
+        .unwrap();
+        let updated = directory
+            .receive_at(
+                &alias_update,
+                topic,
+                wall + 1_001,
+                monotonic + Duration::from_millis(1_001),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.kind, PeerTransitionKind::Updated);
+        assert_eq!(updated.peer.alias.as_deref(), Some("renamed"));
+
+        let route_update = SignedPresence::encode_at(
+            &secret,
+            topic,
+            Some("renamed"),
+            endpoint(&secret, 41_002),
+            wall + 3,
+            [4; 16],
+        )
+        .unwrap();
+        let updated = directory
+            .receive_at(
+                &route_update,
+                topic,
+                wall + 1_002,
+                monotonic + Duration::from_millis(1_002),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.kind, PeerTransitionKind::Updated);
+        assert_eq!(updated.peer.alias.as_deref(), Some("renamed"));
+
+        let after_expiry = monotonic + PRESENCE_LIFETIME + Duration::from_secs(2);
+        let expired = directory.cleanup_at(after_expiry);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].kind, PeerTransitionKind::Expired);
+        assert!(!expired[0].peer.online);
+        assert!(directory.cleanup_at(after_expiry).is_empty());
+
+        let rediscovery_wall = wall + PEER_LEASE_MS + 3_000;
+        let rediscovery = SignedPresence::encode_at(
+            &secret,
+            topic,
+            Some("renamed"),
+            endpoint(&secret, 41_003),
+            rediscovery_wall,
+            [5; 16],
+        )
+        .unwrap();
+        let rediscovered = directory
+            .receive_at(&rediscovery, topic, rediscovery_wall, after_expiry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rediscovered.kind, PeerTransitionKind::Discovered);
     }
 
     #[test]

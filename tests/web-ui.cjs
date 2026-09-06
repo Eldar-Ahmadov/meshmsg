@@ -74,6 +74,7 @@ const window = new EventTarget();
 const timers = new Map();
 let timerId = 0;
 const sent = [];
+let peersRequests = 0;
 let sendReply = async () => ({ ok: true, json: async () => ({ type: 'queued' }) });
 const context = vm.createContext({
   document, window, EventSource, Event, TextEncoder, AbortController, console,
@@ -82,6 +83,14 @@ const context = vm.createContext({
   fetch: async (_, options) => {
     const request = JSON.parse(options.body);
     if (request.command === 'status') return { ok: true, json: async () => ({ type: 'status', peer: 'local-peer', running: true, endpoint_online: true, topic_joined: true, neighbors: 1 }) };
+    if (request.command === 'peers') {
+      peersRequests += 1;
+      return { ok: true, json: async () => ({
+        type: 'peers_snapshot', schema_version: 1, generated_at_ms: 1700000001000,
+        self: { public_key: 'local-peer', alias: 'local', online: true },
+        peers: [{ public_key: 'recovered-peer', alias: null, online: true, last_seen_ms: 2, expires_at_ms: 3 }]
+      }) };
+    }
     sent.push(request);
     return sendReply();
   }
@@ -98,6 +107,34 @@ function submit(body) {
   await settle();
   assert.equal(el('status').textContent, '1 direct peer');
   const source = EventSource.instances.at(-1);
+  source.emit({
+    type: 'peers_snapshot', schema_version: 1, generated_at_ms: 1700000000000,
+    self: { public_key: 'local-peer', alias: 'local', online: true },
+    peers: [
+      { public_key: 'peer-a', alias: null, online: true, last_seen_ms: 1, expires_at_ms: 2 },
+      { public_key: 'peer-b', alias: 'bravo', online: true, last_seen_ms: 1, expires_at_ms: 2 }
+    ]
+  });
+  assert.equal(el('status').textContent, '2 current peers');
+  source.emit({
+    type: 'peer_discovered', schema_version: 1,
+    peer: { public_key: '<peer-c>', alias: '<text-only>', online: true, last_seen_ms: 1, expires_at_ms: 2 }
+  });
+  assert.equal(el('status').textContent, '3 current peers');
+  assert.match(el('feed').children[0].children[0].textContent, / · Peer discovered: <peer-c> \(<text-only>\)$/);
+  source.emit({
+    type: 'peer_updated', schema_version: 1,
+    peer: { public_key: '<peer-c>', alias: '<updated>', online: true, last_seen_ms: 2, expires_at_ms: 3 }
+  });
+  assert.equal(el('status').textContent, '3 current peers');
+  assert.match(el('feed').children[0].children[0].textContent, / · Peer updated: <peer-c> \(<updated>\)$/);
+  source.emit({
+    type: 'peer_expired', schema_version: 1,
+    peer: { public_key: '<peer-c>', alias: '<updated>', online: false, last_seen_ms: 2, expires_at_ms: 3 }
+  });
+  assert.equal(el('status').textContent, '2 current peers');
+  assert.match(el('feed').children[0].children[0].textContent, / · Peer expired: <peer-c> \(<updated>\)$/);
+  el('clear').dispatchEvent(new Event('click'));
   submit('hello <script>text only</script>');
   await settle();
   assert.equal(sent.length, 1);
@@ -177,6 +214,10 @@ function submit(body) {
   assert.equal(el('feed').children[0].children[0].textContent, `${new Date(1700000000109).toLocaleTimeString()} · From <peer>`);
   source.emit({ type: 'lagged', message: 'Feed gap: dropped messages.' });
   assert.match(el('gap').textContent, /Feed gap/);
+  await settle();
+  assert.equal(peersRequests, 1, 'lagged feed did not request an authoritative peer snapshot');
+  assert.equal(el('status').textContent, '1 current peer');
+  assert.equal(sent.length, 5, 'peer snapshot recovery was treated as a send');
 
   document.hidden = true;
   document.dispatchEvent(new Event('visibilitychange'));
@@ -228,5 +269,5 @@ function submit(body) {
     'Refreshing status…', 'Status refreshed. Read-only; peer count is not delivery proof.'
   ]);
 
-  console.log('PASS: accessible live feed and status route, silent unchanged periodic polling, mobile 38rem compose metadata hiding without outcome hiding, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
+  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, authoritative lag recovery, silent unchanged periodic polling, mobile 38rem compose metadata hiding without outcome hiding, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

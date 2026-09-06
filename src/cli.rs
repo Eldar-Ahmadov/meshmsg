@@ -187,6 +187,8 @@ pub enum Command {
         /// File or directory to share
         path: PathBuf,
     },
+    /// Show the current sanitized peer-directory snapshot
+    Peers,
     /// List locally pinned incoming and outgoing attachment blobs
     Offers,
     /// Download an explicitly accepted attachment offer
@@ -344,6 +346,7 @@ mod tests {
         assert!(parse(&["send", "--message-stdin"]).is_ok());
         assert!(parse(&["share", "file.txt"]).is_ok());
         assert!(parse(&["offers"]).is_ok());
+        assert!(parse(&["peers"]).is_ok());
         assert!(parse(&["download", "offer-token", "--output", "file.txt"]).is_ok());
         assert!(parse(&["download", "--offer-stdin", "--output", "file.txt"]).is_ok());
         assert!(parse(&["bench-send"]).is_ok());

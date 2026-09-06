@@ -10,7 +10,7 @@ The canonical top-level commands are:
 - `daemon`
 - `web [--listen 127.0.0.1:8787] [--origin https://host.tailnet.ts.net]`
 - `invite`
-- `send [--to <recipient>]`, `listen`, `chat`, `status`, `stop`, and `doctor`
+- `send [--to <recipient>]`, `listen`, `chat`, `status`, `peers`, `stop`, and `doctor`
 - `share <path>`, `offers`, and `download <offer source> --output <path>`
 - `bench-send`, `bench-receive`, and interactive `bench-tui`
 
@@ -82,6 +82,30 @@ meshmsg alias reset-hostname
 Aliases contain 1–63 ASCII letters, digits, or hyphens, must start and end with a letter or digit, and are stored lowercase. If the default hostname does not satisfy this grammar, use `--no-default-alias` and set a valid alias later.
 
 An alias is signed discovery metadata, not a verified person, account, or authorization rule. Any topic participant can advertise any valid alias. Uniqueness is checked only at each send: if one claimant disappears or expires, a formerly colliding alias can later resolve to a different remaining key. There is no trust-on-first-use pin or reassignment confirmation. Do not use an alias when identity or continuity matters; verify and use the full public key.
+
+## Peer directory
+
+`meshmsg peers` asks the running daemon for a sanitized, point-in-time directory. Use `meshmsg --json peers` for the stable v1 schema:
+
+```json
+{"type":"peers_snapshot","schema_version":1,"generated_at_ms":1700000000000,"self":{"public_key":"<local-key>","alias":"laptop","online":true},"peers":[{"public_key":"<remote-key>","alias":"build-node-2","online":true,"last_seen_ms":1699999999000,"expires_at_ms":1700000149000}]}
+```
+
+`self` is always a separate object and the remote `peers` array always excludes it. The array is sorted bytewise by canonical `public_key`; `alias` is always present and is either a normalized alias or JSON `null`. `self.online` is true only when the local endpoint is online **and** its topic is joined. A remote is present with `online:true` only while its authenticated signed-presence lease is current. This is a local freshness judgment, not an active reachability probe, trust assertion, Gossip-neighbor relationship, or delivery guarantee. Expired remotes are omitted.
+
+`last_seen_ms` is the local daemon's receipt time, not the sender-controlled signed timestamp. `expires_at_ms` is locally derived and no more than the fixed 150,000 ms presence lifetime after receipt. The snapshot contains at most 1,024 remote identities and fits a bounded 512 KiB IPC frame. It never contains endpoint addresses, relays, sockets, raw signed records, signatures, invites, capabilities, or message bodies.
+
+Local subscriptions start with `connected`, then an atomic `peers_snapshot`, then live events that occurred after that snapshot:
+
+```json
+{"type":"peer_discovered","schema_version":1,"peer":{"public_key":"<remote-key>","alias":"node-1","online":true,"last_seen_ms":1700000000000,"expires_at_ms":1700000150000}}
+{"type":"peer_updated","schema_version":1,"peer":{"public_key":"<remote-key>","alias":"node-2","online":true,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
+{"type":"peer_expired","schema_version":1,"peer":{"public_key":"<remote-key>","alias":"node-2","online":false,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
+```
+
+These events are reconstructed from an explicit metadata allowlist, are limited to 512 encoded JSON bytes, and contain no message body or routing data. An identical periodic presence refresh advances freshness in later snapshots without emitting an event. First observation emits `peer_discovered`; alias or hidden routing changes emit `peer_updated`; lease cleanup emits one `peer_expired`; a later valid presence emits `peer_discovered` again. The older `peer_up`/`peer_down` events remain low-level broadcast-Gossip neighbor changes and must not be used as directory online state.
+
+A stateful client should use the subscription's startup snapshot, apply lifecycle events, and replace all state after `lagged` or reconnect. `meshmsg listen` prints the startup snapshot and live events. The web bridge refreshes its authoritative snapshot after a lag. The CLI checks the daemon's `peer_directory_v1` capability before sending the new IPC command, so an old daemon fails with an upgrade-and-restart error and no fallback or ambiguous request.
 
 ## Messaging
 
@@ -183,6 +207,7 @@ The global `--json` option produces JSON for one-shot commands and NDJSON for st
 ```sh
 meshmsg --json daemon
 meshmsg --json status
+meshmsg --json peers
 meshmsg --json invite
 meshmsg --json alias show
 meshmsg --json listen

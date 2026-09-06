@@ -8,7 +8,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 
 // JSON may escape each envelope byte as six ASCII bytes.
 pub(crate) const MAX_IPC_REQUEST_SIZE: usize = 4096 * 6 + 1024;
-pub(crate) const MAX_IPC_EVENT_SIZE: usize = MAX_IPC_REQUEST_SIZE;
+// A complete, non-paginated directory can contain the bounded maximum of 1024
+// remote identities. Individual live events remain tiny reconstructed objects,
+// while this hard frame limit accommodates the proven worst-case snapshot.
+pub(crate) const MAX_IPC_EVENT_SIZE: usize = 512 * 1024;
 pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +30,7 @@ pub(crate) enum IpcRequest {
     BenchSend { config: BenchConfig },
     Subscribe,
     Status,
+    Peers,
     Offers,
     Share { path: PathBuf },
     Download { offer: String, output: PathBuf },
@@ -183,6 +187,22 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn peers_uses_a_distinct_fieldless_wire_command() {
+        let mut bytes = Vec::new();
+        write_request(&mut bytes, &IpcRequest::Peers).await.unwrap();
+        assert_eq!(bytes, b"{\"command\":\"peers\"}\n");
+
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(tag = "command", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Send { body: String },
+            Status,
+        }
+        assert!(serde_json::from_slice::<LegacyRequest>(&bytes).is_err());
     }
 
     #[tokio::test]

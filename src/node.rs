@@ -11,6 +11,9 @@ use crate::{
         read_frame, read_subscription, send_request, subscribe, write_request, write_value,
         BenchConfig, IpcRequest, MAX_IPC_REQUEST_SIZE, PRIVATE_SEND_CAPABILITY,
     },
+    peers::{
+        self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
+    },
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -499,6 +502,9 @@ enum DaemonCommand {
         reply: oneshot::Sender<std::result::Result<usize, String>>,
     },
     Status {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    Peers {
         reply: oneshot::Sender<serde_json::Value>,
     },
     Offers {
@@ -1156,6 +1162,7 @@ async fn handle_local_client<S>(
     commands: mpsc::Sender<DaemonCommand>,
     mut events: broadcast::Receiver<serde_json::Value>,
     connected: serde_json::Value,
+    startup_peers: Option<serde_json::Value>,
     benchmark_busy: Arc<AtomicBool>,
 ) -> Result<()>
 where
@@ -1167,6 +1174,9 @@ where
     match request {
         IpcRequest::Subscribe => {
             write_value(&mut stream, &connected).await?;
+            if let Some(snapshot) = startup_peers {
+                write_value(&mut stream, &snapshot).await?;
+            }
             let mut read_closed = false;
             loop {
                 let mut disconnect = [0_u8; 1];
@@ -1220,6 +1230,11 @@ where
         IpcRequest::Status => {
             let (reply, response) = oneshot::channel();
             commands.send(DaemonCommand::Status { reply }).await?;
+            write_value(&mut stream, &response.await?).await?;
+        }
+        IpcRequest::Peers => {
+            let (reply, response) = oneshot::channel();
+            commands.send(DaemonCommand::Peers { reply }).await?;
             write_value(&mut stream, &response.await?).await?;
         }
         IpcRequest::Offers => {
@@ -1713,6 +1728,50 @@ fn shutdown_signals() -> Result<mpsc::Receiver<()>> {
     Ok(receiver)
 }
 
+fn local_peer_online(node: &RunningNode) -> bool {
+    node.endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .any(|status| status.is_connected())
+        && node.receiver.is_joined()
+}
+
+fn peer_snapshot(
+    node: &RunningNode,
+    directory: &Directory,
+    self_peer: &str,
+    self_alias: Option<&str>,
+    generated_at_ms: u64,
+) -> serde_json::Value {
+    peer_api::snapshot_value(
+        self_peer,
+        self_alias,
+        local_peer_online(node),
+        generated_at_ms,
+        directory.peers(),
+    )
+}
+
+fn emit_peer_transitions(
+    transitions: impl IntoIterator<Item = PeerTransition>,
+    events: &broadcast::Sender<serde_json::Value>,
+    json: bool,
+) {
+    for transition in transitions {
+        let value = peer_api::transition_value(transition);
+        // The type-level field bounds make this unreachable; keep an explicit
+        // final guard so future schema changes fail closed instead of creating
+        // unexpectedly large subscription events.
+        if serde_json::to_vec(&value)
+            .is_ok_and(|encoded| encoded.len() <= MAX_PEER_LIFECYCLE_EVENT_BYTES)
+        {
+            let _ = events.send(value.clone());
+            event(json, value);
+        }
+    }
+}
+
 pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     // Install service-manager/console signal handling before startup becomes visible.
     let mut shutdown = shutdown_signals()?;
@@ -1827,8 +1886,16 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let stream = accepted?;
+                // Expiration is authoritative in the daemon. Emit it before
+                // capturing the new subscriber's snapshot so queued events are
+                // strictly later than that snapshot.
+                emit_peer_transitions(directory.cleanup(), &event_tx, json);
                 let commands = command_tx.clone();
                 let events = event_tx.subscribe();
+                let generated_at_ms = unix_timestamp_ms()?;
+                let startup_peers = peer_snapshot(
+                    &node, &directory, &peer, alias_config.effective(), generated_at_ms,
+                );
                 let connected = serde_json::json!({
                     "type":"connected", "peer":peer, "endpoint_online":true,
                     "topic_joined":node.receiver.is_joined(),
@@ -1836,7 +1903,9 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 });
                 let benchmark_busy = benchmark_busy.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_local_client(stream, commands, events, connected, benchmark_busy).await {
+                    if let Err(error) = handle_local_client(
+                        stream, commands, events, connected, Some(startup_peers), benchmark_busy,
+                    ).await {
                         if !is_local_disconnect(&error) {
                             eprintln!("local client error: {error:#}");
                         }
@@ -1861,6 +1930,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     let _ = reply.send(response);
                 }
                 Some(DaemonCommand::PrivateSend { to, body, reply }) => {
+                    emit_peer_transitions(directory.cleanup(), &event_tx, json);
                     let address = match directory.resolve(&to) {
                         Ok(address) => address,
                         Err(error) => {
@@ -1939,8 +2009,15 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY]
+                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY]
                     }));
+                }
+                Some(DaemonCommand::Peers { reply }) => {
+                    emit_peer_transitions(directory.cleanup(), &event_tx, json);
+                    let generated_at_ms = unix_timestamp_ms()?;
+                    let _ = reply.send(peer_snapshot(
+                        &node, &directory, &peer, alias_config.effective(), generated_at_ms,
+                    ));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
                     let response = match list_pinned_blobs(&node.blob_store).await {
@@ -2029,7 +2106,12 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                     // Rate-limit the authenticated transport hop, not the signed
                     // presence identity, which an invite holder can rotate cheaply.
                     if presence_sources.allow(message.delivered_from) {
-                        let _ = directory.receive(&message.content, topic);
+                        // Never let receive-time cleanup swallow an expiry. The
+                        // explicit cleanup transition is emitted first.
+                        emit_peer_transitions(directory.cleanup(), &event_tx, json);
+                        if let Ok(Some(transition)) = directory.receive(&message.content, topic) {
+                            emit_peer_transitions([transition], &event_tx, json);
+                        }
                     }
                 }
                 Some(Event::NeighborDown(source)) => presence_sources.remove(source),
@@ -2054,7 +2136,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 }
             },
             _ = presence_cleanup.tick() => {
-                directory.cleanup();
+                emit_peer_transitions(directory.cleanup(), &event_tx, json);
                 presence_sources.cleanup();
             },
             _ = rejoin.tick(), if !node.bootstrap_peers.is_empty() => {
@@ -2294,15 +2376,19 @@ fn validate_private_acceptance(value: &serde_json::Value, body_bytes: usize) -> 
     Ok(())
 }
 
-fn advertises_private_send(status: &serde_json::Value) -> bool {
+fn advertises_capability(status: &serde_json::Value, expected: &str) -> bool {
     status["type"] == "status"
         && status["ipc_capabilities"]
             .as_array()
             .is_some_and(|capabilities| {
                 capabilities
                     .iter()
-                    .any(|capability| capability.as_str() == Some(PRIVATE_SEND_CAPABILITY))
+                    .any(|capability| capability.as_str() == Some(expected))
             })
+}
+
+fn advertises_private_send(status: &serde_json::Value) -> bool {
+    advertises_capability(status, PRIVATE_SEND_CAPABILITY)
 }
 
 pub async fn send_once(dir: &Path, to: Option<&str>, body: &str, json: bool) -> Result<()> {
@@ -2360,6 +2446,28 @@ pub async fn share(dir: &Path, path: &Path, json: bool) -> Result<()> {
     )
     .await?;
     ensure_success(&value)?;
+    event(json, value);
+    Ok(())
+}
+
+pub async fn peers(dir: &Path, json: bool) -> Result<()> {
+    // Negotiate before sending a command that legacy daemons do not know. A
+    // daemon swap remains safe because `peers` is a distinct, fieldless command
+    // and all IPC enums reject unknown fields.
+    let status = send_request(dir, &IpcRequest::Status).await?;
+    ensure_success(&status)?;
+    anyhow::ensure!(
+        advertises_capability(&status, PEER_DIRECTORY_CAPABILITY),
+        "daemon does not advertise peer-directory IPC; upgrade and restart the daemon"
+    );
+    let value = send_request(dir, &IpcRequest::Peers)
+        .await
+        .context("request peer directory; the daemon may need to be upgraded and restarted")?;
+    ensure_success(&value)?;
+    anyhow::ensure!(
+        value["type"] == "peers_snapshot" && value["schema_version"] == 1,
+        "daemon returned an unsupported peer-directory response"
+    );
     event(json, value);
     Ok(())
 }
@@ -3257,6 +3365,50 @@ fn event(json: bool, value: serde_json::Value) {
                 value["size"].as_u64().unwrap_or(0),
                 value["output"].as_str().unwrap_or("")
             ),
+            "peers_snapshot" => {
+                let self_peer = &value["self"];
+                println!(
+                    "self: {}{} ({})",
+                    self_peer["public_key"].as_str().unwrap_or(""),
+                    self_peer["alias"]
+                        .as_str()
+                        .map(|alias| format!(" ({alias})"))
+                        .unwrap_or_default(),
+                    if self_peer["online"].as_bool() == Some(true) {
+                        "online"
+                    } else {
+                        "offline"
+                    }
+                );
+                for peer in value["peers"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+                    println!(
+                        "peer: {}{} ({})",
+                        peer["public_key"].as_str().unwrap_or(""),
+                        peer["alias"]
+                            .as_str()
+                            .map(|alias| format!(" ({alias})"))
+                            .unwrap_or_default(),
+                        if peer["online"].as_bool() == Some(true) {
+                            "online"
+                        } else {
+                            "offline"
+                        }
+                    );
+                }
+            }
+            "peer_discovered" | "peer_updated" | "peer_expired" => {
+                let peer = &value["peer"];
+                let action = value["type"].as_str().unwrap_or("peer");
+                println!(
+                    "{}: {}{}",
+                    action.replace('_', " "),
+                    peer["public_key"].as_str().unwrap_or(""),
+                    peer["alias"]
+                        .as_str()
+                        .map(|alias| format!(" ({alias})"))
+                        .unwrap_or_default()
+                );
+            }
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
             "daemon_started" => println!(
@@ -4289,6 +4441,7 @@ mod tests {
             commands,
             receiver,
             serde_json::json!({"type":"connected"}),
+            None,
             busy.clone(),
         ));
         write_request(
@@ -4342,6 +4495,7 @@ mod tests {
             commands,
             receiver,
             serde_json::json!({"type":"connected"}),
+            None,
             Arc::new(AtomicBool::new(false)),
         ));
         write_request(
@@ -4386,6 +4540,7 @@ mod tests {
             commands,
             receiver,
             serde_json::json!({"type":"connected"}),
+            None,
             Arc::new(AtomicBool::new(false)),
         ));
         write_request(&mut client, &IpcRequest::Subscribe)
@@ -4440,6 +4595,7 @@ mod tests {
             commands,
             receiver,
             serde_json::json!({"type":"connected"}),
+            None,
             Arc::new(AtomicBool::new(false)),
         ));
         write_request(&mut client, &IpcRequest::Subscribe)
@@ -4456,15 +4612,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscriber_exits_when_daemon_event_channel_closes() {
+    async fn subscriber_gets_connected_then_atomic_startup_snapshot() {
         let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
+        let startup = serde_json::json!({
+            "type":"peers_snapshot", "schema_version":1,
+            "generated_at_ms":1, "self":{"public_key":"self", "alias":null, "online":true},
+            "peers":[]
+        });
         let task = tokio::spawn(handle_local_client(
             server,
             commands,
             receiver,
             serde_json::json!({"type":"connected"}),
+            Some(startup.clone()),
             Arc::new(AtomicBool::new(false)),
         ));
         client
@@ -4475,6 +4637,11 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&connected).unwrap()["type"],
             "connected"
+        );
+        let snapshot = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&snapshot).unwrap(),
+            startup
         );
 
         drop(events);
@@ -4493,6 +4660,7 @@ mod tests {
             commands,
             receiver,
             serde_json::json!({"type":"connected"}),
+            None,
             Arc::new(AtomicBool::new(false)),
         ));
         client

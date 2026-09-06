@@ -1,6 +1,11 @@
 //! Unauthenticated loopback HTTP bridge. Tailscale Serve is the access boundary;
 //! Host/Origin checks defend browsers, not hostile local or authorized clients.
-use crate::ipc::{self, IpcRequest};
+use crate::{
+    alias::validate_alias,
+    direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
+    ipc::{self, IpcRequest},
+    peers::PEER_LEASE_MS,
+};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::stream;
@@ -13,12 +18,14 @@ use hyper::{
     Method, Request, Response, StatusCode, Uri,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
+use iroh::PublicKey;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     convert::Infallible,
     net::SocketAddr,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -115,6 +122,7 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 enum WebRequest {
     Send { body: String },
     Status {},
+    Peers {},
 }
 
 fn parse_request(bytes: &[u8]) -> Result<WebRequest> {
@@ -161,24 +169,106 @@ fn error(status: StatusCode, outcome: &str, message: &str) -> Response<Body> {
 
 fn public_status(value: &Value) -> Value {
     let mut result = json!({"type":"status"});
-    for key in [
-        "peer",
-        "running",
-        "endpoint_online",
-        "topic_joined",
-        "neighbors",
-    ] {
-        if let Some(value) = value.get(key) {
-            result[key] = value.clone();
+    if let Some(peer) = public_key(&value["peer"]) {
+        result["peer"] = peer.into();
+    }
+    for key in ["running", "endpoint_online", "topic_joined"] {
+        if let Some(value) = value[key].as_bool() {
+            result[key] = value.into();
         }
     }
+    if let Some(neighbors) = value["neighbors"].as_u64() {
+        result["neighbors"] = neighbors.into();
+    }
     result
+}
+
+fn public_key(value: &Value) -> Option<&str> {
+    let text = value.as_str()?;
+    let key = PublicKey::from_str(text).ok()?;
+    (key.to_string() == text).then_some(text)
+}
+
+fn public_alias(value: &Value) -> Option<Option<&str>> {
+    if value.is_null() {
+        return Some(None);
+    }
+    let alias = value.as_str()?;
+    validate_alias(alias).ok()?;
+    Some(Some(alias))
+}
+
+fn public_remote_peer(value: &Value, expected_online: bool) -> Option<Value> {
+    let public_key = public_key(&value["public_key"])?;
+    let alias = public_alias(&value["alias"])?;
+    let online = value["online"].as_bool()?;
+    if online != expected_online {
+        return None;
+    }
+    let last_seen_ms = value["last_seen_ms"].as_u64()?;
+    let expires_at_ms = value["expires_at_ms"].as_u64()?;
+    if expires_at_ms < last_seen_ms || expires_at_ms.saturating_sub(last_seen_ms) > PEER_LEASE_MS {
+        return None;
+    }
+    Some(json!({
+        "public_key":public_key, "alias":alias, "online":online,
+        "last_seen_ms":last_seen_ms, "expires_at_ms":expires_at_ms
+    }))
+}
+
+fn public_peers_snapshot(value: &Value) -> Option<Value> {
+    if value["type"] != "peers_snapshot" || value["schema_version"] != 1 {
+        return None;
+    }
+    let generated_at_ms = value["generated_at_ms"].as_u64()?;
+    let self_value = &value["self"];
+    let self_key = public_key(&self_value["public_key"])?;
+    let self_alias = public_alias(&self_value["alias"])?;
+    let self_online = self_value["online"].as_bool()?;
+    let source = value["peers"].as_array()?;
+    if source.len() > MAX_DYNAMIC_PRESENCE_IDENTITIES {
+        return None;
+    }
+    let mut remotes = Vec::with_capacity(source.len());
+    let mut previous: Option<String> = None;
+    for item in source {
+        let peer = public_remote_peer(item, true)?;
+        let key = peer["public_key"].as_str()?;
+        if key == self_key || previous.as_deref().is_some_and(|previous| previous >= key) {
+            return None;
+        }
+        let last_seen_ms = peer["last_seen_ms"].as_u64()?;
+        let expires_at_ms = peer["expires_at_ms"].as_u64()?;
+        if last_seen_ms > generated_at_ms
+            || expires_at_ms < generated_at_ms
+            || expires_at_ms.saturating_sub(generated_at_ms) > PEER_LEASE_MS
+        {
+            return None;
+        }
+        previous = Some(key.to_owned());
+        remotes.push(peer);
+    }
+    Some(json!({
+        "type":"peers_snapshot", "schema_version":1,
+        "generated_at_ms":generated_at_ms,
+        "self":{"public_key":self_key, "alias":self_alias, "online":self_online},
+        "peers":remotes
+    }))
+}
+
+fn public_peer_transition(value: &Value, event_type: &str) -> Option<Value> {
+    if value["schema_version"] != 1 {
+        return None;
+    }
+    let expected_online = event_type != "peer_expired";
+    let peer = public_remote_peer(&value["peer"], expected_online)?;
+    Some(json!({"type":event_type, "schema_version":1, "peer":peer}))
 }
 
 async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
     let request = match parse_request(bytes) {
         Ok(request) => request,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "not_sent", "Only send (nonblank body, at most 4096 UTF-8 bytes) and status are supported; no extra fields."),
+        Err(_) => return error(StatusCode::BAD_REQUEST, "not_sent", "Only send (nonblank body, at most 4096 UTF-8 bytes), status, and peers are supported; no extra fields."),
     };
     let Ok(_permit) = state.requests.try_acquire() else {
         return error(
@@ -188,6 +278,7 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         );
     };
     let is_send = matches!(&request, WebRequest::Send { .. });
+    let is_peers = matches!(&request, WebRequest::Peers {});
     if is_send && !state.take_send(Instant::now()) {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -198,11 +289,16 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
     let request = match request {
         WebRequest::Send { body } => IpcRequest::Send { body },
         WebRequest::Status {} => IpcRequest::Status,
+        WebRequest::Peers {} => IpcRequest::Peers,
     };
     match timeout(IPC_TIMEOUT, ipc::send_request(&state.dir, &request)).await {
         Ok(Ok(value)) if value["type"] == "error" => error(StatusCode::UNPROCESSABLE_ENTITY, "not_sent", value["message"].as_str().unwrap_or("Daemon rejected request.")),
         Ok(Ok(value)) if is_send && value["type"] == "queued" => json_response(StatusCode::OK, json!({"type":"queued", "delivery_acknowledged":false})),
-        Ok(Ok(value)) if !is_send && value["type"] == "status" => json_response(StatusCode::OK, public_status(&value)),
+        Ok(Ok(value)) if !is_send && !is_peers && value["type"] == "status" => json_response(StatusCode::OK, public_status(&value)),
+        Ok(Ok(value)) if is_peers => match public_peers_snapshot(&value) {
+            Some(value) => json_response(StatusCode::OK, value),
+            None => error(StatusCode::BAD_GATEWAY, "offline", "Daemon returned an invalid peer directory."),
+        },
         _ if is_send => error(StatusCode::BAD_GATEWAY, "unknown", "Outcome unknown: daemon unavailable or reply lost. It may have queued. Do not blindly resend."),
         _ => error(StatusCode::SERVICE_UNAVAILABLE, "offline", "Daemon offline or unresponsive. Start or restart it separately."),
     }
@@ -215,7 +311,13 @@ fn sse_frame(value: &Value) -> Bytes {
 
 fn public_event(value: Value) -> Option<Value> {
     match value["type"].as_str()? {
-        "connected" => Some(json!({"type":"connected", "peer":value["peer"]})),
+        "connected" => {
+            let mut connected = json!({"type":"connected"});
+            if let Some(peer) = public_key(&value["peer"]) {
+                connected["peer"] = peer.into();
+            }
+            Some(connected)
+        }
         "message" => Some(
             json!({"type":"message", "from":value["from"], "body":value["body"], "timestamp_ms":value["timestamp_ms"]}),
         ),
@@ -233,10 +335,17 @@ fn public_event(value: Value) -> Option<Value> {
             "timestamp_ms":value["timestamp_ms"], "name":value["name"],
             "kind":value["kind"], "size":value["size"]
         })),
+        "peers_snapshot" => public_peers_snapshot(&value),
+        event_type @ ("peer_discovered" | "peer_updated" | "peer_expired") => {
+            public_peer_transition(&value, event_type)
+        }
         "lagged" => Some(
             json!({"type":"lagged", "message":"Feed gap: daemon dropped events. No history or replay is available."}),
         ),
-        "peer_up" | "peer_down" => Some(json!({"type":value["type"], "peer":value["peer"]})),
+        event_type @ ("peer_up" | "peer_down") => {
+            let peer = public_key(&value["peer"])?;
+            Some(json!({"type":event_type, "peer":peer}))
+        }
         _ => None,
     }
 }
@@ -544,6 +653,7 @@ mod tests {
         }
         assert!(parse_request(br#"{"command":"send","command":"status","body":"a"}"#).is_err());
         assert!(parse_request(br#"{"command":"status"}"#).is_ok());
+        assert!(parse_request(br#"{"command":"peers"}"#).is_ok());
         assert!(parse_request(
             json!({"command":"send", "body":"二".repeat(1365)})
                 .to_string()
@@ -603,6 +713,33 @@ mod tests {
             "type":"private_accepted", "to":"peer", "body":"dm-secret"
         }))
         .is_none());
+        assert!(public_event(json!({
+            "type":"peer_up", "peer":{"endpoint":"private-route", "body":"secret"}
+        }))
+        .is_none());
+        let connected = public_event(json!({
+            "type":"connected", "peer":{"endpoint":"private-route", "body":"secret"}
+        }))
+        .unwrap();
+        assert_eq!(connected, json!({"type":"connected"}));
+        for malformed in [
+            json!({"type":"peer_up", "peer":[{"endpoint":"private-route"}]}),
+            json!({"type":"peer_down", "peer":"10.0.0.1:443"}),
+            json!({"type":"peer_up", "peer":"not-a-canonical-public-key"}),
+        ] {
+            assert!(public_event(malformed).is_none());
+        }
+        let malformed_status = public_status(&json!({
+            "type":"status", "peer":{"endpoint":"private-route", "body":"secret"},
+            "running":{"body":"secret"}, "neighbors":[{"address":"private"}],
+            "endpoint_online":true, "topic_joined":false
+        }));
+        assert_eq!(
+            malformed_status,
+            json!({"type":"status", "endpoint_online":true, "topic_joined":false})
+        );
+        assert!(!malformed_status.to_string().contains("private"));
+        assert!(!malformed_status.to_string().contains("body"));
         let value = public_event(json!({"type":"message", "body":"<script>\ndata: injected\n", "from":"peer", "private":"secret"})).unwrap();
         let frame = String::from_utf8(sse_frame(&value).to_vec()).unwrap();
         assert_eq!(frame.lines().count(), 2);
@@ -624,6 +761,61 @@ mod tests {
         );
         assert!(status.get("socket").is_none());
         assert!(status.get("invite").is_none());
+
+        let self_key = iroh::SecretKey::generate().public().to_string();
+        let remote_key = iroh::SecretKey::generate().public().to_string();
+        let injected = json!({
+            "type":"peers_snapshot", "schema_version":1, "generated_at_ms":1_000,
+            "self":{
+                "public_key":self_key, "alias":"local", "online":true,
+                "endpoint":"self-route", "socket":"private"
+            },
+            "peers":[{
+                "public_key":remote_key, "alias":null, "online":true,
+                "last_seen_ms":900, "expires_at_ms":1_100,
+                "endpoint":"remote-route", "address":"10.0.0.1", "body":"private"
+            }],
+            "invite":"secret", "ipc_capabilities":["private"]
+        });
+        let sanitized = public_peers_snapshot(&injected).unwrap();
+        assert_eq!(sanitized["type"], "peers_snapshot");
+        assert_eq!(sanitized["self"]["public_key"], self_key);
+        assert_eq!(sanitized["peers"][0]["public_key"], remote_key);
+        for forbidden in [
+            "endpoint",
+            "address",
+            "socket",
+            "invite",
+            "capabilities",
+            "body",
+            "secret",
+            "route",
+        ] {
+            assert!(
+                !sanitized.to_string().contains(forbidden),
+                "leaked {forbidden}"
+            );
+        }
+        let transition = public_event(json!({
+            "type":"peer_updated", "schema_version":1,
+            "peer":{
+                "public_key":remote_key, "alias":"renamed", "online":true,
+                "last_seen_ms":1_000, "expires_at_ms":151_000,
+                "endpoint":"hidden", "body":"private"
+            }
+        }))
+        .unwrap();
+        assert_eq!(transition["type"], "peer_updated");
+        assert!(transition["peer"].get("endpoint").is_none());
+        assert!(transition["peer"].get("body").is_none());
+        assert!(public_event(json!({
+            "type":"peer_discovered", "schema_version":1,
+            "peer":{
+                "public_key":remote_key, "alias":"UPPER", "online":true,
+                "last_seen_ms":1_000, "expires_at_ms":1_100
+            }
+        }))
+        .is_none());
     }
 
     #[test]
