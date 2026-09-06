@@ -196,7 +196,7 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         );
     }
     let request = match request {
-        WebRequest::Send { body } => IpcRequest::Send { body, to: None },
+        WebRequest::Send { body } => IpcRequest::Send { body },
         WebRequest::Status {} => IpcRequest::Status,
     };
     match timeout(IPC_TIMEOUT, ipc::send_request(&state.dir, &request)).await {

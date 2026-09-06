@@ -55,3 +55,7 @@ jobs:
         run: timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
       - name: Run attachment transfer scenario
         run: timeout 600 bash tests/integration-attachments.sh target/debug/meshmsg
+      - name: Run direct-message scenario
+        run: timeout 600 bash tests/integration-direct-messages.sh target/debug/meshmsg
+      - name: Run IPC version compatibility scenario
+        run: timeout 600 bash tests/integration-ipc-version-compat.sh target/debug/meshmsg

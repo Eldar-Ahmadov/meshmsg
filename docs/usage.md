@@ -121,6 +121,8 @@ printf '%s' 'private hello' | meshmsg send --to '<full-peer-key>' --message-stdi
 
 Public-key parsing takes precedence over alias parsing and requires the canonical full encoding. The daemon must know a current signed endpoint presence for that key, unless its endpoint was pinned from the local invite. Alias lookup uses unexpired signed presence records and succeeds only when exactly one peer currently advertises the normalized alias. Zero matches or collisions fail closed; meshmsg never guesses or falls back to broadcast. Because presence is periodic and expires, a recently started, disconnected, renamed, or stopped peer may temporarily be unresolved, and a stopped peer's alias may remain visible until expiry.
 
+Before submitting a private body over local IPC, the CLI checks that the running daemon explicitly advertises `private_send_v1`. It then uses the distinct `private_send` IPC command; it never encodes a recipient into the legacy broadcast `send` command and never retries or falls back to broadcast. An older or stale daemon therefore causes an error saying the message was not submitted. Upgrade and restart the daemon, then rerun the command only after reviewing that failure.
+
 A private message travels over a separate authenticated, encrypted Iroh connection and is signed and bound to the sender, recipient, and topic. It is not placed in the broadcast message stream. On success, human output says the private message was accepted; JSON reports metadata, never the sent body:
 
 ```json

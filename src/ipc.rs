@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 // JSON may escape each envelope byte as six ASCII bytes.
 pub(crate) const MAX_IPC_REQUEST_SIZE: usize = 4096 * 6 + 1024;
 pub(crate) const MAX_IPC_EVENT_SIZE: usize = MAX_IPC_REQUEST_SIZE;
+pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BenchConfig {
@@ -19,26 +20,16 @@ pub(crate) struct BenchConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum IpcRequest {
-    Send {
-        body: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        to: Option<String>,
-    },
-    BenchSend {
-        config: BenchConfig,
-    },
+    Send { body: String },
+    PrivateSend { to: String, body: String },
+    BenchSend { config: BenchConfig },
     Subscribe,
     Status,
     Offers,
-    Share {
-        path: PathBuf,
-    },
-    Download {
-        offer: String,
-        output: PathBuf,
-    },
+    Share { path: PathBuf },
+    Download { offer: String, output: PathBuf },
     Stop,
 }
 
@@ -179,7 +170,6 @@ mod tests {
             &mut bytes,
             &IpcRequest::Send {
                 body: "a\nb".into(),
-                to: None,
             },
         )
         .await
@@ -189,10 +179,48 @@ mod tests {
             &mut bytes,
             &IpcRequest::Send {
                 body: "x".repeat(MAX_IPC_REQUEST_SIZE),
-                to: None,
             }
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn private_send_uses_a_distinct_wire_command_rejected_by_legacy_daemons() {
+        let mut bytes = Vec::new();
+        write_request(
+            &mut bytes,
+            &IpcRequest::PrivateSend {
+                to: "peer".into(),
+                body: "private text".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bytes,
+            b"{\"command\":\"private_send\",\"to\":\"peer\",\"body\":\"private text\"}\n"
+        );
+
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        #[serde(tag = "command", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Send { body: String },
+            Status,
+        }
+
+        assert!(serde_json::from_slice::<LegacyRequest>(&bytes).is_err());
+    }
+
+    #[test]
+    fn ambiguous_legacy_send_with_recipient_is_rejected() {
+        let ambiguous = br#"{"command":"send","body":"private text","to":"peer"}"#;
+        assert!(serde_json::from_slice::<IpcRequest>(ambiguous).is_err());
+        assert!(matches!(
+            serde_json::from_slice::<IpcRequest>(br#"{"command":"send","body":"broadcast"}"#)
+                .unwrap(),
+            IpcRequest::Send { body } if body == "broadcast"
+        ));
     }
 }

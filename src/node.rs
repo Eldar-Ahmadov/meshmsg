@@ -2,11 +2,14 @@ use crate::{
     alias::AliasConfig,
     attachment::{self, AttachmentKind, AttachmentOffer, MAX_ATTACHMENT_BYTES},
     config::{prepare_state_dir, State, StateLock},
-    direct::{self, DirectHandler, Directory, IncomingDirect, DIRECT_ALPN, PRESENCE_ALPN},
+    direct::{
+        self, DirectHandler, Directory, IncomingDirect, PresenceSourceLimiter, DIRECT_ALPN,
+        PRESENCE_ALPN,
+    },
     invite::Invite,
     ipc::{
         read_frame, read_subscription, send_request, subscribe, write_request, write_value,
-        BenchConfig, IpcRequest, MAX_IPC_REQUEST_SIZE,
+        BenchConfig, IpcRequest, MAX_IPC_REQUEST_SIZE, PRIVATE_SEND_CAPABILITY,
     },
 };
 use anyhow::{Context, Result};
@@ -81,6 +84,7 @@ const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 /// network interface is still unavailable.
 const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(30);
+const PRESENCE_CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 const DIRECT_CONCURRENCY: usize = 8;
 const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 const ATTACHMENT_OFFER_VERSION: u8 = 1;
@@ -381,6 +385,7 @@ struct RunningNode {
     blob_store: Store,
     downloader: Downloader,
     lookup: MemoryLookup,
+    presence_lookup: MemoryLookup,
 }
 
 async fn start(
@@ -391,10 +396,14 @@ async fn start(
 ) -> Result<RunningNode> {
     state.validate()?;
     let topic: TopicId = state.topic_id()?;
-    let lookup = MemoryLookup::new();
+    // Keep stable invite/attachment routes isolated from expiring presence.
+    // Each MemoryLookup owns one source so presence cleanup cannot erase another.
+    let lookup = MemoryLookup::with_provenance("meshmsg_stable");
+    let presence_lookup = MemoryLookup::with_provenance("meshmsg_presence");
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret.clone())
         .address_lookup(lookup.clone())
+        .address_lookup(presence_lookup.clone())
         .bind()
         .await?;
     let gossip = Gossip::builder()
@@ -432,9 +441,11 @@ async fn start(
         let invite: Invite = token.parse()?;
         for peer in invite.bootstrap_peers {
             if peer.id != endpoint.id() {
+                direct::validate_endpoint_addr(&peer, peer.id)
+                    .context("invalid bootstrap endpoint address")?;
                 bootstrap.push(peer.id);
                 bootstrap_addrs.push(peer.clone());
-                lookup.add_endpoint_info(peer);
+                lookup.set_endpoint_info(peer);
             }
         }
     }
@@ -467,13 +478,18 @@ async fn start(
         blob_store,
         downloader,
         lookup,
+        presence_lookup,
     })
 }
 
 enum DaemonCommand {
     Send {
         body: String,
-        to: Option<String>,
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    PrivateSend {
+        to: String,
+        body: String,
         reply: oneshot::Sender<serde_json::Value>,
     },
     BenchMessage {
@@ -1186,10 +1202,15 @@ where
                 }
             }
         }
-        IpcRequest::Send { body, to } => {
+        IpcRequest::Send { body } => {
+            let (reply, response) = oneshot::channel();
+            commands.send(DaemonCommand::Send { body, reply }).await?;
+            write_value(&mut stream, &response.await?).await?;
+        }
+        IpcRequest::PrivateSend { to, body } => {
             let (reply, response) = oneshot::channel();
             commands
-                .send(DaemonCommand::Send { body, to, reply })
+                .send(DaemonCommand::PrivateSend { to, body, reply })
                 .await?;
             write_value(&mut stream, &response.await?).await?;
         }
@@ -1783,7 +1804,7 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     let transfer_limit = Arc::new(Semaphore::new(2));
     let direct_limit = Arc::new(Semaphore::new(DIRECT_CONCURRENCY));
     let topic = state.topic_id()?;
-    let mut directory = Directory::default();
+    let mut directory = Directory::new(node.presence_lookup.clone());
     for address in &node.bootstrap_addrs {
         if directory.pin(address.clone()).is_ok() {
             // Invite validation already bounds bootstrap addresses; invalid direct
@@ -1795,6 +1816,9 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
     }
     let mut presence = tokio::time::interval(PRESENCE_INTERVAL);
     presence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut presence_cleanup = tokio::time::interval(PRESENCE_CLEANUP_INTERVAL);
+    presence_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut presence_sources = PresenceSourceLimiter::default();
     let mut transfer_tasks = tokio::task::JoinSet::new();
     let mut rejoin = tokio::time::interval(REJOIN_INTERVAL);
     rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1820,65 +1844,64 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 });
             }
             command = command_rx.recv() => match command {
-                Some(DaemonCommand::Send { body, to, reply }) => {
-                    if let Some(recipient) = to {
-                        let address = match directory.resolve(&recipient) {
-                            Ok(address) => address,
-                            Err(error) => {
-                                let _ = reply.send(serde_json::json!({
-                                    "type":"error", "code":"recipient_unresolved",
-                                    "message":error.to_string()
-                                }));
-                                continue;
-                            }
-                        };
-                        let permit = match direct_limit.clone().try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                let _ = reply.send(serde_json::json!({
-                                    "type":"error", "code":"private_send_busy",
-                                    "message":"private-message send capacity reached"
-                                }));
-                                continue;
-                            }
-                        };
-                        let endpoint = node.endpoint.clone();
-                        let secret = node.secret.clone();
-                        transfer_tasks.spawn(async move {
-                            let _permit = permit;
-                            let response = match direct::send(endpoint, secret, topic, address, body).await {
-                                Ok(accepted) => serde_json::json!({
-                                    "type":"private_accepted", "schema_version":1,
-                                    "to":accepted.recipient.to_string(),
-                                    "message_id":direct::id_string(&accepted.id),
-                                    "timestamp_ms":accepted.timestamp_ms,
-                                    "body_bytes":accepted.body_bytes,
-                                    "acceptance_acknowledged":true,
-                                    "durable":false, "read":false
-                                }),
-                                Err(error) => serde_json::json!({
-                                    "type":"error", "code":"private_send_failed",
-                                    "message":format!("{error:#}")
-                                }),
-                            };
-                            let _ = reply.send(response);
-                        });
-                    } else {
-                        let response = match unix_timestamp_ms() {
-                            Ok(timestamp_ms) => match Envelope::encode_at(&node.secret, body.clone(), timestamp_ms) {
-                                Ok(envelope) => match node.sender.broadcast(envelope).await {
-                                    Ok(()) => queued_event(&peer, body, timestamp_ms),
-                                    Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
-                                },
-                                Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
+                Some(DaemonCommand::Send { body, reply }) => {
+                    let response = match unix_timestamp_ms() {
+                        Ok(timestamp_ms) => match Envelope::encode_at(&node.secret, body.clone(), timestamp_ms) {
+                            Ok(envelope) => match node.sender.broadcast(envelope).await {
+                                Ok(()) => queued_event(&peer, body, timestamp_ms),
+                                Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
                             },
                             Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
-                        };
-                        if response["type"] == "queued" {
-                            let _ = event_tx.send(response.clone());
-                        }
-                        let _ = reply.send(response);
+                        },
+                        Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
+                    };
+                    if response["type"] == "queued" {
+                        let _ = event_tx.send(response.clone());
                     }
+                    let _ = reply.send(response);
+                }
+                Some(DaemonCommand::PrivateSend { to, body, reply }) => {
+                    let address = match directory.resolve(&to) {
+                        Ok(address) => address,
+                        Err(error) => {
+                            let _ = reply.send(serde_json::json!({
+                                "type":"error", "code":"recipient_unresolved",
+                                "message":error.to_string()
+                            }));
+                            continue;
+                        }
+                    };
+                    let permit = match direct_limit.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let _ = reply.send(serde_json::json!({
+                                "type":"error", "code":"private_send_busy",
+                                "message":"private-message send capacity reached"
+                            }));
+                            continue;
+                        }
+                    };
+                    let endpoint = node.endpoint.clone();
+                    let secret = node.secret.clone();
+                    transfer_tasks.spawn(async move {
+                        let _permit = permit;
+                        let response = match direct::send(endpoint, secret, topic, address, body).await {
+                            Ok(accepted) => serde_json::json!({
+                                "type":"private_accepted", "schema_version":1,
+                                "to":accepted.recipient.to_string(),
+                                "message_id":direct::id_string(&accepted.id),
+                                "timestamp_ms":accepted.timestamp_ms,
+                                "body_bytes":accepted.body_bytes,
+                                "acceptance_acknowledged":true,
+                                "durable":false, "read":false
+                            }),
+                            Err(error) => serde_json::json!({
+                                "type":"error", "code":"private_send_failed",
+                                "message":format!("{error:#}")
+                            }),
+                        };
+                        let _ = reply.send(response);
+                    });
                 }
                 Some(DaemonCommand::BenchMessage { body, timestamp_ms, cancel, reply }) => {
                     match Envelope::encode_at(&node.secret, body, timestamp_ms) {
@@ -1915,7 +1938,8 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                         "alias_enabled":alias_config.enabled(),
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
-                        "advertised_aliases":directory.advertised_aliases()
+                        "advertised_aliases":directory.advertised_aliases(),
+                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY]
                     }));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
@@ -2002,11 +2026,14 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
             },
             incoming = node.presence_receiver.try_next() => match incoming? {
                 Some(Event::Received(message)) => {
-                    if let Ok(address) = directory.receive(&message.content, topic) {
-                        node.lookup.add_endpoint_info(address);
+                    // Rate-limit the authenticated transport hop, not the signed
+                    // presence identity, which an invite holder can rotate cheaply.
+                    if presence_sources.allow(message.delivered_from) {
+                        let _ = directory.receive(&message.content, topic);
                     }
                 }
-                Some(Event::NeighborUp(_) | Event::NeighborDown(_) | Event::Lagged) => {}
+                Some(Event::NeighborDown(source)) => presence_sources.remove(source),
+                Some(Event::NeighborUp(_) | Event::Lagged) => {}
                 None => break,
             },
             incoming = direct_incoming_rx.recv() => {
@@ -2025,6 +2052,10 @@ pub async fn run_daemon(dir: &Path, json: bool) -> Result<()> {
                 ) {
                     let _ = node.presence_sender.broadcast(record).await;
                 }
+            },
+            _ = presence_cleanup.tick() => {
+                directory.cleanup();
+                presence_sources.cleanup();
             },
             _ = rejoin.tick(), if !node.bootstrap_peers.is_empty() => {
                 if !node.receiver.is_joined() {
@@ -2214,16 +2245,98 @@ fn ensure_success(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateAcceptedResponse {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u64,
+    to: String,
+    message_id: String,
+    timestamp_ms: u64,
+    body_bytes: usize,
+    acceptance_acknowledged: bool,
+    durable: bool,
+    read: bool,
+}
+
+fn validate_private_acceptance(value: &serde_json::Value, body_bytes: usize) -> Result<()> {
+    let accepted: PrivateAcceptedResponse = serde_json::from_value(value.clone())
+        .context("daemon returned an invalid private-send acceptance")?;
+    anyhow::ensure!(
+        accepted.kind == "private_accepted"
+            && accepted.schema_version == 1
+            && accepted.acceptance_acknowledged
+            && !accepted.durable
+            && !accepted.read,
+        "daemon returned an invalid private-send acceptance"
+    );
+    let recipient = accepted
+        .to
+        .parse::<PublicKey>()
+        .context("private-send acceptance contains an invalid recipient")?;
+    anyhow::ensure!(
+        recipient.to_string() == accepted.to,
+        "private-send acceptance recipient is not canonical"
+    );
+    anyhow::ensure!(
+        accepted.message_id.len() == 32
+            && accepted
+                .message_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "private-send acceptance contains an invalid message ID"
+    );
+    anyhow::ensure!(
+        accepted.timestamp_ms != 0 && accepted.body_bytes == body_bytes,
+        "private-send acceptance metadata does not match the request"
+    );
+    Ok(())
+}
+
+fn advertises_private_send(status: &serde_json::Value) -> bool {
+    status["type"] == "status"
+        && status["ipc_capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some(PRIVATE_SEND_CAPABILITY))
+            })
+}
+
 pub async fn send_once(dir: &Path, to: Option<&str>, body: &str, json: bool) -> Result<()> {
-    let value = send_request(
-        dir,
-        &IpcRequest::Send {
-            body: body.to_owned(),
-            to: to.map(str::to_owned),
-        },
-    )
-    .await?;
-    ensure_success(&value)?;
+    let value = if let Some(to) = to {
+        // Negotiate without the body first. A daemon swap after this check is
+        // still safe because private_send is never interpreted as broadcast.
+        let status = send_request(dir, &IpcRequest::Status).await?;
+        ensure_success(&status)?;
+        anyhow::ensure!(
+            advertises_private_send(&status),
+            "daemon does not advertise safe private-send IPC; upgrade and restart the daemon (message was not submitted)"
+        );
+        let value = send_request(
+            dir,
+            &IpcRequest::PrivateSend {
+                to: to.to_owned(),
+                body: body.to_owned(),
+            },
+        )
+        .await?;
+        ensure_success(&value)?;
+        validate_private_acceptance(&value, body.len())?;
+        value
+    } else {
+        let value = send_request(
+            dir,
+            &IpcRequest::Send {
+                body: body.to_owned(),
+            },
+        )
+        .await?;
+        ensure_success(&value)?;
+        value
+    };
     event(json, value);
     Ok(())
 }
@@ -2965,7 +3078,7 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
         tokio::select! {
             line = rx.recv() => match line {
                 Some(body) => {
-                    let value = send_request(dir, &IpcRequest::Send { body, to: None }).await?;
+                    let value = send_request(dir, &IpcRequest::Send { body }).await?;
                     ensure_success(&value)?;
                 }
                 None => break,
@@ -3874,6 +3987,53 @@ mod tests {
         assert_eq!(value["timestamp_ms"], 1_700_000_000_000_u64);
         assert_eq!(value["delivery_acknowledged"], false);
         assert!(value.get("sent").is_none());
+    }
+
+    #[test]
+    fn private_send_capability_and_acceptance_are_validated_strictly() {
+        assert!(!advertises_private_send(
+            &serde_json::json!({"type":"status"})
+        ));
+        assert!(!advertises_private_send(&serde_json::json!({
+            "type":"connected", "ipc_capabilities":[PRIVATE_SEND_CAPABILITY]
+        })));
+        assert!(advertises_private_send(&serde_json::json!({
+            "type":"status", "ipc_capabilities":[PRIVATE_SEND_CAPABILITY]
+        })));
+
+        let recipient = SecretKey::generate().public().to_string();
+        let accepted = serde_json::json!({
+            "type":"private_accepted", "schema_version":1,
+            "to":recipient, "message_id":"0123456789abcdef0123456789abcdef",
+            "timestamp_ms":1_700_000_000_000_u64, "body_bytes":6,
+            "acceptance_acknowledged":true, "durable":false, "read":false
+        });
+        validate_private_acceptance(&accepted, "秘密".len()).unwrap();
+
+        for invalid in [
+            {
+                let mut value = accepted.clone();
+                value["type"] = "queued".into();
+                value
+            },
+            {
+                let mut value = accepted.clone();
+                value["body_bytes"] = 7.into();
+                value
+            },
+            {
+                let mut value = accepted.clone();
+                value["body"] = "secret".into();
+                value
+            },
+            {
+                let mut value = accepted.clone();
+                value["message_id"] = "0123456789ABCDEF0123456789ABCDEF".into();
+                value
+            },
+        ] {
+            assert!(validate_private_acceptance(&invalid, 6).is_err());
+        }
     }
 
     #[test]

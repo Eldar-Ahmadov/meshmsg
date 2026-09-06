@@ -2,6 +2,7 @@ use crate::alias::{normalize_alias, validate_alias};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh::{
+    address_lookup::memory::MemoryLookup,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
     Endpoint, EndpointAddr, PublicKey, SecretKey, TransportAddr,
@@ -26,8 +27,14 @@ const MAX_DIRECT_FRAME: usize = 6 * 1024;
 const MAX_BODY_BYTES: usize = 4096;
 const MAX_PRESENCE_FRAME: usize = 2048;
 const MAX_ENDPOINT_ADDRS: usize = 8;
+pub(crate) const MAX_DYNAMIC_PRESENCE_IDENTITIES: usize = 1024;
+const MAX_PINNED_ENDPOINTS: usize = crate::invite::MAX_BOOTSTRAP_PEERS + 1;
 const PRESENCE_LIFETIME: Duration = Duration::from_secs(150);
 const MAX_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
+const PRESENCE_REPLAY_LIFETIME: Duration = Duration::from_secs(450);
+const MAX_PRESENCE_TRANSPORT_SOURCES: usize = 32;
+const MAX_PRESENCE_RECORDS_PER_SOURCE: usize = 128;
+const PRESENCE_SOURCE_WINDOW: Duration = Duration::from_secs(1);
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLAY_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAX_REPLAY_ENTRIES: usize = 65_536;
@@ -108,9 +115,19 @@ impl SignedPresence {
         alias: Option<&str>,
         endpoint: EndpointAddr,
     ) -> Result<Bytes> {
+        Self::encode_at(secret, topic, alias, endpoint, now_ms()?, rand::random())
+    }
+
+    fn encode_at(
+        secret: &SecretKey,
+        topic: TopicId,
+        alias: Option<&str>,
+        endpoint: EndpointAddr,
+        issued_ms: u64,
+        id: [u8; 16],
+    ) -> Result<Bytes> {
         validate_endpoint_addr(&endpoint, secret.public())?;
         let alias = alias.map(normalize_alias).transpose()?;
-        let issued_ms = now_ms()?;
         let payload = PresencePayload {
             version: VERSION,
             topic,
@@ -121,7 +138,7 @@ impl SignedPresence {
             expires_ms: issued_ms
                 .checked_add(PRESENCE_LIFETIME.as_millis() as u64)
                 .context("presence expiration overflow")?,
-            id: rand::random(),
+            id,
         };
         let signed = postcard::to_stdvec(&(PRESENCE_DOMAIN, &payload))?;
         let record = Self {
@@ -184,113 +201,219 @@ impl SignedPresence {
 }
 
 #[derive(Debug, Clone)]
-struct DirectoryEntry {
+struct DynamicDirectoryEntry {
     endpoint: EndpointAddr,
     alias: Option<String>,
-    expires: Option<Instant>,
+    expires: Instant,
     issued_ms: u64,
-    pinned: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct PresenceReplayWatermark {
+    issued_ms: u64,
+    forget_at: Instant,
+}
+
+#[derive(Debug)]
 pub(crate) struct Directory {
-    entries: HashMap<PublicKey, DirectoryEntry>,
+    pinned: HashMap<PublicKey, EndpointAddr>,
+    dynamic: HashMap<PublicKey, DynamicDirectoryEntry>,
+    replay_watermarks: HashMap<PublicKey, PresenceReplayWatermark>,
+    presence_lookup: MemoryLookup,
 }
 
 impl Directory {
+    pub(crate) fn new(presence_lookup: MemoryLookup) -> Self {
+        Self {
+            pinned: HashMap::new(),
+            dynamic: HashMap::new(),
+            replay_watermarks: HashMap::new(),
+            presence_lookup,
+        }
+    }
+
     pub(crate) fn pin(&mut self, endpoint: EndpointAddr) -> Result<()> {
         validate_endpoint_addr(&endpoint, endpoint.id)?;
-        self.entries.entry(endpoint.id).or_insert(DirectoryEntry {
-            endpoint,
-            alias: None,
-            expires: None,
-            issued_ms: 0,
-            pinned: true,
-        });
+        anyhow::ensure!(
+            self.pinned.contains_key(&endpoint.id) || self.pinned.len() < MAX_PINNED_ENDPOINTS,
+            "pinned endpoint capacity reached"
+        );
+        self.pinned.entry(endpoint.id).or_insert(endpoint);
         Ok(())
     }
 
-    pub(crate) fn receive(&mut self, bytes: &[u8], topic: TopicId) -> Result<EndpointAddr> {
-        let payload = SignedPresence::decode(bytes, topic, now_ms()?)?;
-        let endpoint = payload.endpoint.clone();
+    pub(crate) fn receive(&mut self, bytes: &[u8], topic: TopicId) -> Result<()> {
+        self.receive_at(bytes, topic, now_ms()?, Instant::now())
+    }
+
+    fn receive_at(
+        &mut self,
+        bytes: &[u8],
+        topic: TopicId,
+        wall_ms: u64,
+        monotonic_now: Instant,
+    ) -> Result<()> {
+        self.cleanup_at(monotonic_now);
+        let payload = SignedPresence::decode(bytes, topic, wall_ms)?;
         if self
-            .entries
+            .dynamic
             .get(&payload.sender)
             .is_some_and(|entry| entry.issued_ms >= payload.issued_ms)
+            || self
+                .replay_watermarks
+                .get(&payload.sender)
+                .is_some_and(|entry| entry.issued_ms >= payload.issued_ms)
         {
             anyhow::bail!("presence record is not newer than the current record");
         }
-        let pinned = self
-            .entries
-            .get(&payload.sender)
-            .is_some_and(|entry| entry.pinned);
-        let remaining = Duration::from_millis(payload.expires_ms.saturating_sub(now_ms()?))
+        let already_tracked = self.dynamic.contains_key(&payload.sender)
+            || self.replay_watermarks.contains_key(&payload.sender);
+        anyhow::ensure!(
+            already_tracked
+                || self.dynamic.len() + self.replay_watermarks.len()
+                    < MAX_DYNAMIC_PRESENCE_IDENTITIES,
+            "dynamic presence identity capacity reached"
+        );
+        let remaining = Duration::from_millis(payload.expires_ms.saturating_sub(wall_ms))
             .min(PRESENCE_LIFETIME);
-        self.entries.insert(
+        anyhow::ensure!(!remaining.is_zero(), "presence record is expired");
+        let endpoint = payload.endpoint;
+        self.replay_watermarks.remove(&payload.sender);
+        self.dynamic.insert(
             payload.sender,
-            DirectoryEntry {
+            DynamicDirectoryEntry {
                 endpoint: endpoint.clone(),
                 alias: payload.alias,
-                expires: Some(Instant::now() + remaining),
+                expires: monotonic_now + remaining,
                 issued_ms: payload.issued_ms,
-                pinned,
             },
         );
-        Ok(endpoint)
+        // MemoryLookup::add_endpoint_info merges direct addresses forever. Presence
+        // records are snapshots, so replace this source's record in full instead.
+        self.presence_lookup.set_endpoint_info(endpoint);
+        Ok(())
     }
 
-    fn prune(&mut self) {
-        let now = Instant::now();
-        self.entries.retain(|_, entry| {
-            if entry.expires.is_some_and(|expires| expires <= now) {
-                if entry.pinned {
-                    entry.alias = None;
-                    entry.expires = None;
-                    entry.issued_ms = 0;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                true
+    pub(crate) fn cleanup(&mut self) {
+        self.cleanup_at(Instant::now());
+    }
+
+    fn cleanup_at(&mut self, now: Instant) {
+        self.replay_watermarks
+            .retain(|_, watermark| watermark.forget_at > now);
+        let expired: Vec<_> = self
+            .dynamic
+            .iter()
+            .filter_map(|(key, entry)| (entry.expires <= now).then_some(*key))
+            .collect();
+        for key in expired {
+            if let Some(entry) = self.dynamic.remove(&key) {
+                self.presence_lookup.remove_endpoint_info(key);
+                self.replay_watermarks.insert(
+                    key,
+                    PresenceReplayWatermark {
+                        issued_ms: entry.issued_ms,
+                        forget_at: now + PRESENCE_REPLAY_LIFETIME,
+                    },
+                );
             }
-        });
+        }
     }
 
     pub(crate) fn resolve(&mut self, recipient: &str) -> Result<EndpointAddr> {
-        self.prune();
+        self.cleanup();
         if let Ok(key) = PublicKey::from_str(recipient) {
             anyhow::ensure!(
                 key.to_string() == recipient,
                 "public key recipient must use its canonical encoding"
             );
             return self
-                .entries
+                .dynamic
                 .get(&key)
                 .map(|entry| entry.endpoint.clone())
+                .or_else(|| self.pinned.get(&key).cloned())
                 .context("recipient has no current signed presence or pinned endpoint address");
         }
 
         let alias = normalize_alias(recipient)
             .context("recipient is neither a public key nor a valid alias")?;
         let mut matches = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.alias.as_deref() == Some(alias.as_str()));
+            .dynamic
+            .values()
+            .filter(|entry| entry.alias.as_deref() == Some(alias.as_str()));
         let first = matches.next().context("no peer advertises that alias")?;
         anyhow::ensure!(
             matches.next().is_none(),
             "alias is advertised by multiple peers; use a full public key"
         );
-        Ok(first.1.endpoint.clone())
+        Ok(first.endpoint.clone())
     }
 
-    pub(crate) fn advertised_aliases(&mut self) -> usize {
-        self.prune();
-        self.entries
+    pub(crate) fn advertised_aliases(&self) -> usize {
+        let now = Instant::now();
+        self.dynamic
             .values()
-            .filter(|entry| entry.alias.is_some())
+            .filter(|entry| entry.expires > now && entry.alias.is_some())
             .count()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PresenceSourceWindow {
+    started: Instant,
+    accepted: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PresenceSourceLimiter {
+    sources: HashMap<PublicKey, PresenceSourceWindow>,
+}
+
+impl PresenceSourceLimiter {
+    pub(crate) fn allow(&mut self, transport_source: PublicKey) -> bool {
+        self.allow_at(transport_source, Instant::now())
+    }
+
+    fn allow_at(&mut self, transport_source: PublicKey, now: Instant) -> bool {
+        self.cleanup_at(now);
+        if let Some(window) = self.sources.get_mut(&transport_source) {
+            if now.duration_since(window.started) >= PRESENCE_SOURCE_WINDOW {
+                *window = PresenceSourceWindow {
+                    started: now,
+                    accepted: 1,
+                };
+                return true;
+            }
+            if window.accepted >= MAX_PRESENCE_RECORDS_PER_SOURCE {
+                return false;
+            }
+            window.accepted += 1;
+            return true;
+        }
+        if self.sources.len() >= MAX_PRESENCE_TRANSPORT_SOURCES {
+            return false;
+        }
+        self.sources.insert(
+            transport_source,
+            PresenceSourceWindow {
+                started: now,
+                accepted: 1,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn remove(&mut self, transport_source: PublicKey) {
+        self.sources.remove(&transport_source);
+    }
+
+    pub(crate) fn cleanup(&mut self) {
+        self.cleanup_at(Instant::now());
+    }
+
+    fn cleanup_at(&mut self, now: Instant) {
+        self.sources
+            .retain(|_, window| now.duration_since(window.started) < PRESENCE_SOURCE_WINDOW);
     }
 }
 
@@ -690,7 +813,7 @@ mod tests {
         *tampered.last_mut().unwrap() ^= 1;
         assert!(SignedPresence::decode(&tampered, topic, now_ms().unwrap()).is_err());
 
-        let mut directory = Directory::default();
+        let mut directory = Directory::new(MemoryLookup::new());
         directory.receive(&bytes, topic).unwrap();
         assert!(directory.receive(&bytes, topic).is_err());
     }
@@ -700,7 +823,7 @@ mod tests {
         let one = SecretKey::generate();
         let two = SecretKey::generate();
         let topic = TopicId::from_bytes([3; 32]);
-        let mut directory = Directory::default();
+        let mut directory = Directory::new(MemoryLookup::new());
         for (secret, port) in [(&one, 1111), (&two, 2222)] {
             let bytes = SignedPresence::encode(secret, topic, Some("same"), endpoint(secret, port))
                 .unwrap();
@@ -719,6 +842,166 @@ mod tests {
             .resolve(&one.public().to_string().to_ascii_uppercase())
             .is_err());
         assert!(directory.resolve("does-not-exist").is_err());
+    }
+
+    #[test]
+    fn dynamic_directory_has_a_hard_fail_closed_identity_cap() {
+        let topic = TopicId::from_bytes([5; 32]);
+        let wall = now_ms().unwrap();
+        let monotonic = Instant::now();
+        let lookup = MemoryLookup::new();
+        let mut directory = Directory::new(lookup.clone());
+        let mut admitted = Vec::new();
+
+        for index in 0..MAX_DYNAMIC_PRESENCE_IDENTITIES {
+            let secret = SecretKey::generate();
+            let bytes = SignedPresence::encode_at(
+                &secret,
+                topic,
+                None,
+                endpoint(&secret, 10_000 + index as u16),
+                wall,
+                [index as u8; 16],
+            )
+            .unwrap();
+            directory
+                .receive_at(&bytes, topic, wall, monotonic)
+                .unwrap();
+            admitted.push(secret.public());
+        }
+        let rejected = SecretKey::generate();
+        let bytes = SignedPresence::encode_at(
+            &rejected,
+            topic,
+            None,
+            endpoint(&rejected, 20_000),
+            wall,
+            [255; 16],
+        )
+        .unwrap();
+        assert!(directory
+            .receive_at(&bytes, topic, wall, monotonic)
+            .unwrap_err()
+            .to_string()
+            .contains("capacity"));
+
+        assert_eq!(directory.dynamic.len(), MAX_DYNAMIC_PRESENCE_IDENTITIES);
+        assert_eq!(directory.replay_watermarks.len(), 0);
+        assert!(lookup.get_endpoint_info(rejected.public()).is_none());
+        assert!(admitted
+            .iter()
+            .all(|key| lookup.get_endpoint_info(*key).is_some()));
+        let before = directory.dynamic.len();
+        assert_eq!(directory.advertised_aliases(), 0);
+        assert_eq!(directory.dynamic.len(), before);
+    }
+
+    #[test]
+    fn newer_presence_replaces_rotating_addresses_in_directory_and_lookup() {
+        let secret = SecretKey::generate();
+        let topic = TopicId::from_bytes([6; 32]);
+        let wall = now_ms().unwrap();
+        let monotonic = Instant::now();
+        let lookup = MemoryLookup::new();
+        let mut directory = Directory::new(lookup.clone());
+        let mut latest = endpoint(&secret, 30_000);
+
+        for sequence in 0..32_u64 {
+            latest = endpoint(&secret, 30_000 + sequence as u16);
+            let bytes = SignedPresence::encode_at(
+                &secret,
+                topic,
+                Some("rotating"),
+                latest.clone(),
+                wall + sequence,
+                [sequence as u8; 16],
+            )
+            .unwrap();
+            directory
+                .receive_at(
+                    &bytes,
+                    topic,
+                    wall + sequence,
+                    monotonic + Duration::from_millis(sequence),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(directory.dynamic.len(), 1);
+        assert_eq!(directory.resolve("rotating").unwrap(), latest);
+        let lookup_addr: EndpointAddr = lookup.get_endpoint_info(secret.public()).unwrap().into();
+        assert_eq!(lookup_addr, latest);
+        assert_eq!(lookup_addr.addrs.len(), 1);
+    }
+
+    #[test]
+    fn periodic_expiry_removes_only_dynamic_route_preserves_pin_and_rejects_replay() {
+        let secret = SecretKey::generate();
+        let topic = TopicId::from_bytes([10; 32]);
+        let wall = now_ms().unwrap();
+        let monotonic = Instant::now();
+        let pinned = endpoint(&secret, 40_001);
+        let dynamic = endpoint(&secret, 40_002);
+        let stable_lookup = MemoryLookup::with_provenance("test_stable");
+        let presence_lookup = MemoryLookup::with_provenance("test_presence");
+        stable_lookup.set_endpoint_info(pinned.clone());
+        let mut directory = Directory::new(presence_lookup.clone());
+        directory.pin(pinned.clone()).unwrap();
+        let bytes = SignedPresence::encode_at(
+            &secret,
+            topic,
+            Some("expires"),
+            dynamic.clone(),
+            wall,
+            [7; 16],
+        )
+        .unwrap();
+        directory
+            .receive_at(&bytes, topic, wall, monotonic)
+            .unwrap();
+        assert_eq!(directory.resolve("expires").unwrap(), dynamic);
+
+        // This is the daemon's periodic cleanup path; no status or resolution
+        // call is needed to expire the active state and its lookup source.
+        let after_expiry = monotonic + PRESENCE_LIFETIME + Duration::from_millis(1);
+        directory.cleanup_at(after_expiry);
+        assert!(directory.dynamic.is_empty());
+        assert!(presence_lookup.get_endpoint_info(secret.public()).is_none());
+        let stable_addr: EndpointAddr = stable_lookup
+            .get_endpoint_info(secret.public())
+            .unwrap()
+            .into();
+        assert_eq!(stable_addr, pinned);
+        assert_eq!(
+            directory.resolve(&secret.public().to_string()).unwrap(),
+            pinned
+        );
+        assert!(directory.resolve("expires").is_err());
+
+        // Replaying the exact signed record cannot renew its lifetime or route.
+        assert!(directory
+            .receive_at(&bytes, topic, wall, after_expiry)
+            .is_err());
+        assert!(directory.dynamic.is_empty());
+        assert!(presence_lookup.get_endpoint_info(secret.public()).is_none());
+    }
+
+    #[test]
+    fn presence_rate_limit_uses_bounded_transport_sources() {
+        let source = SecretKey::generate().public();
+        let start = Instant::now();
+        let mut limiter = PresenceSourceLimiter::default();
+        for _ in 0..MAX_PRESENCE_RECORDS_PER_SOURCE {
+            assert!(limiter.allow_at(source, start));
+        }
+        assert!(!limiter.allow_at(source, start));
+
+        for _ in 1..MAX_PRESENCE_TRANSPORT_SOURCES {
+            assert!(limiter.allow_at(SecretKey::generate().public(), start));
+        }
+        assert!(!limiter.allow_at(SecretKey::generate().public(), start));
+        assert!(limiter.allow_at(source, start + PRESENCE_SOURCE_WINDOW));
+        assert_eq!(limiter.sources.len(), 1);
     }
 
     #[test]

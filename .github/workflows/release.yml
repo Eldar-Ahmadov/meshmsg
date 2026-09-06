@@ -53,6 +53,8 @@ jobs:
           cargo build --locked
           timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
           timeout 600 bash tests/integration-attachments.sh target/debug/meshmsg
+          timeout 600 bash tests/integration-direct-messages.sh target/debug/meshmsg
+          timeout 600 bash tests/integration-ipc-version-compat.sh target/debug/meshmsg
       - name: Build locked release binaries
         shell: bash
         run: |

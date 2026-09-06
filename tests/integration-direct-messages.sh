@@ -149,6 +149,24 @@ start_listener spy "$ROOT/spy.listen.log"; SPY_LISTEN=$LISTENER_PID
 wait_for 10 "sender listener" grep -Fq '"type":"connected"' "$ROOT/sender.listen.log"
 wait_for 10 "receiver listener" grep -Fq '"type":"connected"' "$ROOT/receiver.listen.log"
 wait_for 10 "spy listener" grep -Fq '"type":"connected"' "$ROOT/spy.listen.log"
+wait_for 40 "sender presence at receiver" status_aliases receiver 2
+
+SENDER_STATUS=$("$BIN" --state-dir "$ROOT/sender" --json status)
+SENDER_PEER=$(python3 -c \
+  'import json,sys; v=json.load(sys.stdin); assert "private_send_v1" in v["ipc_capabilities"]; print(v["peer"])' \
+  <<<"$SENDER_STATUS") || fail "current daemon did not advertise safe private-send IPC"
+
+# The receiver learned the sender from its invite. Exercise that identity after
+# dynamic presence has updated the same peer so route replacement cannot discard
+# the separately pinned bootstrap route.
+PINNED="private-pinned-bootstrap-$(date +%s%N)"
+PINNED_RESULT=$("$BIN" --state-dir "$ROOT/receiver" --json send --to "$SENDER_PEER" "$PINNED")
+python3 -c \
+  'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["to"] == sys.argv[1] and "body" not in v' \
+  "$SENDER_PEER" <<<"$PINNED_RESULT" \
+  || fail "invite-pinned private route was not authenticated and acknowledged"
+wait_for 30 "invite-pinned private delivery" grep -Fq "\"body\":\"$PINNED\"" "$ROOT/sender.listen.log"
+! grep -Fq "$PINNED" "$ROOT/spy.listen.log" || fail "invite-pinned private body reached a third peer"
 
 # Attach the broadcast-only web bridge to the receiver before delivering a DM.
 WEB_PORT=$(python3 - <<'PY'
@@ -225,7 +243,7 @@ sleep 2
 
 # Private contents may appear only in the explicit owner CLI subscription, not
 # daemon diagnostics, sender responses, or the broadcast-only web process/feed.
-for secret in "$PRIVATE" "$CANONICAL" "$COLLISION"; do
+for secret in "$PINNED" "$PRIVATE" "$CANONICAL" "$COLLISION"; do
   for output in "$ROOT"/*.daemon.log "$ROOT"/*.daemon.err "$ROOT"/web.log "$ROOT"/web.err "$ROOT"/web.sse "$ROOT"/collision.out "$ROOT"/collision.err; do
     [[ -e "$output" ]] || continue
     ! grep -Fq "$secret" "$output" || fail "private body leaked to $output"
