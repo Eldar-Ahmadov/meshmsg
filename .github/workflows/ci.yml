@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: cargo build --locked
       - name: Check web JavaScript syntax
-        run: timeout 30 node --check src/web/app.js
+        run: timeout 30 bash -c 'node --check src/web/app.js && node --check src/web/settings.js'
       - name: Run web UI checks
         run: timeout 60 node tests/web-ui.cjs
       - name: Run fake-daemon CLI error scenario
