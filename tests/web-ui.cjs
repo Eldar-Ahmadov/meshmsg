@@ -9,6 +9,10 @@ const settingsHtml = fs.readFileSync('src/web/settings.html', 'utf8');
 const css = fs.readFileSync('src/web/app.css', 'utf8');
 const js = fs.readFileSync('src/web/app.js', 'utf8');
 const settingsJs = fs.readFileSync('src/web/settings.js', 'utf8');
+for (const source of [js, settingsJs]) {
+  assert.match(source, /mode: 'cors'/, 'POST fetches must preserve Origin under no-referrer policy');
+  assert.doesNotMatch(source, /mode: 'same-origin'/);
+}
 assert.match(html, /<ol id="feed"[^>]*aria-live="polite"[^>]*aria-relevant="additions"/);
 assert.match(html, /<a class="settings-link" href="\/settings" aria-label="[^"]+">/);
 assert.doesNotMatch(html, /Local daemon|Sending identity/);
@@ -44,7 +48,7 @@ assert.match(composerCss, /overflow-y:\s*auto/);
 assert.match(cssBlock('main'), /padding:[^;]*var\(--composer-space\)/);
 
 class Element extends EventTarget {
-  constructor() { super(); this.children = []; this.attributes = {}; this._textContent = ''; this.textContentWrites = []; this.value = ''; }
+  constructor() { super(); this.children = []; this.attributes = {}; this._textContent = ''; this.textContentWrites = []; this.value = ''; this.href = ''; }
   get textContent() { return this._textContent; }
   set textContent(value) { this._textContent = value; this.textContentWrites.push(value); }
   append(child) { child.parent = this; this.children.push(child); }
@@ -54,9 +58,10 @@ class Element extends EventTarget {
   remove() { this.parent.children.splice(this.parent.children.indexOf(this), 1); }
   replaceChildren() { this.children = []; }
   requestSubmit() { this.dispatchEvent(new Event('submit', { cancelable: true })); }
+  click() { this.clicked = true; this.dispatchEvent(new Event('click')); }
 }
 class Document extends EventTarget {
-  constructor() { super(); this.elements = new Map(); this.hidden = false; }
+  constructor() { super(); this.elements = new Map(); this.hidden = false; this.body = new Element(); }
   getElementById(id) {
     if (!this.elements.has(id)) this.elements.set(id, new Element());
     return this.elements.get(id);
@@ -77,6 +82,8 @@ let timerId = 0;
 const deterministicMath = Object.create(Math);
 deterministicMath.random = () => 0;
 const sent = [];
+const downloadRequests = [];
+let downloadedHref = null;
 let peersRequests = 0;
 let statusReply = async () => ({ ok: true, json: async () => ({ type: 'status', peer: 'local-peer', running: true, endpoint_online: true, topic_joined: true, neighbors: 1 }) });
 let sendReply = async () => ({ ok: true, json: async () => ({ type: 'queued' }) });
@@ -101,6 +108,15 @@ const context = vm.createContext({
         self: { public_key: 'local-peer', alias: 'local', online: true },
         peers: [{ public_key: 'recovered-peer', alias: null, online: true, last_seen_ms: 2, expires_at_ms: 3 }]
       }) };
+    }
+    if (request.command === 'download') {
+      downloadRequests.push(request);
+      return { ok: true, json: async () => ({ type: 'download_started', id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', poll_timeout_ms: 4260000 }) };
+    }
+    if (request.command === 'download_status') {
+      downloadRequests.push(request);
+      downloadedHref = `/api/download/${request.id}`;
+      return { ok: true, json: async () => ({ type: 'download_ready', url: downloadedHref }) };
     }
     sent.push(request);
     return sendReply();
@@ -209,7 +225,8 @@ function submit(body) {
   source.emit({
     type: 'attachment_offer', direction: 'incoming', from: '<peer>',
     timestamp_ms: 1700000000100, name: '<img src=x onerror=alert(1)>',
-    kind: 'file', size: 1536, offer: 'must-not-arrive', ticket: 'must-not-arrive'
+    kind: 'file', size: 1536, download_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    offer: 'must-not-arrive', ticket: 'must-not-arrive'
   });
   let card = el('feed').children[0];
   assert.equal(card.className, 'attachment incoming');
@@ -218,6 +235,23 @@ function submit(body) {
   assert.equal(card.children[1].children[1].children[0].textContent, '<img src=x onerror=alert(1)>');
   assert.equal(card.children[1].children[1].children[1].textContent, 'File · 1.5 KiB');
   assert.equal(card.children[2].textContent, 'Offer received');
+  assert.equal(card.children[3].textContent, 'Download');
+  const realDateNow = Date.now;
+  let downloadClockReads = 0;
+  Date.now = () => (downloadClockReads++ === 0 ? 0 : 60 * 60 * 1000 + 1);
+  card.children[3].click();
+  await settle();
+  await settle();
+  Date.now = realDateNow;
+  assert.deepEqual(downloadRequests, [
+    { command: 'download', id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+    { command: 'download_status', id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
+  ]);
+  assert.equal(downloadedHref, '/api/download/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  assert.match(card.children[2].textContent, /Download ready.*Choose Save file/);
+  assert.equal(card.children[3].textContent, 'Save file');
+  assert.equal(card.children[3].href, downloadedHref);
+  assert.equal(card.children[3].clicked, undefined, 'ready download was opened without another user click');
 
   source.emit({
     type: 'attachment_shared', direction: 'outgoing', from: 'local-peer',

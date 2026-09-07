@@ -44,6 +44,8 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
 
     def __init__(self, path):
         self.requests = []
+        self.web_download_attempts = {}
+        self.web_download_capability = True
         self.clients = set()
         self.subscribers = set()
         self.lock = threading.Lock()
@@ -92,6 +94,33 @@ class Handler(socketserver.StreamRequestHandler):
                       'socket': 'private-path', 'invite': 'private-token'})
             elif value['command'] == 'peers':
                 emit(malicious_peers_snapshot())
+            elif value['command'] == 'web_download':
+                offer = value['offer']
+                self.server.web_download_attempts[offer] = self.server.web_download_attempts.get(offer, 0) + 1
+                if offer == 'retry-token' and self.server.web_download_attempts[offer] == 1:
+                    emit({'type': 'error', 'code': 'download_busy', 'message': 'scripted busy'})
+                    return
+                output = pathlib.Path(value['output'])
+                if offer == 'late-token':
+                    def late_export():
+                        time.sleep(.3)
+                        output.parent.mkdir(parents=True, exist_ok=True)
+                        output.write_bytes(b'late daemon export\n')
+                    threading.Thread(target=late_export, daemon=True).start()
+                    return  # Accepted, but IPC reply is lost before completion.
+
+                assert output.parent.parent.name == 'web-downloads-v2'
+                assert output.name.endswith('.blob') and '..' not in output.name
+                output.write_bytes(b'browser attachment payload\n')
+                if offer == 'missing-schema-token':
+                    emit({'type': 'download_complete'})
+                elif offer == 'wrong-schema-token':
+                    emit({'type': 'download_complete', 'schema_version': 2})
+                elif offer == 'malformed-schema-token':
+                    emit({'type': 'download_complete', 'schema_version': '1'})
+                else:
+                    emit({'type': 'download_complete', 'schema_version': 1,
+                          'name': '<incoming>.txt', 'kind': 'file', 'size': output.stat().st_size})
             elif value['command'] == 'send':
                 if value['body'] == 'lost-reply':
                     return  # Ambiguous: command reached daemon, reply did not.
@@ -103,7 +132,9 @@ class Handler(socketserver.StreamRequestHandler):
                     self.server.broadcast(queued)
                     emit(queued)
             elif value['command'] == 'subscribe':
-                emit({'type': 'connected', 'peer': SELF_KEY})
+                capabilities = ['web_download_v1'] if self.server.web_download_capability else []
+                emit({'type': 'connected', 'peer': SELF_KEY,
+                      'ipc_capabilities': capabilities})
                 emit(malicious_peers_snapshot())
                 emit({'type': 'attachment_offer', 'from': 'other-peer', 'timestamp_ms': 2,
                       'name': '<incoming>.txt', 'kind': 'file', 'size': 1536,
@@ -207,6 +238,17 @@ def main():
                 for path in ['/config.json', '/../config.json', '/api/request?command=stop']:
                     assert request('GET', path)[0] == 404
                 assert request('OPTIONS', '/api/request')[0] == 404
+                daemon.web_download_capability = False
+                legacy_feed = open_feed()
+                legacy_connected = next_event(legacy_feed)
+                assert legacy_connected['type'] == 'connected' and legacy_connected['download_supported'] is False
+                assert next_event(legacy_feed)['type'] == 'peers_snapshot'
+                legacy_attachment = next_event(legacy_feed)
+                assert legacy_attachment['type'] == 'attachment_offer' and 'download_id' not in legacy_attachment
+                legacy_feed.close()
+                streams.pop()[1].close()
+                daemon.web_download_capability = True
+
                 code, status = api({'command': 'status'})
                 assert code == 200 and status['peer'] == SELF_KEY
                 assert all(key not in status for key in ['socket', 'invite', 'ipc_capabilities'])
@@ -254,6 +296,7 @@ def main():
 
                 feed = open_feed()
                 other_tab = open_feed()
+                incoming_download_ids = []
                 for response in [feed, other_tab]:
                     assert response.status == 200
                     assert next_event(response)['type'] == 'connected'
@@ -266,9 +309,14 @@ def main():
                             'last_seen_ms': 900, 'expires_at_ms': 150900,
                         }],
                     }
-                    assert next_event(response) == {
+                    attachment = next_event(response)
+                    download_id = attachment.pop('download_id')
+                    assert len(download_id) == 32 and all(c in '0123456789abcdef' for c in download_id)
+                    incoming_download_ids.append(download_id)
+                    assert attachment == {
                         'type': 'attachment_offer', 'direction': 'incoming', 'from': 'other-peer',
                         'timestamp_ms': 2, 'name': '<incoming>.txt', 'kind': 'file', 'size': 1536}
+                    assert 'private-token' not in json.dumps(attachment)
                     value = next_event(response)
                     assert value['type'] == 'message' and '\ndata: injected' in value['body']
                     assert next_event(response)['type'] == 'lagged'
@@ -289,6 +337,92 @@ def main():
                     assert time.monotonic() < deadline, 'fake daemon subscriptions were not active'
                     time.sleep(.01)
 
+                code, started = api({'command': 'download', 'id': incoming_download_ids[0]})
+                assert code == 202 and started['type'] == 'download_started'
+                assert started['poll_timeout_ms'] == 71 * 60 * 1000
+                deadline = time.monotonic() + 5
+                while True:
+                    code, download = api({'command': 'download_status', 'id': started['id']})
+                    if download.get('type') == 'download_ready':
+                        break
+                    assert code == 200 and download['type'] == 'download_pending'
+                    assert time.monotonic() < deadline, 'web download did not become ready'
+                    time.sleep(.01)
+                interrupted = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
+                interrupted.request('GET', download['url'])
+                interrupted_response = interrupted.getresponse()
+                assert interrupted_response.status == 200
+                assert interrupted_response.read(5) == b'brows'
+                interrupted.close()
+                code, download_headers, payload = request('GET', download['url'])
+                assert code == 200 and payload == b'browser attachment payload\n'
+                assert download_headers['cache-control'] == 'no-store'
+                assert download_headers['content-type'] == 'application/octet-stream'
+                assert download_headers['content-length'] == str(len(payload))
+                disposition = download_headers['content-disposition']
+                assert 'attachment;' in disposition and 'filename*=UTF-8' in disposition
+                assert '%3Cincoming%3E.txt' in disposition and '\r' not in disposition and '\n' not in disposition
+                retry_code, _, retry_payload = request('GET', download['url'])
+                assert retry_code == 200 and retry_payload == payload, 'ready download was not retryable'
+                range_code, range_headers, range_payload = request(
+                    'GET', download['url'], headers={'Range': 'bytes=8-17'})
+                assert range_code == 206 and range_payload == payload[8:18]
+                assert range_headers['content-range'] == f'bytes 8-17/{len(payload)}'
+                assert range_headers['accept-ranges'] == 'bytes'
+                web_download = next(value for value in daemon.requests if value['command'] == 'web_download')
+                assert set(web_download) == {'command', 'offer', 'output'}
+                assert web_download['offer'] == 'private-token'
+                output_path = pathlib.Path(web_download['output'])
+                assert output_path.parent.parent == root / 'web-downloads-v2'
+                assert output_path.exists(), 'retryable ready file was removed after serving'
+
+                retry_offer = {'type': 'attachment_offer', 'from': 'retry-peer', 'timestamp_ms': 5,
+                               'name': 'retry.txt', 'kind': 'file', 'size': 27,
+                               'offer_id': 'retry-id', 'offer': 'retry-token', 'ticket': 'private-ticket'}
+                daemon.broadcast(retry_offer)
+                retry_ids = []
+                for response in [feed, other_tab]:
+                    retry_ids.append(next_event(response)['download_id'])
+                code, first_retry = api({'command': 'download', 'id': retry_ids[0]})
+                assert code == 202
+                deadline = time.monotonic() + 5
+                while True:
+                    code, failed = api({'command': 'download_status', 'id': first_retry['id']})
+                    if code == 422:
+                        break
+                    assert time.monotonic() < deadline
+                    time.sleep(.01)
+                code, second_retry = api({'command': 'download', 'id': retry_ids[0]})
+                assert code == 202, 'definitely-not-started failure consumed the offer handle'
+                deadline = time.monotonic() + 5
+                while True:
+                    code, retried = api({'command': 'download_status', 'id': second_retry['id']})
+                    if retried.get('type') == 'download_ready':
+                        break
+                    assert time.monotonic() < deadline
+                    time.sleep(.01)
+                assert request('GET', retried['url'])[2] == b'browser attachment payload\n'
+
+                for schema_offer in ['missing-schema-token', 'wrong-schema-token', 'malformed-schema-token']:
+                    daemon.broadcast({'type': 'attachment_offer', 'from': schema_offer,
+                                      'timestamp_ms': 6, 'name': 'schema.txt', 'kind': 'file',
+                                      'size': 27, 'offer_id': 'schema-id', 'offer': schema_offer,
+                                      'ticket': 'private-ticket'})
+                    schema_ids = [next_event(response)['download_id'] for response in [feed, other_tab]]
+                    code, schema_started = api({'command': 'download', 'id': schema_ids[0]})
+                    assert code == 202
+                    deadline = time.monotonic() + 5
+                    while True:
+                        code, schema_status = api({'command': 'download_status', 'id': schema_started['id']})
+                        if code == 422:
+                            break
+                        assert time.monotonic() < deadline
+                        time.sleep(.01)
+                    schema_request = next(value for value in reversed(daemon.requests)
+                                          if value.get('command') == 'web_download'
+                                          and value.get('offer') == schema_offer)
+                    assert not pathlib.Path(schema_request['output']).exists(), 'invalid IPC success exposed a file'
+
                 shared = {'type': 'attachment_shared', 'from': 'fake-peer', 'timestamp_ms': 3,
                           'name': 'shared-directory.tar', 'kind': 'directory_tar_v1', 'size': 4096,
                           'offer_id': 'private-id', 'offer': 'private-token',
@@ -306,7 +440,10 @@ def main():
                             'offer_id': 'private-id', 'offer': 'private-token', 'ticket': 'private-ticket'}
                 daemon.broadcast(incoming)
                 for response in [feed, other_tab]:
-                    assert next_event(response) == {
+                    directory = next_event(response)
+                    directory_id = directory.pop('download_id')
+                    assert len(directory_id) == 32
+                    assert directory == {
                         'type': 'attachment_offer', 'direction': 'incoming', 'from': 'another-peer',
                         'timestamp_ms': 4, 'name': 'incoming-directory.tar',
                         'kind': 'directory_tar_v1', 'size': 8192}
@@ -368,6 +505,45 @@ def main():
                 assert next_event(restarted)['type'] == 'connected'
                 restarted.close()
 
+                late_feed = open_feed()
+                assert next_event(late_feed)['type'] == 'connected'
+                assert next_event(late_feed)['type'] == 'peers_snapshot'
+                daemon.broadcast({'type': 'attachment_offer', 'from': 'late-peer', 'timestamp_ms': 9,
+                                  'name': 'late.txt', 'kind': 'file', 'size': 19,
+                                  'offer_id': 'late-id', 'offer': 'late-token', 'ticket': 'private-ticket'})
+                while True:
+                    late_event = next_event(late_feed)
+                    if late_event.get('from') == 'late-peer':
+                        late_id = late_event['download_id']
+                        break
+                code, late_started = api({'command': 'download', 'id': late_id})
+                assert code == 202
+                deadline = time.monotonic() + 5
+                while True:
+                    matches = [value for value in daemon.requests
+                               if value.get('command') == 'web_download' and value.get('offer') == 'late-token']
+                    if matches:
+                        break
+                    assert time.monotonic() < deadline
+                    time.sleep(.01)
+                late_output = pathlib.Path(matches[0]['output'])
+                late_feed.close()
+                web.send_signal(signal.SIGINT)
+                assert web.wait(timeout=5) == 0
+                time.sleep(.5)
+                assert late_output.read_bytes() == b'late daemon export\n', 'web shutdown raced late daemon export'
+                web = subprocess.Popen([BIN, '--state-dir', str(root), 'web', '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
+                deadline = time.monotonic() + 15
+                while True:
+                    assert web.poll() is None, 'web restart failed after late export'
+                    try:
+                        if api({'command': 'status'})[0] == 200:
+                            break
+                    except ConnectionRefusedError:
+                        pass
+                    assert time.monotonic() < deadline
+                    time.sleep(.05)
+                assert late_output.exists(), 'new web process removed a possibly active prior root'
                 web.send_signal(signal.SIGINT)
                 assert web.wait(timeout=5) == 0
                 # Web shutdown must leave the separate daemon endpoint usable.
@@ -375,7 +551,7 @@ def main():
                     client.connect(str(root / 'daemon.sock'))
                     client.sendall(b'{"command":"status"}\n')
                     assert json.loads(client.recv(4096))['running'] is True
-                print('PASS: HTTP security/allowlist/assets, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
+                print('PASS: HTTP security/allowlist/assets, negotiated opaque retryable/ranged browser attachment downloads with safe headers and unique temporary roots, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
             finally:
                 for response, conn in streams:
                     response.close()

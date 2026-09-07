@@ -55,6 +55,8 @@ h2 { margin-bottom: .35rem; color: #f8edc4; font-size: 1rem; letter-spacing: .05
 #feed .attachment-details { margin-top: .15rem; color: var(--muted); font-size: .82rem; }
 #feed .attachment-status { margin-top: .75rem; color: var(--muted); font-size: .78rem; }
 #feed .attachment.incoming .attachment-status { color: #83d794; }
+.attachment-download { margin-top: .65rem; color: #fff0b7; }
+.attachment-save { display: inline-flex; min-height: 44px; margin-top: .65rem; padding: .62rem 1rem; align-items: center; border: 1px solid #a985d1; border-radius: .25rem; color: #fff0b7; font-weight: 700; text-decoration: none; }
 button { min-height: 44px; padding: .62rem 1rem; cursor: pointer; border: 1px solid #a985d1; border-radius: .25rem; background: #8c64b9; color: #000000; font-weight: 700; }
 button.quiet { min-height: 36px; padding: .35rem .6rem; border-color: var(--line); background: transparent; color: var(--muted); font-size: .78rem; }
 button:disabled { cursor: wait; opacity: .55; }

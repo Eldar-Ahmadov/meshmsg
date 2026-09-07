@@ -10,7 +10,9 @@ async function requestStatus() {
     const response = await fetch('/api/request', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command: 'status' }), signal: controller.signal,
-      mode: 'same-origin', credentials: 'omit', redirect: 'error', cache: 'no-store'
+      // Preserve the real Origin under Referrer-Policy: no-referrer so the
+      // server can enforce its exact Host/Origin write policy.
+      mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store'
     });
     return { ok: response.ok, value: await response.json() };
   } finally { clearTimeout(timer); }

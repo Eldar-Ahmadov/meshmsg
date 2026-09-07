@@ -2,12 +2,14 @@
 """Real two-peer web receipt check. Requires working Iroh networking; no Tailscale changes."""
 import contextlib
 import http.client
+import io
 import json
 import pathlib
 import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
@@ -73,6 +75,29 @@ def main():
                 result = response.status, json.loads(response.read())
                 conn.close()
                 return result
+
+            def get(path):
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
+                conn.request('GET', path)
+                response = conn.getresponse()
+                result = response.status, dict(response.getheaders()), response.read()
+                conn.close()
+                return result
+
+            def browser_download(offer_id):
+                code, started = post({'command': 'download', 'id': offer_id})
+                assert code == 202 and started['type'] == 'download_started'
+                deadline = time.monotonic() + 30
+                while True:
+                    code, status = post({'command': 'download_status', 'id': started['id']})
+                    if status.get('type') == 'download_ready':
+                        break
+                    assert code == 200 and status['type'] == 'download_pending'
+                    assert time.monotonic() < deadline, 'browser attachment download timeout'
+                    time.sleep(.1)
+                code, headers, body = get(status['url'])
+                assert code == 200 and headers['cache-control'] == 'no-store'
+                return headers, body
 
             wait_for(lambda: post({'command': 'status'})[0] == 200, 'web ready', 15)
 
@@ -172,6 +197,8 @@ def main():
                     incoming = event(feed)
                     if incoming['type'] == 'attachment_offer' and incoming['name'] == 'reverse-attachment.txt':
                         break
+                offer_id = incoming.pop('download_id')
+                assert len(offer_id) == 32
                 assert set(incoming) == {'type', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
                 assert incoming == {
                     'type': 'attachment_offer', 'direction': 'incoming', 'from': reverse_shared['from'],
@@ -179,8 +206,33 @@ def main():
                     'kind': 'file', 'size': reverse_attachment_path.stat().st_size}
                 if safe_offer is None:
                     safe_offer = incoming
+                    file_offer_id = offer_id
                 else:
                     assert incoming == safe_offer
+            headers, body = browser_download(file_offer_id)
+            assert body == reverse_attachment_path.read_bytes()
+            assert 'reverse-attachment.txt' in headers['content-disposition']
+            pinned = cli('one', 'offers')['blobs']
+            assert any(item['direction'] == 'incoming' and item['name'] == 'reverse-attachment.txt'
+                       for item in pinned), 'web preparation did not retain its documented inbound blob pin'
+
+            directory_path = root / 'reverse-directory'
+            directory_path.mkdir()
+            (directory_path / 'inside.txt').write_text('browser directory payload\n')
+            cli('two', 'share', str(directory_path))
+            directory_offer_id = None
+            for feed, _ in feeds:
+                while True:
+                    incoming = event(feed)
+                    if incoming['type'] == 'attachment_offer' and incoming['name'] == 'reverse-directory.tar':
+                        break
+                current_id = incoming.pop('download_id')
+                directory_offer_id = directory_offer_id or current_id
+                assert incoming['kind'] == 'directory_tar_v1'
+            headers, archive = browser_download(directory_offer_id)
+            assert 'reverse-directory.tar' in headers['content-disposition']
+            with tarfile.open(fileobj=io.BytesIO(archive), mode='r:') as downloaded:
+                assert downloaded.extractfile('inside.txt').read() == b'browser directory payload\n'
 
             reverse = marker + '-reverse'
             assert cli('two', 'send', reverse)['type'] == 'queued'
@@ -206,7 +258,7 @@ def main():
             web.send_signal(signal.SIGINT)
             assert web.wait(timeout=5) == 0
             assert running('one') and running('two')
-            print('PASS: real sanitized peer snapshot reached HTTP and both SSE handshakes without routes; web and local CLI sends reached both feeds as canonical queued events; safe real attachment metadata reached both feeds; reverse peer send, daemon offline/restart, and independent web shutdown passed')
+            print('PASS: real sanitized peer snapshot reached HTTP and both SSE handshakes without routes; web and local CLI sends reached both feeds as canonical queued events; safe real attachment metadata and verified browser file/directory-tar downloads passed; reverse peer send, daemon offline/restart, and independent web shutdown passed')
         except BaseException:
             for log in logs:
                 log.flush()

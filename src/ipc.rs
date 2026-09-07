@@ -13,6 +13,7 @@ pub(crate) const MAX_IPC_REQUEST_SIZE: usize = 4096 * 6 + 1024;
 // while this hard frame limit accommodates the proven worst-case snapshot.
 pub(crate) const MAX_IPC_EVENT_SIZE: usize = 512 * 1024;
 pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v1";
+pub(crate) const WEB_DOWNLOAD_CAPABILITY: &str = "web_download_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BenchConfig {
@@ -25,15 +26,33 @@ pub(crate) struct BenchConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum IpcRequest {
-    Send { body: String },
-    PrivateSend { to: String, body: String },
-    BenchSend { config: BenchConfig },
+    Send {
+        body: String,
+    },
+    PrivateSend {
+        to: String,
+        body: String,
+    },
+    BenchSend {
+        config: BenchConfig,
+    },
     Subscribe,
     Status,
     Peers,
     Offers,
-    Share { path: PathBuf },
-    Download { offer: String, output: PathBuf },
+    Share {
+        path: PathBuf,
+    },
+    Download {
+        offer: String,
+        output: PathBuf,
+    },
+    /// Export the verified offered blob without interpreting it. Used by the
+    /// local web bridge with a server-selected temporary output path.
+    WebDownload {
+        offer: String,
+        output: PathBuf,
+    },
     Stop,
 }
 
@@ -383,6 +402,24 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn web_download_is_a_distinct_raw_export_command() {
+        let mut bytes = Vec::new();
+        write_request(
+            &mut bytes,
+            &IpcRequest::WebDownload {
+                offer: "signed-offer".into(),
+                output: PathBuf::from("server-selected.blob"),
+            },
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["command"], "web_download");
+        assert_eq!(value["offer"], "signed-offer");
+        assert_eq!(value["output"], "server-selected.blob");
     }
 
     #[tokio::test]

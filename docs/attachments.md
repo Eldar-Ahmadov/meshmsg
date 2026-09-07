@@ -65,7 +65,7 @@ Configure the per-daemon attachment limit with `meshmsg daemon --max-attachment-
 
 Before transferring missing content, the downloader verifies its size against the content hash, rejects blobs larger than the local daemon's configured limit, and compares the result with the size in a signed offer.
 
-Blob data and named pins live under `blobs-v1/<node-public-key>` in the state directory. Outgoing content is named and synced before its offer is broadcast, so an observed offer is already available. An ordinarily returned pre-broadcast failure attempts to remove and sync the named pin. Forced task cancellation or process termination can interrupt publication or cleanup and may therefore leave a conservative pin even when no offer was sent. Once broadcast is attempted, an error has an unknown delivery outcome and the pin is deliberately retained so any peer that may have observed the offer can still fetch it. Successful outgoing shares use `meshmsg/out/v1/...` pins and successful downloads use `meshmsg/in/v1/...` pins. They survive daemon restarts and currently have no automatic expiry or removal command. Unpinned partial data can remain until store garbage collection.
+Blob data and named pins live under `blobs-v1/<node-public-key>` in the state directory. Outgoing content is named and synced before its offer is broadcast, so an observed offer is already available. An ordinarily returned pre-broadcast failure attempts to remove and sync the named pin. Forced task cancellation or process termination can interrupt publication or cleanup and may therefore leave a conservative pin even when no offer was sent. Once broadcast is attempted, an error has an unknown delivery outcome and the pin is deliberately retained so any peer that may have observed the offer can still fetch it. Successful outgoing shares use `meshmsg/out/v1/...` pins and successful downloads—including downloads prepared for the web UI—use `meshmsg/in/v1/...` pins. They survive daemon restarts and currently have no automatic expiry or removal command; expiry of a browser's temporary file does not release this persistent blob pin. Unpinned partial data can remain until store garbage collection.
 
 ## Security and compatibility
 
@@ -75,7 +75,7 @@ New clients decode typed, versioned attachment payloads while continuing to acce
 
 ## JSON events
 
-The optional web UI shows live-only, read-only cards for incoming and locally shared attachments. It forwards only direction/sender, timestamp, filename, kind, and known size; it exposes no signed offer token, blob ticket, path/output, transfer control, offers API, or attachment mutation endpoint.
+The optional web UI shows live-only cards for incoming and locally shared attachments. Incoming cards can explicitly download the verified content to the browser; directory snapshots download as their deterministic `.tar` archive. The bridge retains signed offers only in bounded, expiring server memory and gives the browser opaque IDs that can be retried during their short TTL, never raw offers, blob tickets, or server filesystem paths. Ready temporary files likewise remain retryable/resumable for 65 minutes after readiness or their latest retrieval; a user must click the displayed **Save file** link after preparation. Outgoing cards remain informational and there is no web offers/history, upload, or arbitrary attachment mutation API.
 
 Representative records:
 

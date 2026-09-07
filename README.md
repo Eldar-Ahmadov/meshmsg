@@ -77,7 +77,7 @@ See [Benchmarking](docs/benchmarking.md) for measurement semantics, coordinated 
 
 ## Mobile web broadcast
 
-Run `meshmsg web` alongside the existing daemon, then open `http://127.0.0.1:8787/`. For phone access, use **Tailscale Serve, never Funnel**, with an explicitly configured HTTPS `--origin`. There is no app authentication: tailnet access rules are the remote access boundary. The UI queues text broadcasts locally (not delivery acknowledgements) and shows a bounded live feed without history, including read-only attachment cards with safe metadata but no transfer controls or capabilities.
+Run `meshmsg web` alongside the existing daemon, then open `http://127.0.0.1:8787/`. For phone access, use **Tailscale Serve, never Funnel**, with an explicitly configured HTTPS `--origin`. There is no app authentication: tailnet access rules are the remote access boundary. The UI queues text broadcasts locally (not delivery acknowledgements) and shows a bounded live feed without history. Incoming attachment cards support explicit, verified browser downloads (directories as `.tar`) without exposing raw offer capabilities or server filesystem paths.
 
 See [Mobile web UI](docs/web.md) for setup, security boundaries, reconnect behavior, and operations.
 

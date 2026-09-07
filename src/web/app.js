@@ -54,6 +54,41 @@ function attachmentSize(size) {
   return `${amount.toFixed(digits).replace(/\.0$/, '')} ${units[unit]}`;
 }
 
+async function downloadAttachment(id, button, status, item) {
+  button.disabled = true;
+  status.textContent = 'Starting download…';
+  try {
+    const started = await request({ command: 'download', id });
+    if (!started.ok || started.value.type !== 'download_started'
+      || !Number.isSafeInteger(started.value.poll_timeout_ms)
+      || started.value.poll_timeout_ms < 1 || started.value.poll_timeout_ms > 71 * 60 * 1000) {
+      throw new Error(started.value.message || 'Download could not be started.');
+    }
+    const pollDeadline = Date.now() + started.value.poll_timeout_ms;
+    while (Date.now() < pollDeadline) {
+      const result = await request({ command: 'download_status', id: started.value.id });
+      if (!result.ok) throw new Error(result.value.message || 'Download failed.');
+      if (result.value.type === 'download_ready') {
+        status.textContent = 'Download ready for at least one hour. Choose Save file.';
+        const link = document.createElement('a');
+        link.className = 'attachment-save';
+        link.href = result.value.url;
+        link.textContent = 'Save file';
+        item.append(link);
+        button.remove();
+        return;
+      }
+      if (result.value.type !== 'download_pending') throw new Error('Unexpected download status.');
+      status.textContent = 'Downloading and verifying…';
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error('Download preparation deadline expired.');
+  } catch (error) {
+    status.textContent = `Download failed: ${error.message}`;
+    button.disabled = false;
+  }
+}
+
 function addAttachment(value) {
   const outgoing = value.type === 'attachment_shared';
   const directory = value.kind === 'directory_tar_v1';
@@ -89,6 +124,14 @@ function addAttachment(value) {
   status.className = 'attachment-status';
   status.textContent = outgoing ? 'Offer shared · delivery not acknowledged' : 'Offer received';
   item.append(status);
+  if (!outgoing && typeof value.download_id === 'string') {
+    const button = document.createElement('button');
+    button.className = 'attachment-download quiet';
+    button.type = 'button';
+    button.textContent = directory ? 'Download .tar' : 'Download';
+    button.addEventListener('click', () => downloadAttachment(value.download_id, button, status, item));
+    item.append(button);
+  }
   prependEntry(item);
 }
 
@@ -105,7 +148,10 @@ async function request(value) {
     const response = await fetch('/api/request', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(value), signal: controller.signal,
-      mode: 'same-origin', credentials: 'omit', redirect: 'error', cache: 'no-store'
+      // CORS mode makes browsers send the real Origin even under our
+      // Referrer-Policy: no-referrer. The URL remains same-origin and the
+      // server still rejects every non-matching Host/Origin pair.
+      mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store'
     });
     return { ok: response.ok, value: await response.json() };
   } finally { clearTimeout(timer); }

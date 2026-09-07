@@ -10,7 +10,7 @@ use crate::{
     ipc::{
         daemon_error_message, read_frame, send_request_checked, subscribe, write_request,
         write_value, BenchConfig, IpcRequest, SubscriptionReader, MAX_IPC_REQUEST_SIZE,
-        PRIVATE_SEND_CAPABILITY,
+        PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY,
     },
     peers::{
         self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
@@ -520,6 +520,7 @@ enum DaemonCommand {
     Download {
         offer: String,
         output: PathBuf,
+        raw_export: bool,
         reply: oneshot::Sender<serde_json::Value>,
     },
     Stop,
@@ -1256,6 +1257,19 @@ where
                 .send(DaemonCommand::Download {
                     offer,
                     output,
+                    raw_export: false,
+                    reply,
+                })
+                .await?;
+            write_value(&mut stream, &response.await?).await?;
+        }
+        IpcRequest::WebDownload { offer, output } => {
+            let (reply, response) = oneshot::channel();
+            commands
+                .send(DaemonCommand::Download {
+                    offer,
+                    output,
+                    raw_export: true,
                     reply,
                 })
                 .await?;
@@ -1594,6 +1608,7 @@ async fn download_attachment(
     offer_token: String,
     output: PathBuf,
     max_attachment_bytes: u64,
+    raw_export: bool,
 ) -> Result<serde_json::Value> {
     let DownloadResources {
         store,
@@ -1737,8 +1752,8 @@ async fn download_attachment(
     })
     .await
     .context("attachment export task failed")??;
-    match offer.kind {
-        AttachmentKind::File => {
+    match (raw_export, offer.kind) {
+        (true, _) | (false, AttachmentKind::File) => {
             let output_for_task = output.clone();
             tokio::task::spawn_blocking(move || {
                 attachment::install_staged_file_no_clobber(staging, &output_for_task)
@@ -1746,7 +1761,7 @@ async fn download_attachment(
             .await
             .context("install task failed")??;
         }
-        AttachmentKind::DirectoryTarV1 => {
+        (false, AttachmentKind::DirectoryTarV1) => {
             let output_for_task = output.clone();
             tokio::task::spawn_blocking(move || {
                 attachment::extract_staged_tar_no_clobber(
@@ -1991,7 +2006,8 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                 let connected = serde_json::json!({
                     "type":"connected", "peer":peer, "endpoint_online":true,
                     "topic_joined":node.receiver.is_joined(),
-                    "alias":alias_config.effective()
+                    "alias":alias_config.effective(),
+                    "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY]
                 });
                 let benchmark_busy = benchmark_busy.clone();
                 tokio::spawn(async move {
@@ -2101,7 +2117,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY],
+                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY],
                         "max_attachment_bytes":max_attachment_bytes
                     }));
                 }
@@ -2183,7 +2199,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         let _ = reply.send(response);
                     });
                 }
-                Some(DaemonCommand::Download { offer, output, reply }) => {
+                Some(DaemonCommand::Download { offer, output, raw_export, reply }) => {
                     let permit = match try_admit_transfer(
                         &transfer_limit, "download_busy", "attachment transfer capacity reached"
                     ) {
@@ -2213,6 +2229,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                             offer,
                             output,
                             max_attachment_bytes,
+                            raw_export,
                         ).await {
                             Ok(value) => value,
                             Err(error) => serde_json::json!({"type":"error", "code":"download_failed", "message":error.to_string()}),
