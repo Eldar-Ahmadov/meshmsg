@@ -10,7 +10,7 @@ use crate::{
     ipc::{
         daemon_error_message, read_frame, send_request_checked, subscribe, write_request,
         write_value, BenchConfig, IpcRequest, SubscriptionReader, MAX_IPC_REQUEST_SIZE,
-        PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY,
+        PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY,
     },
     peers::{
         self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
@@ -2007,7 +2007,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                     "type":"connected", "peer":peer, "endpoint_online":true,
                     "topic_joined":node.receiver.is_joined(),
                     "alias":alias_config.effective(),
-                    "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY]
+                    "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY]
                 });
                 let benchmark_busy = benchmark_busy.clone();
                 tokio::spawn(async move {
@@ -2117,7 +2117,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY],
+                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY],
                         "max_attachment_bytes":max_attachment_bytes
                     }));
                 }

@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 
 BIN = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/meshmsg').resolve())
 
@@ -71,6 +72,16 @@ def main():
             def post(value):
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
                 conn.request('POST', '/api/request', json.dumps(value), {'Origin': origin, 'Content-Type': 'application/json'})
+                response = conn.getresponse()
+                result = response.status, json.loads(response.read())
+                conn.close()
+                return result
+
+            def upload(name, payload):
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
+                conn.request('POST', '/api/attachment', payload, {
+                    'Origin': origin, 'Content-Type': 'application/octet-stream',
+                    'X-Meshmsg-File-Name': urllib.parse.quote(name, safe="~()*!.'-")})
                 response = conn.getresponse()
                 result = response.status, json.loads(response.read())
                 conn.close()
@@ -168,25 +179,35 @@ def main():
                 local = event(feed)
                 assert local['type'] == 'queued' and local['body'] == local_cli
 
-            attachment_path = root / 'web-attachment.txt'
-            attachment_path.write_text('real web attachment metadata\n')
-            shared = cli('one', 'share', str(attachment_path))
-            assert shared['type'] == 'attachment_shared' and isinstance(shared['timestamp_ms'], int)
+            attachment_name = 'web-attachment.txt'
+            attachment_payload = b'real web attachment upload\n'
+            code, shared_reply = upload(attachment_name, attachment_payload)
+            assert code == 200 and shared_reply == {
+                'type': 'attachment_shared', 'name': attachment_name,
+                'size': len(attachment_payload), 'delivery_acknowledged': False}
             safe_shared = None
             for feed, _ in feeds:
                 local = event(feed)
                 assert set(local) == {'type', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
-                assert local == {
-                    'type': 'attachment_shared', 'direction': 'outgoing', 'from': shared['from'],
-                    'timestamp_ms': shared['timestamp_ms'], 'name': 'web-attachment.txt',
-                    'kind': 'file', 'size': attachment_path.stat().st_size}
+                assert local['type'] == 'attachment_shared' and local['direction'] == 'outgoing'
+                assert local['name'] == attachment_name and local['kind'] == 'file'
+                assert local['size'] == len(attachment_payload) and isinstance(local['timestamp_ms'], int)
                 if safe_shared is None:
                     safe_shared = local
                 else:
                     assert local == safe_shared
             wait_for(lambda: '"type":"attachment_offer"' in pathlib.Path(peer_log.name).read_text()
-                     and 'web-attachment.txt' in pathlib.Path(peer_log.name).read_text(),
+                     and attachment_name in pathlib.Path(peer_log.name).read_text(),
                      'attachment offer received on distinct peer', 30)
+            remote_offer = next(
+                value for value in map(json.loads, pathlib.Path(peer_log.name).read_text().splitlines())
+                if value.get('type') == 'attachment_offer' and value.get('name') == attachment_name)
+            offer_file = root / 'web-upload.offer'
+            offer_file.write_text(remote_offer['offer'])
+            received_upload = root / 'received-web-upload.txt'
+            downloaded = cli('two', 'download', '--offer-file', str(offer_file), '--output', str(received_upload))
+            assert downloaded['type'] == 'download_complete'
+            assert received_upload.read_bytes() == attachment_payload
 
             reverse_attachment_path = root / 'reverse-attachment.txt'
             reverse_attachment_path.write_text('reverse real attachment metadata\n')
@@ -258,7 +279,7 @@ def main():
             web.send_signal(signal.SIGINT)
             assert web.wait(timeout=5) == 0
             assert running('one') and running('two')
-            print('PASS: real sanitized peer snapshot reached HTTP and both SSE handshakes without routes; web and local CLI sends reached both feeds as canonical queued events; safe real attachment metadata and verified browser file/directory-tar downloads passed; reverse peer send, daemon offline/restart, and independent web shutdown passed')
+            print('PASS: real sanitized peer snapshot reached HTTP and both SSE handshakes without routes; web messages and a real browser attachment upload reached the distinct peer and both feeds as canonical events; safe metadata and verified browser file/directory-tar downloads passed; reverse peer send, daemon offline/restart, and independent web shutdown passed')
         except BaseException:
             for log in logs:
                 log.flush()

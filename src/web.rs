@@ -2,9 +2,10 @@
 //! Host/Origin checks defend browsers, not hostile local or authorized clients.
 use crate::{
     alias::validate_alias,
+    attachment::validate_display_name,
     config::prepare_state_dir,
     direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
-    ipc::{self, IpcRequest, WEB_DOWNLOAD_CAPABILITY},
+    ipc::{self, IpcRequest, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY},
     peers::PEER_LEASE_MS,
 };
 use anyhow::{Context, Result};
@@ -31,10 +32,10 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::TcpListener,
     sync::{mpsc, Semaphore},
     time::{interval, timeout},
@@ -43,16 +44,19 @@ use tokio::{
 type Body = BoxBody<Bytes, std::io::Error>;
 const REQUEST_LIMIT: usize = ipc::MAX_IPC_REQUEST_SIZE;
 const IPC_TIMEOUT: Duration = Duration::from_secs(8);
-const HTTP_CONNECTION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const HTTP_CONNECTION_LIFETIME: Duration = Duration::from_secs(75 * 60);
 const SEND_INTERVAL: Duration = Duration::from_secs(1);
+const WEB_SHARE_TIMEOUT: Duration = Duration::from_secs(70 * 60);
 const DOWNLOAD_TTL: Duration = Duration::from_secs(10 * 60);
 const DOWNLOAD_READY_TTL: Duration = Duration::from_secs(65 * 60);
 const WEB_DOWNLOAD_IPC_TIMEOUT: Duration = Duration::from_secs(70 * 60);
 const DOWNLOAD_PENDING_TTL: Duration = Duration::from_secs(71 * 60);
 const STALE_DOWNLOAD_ROOT_AGE: Duration = Duration::from_secs(3 * 60 * 60);
+const RETAINED_UPLOAD_TTL: Duration = STALE_DOWNLOAD_ROOT_AGE;
 const MAX_DOWNLOAD_OFFERS: usize = 128;
 const MAX_DOWNLOAD_JOBS: usize = 128;
 const MAX_DOWNLOADS: usize = 2;
+const MAX_UPLOADS: usize = 2;
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[derive(Clone)]
@@ -84,9 +88,11 @@ struct WebState {
     subscriptions: Arc<Semaphore>,
     requests: Semaphore,
     downloads: Arc<Semaphore>,
+    uploads: Arc<Semaphore>,
     offers: Mutex<HashMap<String, StoredOffer>>,
     jobs: Arc<Mutex<HashMap<String, DownloadJob>>>,
     download_root: PathBuf,
+    upload_root: PathBuf,
     last_send: Mutex<Option<Instant>>,
 }
 
@@ -114,8 +120,26 @@ fn touch_download_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prepare_download_root(dir: &Path) -> Result<PathBuf> {
-    let parent = dir.join("web-downloads-v2");
+fn prune_upload_root(root: &Path, now: SystemTime) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= RETAINED_UPLOAD_TTL);
+        if stale && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn prepare_temporary_root(dir: &Path, parent_name: &str) -> Result<PathBuf> {
+    let parent = dir.join(parent_name);
     restrict_download_directory(&parent)?;
     if let Ok(entries) = fs::read_dir(&parent) {
         for entry in entries.flatten() {
@@ -143,10 +167,10 @@ fn prepare_download_root(dir: &Path) -> Result<PathBuf> {
                 return Ok(process_root);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error).context("create unique web download directory"),
+            Err(error) => return Err(error).context("create unique web temporary directory"),
         }
     }
-    anyhow::bail!("could not allocate a unique web download directory")
+    anyhow::bail!("could not allocate a unique web temporary directory")
 }
 
 impl WebState {
@@ -167,16 +191,19 @@ impl WebState {
             origins.push(origin);
         }
         prepare_state_dir(dir)?;
-        let download_root = prepare_download_root(dir)?;
+        let download_root = prepare_temporary_root(dir, "web-downloads-v2")?;
+        let upload_root = prepare_temporary_root(dir, "web-uploads-v1")?;
         Ok(Self {
             dir: dir.into(),
             origins,
             subscriptions: Arc::new(Semaphore::new(16)),
             requests: Semaphore::new(16),
             downloads: Arc::new(Semaphore::new(MAX_DOWNLOADS)),
+            uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             offers: Mutex::new(HashMap::new()),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             download_root,
+            upload_root,
             last_send: Mutex::new(None),
         })
     }
@@ -254,6 +281,7 @@ impl WebState {
             .expect("offer registry mutex poisoned")
             .retain(|_, value| now.duration_since(value.created) <= DOWNLOAD_TTL);
         self.prune_jobs(now);
+        prune_upload_root(&self.upload_root, SystemTime::now());
     }
 
     fn prune_jobs(&self, now: Instant) {
@@ -1019,6 +1047,238 @@ async fn serve_download(state: &WebState, id: &str, headers: &HeaderMap) -> Resp
     result
 }
 
+fn decode_upload_name(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = bytes.get(index + 1..index + 3)?;
+            let text = std::str::from_utf8(pair).ok()?;
+            decoded.push(u8::from_str_radix(text, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn daemon_supports_web_share(status: &Value) -> Option<u64> {
+    let supported = status["type"] == "status"
+        && status["ipc_capabilities"].as_array().is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(WEB_SHARE_CAPABILITY))
+        });
+    if !supported {
+        return None;
+    }
+    status["max_attachment_bytes"]
+        .as_u64()
+        .filter(|limit| *limit > 0)
+}
+
+fn compatible_attachment_shared(value: &Value, name: &str, size: u64) -> bool {
+    value["type"] == "attachment_shared"
+        && value["schema_version"] == 1
+        && value["kind"] == "file"
+        && value["name"].as_str() == Some(name)
+        && value["size"].as_u64() == Some(size)
+}
+
+async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> Response<Body> {
+    let Some(encoded_name) = single_header(request.headers(), "x-meshmsg-file-name") else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "not_shared",
+            "A single encoded attachment filename is required.",
+        );
+    };
+    let Some(name) = decode_upload_name(encoded_name) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "not_shared",
+            "Invalid attachment filename encoding.",
+        );
+    };
+    if validate_display_name(&name).is_err() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "not_shared",
+            "The attachment filename is not portable or is too long.",
+        );
+    }
+    let declared_size = match single_header(request.headers(), "content-length") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "not_shared",
+                    "Invalid attachment size.",
+                )
+            }
+        },
+        None if request.headers().contains_key("content-length") => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "not_shared",
+                "Invalid attachment size.",
+            );
+        }
+        None => None,
+    };
+    let Ok(_permit) = state.uploads.clone().try_acquire_owned() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_shared",
+            "Web attachment upload capacity reached.",
+        );
+    };
+    let status = match timeout(
+        IPC_TIMEOUT,
+        ipc::send_request(&state.dir, &IpcRequest::Status),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        _ => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not_shared",
+                "Daemon offline or unresponsive. Start or restart it separately.",
+            )
+        }
+    };
+    let Some(maximum) = daemon_supports_web_share(&status) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_shared",
+            "The daemon does not support web attachment sharing. Upgrade and restart it.",
+        );
+    };
+    if declared_size.is_some_and(|size| size > maximum) {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "not_shared",
+            "Attachment exceeds the daemon's configured size limit.",
+        );
+    }
+    if touch_download_root(&state.upload_root).is_err() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "not_shared",
+            "Web upload staging is unavailable.",
+        );
+    }
+    let operation_root = state.upload_root.join(random_id());
+    if restrict_download_directory(&operation_root).is_err() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "not_shared",
+            "Web upload staging is unavailable.",
+        );
+    }
+    let path = operation_root.join(&name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&operation_root);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "not_shared",
+                "Web upload staging is unavailable.",
+            );
+        }
+    };
+    let receive = async {
+        let mut file = tokio::fs::File::from_std(file);
+        let mut received = 0_u64;
+        while let Some(frame) = request.body_mut().frame().await {
+            let frame = frame.context("read upload body")?;
+            let data = frame
+                .into_data()
+                .map_err(|_| anyhow::anyhow!("upload trailers are unsupported"))?;
+            received = received
+                .checked_add(data.len() as u64)
+                .context("upload size overflow")?;
+            anyhow::ensure!(received <= maximum, "upload exceeds size limit");
+            file.write_all(&data).await.context("stage upload")?;
+        }
+        anyhow::ensure!(
+            declared_size.is_none_or(|size| size == received),
+            "incomplete upload"
+        );
+        file.sync_all().await.context("sync staged upload")?;
+        Result::<u64>::Ok(received)
+    };
+    let received = match timeout(WEB_SHARE_TIMEOUT, receive).await {
+        Ok(Ok(size)) => size,
+        Ok(Err(_)) => {
+            let _ = fs::remove_dir_all(&operation_root);
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "not_shared",
+                "Attachment was incomplete or exceeded the configured size limit.",
+            );
+        }
+        Err(_) => {
+            let _ = fs::remove_dir_all(&operation_root);
+            return error(
+                StatusCode::REQUEST_TIMEOUT,
+                "not_shared",
+                "Attachment upload exceeded its time limit.",
+            );
+        }
+    };
+    let result = timeout(
+        WEB_SHARE_TIMEOUT,
+        ipc::send_request(&state.dir, &IpcRequest::Share { path: path.clone() }),
+    )
+    .await;
+    match result {
+        Ok(Ok(value)) if compatible_attachment_shared(&value, &name, received) => {
+            let _ = fs::remove_dir_all(&operation_root);
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "type":"attachment_shared", "name":name, "size":received,
+                    "delivery_acknowledged":false
+                }),
+            )
+        }
+        Ok(Ok(value)) if value["type"] == "error" && value["code"] == "share_busy" => {
+            let _ = fs::remove_dir_all(&operation_root);
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not_shared",
+                "Daemon attachment sharing is busy.",
+            )
+        }
+        Ok(Ok(_)) => {
+            // `share_failed` can be returned after broadcast was attempted, and a
+            // success-shaped reply is authoritative only when all staged metadata
+            // matches. In both cases a retry could publish a duplicate offer.
+            let _ = fs::remove_dir_all(&operation_root);
+            error(StatusCode::BAD_GATEWAY, "unknown", "Share outcome unknown: the daemon reported a failure or incompatible result after submission. Check the live feed before retrying.")
+        }
+        Ok(Err(_)) | Err(_) => {
+            // The daemon may still have opened the source or published its offer.
+            // Retain the isolated staging directory for stale-startup cleanup.
+            error(StatusCode::BAD_GATEWAY, "unknown", "Share outcome unknown: daemon unavailable or reply lost. Check the live feed before retrying.")
+        }
+    }
+}
+
 async fn route(
     request: Request<Incoming>,
     state: Arc<WebState>,
@@ -1067,6 +1327,19 @@ async fn route(
             include_str!("web/settings.js"),
         ),
         (&Method::GET, "/api/events") => events(state).await,
+        (&Method::POST, "/api/attachment") => {
+            if single_header(request.headers(), "content-type") != Some("application/octet-stream")
+                || request.headers().contains_key("content-encoding")
+            {
+                error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "not_shared",
+                    "Use unencoded application/octet-stream.",
+                )
+            } else {
+                upload_attachment(&state, request).await
+            }
+        }
         (&Method::POST, "/api/request") => {
             if single_header(request.headers(), "content-type") != Some("application/json")
                 || request.headers().contains_key("content-encoding")
@@ -1348,6 +1621,69 @@ mod tests {
     }
 
     #[test]
+    fn upload_names_and_share_capability_are_strict() {
+        assert_eq!(
+            decode_upload_name("r%C3%A9sum%C3%A9.txt").as_deref(),
+            Some("résumé.txt")
+        );
+        for invalid in ["%", "%zz", "%ff"] {
+            assert!(decode_upload_name(invalid).is_none(), "{invalid}");
+        }
+        assert_eq!(
+            daemon_supports_web_share(&json!({
+                "type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY],
+                "max_attachment_bytes":123
+            })),
+            Some(123)
+        );
+        for status in [
+            json!({"type":"status", "ipc_capabilities":[], "max_attachment_bytes":123}),
+            json!({"type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY]}),
+            json!({"type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY], "max_attachment_bytes":0}),
+            json!({"type":"connected", "ipc_capabilities":[WEB_SHARE_CAPABILITY], "max_attachment_bytes":123}),
+        ] {
+            assert_eq!(daemon_supports_web_share(&status), None);
+        }
+    }
+
+    #[test]
+    fn upload_success_metadata_must_match_the_staged_file() {
+        let valid = json!({
+            "type":"attachment_shared", "schema_version":1,
+            "kind":"file", "name":"report.txt", "size":7
+        });
+        assert!(compatible_attachment_shared(&valid, "report.txt", 7));
+        for mismatch in [
+            json!({"type":"attachment_shared", "schema_version":2, "kind":"file", "name":"report.txt", "size":7}),
+            json!({"type":"attachment_shared", "schema_version":1, "kind":"directory_tar_v1", "name":"report.txt", "size":7}),
+            json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"other.txt", "size":7}),
+            json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"report.txt", "size":8}),
+        ] {
+            assert!(!compatible_attachment_shared(&mismatch, "report.txt", 7));
+        }
+    }
+
+    #[test]
+    fn retained_uploads_are_pruned_only_after_the_race_safety_window() {
+        let state = state();
+        let operation = state.upload_root.join("retained-operation");
+        fs::create_dir(&operation).unwrap();
+        fs::write(operation.join("upload.txt"), b"data").unwrap();
+        let modified = fs::metadata(&operation).unwrap().modified().unwrap();
+        prune_upload_root(
+            &state.upload_root,
+            modified + RETAINED_UPLOAD_TTL - Duration::from_secs(1),
+        );
+        assert!(operation.exists());
+        prune_upload_root(
+            &state.upload_root,
+            modified + RETAINED_UPLOAD_TTL + Duration::from_secs(1),
+        );
+        assert!(!operation.exists());
+        assert!(state.upload_root.join(".lease").exists());
+    }
+
+    #[test]
     fn sends_are_globally_throttled_without_automatic_retries() {
         let state = state();
         let now = Instant::now();
@@ -1539,6 +1875,8 @@ mod tests {
         }
         assert!(js.contains("feed.children.length > 100"));
         assert!(index.contains("href=\"/settings\""));
+        assert!(index.contains("type=\"file\""));
+        assert!(js.contains("fetch('/api/attachment'"));
         assert!(!index.contains("Local daemon"));
         assert!(settings.contains("MESHMSG STATUS"));
         for private in ["state dir", "invite", "offer", "token", "ticket"] {

@@ -48,7 +48,7 @@ assert.match(composerCss, /overflow-y:\s*auto/);
 assert.match(cssBlock('main'), /padding:[^;]*var\(--composer-space\)/);
 
 class Element extends EventTarget {
-  constructor() { super(); this.children = []; this.attributes = {}; this._textContent = ''; this.textContentWrites = []; this.value = ''; this.href = ''; }
+  constructor() { super(); this.children = []; this.attributes = {}; this._textContent = ''; this.textContentWrites = []; this.value = ''; this.href = ''; this.files = null; }
   get textContent() { return this._textContent; }
   set textContent(value) { this._textContent = value; this.textContentWrites.push(value); }
   append(child) { child.parent = this; this.children.push(child); }
@@ -84,6 +84,8 @@ deterministicMath.random = () => 0;
 const sent = [];
 const downloadRequests = [];
 let downloadedHref = null;
+let uploaded = null;
+let uploadReply = async () => ({ ok: true, json: async () => ({ type: 'attachment_shared' }) });
 let peersRequests = 0;
 let statusReply = async () => ({ ok: true, json: async () => ({ type: 'status', peer: 'local-peer', running: true, endpoint_online: true, topic_joined: true, neighbors: 1 }) });
 let sendReply = async () => ({ ok: true, json: async () => ({ type: 'queued' }) });
@@ -97,7 +99,11 @@ const context = vm.createContext({
     return id;
   },
   clearTimeout: (id) => { const timer = timers.get(id); if (timer) timer.cancelled = true; }, setInterval: () => {},
-  fetch: async (_, options) => {
+  fetch: async (url, options) => {
+    if (url === '/api/attachment') {
+      uploaded = { body: options.body, headers: options.headers };
+      return uploadReply();
+    }
     const request = JSON.parse(options.body);
     if (request.command === 'status') return statusReply();
     if (request.command === 'peers') {
@@ -213,6 +219,36 @@ function submit(body) {
   assert.equal(sent.at(-1).body, 'keyboard send');
   assert.equal(shortcut.defaultPrevented, true);
   assert.equal(el('feed').children.length, 0, 'POST response created a duplicate optimistic entry');
+  const file = { name: 'browser résumé.txt', size: 24 };
+  el('attachment').files = [file];
+  el('attachment').value = 'selected';
+  el('share-attachment').click();
+  await settle();
+  assert.equal(uploaded.body, file);
+  assert.equal(uploaded.headers['Content-Type'], 'application/octet-stream');
+  assert.equal(uploaded.headers['X-Meshmsg-File-Name'], 'browser%20r%C3%A9sum%C3%A9.txt');
+  assert.equal(el('attachment').value, '');
+  assert.match(el('attachment-outcome').textContent, /shared locally.*delivery unconfirmed.*live feed/);
+  assert.equal(el('feed').children.length, 0, 'upload response created an optimistic attachment');
+
+  uploadReply = async () => ({ ok: false, json: async () => ({ outcome: 'not_shared', message: 'Attachment too large.' }) });
+  const rejectedFile = { name: 'large.bin', size: 999 };
+  el('attachment').files = [rejectedFile];
+  el('attachment').value = 'preserved';
+  el('share-attachment').click();
+  await settle();
+  assert.equal(el('attachment').value, 'preserved');
+  assert.match(el('attachment-outcome').textContent, /Not shared.*File selection preserved/);
+
+  uploadReply = async () => ({ ok: false, json: async () => ({ outcome: 'unknown', message: 'Post-broadcast failure.' }) });
+  const ambiguousFile = { name: 'ambiguous.txt', size: 12 };
+  el('attachment').files = [ambiguousFile];
+  el('attachment').value = 'ambiguous-preserved';
+  el('share-attachment').click();
+  await settle();
+  assert.equal(el('attachment').value, 'ambiguous-preserved');
+  assert.match(el('attachment-outcome').textContent, /outcome unknown.*Check the live feed before retrying.*duplicates/i);
+
   source.emit({ type: 'queued', from: 'local-peer', body: 'hello <script>text only</script>', timestamp_ms: 1700000000000, delivery_acknowledged: false });
   assert.equal(el('feed').children.length, 1);
   assert.equal(el('feed').children[0].children[1].textContent, 'hello <script>text only</script>');
@@ -415,5 +451,5 @@ function submit(body) {
     'Refreshing status…', 'Status refreshed. Read-only; peer count is not delivery proof.'
   ]);
 
-  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, atomic lag recovery without stale snapshot/callback rollback, silent unchanged periodic polling, mobile 38rem compose metadata hiding without outcome hiding, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon queued event without optimistic duplicate, read-only incoming/outgoing attachment cards with safe text and human metadata, queued/rejected/ambiguous wording, sender/timestamps, draft preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no send retry');
+  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, atomic lag recovery without stale snapshot/callback rollback, silent unchanged periodic polling, mobile compose, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon events without optimistic duplicates, browser attachment upload success/rejection and incoming/outgoing cards with safe text, queued/rejected/ambiguous wording, sender/timestamps, draft/file preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no retry');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

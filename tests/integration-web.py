@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 BIN = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/meshmsg').resolve())
 SELF_KEY = '7c9f3405d1e6ca4df5947f98bbe1301227ca6b82973940ed2d04b71ffa54b25c'
@@ -90,7 +91,8 @@ class Handler(socketserver.StreamRequestHandler):
             if value['command'] == 'status':
                 emit({'type': 'status', 'running': True, 'peer': SELF_KEY, 'neighbors': 1,
                       'endpoint_online': True, 'topic_joined': True,
-                      'ipc_capabilities': ['peer_directory_v2'],
+                      'ipc_capabilities': ['peer_directory_v2', 'web_share_v1'],
+                      'max_attachment_bytes': 1024 * 1024,
                       'socket': 'private-path', 'invite': 'private-token'})
             elif value['command'] == 'peers':
                 emit(malicious_peers_snapshot())
@@ -121,6 +123,24 @@ class Handler(socketserver.StreamRequestHandler):
                 else:
                     emit({'type': 'download_complete', 'schema_version': 1,
                           'name': '<incoming>.txt', 'kind': 'file', 'size': output.stat().st_size})
+            elif value['command'] == 'share':
+                path = pathlib.Path(value['path'])
+                assert path.parent.parent.parent == pathlib.Path(self.server.server_address).parent / 'web-uploads-v1'
+                payload = path.read_bytes()
+                shared = {'type': 'attachment_shared', 'schema_version': 1, 'from': 'fake-peer',
+                          'timestamp_ms': 1700000000001, 'name': path.name, 'kind': 'file',
+                          'size': len(payload), 'offer': 'private-offer', 'ticket': 'private-ticket',
+                          'delivery_acknowledged': False}
+                if path.name == 'post-broadcast-failure.txt':
+                    self.server.broadcast(shared)
+                    emit({'type': 'error', 'code': 'share_failed',
+                          'message': 'broadcast result was ambiguous'})
+                elif path.name == 'mismatched-success.txt':
+                    shared['name'] = 'wrong-name.txt'
+                    emit(shared)
+                else:
+                    self.server.broadcast(shared)
+                    emit(shared)
             elif value['command'] == 'send':
                 if value['body'] == 'lost-reply':
                     return  # Ambiguous: command reached daemon, reply did not.
@@ -238,6 +258,9 @@ def main():
                 for path in ['/config.json', '/../config.json', '/api/request?command=stop']:
                     assert request('GET', path)[0] == 404
                 assert request('OPTIONS', '/api/request')[0] == 404
+                assert request('POST', '/api/attachment', raw=b'file', headers={
+                    'Origin': origin, 'Content-Type': 'text/plain',
+                    'X-Meshmsg-File-Name': 'file.txt'})[0] == 415
                 daemon.web_download_capability = False
                 legacy_feed = open_feed()
                 legacy_connected = next_event(legacy_feed)
@@ -336,6 +359,61 @@ def main():
                             break
                     assert time.monotonic() < deadline, 'fake daemon subscriptions were not active'
                     time.sleep(.01)
+
+                upload_name = 'browser résumé.txt'
+                upload_payload = b'attachment sent from browser\n'
+                code, _, upload_response = request(
+                    'POST', '/api/attachment', raw=upload_payload,
+                    headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
+                             'X-Meshmsg-File-Name': urllib.parse.quote(upload_name, safe="~()*!.'-")})
+                assert code == 200
+                assert json.loads(upload_response) == {
+                    'type': 'attachment_shared', 'name': upload_name,
+                    'size': len(upload_payload), 'delivery_acknowledged': False}
+                for response in [feed, other_tab]:
+                    assert next_event(response) == {
+                        'type': 'attachment_shared', 'direction': 'outgoing', 'from': 'fake-peer',
+                        'timestamp_ms': 1700000000001, 'name': upload_name,
+                        'kind': 'file', 'size': len(upload_payload)}
+                upload_request = next(value for value in daemon.requests if value.get('command') == 'share')
+                upload_path = pathlib.Path(upload_request['path'])
+                assert not upload_path.exists(), 'completed upload staging file was retained'
+                assert upload_path.name == upload_name
+                assert request(
+                    'POST', '/api/attachment', raw=b'x',
+                    headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
+                             'X-Meshmsg-File-Name': '../escape'})[0] == 400
+                assert request(
+                    'POST', '/api/attachment', raw=b'x' * (1024 * 1024 + 1),
+                    headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
+                             'X-Meshmsg-File-Name': 'large.bin'})[0] == 413
+
+                code, _, ambiguous_body = request(
+                    'POST', '/api/attachment', raw=b'ambiguous publication\n',
+                    headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
+                             'X-Meshmsg-File-Name': 'post-broadcast-failure.txt'})
+                ambiguous = json.loads(ambiguous_body)
+                assert code == 502 and ambiguous['outcome'] == 'unknown'
+                assert 'before retrying' in ambiguous['message']
+                for response in [feed, other_tab]:
+                    observed = next_event(response)
+                    assert observed['type'] == 'attachment_shared'
+                    assert observed['name'] == 'post-broadcast-failure.txt'
+                ambiguous_request = next(
+                    value for value in daemon.requests
+                    if pathlib.Path(value.get('path', '')).name == 'post-broadcast-failure.txt')
+                assert not pathlib.Path(ambiguous_request['path']).exists()
+
+                code, _, mismatch_body = request(
+                    'POST', '/api/attachment', raw=b'metadata mismatch\n',
+                    headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
+                             'X-Meshmsg-File-Name': 'mismatched-success.txt'})
+                mismatch = json.loads(mismatch_body)
+                assert code == 502 and mismatch['outcome'] == 'unknown'
+                mismatch_request = next(
+                    value for value in daemon.requests
+                    if pathlib.Path(value.get('path', '')).name == 'mismatched-success.txt')
+                assert not pathlib.Path(mismatch_request['path']).exists()
 
                 code, started = api({'command': 'download', 'id': incoming_download_ids[0]})
                 assert code == 202 and started['type'] == 'download_started'
@@ -551,7 +629,7 @@ def main():
                     client.connect(str(root / 'daemon.sock'))
                     client.sendall(b'{"command":"status"}\n')
                     assert json.loads(client.recv(4096))['running'] is True
-                print('PASS: HTTP security/allowlist/assets, negotiated opaque retryable/ranged browser attachment downloads with safe headers and unique temporary roots, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
+                print('PASS: HTTP security/allowlist/assets, bounded browser attachment uploads and negotiated opaque retryable/ranged downloads with safe staging/headers, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
             finally:
                 for response, conn in streams:
                     response.close()

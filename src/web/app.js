@@ -4,6 +4,7 @@ const draft = byId('draft');
 const feed = byId('feed');
 const encoder = new TextEncoder();
 let sending = false;
+let sharing = false;
 let source = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
@@ -155,6 +156,40 @@ async function request(value) {
     });
     return { ok: response.ok, value: await response.json() };
   } finally { clearTimeout(timer); }
+}
+
+async function shareAttachment(file) {
+  const outcome = byId('attachment-outcome');
+  const button = byId('share-attachment');
+  sharing = true;
+  button.disabled = true;
+  outcome.textContent = `Uploading ${file.name} once…`;
+  try {
+    const response = await fetch('/api/attachment', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Meshmsg-File-Name': encodeURIComponent(file.name)
+      },
+      body: file,
+      mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store'
+    });
+    const value = await response.json();
+    if (response.ok && value.type === 'attachment_shared') {
+      outcome.textContent = 'Attachment offer shared locally — delivery unconfirmed and not acknowledged. The live feed uses the daemon event.';
+      const input = byId('attachment');
+      if (input.files && input.files[0] === file) input.value = '';
+    } else if (value.outcome === 'not_shared') {
+      outcome.textContent = `Not shared: ${value.message} File selection preserved.`;
+    } else {
+      outcome.textContent = 'Share outcome unknown: the offer may have been published. File selection preserved. Check the live feed before retrying; duplicates are possible.';
+    }
+  } catch (_) {
+    outcome.textContent = 'Share outcome unknown: upload connection failed or the reply was lost. File selection preserved. Check the live feed before retrying; no automatic retry.';
+  } finally {
+    sharing = false;
+    button.disabled = false;
+  }
 }
 
 async function refreshStatus() {
@@ -366,6 +401,20 @@ byId('composer').addEventListener('submit', async (event) => {
     sending = false;
     byId('broadcast').disabled = false;
   }
+});
+byId('share-attachment').addEventListener('click', () => {
+  if (sharing) return;
+  const input = byId('attachment');
+  const file = input.files && input.files[0];
+  if (!file) {
+    byId('attachment-outcome').textContent = 'Not shared: choose one file first.';
+    return;
+  }
+  if (!file.name || encoder.encode(file.name).length > 100) {
+    byId('attachment-outcome').textContent = 'Not shared: filename must be nonblank and at most 100 UTF-8 bytes.';
+    return;
+  }
+  shareAttachment(file);
 });
 byId('clear').addEventListener('click', () => feed.replaceChildren());
 document.addEventListener('visibilitychange', () => {
