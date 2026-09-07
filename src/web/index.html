@@ -32,21 +32,25 @@
 <section class="compose" aria-labelledby="compose-heading">
 <h2 id="compose-heading">Broadcast</h2>
 <form id="composer">
-<label class="visually-hidden" for="draft">Message to this daemon's topic</label>
-<div class="compose-row">
-<textarea id="draft" rows="2" placeholder="Message the topic…" required aria-describedby="size send-help outcome" spellcheck="true"></textarea>
-<button id="broadcast" type="submit">Send</button>
+<label class="visually-hidden" for="draft">Message or attachment to this daemon's topic</label>
+<div id="composer-box" class="composer-box">
+<textarea id="draft" rows="2" placeholder="Message the topic…" aria-describedby="size outcome" spellcheck="true"></textarea>
+<div id="selected-attachment" class="selected-attachment" hidden>
+<span class="selected-file-icon" aria-hidden="true">▱</span>
+<span id="selected-file-name"></span>
+<span id="selected-file-size"></span>
+<button id="remove-attachment" class="remove-attachment" type="button" aria-label="Remove selected attachment">×</button>
 </div>
-<div class="compose-meta"><p id="size">0 / 4096 UTF-8 bytes</p><p id="send-help">Ctrl+Enter to send. Queues locally; not delivery acknowledgement. Never retried automatically.</p></div>
-</form>
-<div class="attachment-compose">
-<label class="attachment-picker" for="attachment">Choose file</label>
-<input id="attachment" type="file" aria-describedby="attachment-help attachment-outcome">
-<button id="share-attachment" class="quiet" type="button">Share attachment</button>
-<p id="attachment-help">Files are shared topic-wide without encryption. Never retried automatically.</p>
+<div class="composer-tools">
+<label class="attachment-picker" for="attachment"><span aria-hidden="true">+</span> Attach file</label>
+<input id="attachment" class="visually-hidden" type="file" aria-describedby="outcome">
+<div class="composer-actions"><span class="shortcut">Ctrl+Enter</span><button id="broadcast" type="submit">Send</button></div>
 </div>
+<div id="drop-prompt" aria-hidden="true">Drop file to share</div>
+</div>
+<p id="size" class="visually-hidden">0 / 4096 UTF-8 bytes</p>
 <p id="outcome" role="status" aria-live="polite"></p>
-<p id="attachment-outcome" role="status" aria-live="polite"></p>
+</form>
 </section>
 <noscript>JavaScript is required to use the broadcast UI.</noscript>
 </main>

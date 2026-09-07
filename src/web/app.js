@@ -5,6 +5,7 @@ const feed = byId('feed');
 const encoder = new TextEncoder();
 let sending = false;
 let sharing = false;
+let selectedFile = null;
 let source = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
@@ -158,9 +159,24 @@ async function request(value) {
   } finally { clearTimeout(timer); }
 }
 
+function showSelectedFile(file) {
+  selectedFile = file;
+  byId('selected-file-name').textContent = file.name;
+  byId('selected-file-size').textContent = attachmentSize(file.size) || '';
+  byId('selected-attachment').hidden = false;
+}
+
+function clearSelectedFile() {
+  selectedFile = null;
+  byId('attachment').value = '';
+  byId('selected-attachment').hidden = true;
+  byId('selected-file-name').textContent = '';
+  byId('selected-file-size').textContent = '';
+}
+
 async function shareAttachment(file) {
-  const outcome = byId('attachment-outcome');
-  const button = byId('share-attachment');
+  const outcome = byId('outcome');
+  const button = byId('broadcast');
   sharing = true;
   button.disabled = true;
   outcome.textContent = `Uploading ${file.name} once…`;
@@ -177,8 +193,7 @@ async function shareAttachment(file) {
     const value = await response.json();
     if (response.ok && value.type === 'attachment_shared') {
       outcome.textContent = 'Attachment offer shared locally — delivery unconfirmed and not acknowledged. The live feed uses the daemon event.';
-      const input = byId('attachment');
-      if (input.files && input.files[0] === file) input.value = '';
+      if (selectedFile === file) clearSelectedFile();
     } else if (value.outcome === 'not_shared') {
       outcome.textContent = `Not shared: ${value.message} File selection preserved.`;
     } else {
@@ -363,7 +378,7 @@ function connect() {
 draft.addEventListener('input', () => {
   byId('size').textContent = `${encoder.encode(draft.value).length} / 4096 UTF-8 bytes (envelope may reduce limit)`;
 });
-draft.addEventListener('keydown', (event) => {
+document.addEventListener('keydown', (event) => {
   if (event.ctrlKey && event.key === 'Enter') {
     event.preventDefault();
     byId('composer').requestSubmit();
@@ -371,10 +386,19 @@ draft.addEventListener('keydown', (event) => {
 });
 byId('composer').addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (sending) return;
+  if (sending || sharing) return;
+  if (selectedFile) {
+    const file = selectedFile;
+    if (!file.name || encoder.encode(file.name).length > 100) {
+      byId('outcome').textContent = 'Not shared: filename must be nonblank and at most 100 UTF-8 bytes.';
+      return;
+    }
+    await shareAttachment(file);
+    return;
+  }
   const body = draft.value;
   if (!body.trim() || encoder.encode(body).length > 4096) {
-    byId('outcome').textContent = 'Not sent: use nonblank text, at most 4096 UTF-8 bytes.';
+    byId('outcome').textContent = 'Not sent: write a nonblank message or attach a file. Text may be at most 4096 UTF-8 bytes.';
     return;
   }
   sending = true;
@@ -383,7 +407,7 @@ byId('composer').addEventListener('submit', async (event) => {
   try {
     const { ok, value } = await request({ command: 'send', body });
     if (ok && value.type === 'queued') {
-      byId('outcome').textContent = 'Queued locally — delivery unconfirmed and not acknowledged. The live feed uses the daemon event; feed gaps are not replayed.';
+      byId('outcome').textContent = '';
       // The daemon's queued event is the one canonical feed entry in every tab.
       // Never erase edits made while the submission was in flight.
       if (draft.value === body) {
@@ -402,19 +426,27 @@ byId('composer').addEventListener('submit', async (event) => {
     byId('broadcast').disabled = false;
   }
 });
-byId('share-attachment').addEventListener('click', () => {
-  if (sharing) return;
-  const input = byId('attachment');
-  const file = input.files && input.files[0];
-  if (!file) {
-    byId('attachment-outcome').textContent = 'Not shared: choose one file first.';
-    return;
-  }
-  if (!file.name || encoder.encode(file.name).length > 100) {
-    byId('attachment-outcome').textContent = 'Not shared: filename must be nonblank and at most 100 UTF-8 bytes.';
-    return;
-  }
-  shareAttachment(file);
+byId('attachment').addEventListener('change', (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (file) showSelectedFile(file);
+});
+byId('remove-attachment').addEventListener('click', clearSelectedFile);
+const composerBox = byId('composer-box');
+for (const eventName of ['dragenter', 'dragover']) {
+  composerBox.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    composerBox.classList.add('dragging');
+  });
+}
+composerBox.addEventListener('dragleave', (event) => {
+  if (!composerBox.contains(event.relatedTarget)) composerBox.classList.remove('dragging');
+});
+composerBox.addEventListener('drop', (event) => {
+  event.preventDefault();
+  composerBox.classList.remove('dragging');
+  const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+  if (file) showSelectedFile(file);
 });
 byId('clear').addEventListener('click', () => feed.replaceChildren());
 document.addEventListener('visibilitychange', () => {

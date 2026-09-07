@@ -23,7 +23,7 @@ for (const privateLabel of ['state dir', 'invite', 'offer', 'token', 'ticket']) 
   assert.ok(!settingsHtml.toLowerCase().includes(privateLabel), `status page exposed ${privateLabel}`);
 }
 const mobileCss = css.slice(css.indexOf('@media (max-width: 38rem)'), css.indexOf('@media (prefers-reduced-transparency'));
-assert.match(mobileCss, /\.compose h2, \.compose-meta \{ display: none; \}/);
+assert.match(mobileCss, /\.compose h2, \.shortcut \{ display: none; \}/);
 assert.doesNotMatch(mobileCss, /#outcome[^}]*display:\s*none/);
 
 function cssBlock(selector) {
@@ -208,12 +208,12 @@ function submit(body) {
   await settle();
   assert.equal(sent.length, 1);
   assert.equal(el('draft').value, '');
-  assert.match(el('outcome').textContent, /Queued locally.*delivery unconfirmed.*not acknowledged.*daemon event/);
+  assert.equal(el('outcome').textContent, '');
 
   el('draft').value = 'keyboard send';
   const shortcut = new Event('keydown', { cancelable: true });
   Object.defineProperties(shortcut, { ctrlKey: { value: true }, key: { value: 'Enter' } });
-  el('draft').dispatchEvent(shortcut);
+  document.dispatchEvent(shortcut);
   await settle();
   assert.equal(sent.length, 2);
   assert.equal(sent.at(-1).body, 'keyboard send');
@@ -222,32 +222,39 @@ function submit(body) {
   const file = { name: 'browser résumé.txt', size: 24 };
   el('attachment').files = [file];
   el('attachment').value = 'selected';
-  el('share-attachment').click();
+  el('attachment').dispatchEvent(new Event('change'));
+  const attachmentShortcut = new Event('keydown', { cancelable: true });
+  Object.defineProperties(attachmentShortcut, { ctrlKey: { value: true }, key: { value: 'Enter' } });
+  document.dispatchEvent(attachmentShortcut);
   await settle();
+  assert.equal(attachmentShortcut.defaultPrevented, true);
   assert.equal(uploaded.body, file);
   assert.equal(uploaded.headers['Content-Type'], 'application/octet-stream');
   assert.equal(uploaded.headers['X-Meshmsg-File-Name'], 'browser%20r%C3%A9sum%C3%A9.txt');
   assert.equal(el('attachment').value, '');
-  assert.match(el('attachment-outcome').textContent, /shared locally.*delivery unconfirmed.*live feed/);
+  assert.match(el('outcome').textContent, /shared locally.*delivery unconfirmed.*live feed/);
   assert.equal(el('feed').children.length, 0, 'upload response created an optimistic attachment');
 
   uploadReply = async () => ({ ok: false, json: async () => ({ outcome: 'not_shared', message: 'Attachment too large.' }) });
   const rejectedFile = { name: 'large.bin', size: 999 };
   el('attachment').files = [rejectedFile];
   el('attachment').value = 'preserved';
-  el('share-attachment').click();
+  el('attachment').dispatchEvent(new Event('change'));
+  el('composer').dispatchEvent(new Event('submit', { cancelable: true }));
   await settle();
   assert.equal(el('attachment').value, 'preserved');
-  assert.match(el('attachment-outcome').textContent, /Not shared.*File selection preserved/);
+  assert.match(el('outcome').textContent, /Not shared.*File selection preserved/);
 
   uploadReply = async () => ({ ok: false, json: async () => ({ outcome: 'unknown', message: 'Post-broadcast failure.' }) });
   const ambiguousFile = { name: 'ambiguous.txt', size: 12 };
   el('attachment').files = [ambiguousFile];
   el('attachment').value = 'ambiguous-preserved';
-  el('share-attachment').click();
+  el('attachment').dispatchEvent(new Event('change'));
+  el('composer').dispatchEvent(new Event('submit', { cancelable: true }));
   await settle();
   assert.equal(el('attachment').value, 'ambiguous-preserved');
-  assert.match(el('attachment-outcome').textContent, /outcome unknown.*Check the live feed before retrying.*duplicates/i);
+  assert.match(el('outcome').textContent, /outcome unknown.*Check the live feed before retrying.*duplicates/i);
+  el('remove-attachment').click();
 
   source.emit({ type: 'queued', from: 'local-peer', body: 'hello <script>text only</script>', timestamp_ms: 1700000000000, delivery_acknowledged: false });
   assert.equal(el('feed').children.length, 1);
