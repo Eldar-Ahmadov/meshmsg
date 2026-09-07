@@ -1389,8 +1389,17 @@ async fn serve(listener: TcpListener, state: Arc<WebState>) -> Result<()> {
     let connections = Arc::new(Semaphore::new(64));
     let mut tasks = tokio::task::JoinSet::new();
     let mut cleanup = interval(Duration::from_secs(30));
+    // Keep one registered signal future for the server lifetime. Recreating it in
+    // each select can lose the shutdown wake-up when another ready branch wins.
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
+            biased;
+            result = &mut shutdown => {
+                result.context("listen for web shutdown signal")?;
+                break;
+            }
             accepted = listener.accept() => {
                 let (socket, _) = accepted?;
                 let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
@@ -1405,7 +1414,6 @@ async fn serve(listener: TcpListener, state: Arc<WebState>) -> Result<()> {
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             _ = cleanup.tick() => state.prune(Instant::now()),
-            _ = tokio::signal::ctrl_c() => break,
         }
     }
     tasks.abort_all();
