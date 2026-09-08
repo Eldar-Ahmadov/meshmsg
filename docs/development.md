@@ -19,7 +19,7 @@ bash tests/integration-attachments.sh target/debug/meshmsg
 bash tests/integration-direct-messages.sh target/debug/meshmsg
 ```
 
-The fake-daemon CLI regression and web HTTP harness require Unix sockets and run in Linux CI; they are not Windows named-pipe tests. The peer-directory, IPC-version compatibility, real-peer web, and direct-message harnesses require working Iroh networking. The Node UI checks use a DOM mock, not a mobile browser. Neither harness changes Tailscale configuration. See [web validation limits](web.md#tests-and-validation-limits).
+The fake-daemon CLI regression and web HTTP harness require Unix sockets and run in Linux CI. Every push and pull request also runs the full Rust test suite, Clippy, and a debug build natively on Windows Server 2022; platform-gated tests exercise named-pipe ownership, cancellation-safe accept, the shared 64-client admission path, initial-frame timeout recovery, and shutdown drain/abort. The peer-directory, IPC-version compatibility, real-peer web, and direct-message harnesses require working Iroh networking. The Node UI checks use a DOM mock, not a mobile browser. Neither harness changes Tailscale configuration. See [web validation limits](web.md#tests-and-validation-limits).
 
 CI also runs dependency audit and policy checks.
 

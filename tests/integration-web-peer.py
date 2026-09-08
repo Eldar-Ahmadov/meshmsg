@@ -170,6 +170,8 @@ def main():
             wait_for(lambda: marker in pathlib.Path(peer_log.name).read_text(), 'web broadcast received on distinct peer', 30)
             received = [json.loads(line) for line in pathlib.Path(peer_log.name).read_text().splitlines() if marker in line]
             remote = next(value for value in received if value['type'] == 'message' and value['body'] == marker)
+            assert canonical['schema_version'] == remote['schema_version'] == 2
+            assert canonical['message_id'] == remote['message_id']
             assert remote['from'] == canonical['from']
             assert remote['timestamp_ms'] == canonical['timestamp_ms']
 
@@ -188,7 +190,7 @@ def main():
             safe_shared = None
             for feed, _ in feeds:
                 local = event(feed)
-                assert set(local) == {'type', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
+                assert set(local) == {'type', 'schema_version', 'message_id', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
                 assert local['type'] == 'attachment_shared' and local['direction'] == 'outgoing'
                 assert local['name'] == attachment_name and local['kind'] == 'file'
                 assert local['size'] == len(attachment_payload) and isinstance(local['timestamp_ms'], int)
@@ -220,9 +222,11 @@ def main():
                         break
                 offer_id = incoming.pop('download_id')
                 assert len(offer_id) == 32
-                assert set(incoming) == {'type', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
+                assert set(incoming) == {'type', 'schema_version', 'message_id', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
                 assert incoming == {
-                    'type': 'attachment_offer', 'direction': 'incoming', 'from': reverse_shared['from'],
+                    'type': 'attachment_offer', 'schema_version': 2,
+                    'message_id': reverse_shared['message_id'],
+                    'direction': 'incoming', 'from': reverse_shared['from'],
                     'timestamp_ms': reverse_shared['timestamp_ms'], 'name': 'reverse-attachment.txt',
                     'kind': 'file', 'size': reverse_attachment_path.stat().st_size}
                 if safe_offer is None:

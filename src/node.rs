@@ -39,12 +39,13 @@ use iroh_blobs::{
 };
 use iroh_gossip::{
     api::{Event, GossipReceiver, GossipSender},
-    net::{Gossip, GOSSIP_ALPN},
+    net::Gossip,
     proto::TopicId,
 };
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     io::BufRead as _,
     path::{Path, PathBuf},
     sync::{
@@ -68,6 +69,44 @@ use tokio::{
 use crate::ipc::MAX_IPC_EVENT_SIZE;
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
+const BROADCAST_ALPN_V2: &[u8] = b"/meshmsg/broadcast-gossip/2";
+const ENVELOPE_DOMAIN: &str = "meshmsg-broadcast";
+const ENVELOPE_VERSION: u8 = 2;
+const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
+const REPLAY_BUCKET_WIDTH: Duration = Duration::from_secs(60);
+// A bucket may receive an envelope at its last millisecond whose timestamp is
+// at the future-skew boundary. Keep that whole bucket for one width beyond the
+// five-minute past acceptance window plus the one-minute future allowance.
+const REPLAY_BUCKET_RETENTION: Duration = Duration::from_secs(7 * 60);
+const PER_SENDER_REPLAY_RATE_PER_SEC: u64 = 100;
+const PER_SENDER_REPLAY_BURST: u64 = 200;
+const TRANSPORT_SOURCE_RATE_PER_SEC: u64 = 500;
+const TRANSPORT_SOURCE_BURST: u64 = 1_000;
+const GLOBAL_TRANSPORT_RATE_PER_SEC: u64 = 1_500;
+const GLOBAL_TRANSPORT_BURST: u64 = 3_000;
+const TRANSPORT_SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(60);
+const MAX_TRANSPORT_SOURCES: usize = 128;
+const MAX_REPLAY_SENDERS_PER_SOURCE: usize = 256;
+const MAX_REPLAY_SOURCES: usize = 128;
+const GLOBAL_REPLAY_RATE_PER_SEC: u64 = 1_000;
+const GLOBAL_REPLAY_BURST: u64 = 2_000;
+const MAX_REPLAY_SENDERS: usize = 4_096;
+const MAX_REPLAY_IDS_PER_SENDER: usize = (PER_SENDER_REPLAY_BURST
+    + PER_SENDER_REPLAY_RATE_PER_SEC * REPLAY_BUCKET_RETENTION.as_secs())
+    as usize;
+const MAX_REPLAY_IDS_PER_SOURCE: usize = (TRANSPORT_SOURCE_BURST
+    + TRANSPORT_SOURCE_RATE_PER_SEC * REPLAY_BUCKET_RETENTION.as_secs())
+    as usize;
+const MAX_ENVELOPE_REPLAY_ENTRIES: usize =
+    (GLOBAL_REPLAY_BURST + GLOBAL_REPLAY_RATE_PER_SEC * REPLAY_BUCKET_RETENTION.as_secs()) as usize;
+const REJECTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+const _: () = assert!(
+    REPLAY_BUCKET_RETENTION.as_secs()
+        >= ENVELOPE_ACCEPTANCE_WINDOW.as_secs()
+            + ENVELOPE_FUTURE_SKEW.as_secs()
+            + REPLAY_BUCKET_WIDTH.as_secs()
+);
 /// Maximum serialized application envelope accepted for broadcast.
 const MAX_ENVELOPE_SIZE: usize = 4096;
 /// Iroh's limit includes its own framing, so reserve explicit protocol headroom.
@@ -75,6 +114,18 @@ const GOSSIP_PROTOCOL_HEADROOM: usize = 512;
 const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADROOM;
 const MAX_PRESENCE_GOSSIP_MESSAGE_SIZE: usize = 2048 + GOSSIP_PROTOCOL_HEADROOM;
 const IPC_EVENT_CAPACITY: usize = 256;
+/// Bounds all accepted local IPC connections, including long-lived subscriptions
+/// and benchmarks. Connections beyond this limit receive a small rejection and
+/// are closed without creating a handler task.
+const LOCAL_IPC_CONNECTION_CAPACITY: usize = 64;
+const LOCAL_IPC_INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+const LOCAL_IPC_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_IPC_ORDINARY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_IPC_PRIVATE_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
+const LOCAL_IPC_LIST_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_IPC_TRANSFER_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60 + 10);
+const LOCAL_IPC_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const LOCAL_IPC_REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const BENCH_MAGIC: &str = "meshmsg-bench-v1";
 const MAX_BENCH_MESSAGES: u64 = 10_000_000;
 const MAX_LATENCY_SAMPLES: usize = 1_000_000;
@@ -107,12 +158,353 @@ const INBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/in/v1/";
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EnvelopeKind {
+    Message,
+    AttachmentOffer,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-struct Envelope {
+struct LegacyEnvelopeV1 {
     from: PublicKey,
     timestamp_ms: u64,
     body: String,
     signature: Signature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Envelope {
+    domain: String,
+    version: u8,
+    topic: TopicId,
+    from: PublicKey,
+    message_id: [u8; 16],
+    timestamp_ms: u64,
+    kind: EnvelopeKind,
+    body: String,
+    signature: Signature,
+}
+
+#[derive(Debug, Serialize)]
+struct EnvelopeSignaturePayload<'a> {
+    domain: &'a str,
+    version: u8,
+    topic: TopicId,
+    from: PublicKey,
+    message_id: [u8; 16],
+    timestamp_ms: u64,
+    kind: EnvelopeKind,
+    body: &'a str,
+}
+
+type EnvelopeReplayKey = (PublicKey, [u8; 16]);
+
+struct ReplayBucket {
+    started_at_ms: u64,
+    expires_at_ms: u64,
+    entries: HashSet<EnvelopeReplayKey>,
+}
+
+#[derive(Clone)]
+struct TokenBucket {
+    milli_tokens: u64,
+    burst: u64,
+    rate_per_sec: u64,
+    last_refill_ms: u64,
+}
+
+impl TokenBucket {
+    fn new(rate_per_sec: u64, burst: u64, now_ms: u64) -> Self {
+        Self {
+            milli_tokens: burst.saturating_mul(1_000),
+            burst,
+            rate_per_sec,
+            last_refill_ms: now_ms,
+        }
+    }
+
+    fn refill(&mut self, now_ms: u64) {
+        let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms);
+        self.milli_tokens = self
+            .milli_tokens
+            .saturating_add(elapsed_ms.saturating_mul(self.rate_per_sec))
+            .min(self.burst.saturating_mul(1_000));
+        self.last_refill_ms = self.last_refill_ms.max(now_ms);
+    }
+
+    fn available(&self) -> bool {
+        self.milli_tokens >= 1_000
+    }
+
+    fn consume(&mut self) {
+        self.milli_tokens -= 1_000;
+    }
+}
+
+struct TransportSourceState {
+    limiter: TokenBucket,
+    last_seen_ms: u64,
+}
+
+struct TransportSourceLimiter {
+    sources: HashMap<PublicKey, TransportSourceState>,
+    global: TokenBucket,
+}
+
+impl Default for TransportSourceLimiter {
+    fn default() -> Self {
+        Self {
+            sources: HashMap::new(),
+            global: TokenBucket::new(GLOBAL_TRANSPORT_RATE_PER_SEC, GLOBAL_TRANSPORT_BURST, 0),
+        }
+    }
+}
+
+impl TransportSourceLimiter {
+    fn allow(&mut self, source: PublicKey, now_ms: u64) -> bool {
+        let idle_ms = TRANSPORT_SOURCE_IDLE_LIFETIME.as_millis() as u64;
+        self.sources
+            .retain(|_, state| state.last_seen_ms.saturating_add(idle_ms) > now_ms);
+        self.global.refill(now_ms);
+        if !self.global.available() {
+            return false;
+        }
+        if !self.sources.contains_key(&source) {
+            if self.sources.len() >= MAX_TRANSPORT_SOURCES {
+                return false;
+            }
+            self.sources.insert(
+                source,
+                TransportSourceState {
+                    limiter: TokenBucket::new(
+                        TRANSPORT_SOURCE_RATE_PER_SEC,
+                        TRANSPORT_SOURCE_BURST,
+                        now_ms,
+                    ),
+                    last_seen_ms: now_ms,
+                },
+            );
+        }
+        let state = self.sources.get_mut(&source).expect("source was inserted");
+        state.limiter.refill(now_ms);
+        if !state.limiter.available() {
+            return false;
+        }
+        self.global.consume();
+        state.limiter.consume();
+        state.last_seen_ms = now_ms;
+        true
+    }
+}
+
+#[derive(Default)]
+struct RejectionSampler {
+    last_emitted_ms: Option<u64>,
+    suppressed: u64,
+}
+
+impl RejectionSampler {
+    fn event(&mut self, now_ms: u64, message: &str) -> Option<serde_json::Value> {
+        let interval_ms = REJECTION_SAMPLE_INTERVAL.as_millis() as u64;
+        if self
+            .last_emitted_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms)
+        {
+            let suppressed = std::mem::take(&mut self.suppressed);
+            self.last_emitted_ms = Some(now_ms);
+            return Some(serde_json::json!({
+                "type":"error", "code":"invalid_message", "message":message,
+                "rate_limited":true, "suppressed_since_last":suppressed
+            }));
+        }
+        self.suppressed = self.suppressed.saturating_add(1);
+        None
+    }
+}
+
+struct SenderReplayState {
+    limiter: TokenBucket,
+    live_ids: usize,
+    last_seen_ms: u64,
+}
+
+struct SourceReplayState {
+    live_ids: usize,
+    senders: HashMap<PublicKey, usize>,
+}
+
+struct EnvelopeReplayCache {
+    buckets: VecDeque<ReplayBucket>,
+    senders: HashMap<PublicKey, SenderReplayState>,
+    sources: HashMap<PublicKey, SourceReplayState>,
+    ownership: HashMap<EnvelopeReplayKey, PublicKey>,
+    global_limiter: TokenBucket,
+    live_ids: usize,
+    max_live_ids: usize,
+}
+
+impl Default for EnvelopeReplayCache {
+    fn default() -> Self {
+        Self {
+            buckets: VecDeque::new(),
+            senders: HashMap::new(),
+            sources: HashMap::new(),
+            ownership: HashMap::new(),
+            global_limiter: TokenBucket::new(GLOBAL_REPLAY_RATE_PER_SEC, GLOBAL_REPLAY_BURST, 0),
+            live_ids: 0,
+            max_live_ids: MAX_ENVELOPE_REPLAY_ENTRIES,
+        }
+    }
+}
+
+impl EnvelopeReplayCache {
+    fn rotate(&mut self, now_ms: u64) {
+        while self
+            .buckets
+            .front()
+            .is_some_and(|bucket| bucket.expires_at_ms <= now_ms)
+        {
+            let expired = self.buckets.pop_front().expect("front exists");
+            self.live_ids -= expired.entries.len();
+            for key @ (sender, _) in expired.entries {
+                if let Some(state) = self.senders.get_mut(&sender) {
+                    state.live_ids -= 1;
+                }
+                if let Some(source) = self.ownership.remove(&key) {
+                    if let Some(state) = self.sources.get_mut(&source) {
+                        state.live_ids -= 1;
+                        if let Some(count) = state.senders.get_mut(&sender) {
+                            *count -= 1;
+                            if *count == 0 {
+                                state.senders.remove(&sender);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let retention_ms = REPLAY_BUCKET_RETENTION.as_millis() as u64;
+        self.senders.retain(|_, state| {
+            state.live_ids != 0 || state.last_seen_ms.saturating_add(retention_ms) > now_ms
+        });
+        self.sources.retain(|_, state| state.live_ids != 0);
+    }
+
+    fn contains(&self, key: &EnvelopeReplayKey) -> bool {
+        self.buckets
+            .iter()
+            .any(|bucket| bucket.entries.contains(key))
+    }
+
+    fn accept(&mut self, envelope: &Envelope, source: PublicKey, now_ms: u64) -> Result<()> {
+        self.rotate(now_ms);
+        let oldest = now_ms.saturating_sub(ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64);
+        let newest = now_ms.saturating_add(ENVELOPE_FUTURE_SKEW.as_millis() as u64);
+        anyhow::ensure!(
+            (oldest..=newest).contains(&envelope.timestamp_ms),
+            "message timestamp is outside the acceptance window"
+        );
+        let key = (envelope.from, envelope.message_id);
+        anyhow::ensure!(!self.contains(&key), "replayed message");
+
+        self.global_limiter.refill(now_ms);
+        anyhow::ensure!(
+            self.global_limiter.available(),
+            "global message rate limit exceeded"
+        );
+        anyhow::ensure!(
+            self.live_ids < self.max_live_ids,
+            "global replay capacity reached"
+        );
+        if !self.sources.contains_key(&source) {
+            anyhow::ensure!(
+                self.sources.len() < MAX_REPLAY_SOURCES,
+                "replay source capacity reached"
+            );
+            self.sources.insert(
+                source,
+                SourceReplayState {
+                    live_ids: 0,
+                    senders: HashMap::new(),
+                },
+            );
+        }
+        let source_state = self.sources.get(&source).expect("source was inserted");
+        anyhow::ensure!(
+            source_state.live_ids < MAX_REPLAY_IDS_PER_SOURCE,
+            "transport source replay quota reached"
+        );
+        anyhow::ensure!(
+            source_state.senders.contains_key(&envelope.from)
+                || source_state.senders.len() < MAX_REPLAY_SENDERS_PER_SOURCE,
+            "transport source sender quota reached"
+        );
+        if !self.senders.contains_key(&envelope.from) {
+            anyhow::ensure!(
+                self.senders.len() < MAX_REPLAY_SENDERS,
+                "replay sender capacity reached"
+            );
+            self.senders.insert(
+                envelope.from,
+                SenderReplayState {
+                    limiter: TokenBucket::new(
+                        PER_SENDER_REPLAY_RATE_PER_SEC,
+                        PER_SENDER_REPLAY_BURST,
+                        now_ms,
+                    ),
+                    live_ids: 0,
+                    last_seen_ms: now_ms,
+                },
+            );
+        }
+        let sender = self
+            .senders
+            .get_mut(&envelope.from)
+            .expect("sender was inserted");
+        sender.limiter.refill(now_ms);
+        anyhow::ensure!(
+            sender.limiter.available(),
+            "sender message rate limit exceeded"
+        );
+        anyhow::ensure!(
+            sender.live_ids < MAX_REPLAY_IDS_PER_SENDER,
+            "sender replay quota reached"
+        );
+
+        self.global_limiter.consume();
+        sender.limiter.consume();
+        sender.live_ids += 1;
+        sender.last_seen_ms = now_ms;
+        let source_state = self.sources.get_mut(&source).expect("source was inserted");
+        source_state.live_ids += 1;
+        *source_state.senders.entry(envelope.from).or_default() += 1;
+        self.ownership.insert(key, source);
+        self.live_ids += 1;
+
+        let width_ms = REPLAY_BUCKET_WIDTH.as_millis() as u64;
+        let started_at_ms = now_ms - now_ms % width_ms;
+        let expires_at_ms =
+            started_at_ms.saturating_add(REPLAY_BUCKET_RETENTION.as_millis() as u64);
+        if self
+            .buckets
+            .back()
+            .is_none_or(|bucket| bucket.started_at_ms != started_at_ms)
+        {
+            self.buckets.push_back(ReplayBucket {
+                started_at_ms,
+                expires_at_ms,
+                entries: HashSet::new(),
+            });
+        }
+        self.buckets
+            .back_mut()
+            .expect("current replay bucket exists")
+            .entries
+            .insert(key);
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -238,8 +630,14 @@ fn validate_bench_config(config: &BenchConfig) -> Result<u64> {
         9_999_999_999_999,
         config.payload_bytes,
     )?;
-    Envelope::encode_at(&SecretKey::generate(), body, 9_999_999_999_999)
-        .context("payload does not fit the signed application envelope")?;
+    Envelope::encode_at(
+        &SecretKey::generate(),
+        TopicId::from_bytes([0; 32]),
+        EnvelopeKind::Message,
+        body,
+        9_999_999_999_999,
+    )
+    .context("payload does not fit the signed application envelope")?;
     Ok(total)
 }
 
@@ -264,11 +662,33 @@ struct AttachmentWire {
 }
 
 impl Envelope {
-    fn encode_at(secret: &SecretKey, body: String, timestamp_ms: u64) -> Result<Bytes> {
-        let signed = postcard::to_stdvec(&(secret.public(), timestamp_ms, &body))?;
-        let value = Self {
+    fn encode_at(
+        secret: &SecretKey,
+        topic: TopicId,
+        kind: EnvelopeKind,
+        body: String,
+        timestamp_ms: u64,
+    ) -> Result<Bytes> {
+        let message_id = rand::random();
+        let payload = EnvelopeSignaturePayload {
+            domain: ENVELOPE_DOMAIN,
+            version: ENVELOPE_VERSION,
+            topic,
             from: secret.public(),
+            message_id,
             timestamp_ms,
+            kind,
+            body: &body,
+        };
+        let signed = postcard::to_stdvec(&payload)?;
+        let value = Self {
+            domain: ENVELOPE_DOMAIN.to_owned(),
+            version: ENVELOPE_VERSION,
+            topic,
+            from: secret.public(),
+            message_id,
+            timestamp_ms,
+            kind,
             body,
             signature: ByteArray::new(secret.sign(&signed).to_bytes()),
         };
@@ -281,7 +701,7 @@ impl Envelope {
         Ok(encoded.into())
     }
 
-    fn decode(data: &[u8]) -> Result<Self> {
+    fn decode(data: &[u8], expected_topic: TopicId) -> Result<Self> {
         anyhow::ensure!(
             data.len() <= MAX_ENVELOPE_SIZE,
             "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
@@ -293,7 +713,25 @@ impl Envelope {
             remainder.is_empty(),
             "encoded message contains trailing bytes"
         );
-        let signed = postcard::to_stdvec(&(value.from, value.timestamp_ms, &value.body))?;
+        anyhow::ensure!(value.domain == ENVELOPE_DOMAIN, "invalid message domain");
+        anyhow::ensure!(
+            value.version == ENVELOPE_VERSION,
+            "unsupported message version"
+        );
+        anyhow::ensure!(
+            value.topic == expected_topic,
+            "message belongs to another topic"
+        );
+        let signed = postcard::to_stdvec(&EnvelopeSignaturePayload {
+            domain: &value.domain,
+            version: value.version,
+            topic: value.topic,
+            from: value.from,
+            message_id: value.message_id,
+            timestamp_ms: value.timestamp_ms,
+            kind: value.kind,
+            body: &value.body,
+        })?;
         value
             .from
             .verify(&signed, &iroh::Signature::from_bytes(&value.signature))
@@ -352,11 +790,47 @@ fn parse_attachment_body(body: &str) -> Result<Option<AttachmentOffer>> {
     Ok(Some(wire.offer))
 }
 
-fn parse_signed_offer_token(token: &str) -> Result<(AttachmentOffer, BlobTicket)> {
+fn decode_legacy_envelope_v1(data: &[u8]) -> Result<LegacyEnvelopeV1> {
+    anyhow::ensure!(
+        data.len() <= MAX_ENVELOPE_SIZE,
+        "legacy envelope is too large"
+    );
+    let (value, remainder): (LegacyEnvelopeV1, &[u8]) =
+        postcard::take_from_bytes(data).context("decode legacy message")?;
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "legacy message contains trailing bytes"
+    );
+    let signed = postcard::to_stdvec(&(value.from, value.timestamp_ms, &value.body))?;
+    value
+        .from
+        .verify(&signed, &iroh::Signature::from_bytes(&value.signature))
+        .context("verify legacy message")?;
+    Ok(value)
+}
+
+fn parse_signed_offer_token(
+    token: &str,
+    expected_topic: TopicId,
+) -> Result<(AttachmentOffer, BlobTicket)> {
     let bytes = BASE64URL_NOPAD
         .decode(token.as_bytes())
         .context("decode signed attachment offer")?;
-    let envelope = Envelope::decode(&bytes)?;
+    let envelope = match Envelope::decode(&bytes, expected_topic) {
+        Ok(envelope) => envelope,
+        Err(v2_error) => {
+            if decode_legacy_envelope_v1(&bytes).is_ok() {
+                anyhow::bail!(
+                    "legacy signed attachment offers are not accepted because they are not topic-bound; ask the sender to share the attachment again"
+                );
+            }
+            return Err(v2_error);
+        }
+    };
+    anyhow::ensure!(
+        envelope.kind == EnvelopeKind::AttachmentOffer,
+        "token is not an attachment offer"
+    );
     let offer =
         parse_attachment_body(&envelope.body)?.context("token is not an attachment offer")?;
     let ticket: BlobTicket = offer.ticket.parse().context("parse attachment ticket")?;
@@ -369,8 +843,10 @@ fn parse_signed_offer_token(token: &str) -> Result<(AttachmentOffer, BlobTicket)
 
 fn offer_event(envelope: Envelope, encoded: &[u8], offer: AttachmentOffer) -> serde_json::Value {
     serde_json::json!({
-        "type":"attachment_offer", "schema_version":1,
-        "from":envelope.from.to_string(), "timestamp_ms":envelope.timestamp_ms,
+        "type":"attachment_offer", "schema_version":2,
+        "from":envelope.from.to_string(),
+        "message_id":direct::id_string(&envelope.message_id),
+        "timestamp_ms":envelope.timestamp_ms,
         "offer_id":offer.offer_id, "kind":offer.kind,
         "name":offer.name, "size":offer.size, "ticket":offer.ticket,
         "offer":BASE64URL_NOPAD.encode(encoded)
@@ -412,6 +888,7 @@ async fn start(
         .bind()
         .await?;
     let gossip = Gossip::builder()
+        .alpn(BROADCAST_ALPN_V2)
         .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
         .spawn(endpoint.clone());
     // Isolate control-plane membership from the long-standing broadcast Gossip
@@ -436,7 +913,7 @@ async fn start(
     let direct = DirectHandler::new(secret.clone(), topic, direct_incoming, state_dir)
         .context("open persistent direct replay state")?;
     let router = Router::builder(endpoint.clone())
-        .accept(GOSSIP_ALPN, gossip.clone())
+        .accept(BROADCAST_ALPN_V2, gossip.clone())
         .accept(PRESENCE_ALPN, presence_gossip.clone())
         .accept(iroh_blobs::ALPN, blobs)
         .accept(DIRECT_ALPN, direct)
@@ -996,9 +1473,10 @@ where
     let total = match validate_bench_config(&config) {
         Ok(total) => total,
         Err(error) => {
-            return write_value(
+            return write_local_response(
                 stream,
                 &serde_json::json!({"type":"error", "code":"invalid_benchmark", "message":error.to_string()}),
+                LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
             )
             .await;
         }
@@ -1007,14 +1485,15 @@ where
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return write_value(
+        return write_local_response(
             stream,
             &serde_json::json!({"type":"error", "code":"benchmark_busy", "message":"another send benchmark is already active"}),
+            LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
         )
         .await;
     }
     let _lease = BenchmarkLease(benchmark_busy);
-    write_value(
+    write_local_response(
         stream,
         &serde_json::json!({
             "type":"bench_send_started", "schema_version":1,
@@ -1022,6 +1501,7 @@ where
             "duration_secs":config.duration_secs, "payload_bytes":config.payload_bytes,
             "planned":total, "delivery_acknowledged":false
         }),
+        LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
     )
     .await?;
 
@@ -1135,9 +1615,10 @@ where
             while next_progress <= elapsed {
                 next_progress += progress_period;
             }
-            write_value(
+            write_local_response(
                 stream,
                 &bench_send_progress(&config, total, &stats, elapsed),
+                LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
             )
             .await?;
         }
@@ -1158,13 +1639,77 @@ where
     let due_slots = benchmark_due_slots(observed, period, total);
     stats.schedule_missed += due_slots.saturating_sub(next_slot);
     let summary = bench_send_summary(&config, total, &stats, reason, elapsed);
-    write_value(stream, &summary).await
+    write_local_response(stream, &summary, LOCAL_IPC_RESPONSE_WRITE_TIMEOUT).await
 }
 
+#[derive(Clone, Copy)]
+struct LocalIpcTimeouts {
+    initial_frame: Duration,
+    response_write: Duration,
+    ordinary_command: Duration,
+    private_command: Duration,
+    list_command: Duration,
+    transfer_command: Duration,
+    rejection_write: Duration,
+}
+
+impl Default for LocalIpcTimeouts {
+    fn default() -> Self {
+        Self {
+            initial_frame: LOCAL_IPC_INITIAL_FRAME_TIMEOUT,
+            response_write: LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
+            ordinary_command: LOCAL_IPC_ORDINARY_COMMAND_TIMEOUT,
+            private_command: LOCAL_IPC_PRIVATE_COMMAND_TIMEOUT,
+            list_command: LOCAL_IPC_LIST_COMMAND_TIMEOUT,
+            transfer_command: LOCAL_IPC_TRANSFER_COMMAND_TIMEOUT,
+            rejection_write: LOCAL_IPC_REJECTION_WRITE_TIMEOUT,
+        }
+    }
+}
+
+async fn write_local_response<S>(
+    stream: &mut S,
+    value: &serde_json::Value,
+    deadline: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(deadline, write_value(stream, value))
+        .await
+        .context("timed out writing local IPC response")?
+}
+
+async fn command_response<F>(operation: F, deadline: Duration) -> serde_json::Value
+where
+    F: std::future::Future<Output = Result<serde_json::Value>>,
+{
+    match tokio::time::timeout(deadline, operation).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => serde_json::json!({
+            "type":"error", "code":"daemon_stopping", "message":error.to_string()
+        }),
+        Err(_) => serde_json::json!({
+            "type":"error", "code":"command_timeout",
+            "message":"local IPC command exceeded its deadline; its outcome may be unknown"
+        }),
+    }
+}
+
+async fn send_command(
+    commands: &mpsc::Sender<DaemonCommand>,
+    command: DaemonCommand,
+    response: oneshot::Receiver<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    commands.send(command).await?;
+    Ok(response.await?)
+}
+
+#[cfg(test)]
 async fn handle_local_client<S>(
-    mut stream: S,
+    stream: S,
     commands: mpsc::Sender<DaemonCommand>,
-    mut events: broadcast::Receiver<serde_json::Value>,
+    events: broadcast::Receiver<serde_json::Value>,
     connected: serde_json::Value,
     startup_peers: Option<serde_json::Value>,
     benchmark_busy: Arc<AtomicBool>,
@@ -1172,14 +1717,57 @@ async fn handle_local_client<S>(
 where
     S: SubscriptionStream,
 {
-    let frame = read_frame(&mut stream, MAX_IPC_REQUEST_SIZE).await?;
+    handle_local_client_with_timeouts(
+        stream,
+        commands,
+        events,
+        connected,
+        startup_peers,
+        benchmark_busy,
+        LocalIpcTimeouts::default(),
+    )
+    .await
+}
+
+async fn handle_local_client_with_timeouts<S>(
+    mut stream: S,
+    commands: mpsc::Sender<DaemonCommand>,
+    mut events: broadcast::Receiver<serde_json::Value>,
+    connected: serde_json::Value,
+    startup_peers: Option<serde_json::Value>,
+    benchmark_busy: Arc<AtomicBool>,
+    timeouts: LocalIpcTimeouts,
+) -> Result<()>
+where
+    S: SubscriptionStream,
+{
+    let frame = match tokio::time::timeout(
+        timeouts.initial_frame,
+        read_frame(&mut stream, MAX_IPC_REQUEST_SIZE),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = write_local_response(
+                &mut stream,
+                &serde_json::json!({
+                    "type":"error", "code":"initial_frame_timeout",
+                    "message":"initial local IPC request was not received before the deadline"
+                }),
+                timeouts.response_write,
+            )
+            .await;
+            return Ok(());
+        }
+    };
     let request: IpcRequest =
         serde_json::from_slice(&frame).context("invalid local IPC request")?;
     match request {
         IpcRequest::Subscribe => {
-            write_value(&mut stream, &connected).await?;
+            write_local_response(&mut stream, &connected, timeouts.response_write).await?;
             if let Some(snapshot) = startup_peers {
-                write_value(&mut stream, &snapshot).await?;
+                write_local_response(&mut stream, &snapshot, timeouts.response_write).await?;
             }
             let mut read_closed = false;
             loop {
@@ -1200,14 +1788,17 @@ where
                         }
                     }
                     value = events.recv() => match value {
-                        Ok(value) => write_value(&mut stream, &value).await?,
+                        Ok(value) => write_local_response(
+                            &mut stream, &value, timeouts.response_write
+                        ).await?,
                         Err(broadcast::error::RecvError::Lagged(count)) => {
-                            write_value(
+                            write_local_response(
                                 &mut stream,
                                 &serde_json::json!({
                                     "type":"lagged", "source":"local", "dropped":count,
                                     "message":format!("local listener missed {count} events")
                                 }),
+                                timeouts.response_write,
                             )
                             .await?;
                         }
@@ -1218,66 +1809,124 @@ where
         }
         IpcRequest::Send { body } => {
             let (reply, response) = oneshot::channel();
-            commands.send(DaemonCommand::Send { body, reply }).await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(&commands, DaemonCommand::Send { body, reply }, response),
+                timeouts.ordinary_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::PrivateSend { to, body } => {
             let (reply, response) = oneshot::channel();
-            commands
-                .send(DaemonCommand::PrivateSend { to, body, reply })
-                .await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(
+                    &commands,
+                    DaemonCommand::PrivateSend { to, body, reply },
+                    response,
+                ),
+                timeouts.private_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::BenchSend { config } => {
+            // The benchmark protocol has its own validated duration and cancellation
+            // path; progress writes are independently bounded below.
             handle_bench_send(&mut stream, &commands, config, benchmark_busy).await?;
         }
         IpcRequest::Status => {
             let (reply, response) = oneshot::channel();
-            commands.send(DaemonCommand::Status { reply }).await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(&commands, DaemonCommand::Status { reply }, response),
+                timeouts.ordinary_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::Peers => {
             let (reply, response) = oneshot::channel();
-            commands.send(DaemonCommand::Peers { reply }).await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(&commands, DaemonCommand::Peers { reply }, response),
+                timeouts.ordinary_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::Offers => {
             let (reply, response) = oneshot::channel();
-            commands.send(DaemonCommand::Offers { reply }).await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(&commands, DaemonCommand::Offers { reply }, response),
+                timeouts.list_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::Share { path } => {
             let (reply, response) = oneshot::channel();
-            commands.send(DaemonCommand::Share { path, reply }).await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(&commands, DaemonCommand::Share { path, reply }, response),
+                timeouts.transfer_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::Download { offer, output } => {
             let (reply, response) = oneshot::channel();
-            commands
-                .send(DaemonCommand::Download {
-                    offer,
-                    output,
-                    raw_export: false,
-                    reply,
-                })
-                .await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(
+                    &commands,
+                    DaemonCommand::Download {
+                        offer,
+                        output,
+                        raw_export: false,
+                        reply,
+                    },
+                    response,
+                ),
+                timeouts.transfer_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::WebDownload { offer, output } => {
             let (reply, response) = oneshot::channel();
-            commands
-                .send(DaemonCommand::Download {
-                    offer,
-                    output,
-                    raw_export: true,
-                    reply,
-                })
-                .await?;
-            write_value(&mut stream, &response.await?).await?;
+            let value = command_response(
+                send_command(
+                    &commands,
+                    DaemonCommand::Download {
+                        offer,
+                        output,
+                        raw_export: true,
+                        reply,
+                    },
+                    response,
+                ),
+                timeouts.transfer_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::Stop => {
-            write_value(&mut stream, &serde_json::json!({"type":"stopping"})).await?;
-            commands.send(DaemonCommand::Stop).await?;
+            // Reserve bounded queue capacity before acknowledging. Once `send`
+            // succeeds the daemon will stop even if the client disappears before
+            // reading the acknowledgement; before it succeeds, report not_started.
+            let response = match tokio::time::timeout(timeouts.ordinary_command, commands.reserve())
+                .await
+            {
+                Ok(Ok(permit)) => {
+                    permit.send(DaemonCommand::Stop);
+                    serde_json::json!({"type":"stopping", "outcome":"accepted"})
+                }
+                Ok(Err(_)) => serde_json::json!({
+                    "type":"error", "code":"daemon_stopping", "outcome":"not_started",
+                    "message":"stop command was not admitted because the daemon command channel is closed"
+                }),
+                Err(_) => serde_json::json!({
+                    "type":"error", "code":"command_timeout", "outcome":"not_started",
+                    "message":"stop command was not admitted before its deadline; the daemon was not stopped by this request"
+                }),
+            };
+            write_local_response(&mut stream, &response, timeouts.response_write).await?;
         }
     }
     Ok(())
@@ -1470,15 +2119,28 @@ fn try_admit_transfer(
         .map_err(|_| serde_json::json!({"type":"error", "code":busy_code, "message":busy_message}))
 }
 
-async fn share_attachment(
+struct ShareResources {
     store: Store,
     endpoint: Endpoint,
     secret: SecretKey,
+    topic: TopicId,
     sender: GossipSender,
     state_dir: PathBuf,
+}
+
+async fn share_attachment(
+    resources: ShareResources,
     path: PathBuf,
     max_attachment_bytes: u64,
 ) -> Result<serde_json::Value> {
+    let ShareResources {
+        store,
+        endpoint,
+        secret,
+        topic,
+        sender,
+        state_dir,
+    } = resources;
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
         .with_context(|| format!("inspect shared path {}", path.display()))?;
@@ -1536,7 +2198,16 @@ async fn share_attachment(
         };
         let body = attachment_body(&offer)?;
         let timestamp_ms = unix_timestamp_ms()?;
-        let encoded = Envelope::encode_at(&secret, body, timestamp_ms)?;
+        let encoded = Envelope::encode_at(
+            &secret,
+            topic,
+            EnvelopeKind::AttachmentOffer,
+            body,
+            timestamp_ms,
+        )?;
+        let message_id = Envelope::decode(&encoded, topic)
+            .expect("locally encoded attachment envelope must decode")
+            .message_id;
         store
             .tags()
             .set(tag_name.as_bytes(), imported.hash_and_format())
@@ -1555,8 +2226,9 @@ async fn share_attachment(
             .await
             .context("broadcast attachment offer after durable pin")?;
         Ok(serde_json::json!({
-            "type":"attachment_shared", "schema_version":1,
-            "from":secret.public().to_string(), "timestamp_ms":timestamp_ms,
+            "type":"attachment_shared", "schema_version":2,
+            "from":secret.public().to_string(),
+            "message_id":direct::id_string(&message_id), "timestamp_ms":timestamp_ms,
             "offer_id":offer.offer_id,
             "kind":offer.kind, "name":offer.name, "size":offer.size,
             "ticket":offer.ticket, "offer":BASE64URL_NOPAD.encode(&encoded),
@@ -1597,6 +2269,7 @@ fn validate_declared_attachment_size(declared_size: Option<u64>, actual_size: u6
 
 struct DownloadResources {
     store: Store,
+    topic: TopicId,
     downloader: Downloader,
     endpoint: Endpoint,
     lookup: MemoryLookup,
@@ -1612,6 +2285,7 @@ async fn download_attachment(
 ) -> Result<serde_json::Value> {
     let DownloadResources {
         store,
+        topic,
         downloader,
         endpoint,
         lookup,
@@ -1621,7 +2295,7 @@ async fn download_attachment(
         "output already exists: {}",
         output.display()
     );
-    let parsed_signed = parse_signed_offer_token(&offer_token);
+    let parsed_signed = parse_signed_offer_token(&offer_token, topic);
     let (offer, ticket, declared_size) = match parsed_signed {
         Ok((offer, ticket)) => {
             let declared_size = Some(offer.size);
@@ -1844,6 +2518,99 @@ fn peer_snapshot(
     )
 }
 
+async fn reject_local_client_at_capacity<S>(mut stream: S, write_timeout: Duration)
+where
+    S: AsyncWrite + Unpin,
+{
+    let _ = write_local_response(
+        &mut stream,
+        &serde_json::json!({
+            "type":"error", "code":"ipc_capacity",
+            "message":"local IPC connection capacity reached; retry later"
+        }),
+        write_timeout,
+    )
+    .await;
+}
+
+struct LocalClientSession {
+    commands: mpsc::Sender<DaemonCommand>,
+    events: broadcast::Receiver<serde_json::Value>,
+    connected: serde_json::Value,
+    startup_peers: Option<serde_json::Value>,
+    benchmark_busy: Arc<AtomicBool>,
+}
+
+async fn handle_admitted_local_client<S>(
+    stream: S,
+    session: LocalClientSession,
+    timeouts: LocalIpcTimeouts,
+    permit: OwnedSemaphorePermit,
+) -> Result<()>
+where
+    S: SubscriptionStream,
+{
+    let _permit = permit;
+    handle_local_client_with_timeouts(
+        stream,
+        session.commands,
+        session.events,
+        session.connected,
+        session.startup_peers,
+        session.benchmark_busy,
+        timeouts,
+    )
+    .await
+}
+
+/// Admit immediately after the platform listener has accepted/authenticated the
+/// stream. The preparation closure is deliberately invoked only after a permit
+/// is owned, so saturated clients cannot trigger snapshots, subscriptions, or
+/// other per-client state work.
+async fn admit_local_client<S, F>(
+    stream: S,
+    connection_limit: &Arc<Semaphore>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    timeouts: LocalIpcTimeouts,
+    prepare: F,
+) -> Result<bool>
+where
+    S: SubscriptionStream + Send + 'static,
+    F: FnOnce() -> Result<LocalClientSession>,
+{
+    let permit = match connection_limit.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            // Accept before rejecting so cooperative clients receive an
+            // explicit retryable result instead of an opaque connect error.
+            reject_local_client_at_capacity(stream, timeouts.rejection_write).await;
+            return Ok(false);
+        }
+    };
+    let session = prepare()?;
+    tasks.spawn(async move {
+        if let Err(error) = handle_admitted_local_client(stream, session, timeouts, permit).await {
+            if !is_local_disconnect(&error) {
+                eprintln!("local client error: {error:#}");
+            }
+        }
+    });
+    Ok(true)
+}
+
+async fn drain_local_client_tasks(tasks: &mut tokio::task::JoinSet<()>, grace: Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(_) => break,
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 fn emit_peer_transitions(
     transitions: impl IntoIterator<Item = PeerTransition>,
     events: &broadcast::Sender<serde_json::Value>,
@@ -1983,6 +2750,11 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
     let mut presence_cleanup = tokio::time::interval(PRESENCE_CLEANUP_INTERVAL);
     presence_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut presence_sources = PresenceSourceLimiter::default();
+    let mut envelope_replay = EnvelopeReplayCache::default();
+    let mut broadcast_sources = TransportSourceLimiter::default();
+    let mut broadcast_rejections = RejectionSampler::default();
+    let connection_limit = Arc::new(Semaphore::new(LOCAL_IPC_CONNECTION_CAPACITY));
+    let mut local_client_tasks = tokio::task::JoinSet::new();
     let mut transfer_tasks = tokio::task::JoinSet::new();
     let mut offer_list_tasks = tokio::task::JoinSet::new();
     let mut rejoin = tokio::time::interval(REJOIN_INTERVAL);
@@ -1992,42 +2764,56 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
         tokio::select! {
             accepted = listener.accept() => {
                 let stream = accepted?;
-                // Expiration is authoritative in the daemon. Emit it before
-                // capturing the new subscriber's snapshot so queued events are
-                // strictly later than that snapshot.
-                emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
-                let commands = command_tx.clone();
-                let events = event_tx.subscribe();
-                let generated_at_ms = unix_timestamp_ms()?;
-                let startup_peers = peer_snapshot(
-                    &node, &directory, &peer, alias_config.effective(), generated_at_ms,
-                    &directory_epoch, directory_revision,
-                );
-                let connected = serde_json::json!({
-                    "type":"connected", "peer":peer, "endpoint_online":true,
-                    "topic_joined":node.receiver.is_joined(),
-                    "alias":alias_config.effective(),
-                    "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY]
-                });
-                let benchmark_busy = benchmark_busy.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_local_client(
-                        stream, commands, events, connected, Some(startup_peers), benchmark_busy,
-                    ).await {
-                        if !is_local_disconnect(&error) {
-                            eprintln!("local client error: {error:#}");
-                        }
-                    }
-                });
+                // Admission is the first operation after the platform listener's
+                // accept/authentication. Everything in this closure—including
+                // cleanup, time lookup, snapshot construction, and subscription—
+                // runs only while this client owns a connection permit.
+                let _admitted = admit_local_client(
+                    stream,
+                    &connection_limit,
+                    &mut local_client_tasks,
+                    LocalIpcTimeouts::default(),
+                    || {
+                        // Expiration is authoritative in the daemon. Emit it before
+                        // capturing the new subscriber's snapshot so queued events
+                        // are strictly later than that snapshot.
+                        emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
+                        let generated_at_ms = unix_timestamp_ms()?;
+                        let startup_peers = peer_snapshot(
+                            &node, &directory, &peer, alias_config.effective(), generated_at_ms,
+                            &directory_epoch, directory_revision,
+                        );
+                        let connected = serde_json::json!({
+                            "type":"connected", "peer":peer, "endpoint_online":true,
+                            "topic_joined":node.receiver.is_joined(),
+                            "alias":alias_config.effective(),
+                            "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY]
+                        });
+                        Ok(LocalClientSession {
+                            commands: command_tx.clone(),
+                            events: event_tx.subscribe(),
+                            connected,
+                            startup_peers: Some(startup_peers),
+                            benchmark_busy: benchmark_busy.clone(),
+                        })
+                    },
+                ).await?;
             }
             command = command_rx.recv() => match command {
                 Some(DaemonCommand::Send { body, reply }) => {
                     let response = match unix_timestamp_ms() {
-                        Ok(timestamp_ms) => match Envelope::encode_at(&node.secret, body.clone(), timestamp_ms) {
-                            Ok(envelope) => match node.sender.broadcast(envelope).await {
-                                Ok(()) => queued_event(&peer, body, timestamp_ms),
-                                Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
-                            },
+                        Ok(timestamp_ms) => match Envelope::encode_at(
+                            &node.secret, topic, EnvelopeKind::Message, body.clone(), timestamp_ms,
+                        ) {
+                            Ok(envelope) => {
+                                let message_id = Envelope::decode(&envelope, topic)
+                                    .expect("locally encoded envelope must decode")
+                                    .message_id;
+                                match node.sender.broadcast(envelope).await {
+                                    Ok(()) => queued_event(&peer, message_id, body, timestamp_ms),
+                                    Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
+                                }
+                            }
                             Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
                         },
                         Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
@@ -2082,7 +2868,9 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                     });
                 }
                 Some(DaemonCommand::BenchMessage { body, timestamp_ms, cancel, reply }) => {
-                    match Envelope::encode_at(&node.secret, body, timestamp_ms) {
+                    match Envelope::encode_at(
+                        &node.secret, topic, EnvelopeKind::Message, body, timestamp_ms,
+                    ) {
                         Ok(envelope) => {
                             let encoded_bytes = envelope.len();
                             let sender = node.sender.clone();
@@ -2182,11 +2970,14 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                     transfer_tasks.spawn(async move {
                         let _permit = permit;
                         let response = match share_attachment(
-                            store,
-                            endpoint,
-                            secret,
-                            sender,
-                            state_dir,
+                            ShareResources {
+                                store,
+                                endpoint,
+                                secret,
+                                topic,
+                                sender,
+                                state_dir,
+                            },
                             path,
                             max_attachment_bytes,
                         ).await {
@@ -2221,6 +3012,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         let response = match download_attachment(
                             DownloadResources {
                                 store,
+                                topic,
                                 downloader,
                                 endpoint,
                                 lookup,
@@ -2258,7 +3050,14 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                             let _ = node.presence_sender.broadcast(record).await;
                         }
                     }
-                    let values = network_event(value);
+                    let values = network_event(
+                        value,
+                        topic,
+                        &mut envelope_replay,
+                        &mut broadcast_sources,
+                        &mut broadcast_rejections,
+                        unix_timestamp_ms()?,
+                    );
                     for full_value in values {
                         let _ = event_tx.send(full_value.clone());
                         event(json, suppress_message_body(full_value));
@@ -2318,6 +3117,11 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         .context("retry presence bootstrap peers after connectivity loss")?;
                 }
             },
+            completed = local_client_tasks.join_next(), if !local_client_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("local client task error: {error}");
+                }
+            },
             completed = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
                 if let Some(Err(error)) = completed {
                     eprintln!("attachment task error: {error}");
@@ -2332,14 +3136,20 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
         }
     }
 
+    // Stop admission and command submission first. Closing the event channel
+    // lets subscriptions finish naturally; cancelling work releases any pending
+    // command replies. Give handlers a short drain window before force-aborting.
+    connection_limit.close();
+    command_rx.close();
     transfer_limit.close();
     offer_list_limit.close();
     direct_limit.close();
+    drop(event_tx);
     transfer_tasks.abort_all();
     offer_list_tasks.abort_all();
     while transfer_tasks.join_next().await.is_some() {}
     while offer_list_tasks.join_next().await.is_some() {}
-    drop(event_tx);
+    drain_local_client_tasks(&mut local_client_tasks, LOCAL_IPC_SHUTDOWN_GRACE).await;
     node.router.shutdown().await?;
     Ok(())
 }
@@ -2368,6 +3178,9 @@ fn is_local_disconnect(error: &anyhow::Error) -> bool {
 }
 
 fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Value {
+    if envelope.kind == EnvelopeKind::Message {
+        return message_event(envelope);
+    }
     match parse_attachment_body(&envelope.body) {
         Ok(Some(offer)) => match offer.ticket.parse::<BlobTicket>() {
             Ok(ticket) if ticket.addr().id == envelope.from => {
@@ -2382,18 +3195,55 @@ fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Va
         },
         // The prefix predates typed attachments as valid signed message text.
         // Only a fully valid typed payload opts into attachment semantics.
-        Ok(None) | Err(_) => message_event(envelope),
+        Ok(None) | Err(_) => serde_json::json!({
+            "type":"error", "code":"invalid_attachment_offer",
+            "message":"attachment envelope does not contain a valid offer"
+        }),
     }
 }
 
-fn network_event(value: Event) -> Vec<serde_json::Value> {
+fn network_event(
+    value: Event,
+    topic: TopicId,
+    replay: &mut EnvelopeReplayCache,
+    sources: &mut TransportSourceLimiter,
+    rejections: &mut RejectionSampler,
+    now_ms: u64,
+) -> Vec<serde_json::Value> {
     match value {
-        Event::Received(message) => vec![match Envelope::decode(&message.content) {
-            Ok(envelope) => received_envelope_event(envelope, &message.content),
-            Err(error) => {
-                serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()})
+        Event::Received(message) => {
+            let source = message.delivered_from;
+            if !sources.allow(source, now_ms) {
+                return rejections
+                    .event(now_ms, "broadcast transport source rate limit exceeded")
+                    .into_iter()
+                    .collect();
             }
-        }],
+            match Envelope::decode(&message.content, topic).and_then(|envelope| {
+                replay.accept(&envelope, source, now_ms)?;
+                Ok(envelope)
+            }) {
+                Ok(envelope) => {
+                    let event = received_envelope_event(envelope, &message.content);
+                    if event["type"] == "error" {
+                        return rejections
+                            .event(
+                                now_ms,
+                                event["message"]
+                                    .as_str()
+                                    .unwrap_or("invalid broadcast message"),
+                            )
+                            .into_iter()
+                            .collect();
+                    }
+                    vec![event]
+                }
+                Err(error) => rejections
+                    .event(now_ms, &error.to_string())
+                    .into_iter()
+                    .collect(),
+            }
+        }
         Event::NeighborUp(peer) => {
             vec![serde_json::json!({"type":"peer_up", "peer":peer.to_string()})]
         }
@@ -2407,16 +3257,24 @@ fn network_event(value: Event) -> Vec<serde_json::Value> {
     }
 }
 
-fn queued_event(peer: &str, body: String, timestamp_ms: u64) -> serde_json::Value {
+fn queued_event(
+    peer: &str,
+    message_id: [u8; 16],
+    body: String,
+    timestamp_ms: u64,
+) -> serde_json::Value {
     serde_json::json!({
-        "type":"queued", "from":peer, "timestamp_ms":timestamp_ms, "body":body,
+        "type":"queued", "schema_version":2,
+        "from":peer, "message_id":direct::id_string(&message_id),
+        "timestamp_ms":timestamp_ms, "body":body,
         "delivery_acknowledged":false
     })
 }
 
 fn message_event(msg: Envelope) -> serde_json::Value {
     serde_json::json!({
-        "type":"message", "from":msg.from.to_string(),
+        "type":"message", "schema_version":2, "from":msg.from.to_string(),
+        "message_id":direct::id_string(&msg.message_id),
         "timestamp_ms":msg.timestamp_ms, "body":msg.body
     })
 }
@@ -2433,7 +3291,8 @@ fn private_message_event(msg: IncomingDirect) -> serde_json::Value {
 fn suppress_message_body(value: serde_json::Value) -> serde_json::Value {
     if value["type"] == "message" {
         return serde_json::json!({
-            "type":"message", "from":value["from"], "timestamp_ms":value["timestamp_ms"],
+            "type":"message", "from":value["from"], "message_id":value["message_id"],
+            "timestamp_ms":value["timestamp_ms"],
             "body_bytes":value["body"].as_str().map(str::len).unwrap_or(0), "body_suppressed":true
         });
     }
@@ -2448,7 +3307,8 @@ fn suppress_message_body(value: serde_json::Value) -> serde_json::Value {
     if value["type"] == "attachment_offer" {
         return serde_json::json!({
             "type":"attachment_offer", "from":value["from"],
-            "timestamp_ms":value["timestamp_ms"], "size":value["size"],
+            "message_id":value["message_id"], "timestamp_ms":value["timestamp_ms"],
+            "size":value["size"],
             "details_suppressed":true
         });
     }
@@ -2615,7 +3475,7 @@ pub async fn share(dir: &Path, path: &Path, json: bool) -> Result<()> {
             path: caller_path(path)?,
         },
         "attachment_shared",
-        Some(1),
+        Some(2),
     )
     .await?;
     event(json, value);
@@ -3622,6 +4482,24 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn test_topic() -> TopicId {
+        TopicId::from_bytes([7; 32])
+    }
+
+    fn unsigned_test_envelope(from: PublicKey, body: String, timestamp_ms: u64) -> Envelope {
+        Envelope {
+            domain: ENVELOPE_DOMAIN.to_owned(),
+            version: ENVELOPE_VERSION,
+            topic: test_topic(),
+            from,
+            message_id: [3; 16],
+            timestamp_ms,
+            kind: EnvelopeKind::Message,
+            body,
+            signature: ByteArray::new([0; SIGNATURE_LENGTH]),
+        }
+    }
+
     fn assert_object_keys(value: &serde_json::Value, expected: &[&str]) {
         let actual: std::collections::BTreeSet<_> = value
             .as_object()
@@ -3720,17 +4598,425 @@ mod tests {
     fn signed_attachment_offer_round_trips_and_rejects_tampering() {
         let secret = SecretKey::generate();
         let offer = sample_offer(secret.public());
-        let encoded = Envelope::encode_at(&secret, attachment_body(&offer).unwrap(), 42).unwrap();
+        let encoded = Envelope::encode_at(
+            &secret,
+            test_topic(),
+            EnvelopeKind::AttachmentOffer,
+            attachment_body(&offer).unwrap(),
+            42,
+        )
+        .unwrap();
         let token = BASE64URL_NOPAD.encode(&encoded);
 
-        let (decoded, ticket) = parse_signed_offer_token(&token).unwrap();
+        let (decoded, ticket) = parse_signed_offer_token(&token, test_topic()).unwrap();
         assert_eq!(decoded, offer);
         assert_eq!(ticket.addr().id, secret.public());
 
         let mut tampered = encoded.to_vec();
         let last = tampered.last_mut().unwrap();
         *last ^= 1;
-        assert!(parse_signed_offer_token(&BASE64URL_NOPAD.encode(&tampered)).is_err());
+        assert!(
+            parse_signed_offer_token(&BASE64URL_NOPAD.encode(&tampered), test_topic()).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_signed_attachment_tokens_are_rejected_with_migration_guidance() {
+        let secret = SecretKey::generate();
+        let body = attachment_body(&sample_offer(secret.public())).unwrap();
+        let timestamp_ms = 42;
+        let signed = postcard::to_stdvec(&(secret.public(), timestamp_ms, &body)).unwrap();
+        let legacy = LegacyEnvelopeV1 {
+            from: secret.public(),
+            timestamp_ms,
+            body,
+            signature: ByteArray::new(secret.sign(&signed).to_bytes()),
+        };
+        let token = BASE64URL_NOPAD.encode(&postcard::to_stdvec(&legacy).unwrap());
+
+        let error = parse_signed_offer_token(&token, test_topic()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "legacy signed attachment offers are not accepted because they are not topic-bound; ask the sender to share the attachment again"
+        );
+    }
+
+    #[test]
+    fn envelope_v2_is_topic_bound_and_replay_and_time_bounded() {
+        let secret = SecretKey::generate();
+        let topic = test_topic();
+        let other_topic = TopicId::from_bytes([8; 32]);
+        let now_ms = 1_700_000_000_000;
+        let encoded = Envelope::encode_at(
+            &secret,
+            topic,
+            EnvelopeKind::Message,
+            "hello".to_owned(),
+            now_ms,
+        )
+        .unwrap();
+
+        assert!(Envelope::decode(&encoded, other_topic).is_err());
+        let envelope = Envelope::decode(&encoded, topic).unwrap();
+        assert_eq!(envelope.domain, ENVELOPE_DOMAIN);
+        assert_eq!(envelope.version, ENVELOPE_VERSION);
+        assert_eq!(envelope.topic, topic);
+        assert_eq!(envelope.kind, EnvelopeKind::Message);
+
+        let mut altered = envelope.clone();
+        altered.topic = other_topic;
+        assert!(Envelope::decode(&postcard::to_stdvec(&altered).unwrap(), other_topic).is_err());
+        let mut altered = envelope.clone();
+        altered.message_id[0] ^= 1;
+        assert!(Envelope::decode(&postcard::to_stdvec(&altered).unwrap(), topic).is_err());
+        let mut altered = envelope.clone();
+        altered.kind = EnvelopeKind::AttachmentOffer;
+        assert!(Envelope::decode(&postcard::to_stdvec(&altered).unwrap(), topic).is_err());
+
+        let mut replay = EnvelopeReplayCache::default();
+        replay.accept(&envelope, envelope.from, now_ms).unwrap();
+        assert!(replay.accept(&envelope, envelope.from, now_ms).is_err());
+
+        let stale = Envelope::decode(
+            &Envelope::encode_at(
+                &secret,
+                topic,
+                EnvelopeKind::Message,
+                "stale".to_owned(),
+                now_ms - ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 - 1,
+            )
+            .unwrap(),
+            topic,
+        )
+        .unwrap();
+        assert!(EnvelopeReplayCache::default()
+            .accept(&stale, stale.from, now_ms)
+            .is_err());
+
+        let future = Envelope::decode(
+            &Envelope::encode_at(
+                &secret,
+                topic,
+                EnvelopeKind::Message,
+                "future".to_owned(),
+                now_ms + ENVELOPE_FUTURE_SKEW.as_millis() as u64 + 1,
+            )
+            .unwrap(),
+            topic,
+        )
+        .unwrap();
+        assert!(EnvelopeReplayCache::default()
+            .accept(&future, future.from, now_ms)
+            .is_err());
+    }
+
+    #[test]
+    fn replay_is_rejected_through_the_exact_bucket_and_freshness_boundary() {
+        let secret = SecretKey::generate();
+        let bucket_start_ms = 1_700_000_040_000;
+        let inserted_at_ms = bucket_start_ms + REPLAY_BUCKET_WIDTH.as_millis() as u64 - 1;
+        let envelope = unsigned_test_envelope(
+            secret.public(),
+            "message".to_owned(),
+            inserted_at_ms + ENVELOPE_FUTURE_SKEW.as_millis() as u64,
+        );
+        let final_fresh_ms = envelope.timestamp_ms + ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64;
+        assert_eq!(
+            final_fresh_ms,
+            bucket_start_ms + REPLAY_BUCKET_RETENTION.as_millis() as u64 - 1
+        );
+        let mut replay = EnvelopeReplayCache::default();
+        replay
+            .accept(&envelope, envelope.from, inserted_at_ms)
+            .unwrap();
+
+        for minutes in 1..=5 {
+            let now_ms = inserted_at_ms + minutes * REPLAY_BUCKET_WIDTH.as_millis() as u64;
+            assert_eq!(
+                replay
+                    .accept(&envelope, envelope.from, now_ms)
+                    .unwrap_err()
+                    .to_string(),
+                "replayed message"
+            );
+        }
+        assert_eq!(
+            replay
+                .accept(&envelope, envelope.from, final_fresh_ms)
+                .unwrap_err()
+                .to_string(),
+            "replayed message"
+        );
+        assert_eq!(
+            replay
+                .accept(&envelope, envelope.from, final_fresh_ms + 1)
+                .unwrap_err()
+                .to_string(),
+            "message timestamp is outside the acceptance window"
+        );
+        assert_eq!(replay.live_ids, 0);
+    }
+
+    #[test]
+    fn replay_buckets_expire_only_after_the_complete_retention_period() {
+        let secret = SecretKey::generate();
+        let base_ms = 1_700_000_040_000;
+        let mut envelope = unsigned_test_envelope(secret.public(), "message".to_owned(), base_ms);
+        let mut replay = EnvelopeReplayCache::default();
+        replay.accept(&envelope, envelope.from, base_ms).unwrap();
+        let just_before_expiry = base_ms + REPLAY_BUCKET_RETENTION.as_millis() as u64 - 1;
+        replay.rotate(just_before_expiry);
+        assert_eq!(replay.live_ids, 1);
+
+        let expiry = base_ms + REPLAY_BUCKET_RETENTION.as_millis() as u64;
+        replay.rotate(expiry);
+        assert_eq!(replay.live_ids, 0);
+        assert!(replay.buckets.is_empty());
+        envelope.timestamp_ms = expiry;
+        replay.accept(&envelope, envelope.from, expiry).unwrap();
+    }
+
+    #[test]
+    fn per_sender_rate_limit_and_quota_isolate_other_senders() {
+        let abusive = SecretKey::generate();
+        let other = SecretKey::generate();
+        let now_ms = 1_700_000_040_000;
+        let mut replay = EnvelopeReplayCache::default();
+        let mut envelope = unsigned_test_envelope(abusive.public(), "message".to_owned(), now_ms);
+        for index in 0..PER_SENDER_REPLAY_BURST {
+            envelope.message_id = u128::from(index).to_le_bytes();
+            replay.accept(&envelope, envelope.from, now_ms).unwrap();
+        }
+        envelope.message_id = u128::from(PER_SENDER_REPLAY_BURST).to_le_bytes();
+        assert_eq!(
+            replay
+                .accept(&envelope, envelope.from, now_ms)
+                .unwrap_err()
+                .to_string(),
+            "sender message rate limit exceeded"
+        );
+
+        let mut other_envelope = unsigned_test_envelope(other.public(), "other".to_owned(), now_ms);
+        replay
+            .accept(&other_envelope, other_envelope.from, now_ms)
+            .unwrap();
+
+        replay.senders.get_mut(&abusive.public()).unwrap().live_ids = MAX_REPLAY_IDS_PER_SENDER;
+        envelope.timestamp_ms += 10;
+        envelope.message_id = u128::from(PER_SENDER_REPLAY_BURST + 1).to_le_bytes();
+        assert_eq!(
+            replay
+                .accept(&envelope, envelope.from, now_ms + 10)
+                .unwrap_err()
+                .to_string(),
+            "sender replay quota reached"
+        );
+        other_envelope.timestamp_ms += 10;
+        other_envelope.message_id[0] ^= 1;
+        replay
+            .accept(&other_envelope, other_envelope.from, now_ms + 10)
+            .unwrap();
+    }
+
+    #[test]
+    fn authenticated_transport_source_bounds_sender_key_rotation() {
+        let source = SecretKey::generate().public();
+        let other_source = SecretKey::generate().public();
+        let now_ms = 1_700_000_040_000;
+        let mut replay = EnvelopeReplayCache::default();
+        for index in 0..MAX_REPLAY_SENDERS_PER_SOURCE {
+            let mut envelope = unsigned_test_envelope(
+                SecretKey::generate().public(),
+                "rotated".to_owned(),
+                now_ms,
+            );
+            envelope.message_id = (index as u128).to_le_bytes();
+            replay.accept(&envelope, source, now_ms).unwrap();
+        }
+        let rotated = unsigned_test_envelope(
+            SecretKey::generate().public(),
+            "one too many".to_owned(),
+            now_ms,
+        );
+        assert_eq!(
+            replay
+                .accept(&rotated, source, now_ms)
+                .unwrap_err()
+                .to_string(),
+            "transport source sender quota reached"
+        );
+        replay.accept(&rotated, other_source, now_ms).unwrap();
+    }
+
+    #[test]
+    fn transport_limiter_precedes_decode_and_rejection_events_are_sampled() {
+        let source = SecretKey::generate().public();
+        let now_ms = 1_700_000_040_000;
+        let mut sources = TransportSourceLimiter::default();
+        for _ in 0..TRANSPORT_SOURCE_BURST {
+            assert!(sources.allow(source, now_ms));
+        }
+        let mut replay = EnvelopeReplayCache::default();
+        let mut sampler = RejectionSampler::default();
+        let values = network_event(
+            Event::Received(iroh_gossip::api::Message {
+                content: Bytes::from_static(b"not an envelope"),
+                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                delivered_from: source,
+            }),
+            test_topic(),
+            &mut replay,
+            &mut sources,
+            &mut sampler,
+            now_ms,
+        );
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["rate_limited"], true);
+        assert_eq!(
+            values[0]["message"],
+            "broadcast transport source rate limit exceeded"
+        );
+        assert_eq!(replay.live_ids, 0);
+
+        for _ in 0..100 {
+            assert!(sampler.event(now_ms + 1, "rejected").is_none());
+        }
+        let sampled = sampler
+            .event(
+                now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64,
+                "rejected",
+            )
+            .unwrap();
+        assert_eq!(sampled["suppressed_since_last"], 100);
+    }
+
+    #[test]
+    fn transport_source_limiter_isolates_sources_and_bounds_source_rotation() {
+        let now_ms = 1_700_000_040_000;
+        let abusive = SecretKey::generate().public();
+        let other = SecretKey::generate().public();
+        let mut limiter = TransportSourceLimiter::default();
+        for _ in 0..TRANSPORT_SOURCE_BURST {
+            assert!(limiter.allow(abusive, now_ms));
+        }
+        assert!(!limiter.allow(abusive, now_ms));
+        assert!(limiter.allow(other, now_ms));
+
+        let mut source_limited = TransportSourceLimiter::default();
+        for _ in 0..MAX_TRANSPORT_SOURCES {
+            assert!(source_limited.allow(SecretKey::generate().public(), now_ms));
+        }
+        assert!(!source_limited.allow(SecretKey::generate().public(), now_ms));
+        assert!(source_limited.allow(
+            SecretKey::generate().public(),
+            now_ms + TRANSPORT_SOURCE_IDLE_LIFETIME.as_millis() as u64
+        ));
+    }
+
+    #[test]
+    fn global_pressure_rejects_without_evicting_live_replay_ids() {
+        let now_ms = 1_700_000_040_000;
+        let secrets: Vec<_> = (0..10).map(|_| SecretKey::generate()).collect();
+        let mut replay = EnvelopeReplayCache::default();
+        let mut first = None;
+        for index in 0..GLOBAL_REPLAY_BURST {
+            let secret = &secrets[index as usize % secrets.len()];
+            let mut envelope =
+                unsigned_test_envelope(secret.public(), "message".to_owned(), now_ms);
+            envelope.message_id = u128::from(index).to_le_bytes();
+            replay.accept(&envelope, envelope.from, now_ms).unwrap();
+            first.get_or_insert(envelope);
+        }
+        let mut next =
+            unsigned_test_envelope(SecretKey::generate().public(), "next".to_owned(), now_ms);
+        assert_eq!(
+            replay
+                .accept(&next, next.from, now_ms)
+                .unwrap_err()
+                .to_string(),
+            "global message rate limit exceeded"
+        );
+        assert_eq!(
+            replay
+                .accept(
+                    first.as_ref().unwrap(),
+                    first.as_ref().unwrap().from,
+                    now_ms,
+                )
+                .unwrap_err()
+                .to_string(),
+            "replayed message"
+        );
+
+        next.timestamp_ms += 1;
+        replay.accept(&next, next.from, now_ms + 1).unwrap();
+
+        let mut capacity_limited = EnvelopeReplayCache {
+            max_live_ids: 3,
+            ..EnvelopeReplayCache::default()
+        };
+        let source = SecretKey::generate().public();
+        let mut retained = unsigned_test_envelope(
+            SecretKey::generate().public(),
+            "retained".to_owned(),
+            now_ms,
+        );
+        for id in 0..3_u128 {
+            retained.message_id = id.to_le_bytes();
+            capacity_limited.accept(&retained, source, now_ms).unwrap();
+        }
+        let first_retained = {
+            let mut value = retained.clone();
+            value.message_id = 0_u128.to_le_bytes();
+            value
+        };
+        retained.message_id = 3_u128.to_le_bytes();
+        assert_eq!(
+            capacity_limited
+                .accept(&retained, source, now_ms)
+                .unwrap_err()
+                .to_string(),
+            "global replay capacity reached"
+        );
+        assert_eq!(capacity_limited.live_ids, 3);
+        assert_eq!(
+            capacity_limited
+                .accept(&first_retained, source, now_ms)
+                .unwrap_err()
+                .to_string(),
+            "replayed message"
+        );
+    }
+
+    #[test]
+    fn token_bucket_and_timestamp_boundaries_are_inclusive_and_exact() {
+        assert_eq!(MAX_REPLAY_IDS_PER_SENDER, 42_200);
+        assert_eq!(MAX_ENVELOPE_REPLAY_ENTRIES, 422_000);
+        let secret = SecretKey::generate();
+        let now_ms = 1_700_000_040_000;
+        let mut replay = EnvelopeReplayCache::default();
+        let mut envelope = unsigned_test_envelope(
+            secret.public(),
+            "oldest".to_owned(),
+            now_ms - ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64,
+        );
+        replay.accept(&envelope, envelope.from, now_ms).unwrap();
+        envelope.message_id[0] ^= 1;
+        envelope.timestamp_ms = now_ms + ENVELOPE_FUTURE_SKEW.as_millis() as u64;
+        replay.accept(&envelope, envelope.from, now_ms).unwrap();
+
+        let mut limiter = TokenBucket::new(100, 1, now_ms);
+        assert!(limiter.available());
+        limiter.consume();
+        limiter.refill(now_ms + 9);
+        assert!(!limiter.available());
+        limiter.refill(now_ms + 10);
+        assert!(limiter.available());
+    }
+
+    #[test]
+    fn broadcast_v2_uses_an_explicitly_new_gossip_protocol() {
+        assert_ne!(BROADCAST_ALPN_V2, iroh_gossip::net::GOSSIP_ALPN);
     }
 
     #[test]
@@ -3738,9 +5024,15 @@ mod tests {
         let signer = SecretKey::generate();
         let other = SecretKey::generate();
         let mismatched = sample_offer(other.public());
-        let encoded =
-            Envelope::encode_at(&signer, attachment_body(&mismatched).unwrap(), 42).unwrap();
-        assert!(parse_signed_offer_token(&BASE64URL_NOPAD.encode(&encoded)).is_err());
+        let encoded = Envelope::encode_at(
+            &signer,
+            test_topic(),
+            EnvelopeKind::AttachmentOffer,
+            attachment_body(&mismatched).unwrap(),
+            42,
+        )
+        .unwrap();
+        assert!(parse_signed_offer_token(&BASE64URL_NOPAD.encode(&encoded), test_topic()).is_err());
 
         let version = postcard::to_stdvec(&AttachmentWire {
             version: ATTACHMENT_OFFER_VERSION + 1,
@@ -3764,8 +5056,15 @@ mod tests {
     fn ordinary_and_malformed_prefixed_signed_text_remain_messages() {
         let secret = SecretKey::generate();
         for body in ["legacy text", "meshmsg-attachment-v1:not-an-offer"] {
-            let encoded = Envelope::encode_at(&secret, body.to_owned(), 42).unwrap();
-            let envelope = Envelope::decode(&encoded).unwrap();
+            let encoded = Envelope::encode_at(
+                &secret,
+                test_topic(),
+                EnvelopeKind::Message,
+                body.to_owned(),
+                42,
+            )
+            .unwrap();
+            let envelope = Envelope::decode(&encoded, test_topic()).unwrap();
             let event = received_envelope_event(envelope, &encoded);
             assert_eq!(event["type"], "message");
             assert_eq!(event["body"], body);
@@ -3789,11 +5088,34 @@ mod tests {
         let timestamp_ms = 1_700_000_000_000;
         let largest_body = (0..=MAX_ENVELOPE_SIZE)
             .rev()
-            .find(|length| Envelope::encode_at(&secret, "a".repeat(*length), timestamp_ms).is_ok())
+            .find(|length| {
+                Envelope::encode_at(
+                    &secret,
+                    test_topic(),
+                    EnvelopeKind::Message,
+                    "a".repeat(*length),
+                    timestamp_ms,
+                )
+                .is_ok()
+            })
             .expect("an empty message must fit");
-        let encoded = Envelope::encode_at(&secret, "a".repeat(largest_body), timestamp_ms).unwrap();
+        let encoded = Envelope::encode_at(
+            &secret,
+            test_topic(),
+            EnvelopeKind::Message,
+            "a".repeat(largest_body),
+            timestamp_ms,
+        )
+        .unwrap();
         assert_eq!(encoded.len(), MAX_ENVELOPE_SIZE);
-        assert!(Envelope::encode_at(&secret, "a".repeat(largest_body + 1), timestamp_ms).is_err());
+        assert!(Envelope::encode_at(
+            &secret,
+            test_topic(),
+            EnvelopeKind::Message,
+            "a".repeat(largest_body + 1),
+            timestamp_ms,
+        )
+        .is_err());
     }
 
     #[test]
@@ -3829,7 +5151,14 @@ mod tests {
             .find(|payload_bytes| {
                 let body =
                     build_bench_body(run_id, 0, 1, 9_999_999_999_999, *payload_bytes).unwrap();
-                Envelope::encode_at(&secret, body, 9_999_999_999_999).is_ok()
+                Envelope::encode_at(
+                    &secret,
+                    test_topic(),
+                    EnvelopeKind::Message,
+                    body,
+                    9_999_999_999_999,
+                )
+                .is_ok()
             })
             .unwrap();
         let config = BenchConfig {
@@ -4289,38 +5618,37 @@ mod tests {
         let secret = SecretKey::generate();
         let timestamp_ms = 1_700_000_000_000;
         let body = "a".repeat(MAX_ENVELOPE_SIZE);
-        let signed = postcard::to_stdvec(&(secret.public(), timestamp_ms, &body)).unwrap();
-        let envelope = Envelope {
-            from: secret.public(),
-            timestamp_ms,
-            body,
-            signature: ByteArray::new(secret.sign(&signed).to_bytes()),
-        };
+        let envelope = unsigned_test_envelope(secret.public(), body, timestamp_ms);
         let encoded = postcard::to_stdvec(&envelope).unwrap();
         assert!(encoded.len() > MAX_ENVELOPE_SIZE);
-        assert!(Envelope::decode(&encoded).is_err());
+        assert!(Envelope::decode(&encoded, test_topic()).is_err());
     }
 
     #[test]
     fn decode_rejects_trailing_bytes() {
         let secret = SecretKey::generate();
-        let mut encoded = Envelope::encode_at(&secret, "hello".to_owned(), 42)
-            .unwrap()
-            .to_vec();
+        let mut encoded = Envelope::encode_at(
+            &secret,
+            test_topic(),
+            EnvelopeKind::Message,
+            "hello".to_owned(),
+            42,
+        )
+        .unwrap()
+        .to_vec();
         encoded.push(0);
 
-        assert!(Envelope::decode(&encoded).is_err());
+        assert!(Envelope::decode(&encoded, test_topic()).is_err());
     }
 
     #[test]
     fn daemon_log_message_event_suppresses_body_but_keeps_metadata() {
         let secret = SecretKey::generate();
-        let value = suppress_message_body(message_event(Envelope {
-            from: secret.public(),
-            timestamp_ms: 42,
-            body: "private text".to_owned(),
-            signature: ByteArray::new([0; SIGNATURE_LENGTH]),
-        }));
+        let value = suppress_message_body(message_event(unsigned_test_envelope(
+            secret.public(),
+            "private text".to_owned(),
+            42,
+        )));
         assert_eq!(value["timestamp_ms"], 42);
         assert_eq!(value["body_bytes"], 12);
         assert_eq!(value["body_suppressed"], true);
@@ -4341,14 +5669,27 @@ mod tests {
 
     #[test]
     fn queued_event_has_canonical_send_metadata_and_does_not_claim_delivery() {
-        let value = queued_event("peer", "hello".to_owned(), 1_700_000_000_000);
+        let value = queued_event("peer", [4; 16], "hello".to_owned(), 1_700_000_000_000);
 
         assert_eq!(value["type"], "queued");
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["message_id"], "04040404040404040404040404040404");
         assert_eq!(value["from"], "peer");
         assert_eq!(value["body"], "hello");
         assert_eq!(value["timestamp_ms"], 1_700_000_000_000_u64);
         assert_eq!(value["delivery_acknowledged"], false);
-        assert!(value.get("sent").is_none());
+        assert_object_keys(
+            &value,
+            &[
+                "type",
+                "schema_version",
+                "from",
+                "message_id",
+                "timestamp_ms",
+                "body",
+                "delivery_acknowledged",
+            ],
+        );
     }
 
     #[test]
@@ -4511,14 +5852,22 @@ mod tests {
         let timestamp_ms = 1_700_000_000_000;
         let largest_body = (0..=MAX_ENVELOPE_SIZE)
             .rev()
-            .find(|length| Envelope::encode_at(&secret, "\0".repeat(*length), timestamp_ms).is_ok())
+            .find(|length| {
+                Envelope::encode_at(
+                    &secret,
+                    test_topic(),
+                    EnvelopeKind::Message,
+                    "\0".repeat(*length),
+                    timestamp_ms,
+                )
+                .is_ok()
+            })
             .unwrap();
-        let value = message_event(Envelope {
-            from: secret.public(),
+        let value = message_event(unsigned_test_envelope(
+            secret.public(),
+            "\0".repeat(largest_body),
             timestamp_ms,
-            body: "\0".repeat(largest_body),
-            signature: ByteArray::new([0; SIGNATURE_LENGTH]),
-        });
+        ));
         assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_IPC_EVENT_SIZE);
     }
 
@@ -4953,6 +6302,352 @@ mod tests {
 
         drop(events);
         task.await.unwrap().unwrap();
+    }
+
+    fn short_ipc_timeouts() -> LocalIpcTimeouts {
+        LocalIpcTimeouts {
+            initial_frame: Duration::from_millis(40),
+            response_write: Duration::from_millis(100),
+            ordinary_command: Duration::from_millis(40),
+            private_command: Duration::from_millis(60),
+            list_command: Duration::from_millis(60),
+            transfer_command: Duration::from_millis(80),
+            rejection_write: Duration::from_millis(20),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_and_admit_test_client(
+        listener: &mut LocalListener,
+        dir: &Path,
+        limit: &Arc<Semaphore>,
+        tasks: &mut tokio::task::JoinSet<()>,
+        commands: &mpsc::Sender<DaemonCommand>,
+        events: &broadcast::Sender<serde_json::Value>,
+        preparations: &Arc<std::sync::atomic::AtomicUsize>,
+        timeouts: LocalIpcTimeouts,
+    ) -> (LocalClientStream, bool) {
+        // Named pipes require the server connect future to be polled while the
+        // client opens; Unix sockets exercise the same production listener API.
+        let (server, client) = tokio::join!(listener.accept(), connect_daemon(dir));
+        let admitted = admit_local_client(server.unwrap(), limit, tasks, timeouts, || {
+            preparations.fetch_add(1, Ordering::SeqCst);
+            Ok(LocalClientSession {
+                commands: commands.clone(),
+                events: events.subscribe(),
+                connected: serde_json::json!({"type":"connected"}),
+                startup_peers: None,
+                benchmark_busy: Arc::new(AtomicBool::new(false)),
+            })
+        })
+        .await
+        .unwrap();
+        (client.unwrap(), admitted)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn platform_listener_enforces_capacity_skips_saturated_preparation_and_recovers() {
+        let dir =
+            std::env::temp_dir().join(format!("meshmsg-ipc-capacity-{}", rand::random::<u64>()));
+        let state_lock = StateLock::acquire(&dir).unwrap();
+        let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
+        let limit = Arc::new(Semaphore::new(LOCAL_IPC_CONNECTION_CAPACITY));
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut timeouts = short_ipc_timeouts();
+        timeouts.initial_frame = Duration::from_secs(5);
+        let mut clients = Vec::new();
+
+        for _ in 0..LOCAL_IPC_CONNECTION_CAPACITY {
+            let (client, admitted) = accept_and_admit_test_client(
+                &mut listener,
+                &dir,
+                &limit,
+                &mut tasks,
+                &commands,
+                &events,
+                &preparations,
+                timeouts,
+            )
+            .await;
+            assert!(admitted);
+            clients.push(client);
+        }
+        assert_eq!(limit.available_permits(), 0);
+
+        let (mut rejected, admitted) = accept_and_admit_test_client(
+            &mut listener,
+            &dir,
+            &limit,
+            &mut tasks,
+            &commands,
+            &events,
+            &preparations,
+            timeouts,
+        )
+        .await;
+        assert!(!admitted);
+        assert_eq!(
+            preparations.load(Ordering::SeqCst),
+            LOCAL_IPC_CONNECTION_CAPACITY,
+            "saturated client unexpectedly ran per-client preparation"
+        );
+        let frame = read_frame(&mut rejected, MAX_IPC_EVENT_SIZE).await.unwrap();
+        let rejection: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(rejection["code"], "ipc_capacity");
+        assert_eq!(tasks.len(), LOCAL_IPC_CONNECTION_CAPACITY);
+
+        tokio::time::timeout(Duration::from_secs(7), async {
+            while !tasks.is_empty() {
+                tasks.join_next().await.unwrap().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(limit.available_permits(), LOCAL_IPC_CONNECTION_CAPACITY);
+        let timeout_frame = read_frame(&mut clients[0], MAX_IPC_EVENT_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&timeout_frame).unwrap()["code"],
+            "initial_frame_timeout"
+        );
+
+        let (mut recovered, admitted) = accept_and_admit_test_client(
+            &mut listener,
+            &dir,
+            &limit,
+            &mut tasks,
+            &commands,
+            &events,
+            &preparations,
+            short_ipc_timeouts(),
+        )
+        .await;
+        assert!(admitted);
+        assert_eq!(
+            preparations.load(Ordering::SeqCst),
+            LOCAL_IPC_CONNECTION_CAPACITY + 1
+        );
+        write_request(&mut recovered, &IpcRequest::Status)
+            .await
+            .unwrap();
+        let DaemonCommand::Status { reply } = command_rx.recv().await.unwrap() else {
+            panic!("expected recovered status command")
+        };
+        reply.send(serde_json::json!({"type":"status"})).unwrap();
+        read_frame(&mut recovered, MAX_IPC_EVENT_SIZE)
+            .await
+            .unwrap();
+        tasks.join_next().await.unwrap().unwrap();
+
+        drop(clients);
+        drop(rejected);
+        drop(recovered);
+        drop(listener);
+        drop(guard);
+        drop(state_lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_acknowledges_only_after_command_admission() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (_events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client_with_timeouts(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            short_ipc_timeouts(),
+        ));
+        write_request(&mut client, &IpcRequest::Stop).await.unwrap();
+        assert!(matches!(command_rx.recv().await, Some(DaemonCommand::Stop)));
+        let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["type"], "stopping");
+        assert_eq!(response["outcome"], "accepted");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_stop_queue_returns_not_started_without_false_success() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (commands, mut command_rx) = mpsc::channel(1);
+        commands.send(DaemonCommand::Stop).await.unwrap();
+        let (_events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client_with_timeouts(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            short_ipc_timeouts(),
+        ));
+        write_request(&mut client, &IpcRequest::Stop).await.unwrap();
+        let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["code"], "command_timeout");
+        assert_eq!(response["outcome"], "not_started");
+        assert!(matches!(command_rx.try_recv(), Ok(DaemonCommand::Stop)));
+        assert!(command_rx.try_recv().is_err());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_stop_channel_returns_not_started_without_false_success() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (commands, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        let (_events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client_with_timeouts(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            short_ipc_timeouts(),
+        ));
+        write_request(&mut client, &IpcRequest::Stop).await.unwrap();
+        let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["code"], "daemon_stopping");
+        assert_eq!(response["outcome"], "not_started");
+        task.await.unwrap().unwrap();
+    }
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_capacity_rejection_write_is_bounded() {
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            reject_local_client_at_capacity(PendingWriter, Duration::from_millis(20)),
+        )
+        .await
+        .expect("capacity rejection write did not respect its bound");
+    }
+
+    #[tokio::test]
+    async fn ordinary_command_deadline_returns_error_and_releases_handler() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (_events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client_with_timeouts(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            short_ipc_timeouts(),
+        ));
+        write_request(&mut client, &IpcRequest::Status)
+            .await
+            .unwrap();
+        let pending = command_rx.recv().await.unwrap();
+        let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["code"], "command_timeout");
+        assert!(response["message"].as_str().unwrap().contains("unknown"));
+        drop(pending);
+        task.await.unwrap().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn platform_listener_shutdown_drains_and_aborts_handlers() {
+        let dir = std::env::temp_dir().join(format!("meshmsg-ipc-drain-{}", rand::random::<u64>()));
+        let state_lock = StateLock::acquire(&dir).unwrap();
+        let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
+        let limit = Arc::new(Semaphore::new(2));
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut long_timeouts = short_ipc_timeouts();
+        long_timeouts.initial_frame = Duration::from_secs(60);
+
+        let (mut subscriber, admitted) = accept_and_admit_test_client(
+            &mut listener,
+            &dir,
+            &limit,
+            &mut tasks,
+            &commands,
+            &events,
+            &preparations,
+            long_timeouts,
+        )
+        .await;
+        assert!(admitted);
+        write_request(&mut subscriber, &IpcRequest::Subscribe)
+            .await
+            .unwrap();
+        read_frame(&mut subscriber, MAX_IPC_EVENT_SIZE)
+            .await
+            .unwrap();
+        let (idle, admitted) = accept_and_admit_test_client(
+            &mut listener,
+            &dir,
+            &limit,
+            &mut tasks,
+            &commands,
+            &events,
+            &preparations,
+            long_timeouts,
+        )
+        .await;
+        assert!(admitted);
+
+        limit.close();
+        command_rx.close();
+        drop(events);
+        drain_local_client_tasks(&mut tasks, Duration::from_millis(50)).await;
+        assert!(tasks.is_empty());
+        assert!(limit.clone().try_acquire_owned().is_err());
+        assert_eq!(Arc::strong_count(&limit), 1);
+
+        drop(idle);
+        drop(subscriber);
+        drop(listener);
+        drop(guard);
+        drop(state_lock);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

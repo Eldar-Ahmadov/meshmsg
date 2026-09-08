@@ -71,7 +71,7 @@ Blob data and named pins live under `blobs-v1/<node-public-key>` in the state di
 
 A signed offer authenticates the provider and advertised metadata. The BLAKE3 content hash verifies downloaded bytes. Neither provides confidentiality: offers are reusable capabilities to fetch plaintext from the named provider, and attachment content is not end-to-end encrypted.
 
-New clients decode typed, versioned attachment payloads while continuing to accept existing signed text envelopes. Older compatible clients see attachment payloads as prefixed text and never download them automatically.
+Attachment offers use the topic-bound broadcast envelope V2. Raw Iroh `BlobTicket` values remain accepted as described above. Legacy meshmsg signed-envelope tokens are rejected explicitly because their signatures do not bind a topic; they are never silently treated as trusted V2 offers. Ask the provider to share the attachment again with a V2 daemon. V2 daemons use `/meshmsg/broadcast-gossip/2`, so pre-V2 peers neither receive nor inject V2 attachment offers.
 
 ## JSON events
 
@@ -80,7 +80,7 @@ The optional web UI shows live-only cards for incoming and locally shared attach
 Representative records:
 
 ```json
-{"type":"attachment_shared","schema_version":1,"from":"<peer-id>","timestamp_ms":1700000000000,"offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"ticket":"<blob-ticket>","offer":"<signed-offer>","delivery_acknowledged":false}
-{"type":"attachment_offer","schema_version":1,"from":"<peer-id>","timestamp_ms":1700000000000,"offer_id":"<id>","kind":"directory_tar_v1","name":"results.tar","size":4096,"ticket":"<blob-ticket>","offer":"<signed-offer>"}
+{"type":"attachment_shared","schema_version":2,"from":"<peer-id>","message_id":"<32-hex-digits>","timestamp_ms":1700000000000,"offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"ticket":"<blob-ticket>","offer":"<signed-offer>","delivery_acknowledged":false}
+{"type":"attachment_offer","schema_version":2,"from":"<peer-id>","message_id":"<32-hex-digits>","timestamp_ms":1700000000000,"offer_id":"<id>","kind":"directory_tar_v1","name":"results.tar","size":4096,"ticket":"<blob-ticket>","offer":"<signed-offer>"}
 {"type":"download_complete","schema_version":1,"offer_id":"<id>","kind":"file","name":"report.pdf","size":1234,"from":"<peer-id>","output":"./received-report.pdf"}
 ```

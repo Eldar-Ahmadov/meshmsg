@@ -40,6 +40,13 @@ def malicious_peers_snapshot():
     }
 
 
+def canonical_broadcast_event(value):
+    if value.get('type') in {'message', 'queued', 'attachment_offer', 'attachment_shared'}:
+        value.setdefault('schema_version', 2)
+        value.setdefault('message_id', '0123456789abcdef0123456789abcdef')
+    return value
+
+
 class Daemon(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
@@ -55,7 +62,7 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
         self.thread.start()
 
     def broadcast(self, value):
-        encoded = json.dumps(value).encode() + b'\n'
+        encoded = json.dumps(canonical_broadcast_event(value)).encode() + b'\n'
         with self.lock:
             subscribers = list(self.subscribers)
         for client in subscribers:
@@ -85,7 +92,7 @@ class Handler(socketserver.StreamRequestHandler):
             self.server.requests.append(value)
 
             def emit(value):
-                self.wfile.write(json.dumps(value).encode() + b'\n')
+                self.wfile.write(json.dumps(canonical_broadcast_event(value)).encode() + b'\n')
                 self.wfile.flush()
 
             if value['command'] == 'status':
@@ -127,7 +134,7 @@ class Handler(socketserver.StreamRequestHandler):
                 path = pathlib.Path(value['path'])
                 assert path.parent.parent.parent == pathlib.Path(self.server.server_address).parent / 'web-uploads-v1'
                 payload = path.read_bytes()
-                shared = {'type': 'attachment_shared', 'schema_version': 1, 'from': 'fake-peer',
+                shared = {'type': 'attachment_shared', 'schema_version': 2, 'from': 'fake-peer',
                           'timestamp_ms': 1700000000001, 'name': path.name, 'kind': 'file',
                           'size': len(payload), 'offer': 'private-offer', 'ticket': 'private-ticket',
                           'delivery_acknowledged': False}
@@ -337,7 +344,9 @@ def main():
                     assert len(download_id) == 32 and all(c in '0123456789abcdef' for c in download_id)
                     incoming_download_ids.append(download_id)
                     assert attachment == {
-                        'type': 'attachment_offer', 'direction': 'incoming', 'from': 'other-peer',
+                        'type': 'attachment_offer', 'schema_version': 2,
+                        'message_id': '0123456789abcdef0123456789abcdef',
+                        'direction': 'incoming', 'from': 'other-peer',
                         'timestamp_ms': 2, 'name': '<incoming>.txt', 'kind': 'file', 'size': 1536}
                     assert 'private-token' not in json.dumps(attachment)
                     value = next_event(response)
@@ -372,7 +381,9 @@ def main():
                     'size': len(upload_payload), 'delivery_acknowledged': False}
                 for response in [feed, other_tab]:
                     assert next_event(response) == {
-                        'type': 'attachment_shared', 'direction': 'outgoing', 'from': 'fake-peer',
+                        'type': 'attachment_shared', 'schema_version': 2,
+                        'message_id': '0123456789abcdef0123456789abcdef',
+                        'direction': 'outgoing', 'from': 'fake-peer',
                         'timestamp_ms': 1700000000001, 'name': upload_name,
                         'kind': 'file', 'size': len(upload_payload)}
                 upload_request = next(value for value in daemon.requests if value.get('command') == 'share')
@@ -509,7 +520,9 @@ def main():
                 daemon.broadcast(shared)
                 for response in [feed, other_tab]:
                     assert next_event(response) == {
-                        'type': 'attachment_shared', 'direction': 'outgoing', 'from': 'fake-peer',
+                        'type': 'attachment_shared', 'schema_version': 2,
+                        'message_id': '0123456789abcdef0123456789abcdef',
+                        'direction': 'outgoing', 'from': 'fake-peer',
                         'timestamp_ms': 3, 'name': 'shared-directory.tar',
                         'kind': 'directory_tar_v1', 'size': 4096}
 
@@ -522,7 +535,9 @@ def main():
                     directory_id = directory.pop('download_id')
                     assert len(directory_id) == 32
                     assert directory == {
-                        'type': 'attachment_offer', 'direction': 'incoming', 'from': 'another-peer',
+                        'type': 'attachment_offer', 'schema_version': 2,
+                        'message_id': '0123456789abcdef0123456789abcdef',
+                        'direction': 'incoming', 'from': 'another-peer',
                         'timestamp_ms': 4, 'name': 'incoming-directory.tar',
                         'kind': 'directory_tar_v1', 'size': 8192}
 
@@ -531,8 +546,11 @@ def main():
                 assert api({'command': 'send', 'body': synced}) == (200, {'type': 'queued', 'delivery_acknowledged': False})
                 for response in [feed, other_tab]:
                     value = next_event(response)
-                    assert value == {'type': 'queued', 'from': 'fake-peer', 'body': synced,
-                                     'timestamp_ms': 1700000000000, 'delivery_acknowledged': False}
+                    assert value == {
+                        'type': 'queued', 'schema_version': 2,
+                        'message_id': '0123456789abcdef0123456789abcdef',
+                        'from': 'fake-peer', 'body': synced,
+                        'timestamp_ms': 1700000000000, 'delivery_acknowledged': False}
 
                 with socket.socket(socket.AF_UNIX) as local_cli:
                     local_cli.connect(str(root / 'daemon.sock'))
@@ -550,8 +568,11 @@ def main():
                 assert any(request == {'command': 'send', 'body': chat_body} for request in daemon.requests)
                 for response in [feed, other_tab]:
                     value = next_event(response)
-                    assert value == {'type': 'queued', 'from': 'fake-peer', 'body': chat_body,
-                                     'timestamp_ms': 1700000000000, 'delivery_acknowledged': False}
+                    assert value == {
+                        'type': 'queued', 'schema_version': 2,
+                        'message_id': '0123456789abcdef0123456789abcdef',
+                        'from': 'fake-peer', 'body': chat_body,
+                        'timestamp_ms': 1700000000000, 'delivery_acknowledged': False}
 
                 for _ in range(14):
                     response = open_feed()

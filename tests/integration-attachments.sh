@@ -68,7 +68,8 @@ FILE_OFFER=$(json_field '"offer"' <<<"$FILE_SHARE")
 FILE_TICKET=$(json_field '"ticket"' <<<"$FILE_SHARE")
 FILE_ID=$(json_field '"offer_id"' <<<"$FILE_SHARE")
 FILE_TIMESTAMP=$(json_field '"timestamp_ms"' <<<"$FILE_SHARE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "attachment_shared" and isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["delivery_acknowledged"] is False' \
+FILE_MESSAGE_ID=$(json_field '"message_id"' <<<"$FILE_SHARE")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "attachment_shared" and v["schema_version"] == 2 and len(v["message_id"]) == 32 and isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["delivery_acknowledged"] is False' \
   <<<"$FILE_SHARE" || fail "shared attachment JSON omitted its canonical timestamp or existing fields"
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["name"] == "source.txt" and b["kind"] == "file" and b["status"] == "complete"' "$FILE_ID" \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
@@ -77,8 +78,8 @@ python3 -c 'import json,sys; assert json.load(sys.stdin)["blobs"] == []' \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "received but undownloaded offer was listed as pinned"
 wait_for 30 "file offer" grep -Fq '"type":"attachment_offer"' "$ROOT/receiver.listen.log"
-python3 -c 'import json,sys; events=[json.loads(line) for line in open(sys.argv[1])]; offer=next(v for v in events if v.get("type") == "attachment_offer" and v.get("offer_id") == sys.argv[2]); assert offer["timestamp_ms"] == int(sys.argv[3]) and offer["name"] == "source.txt" and offer["kind"] == "file"' \
-  "$ROOT/receiver.listen.log" "$FILE_ID" "$FILE_TIMESTAMP" \
+python3 -c 'import json,sys; events=[json.loads(line) for line in open(sys.argv[1])]; offer=next(v for v in events if v.get("type") == "attachment_offer" and v.get("offer_id") == sys.argv[2]); assert offer["schema_version"] == 2 and offer["message_id"] == sys.argv[4] and offer["timestamp_ms"] == int(sys.argv[3]) and offer["name"] == "source.txt" and offer["kind"] == "file"' \
+  "$ROOT/receiver.listen.log" "$FILE_ID" "$FILE_TIMESTAMP" "$FILE_MESSAGE_ID" \
   || fail "local attachment_shared timestamp/metadata did not match the received offer"
 [[ ! -e "$ROOT/receiver/source.txt" ]] || fail "receiver automatically exported an offered file"
 

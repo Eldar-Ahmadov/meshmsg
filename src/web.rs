@@ -730,14 +730,33 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
             connected["download_supported"] = download_supported.into();
             Some(connected)
         }
-        "message" => Some(
-            json!({"type":"message", "from":value["from"], "body":value["body"], "timestamp_ms":value["timestamp_ms"]}),
-        ),
-        "queued" => Some(json!({
-            "type":"queued", "from":value["from"], "body":value["body"],
-            "timestamp_ms":value["timestamp_ms"], "delivery_acknowledged":false
-        })),
+        "message" => {
+            let message_id = value["message_id"].as_str()?;
+            if value["schema_version"] != 2 || !valid_id(message_id) {
+                return None;
+            }
+            Some(json!({
+                "type":"message", "schema_version":2, "from":value["from"],
+                "message_id":message_id, "body":value["body"],
+                "timestamp_ms":value["timestamp_ms"]
+            }))
+        }
+        "queued" => {
+            let message_id = value["message_id"].as_str()?;
+            if value["schema_version"] != 2 || !valid_id(message_id) {
+                return None;
+            }
+            Some(json!({
+                "type":"queued", "schema_version":2, "from":value["from"],
+                "message_id":message_id, "body":value["body"],
+                "timestamp_ms":value["timestamp_ms"], "delivery_acknowledged":false
+            }))
+        }
         "attachment_offer" => {
+            let message_id = value["message_id"].as_str()?;
+            if value["schema_version"] != 2 || !valid_id(message_id) {
+                return None;
+            }
             let offer = value["offer"].as_str()?;
             let name = value["name"].as_str()?;
             let kind = value["kind"].as_str()?;
@@ -745,7 +764,8 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 return None;
             }
             let mut public = json!({
-                "type":"attachment_offer", "direction":"incoming", "from":value["from"],
+                "type":"attachment_offer", "schema_version":2,
+                "direction":"incoming", "from":value["from"], "message_id":message_id,
                 "timestamp_ms":value["timestamp_ms"], "name":name,
                 "kind":kind, "size":value["size"]
             });
@@ -754,11 +774,18 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
             }
             Some(public)
         }
-        "attachment_shared" => Some(json!({
-            "type":"attachment_shared", "direction":"outgoing", "from":value["from"],
-            "timestamp_ms":value["timestamp_ms"], "name":value["name"],
-            "kind":value["kind"], "size":value["size"]
-        })),
+        "attachment_shared" => {
+            let message_id = value["message_id"].as_str()?;
+            if value["schema_version"] != 2 || !valid_id(message_id) {
+                return None;
+            }
+            Some(json!({
+                "type":"attachment_shared", "schema_version":2,
+                "direction":"outgoing", "from":value["from"], "message_id":message_id,
+                "timestamp_ms":value["timestamp_ms"], "name":value["name"],
+                "kind":value["kind"], "size":value["size"]
+            }))
+        }
         "peers_snapshot" => public_peers_snapshot(&value),
         event_type @ ("peer_discovered" | "peer_updated" | "peer_expired") => {
             public_peer_transition(&value, event_type)
@@ -1082,7 +1109,7 @@ fn daemon_supports_web_share(status: &Value) -> Option<u64> {
 
 fn compatible_attachment_shared(value: &Value, name: &str, size: u64) -> bool {
     value["type"] == "attachment_shared"
-        && value["schema_version"] == 1
+        && value["schema_version"] == 2
         && value["kind"] == "file"
         && value["name"].as_str() == Some(name)
         && value["size"].as_u64() == Some(size)
@@ -1657,13 +1684,13 @@ mod tests {
     #[test]
     fn upload_success_metadata_must_match_the_staged_file() {
         let valid = json!({
-            "type":"attachment_shared", "schema_version":1,
+            "type":"attachment_shared", "schema_version":2,
             "kind":"file", "name":"report.txt", "size":7
         });
         assert!(compatible_attachment_shared(&valid, "report.txt", 7));
         for mismatch in [
-            json!({"type":"attachment_shared", "schema_version":2, "kind":"file", "name":"report.txt", "size":7}),
-            json!({"type":"attachment_shared", "schema_version":1, "kind":"directory_tar_v1", "name":"report.txt", "size":7}),
+            json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"report.txt", "size":7}),
+            json!({"type":"attachment_shared", "schema_version":2, "kind":"directory_tar_v1", "name":"report.txt", "size":7}),
             json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"other.txt", "size":7}),
             json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"report.txt", "size":8}),
         ] {
@@ -1707,7 +1734,9 @@ mod tests {
         let public_event = |value| public_event(&state, value, true);
         assert!(public_event(json!({"type":"download_progress", "path":"secret"})).is_none());
         let incoming = public_event(json!({
-            "type":"attachment_offer", "from":"peer", "timestamp_ms":42,
+            "type":"attachment_offer", "schema_version":2,
+            "message_id":"01010101010101010101010101010101",
+            "from":"peer", "timestamp_ms":42,
             "name":"<report>.pdf", "kind":"file", "size":1234,
             "offer_id":"private-id", "offer":"signed-secret", "ticket":"blob-secret",
             "path":"private-path", "output":"private-output"
@@ -1717,13 +1746,13 @@ mod tests {
         let legacy = super::public_event(
             &state,
             json!({
-                "type":"attachment_offer", "from":"peer", "timestamp_ms":42,
+                "type":"attachment_offer", "schema_version":1,
+                "from":"peer", "timestamp_ms":42,
                 "name":"legacy.txt", "kind":"file", "size":1, "offer":"secret"
             }),
             false,
-        )
-        .unwrap();
-        assert!(legacy.get("download_id").is_none());
+        );
+        assert!(legacy.is_none());
         let mut expected_incoming = incoming.clone();
         expected_incoming
             .as_object_mut()
@@ -1732,12 +1761,16 @@ mod tests {
         assert_eq!(
             expected_incoming,
             json!({
-                "type":"attachment_offer", "direction":"incoming", "from":"peer",
+                "type":"attachment_offer", "schema_version":2,
+                "direction":"incoming", "from":"peer",
+                "message_id":"01010101010101010101010101010101",
                 "timestamp_ms":42, "name":"<report>.pdf", "kind":"file", "size":1234
             })
         );
         let outgoing = public_event(json!({
-            "type":"attachment_shared", "from":"local", "timestamp_ms":43,
+            "type":"attachment_shared", "schema_version":2,
+            "message_id":"02020202020202020202020202020202",
+            "from":"local", "timestamp_ms":43,
             "name":"folder.tar", "kind":"directory_tar_v1", "size":5678,
             "offer":"signed-secret", "ticket":"blob-secret", "delivery_acknowledged":true
         }))
@@ -1745,7 +1778,9 @@ mod tests {
         assert_eq!(
             outgoing,
             json!({
-                "type":"attachment_shared", "direction":"outgoing", "from":"local",
+                "type":"attachment_shared", "schema_version":2,
+                "direction":"outgoing", "from":"local",
+                "message_id":"02020202020202020202020202020202",
                 "timestamp_ms":43, "name":"folder.tar", "kind":"directory_tar_v1", "size":5678
             })
         );
@@ -1790,19 +1825,29 @@ mod tests {
         );
         assert!(!malformed_status.to_string().contains("private"));
         assert!(!malformed_status.to_string().contains("body"));
-        let value = public_event(json!({"type":"message", "body":"<script>\ndata: injected\n", "from":"peer", "private":"secret"})).unwrap();
+        let value = public_event(json!({
+            "type":"message", "schema_version":2,
+            "message_id":"03030303030303030303030303030303",
+            "body":"<script>\ndata: injected\n", "from":"peer", "timestamp_ms":41,
+            "private":"secret"
+        }))
+        .unwrap();
         let frame = String::from_utf8(sse_frame(&value).to_vec()).unwrap();
         assert_eq!(frame.lines().count(), 2);
         assert!(!frame.contains("secret"));
         let queued = public_event(json!({
-            "type":"queued", "from":"local", "body":"hello", "timestamp_ms":42,
+            "type":"queued", "schema_version":2,
+            "message_id":"04040404040404040404040404040404",
+            "from":"local", "body":"hello", "timestamp_ms":42,
             "delivery_acknowledged":true, "private":"secret"
         }))
         .unwrap();
         assert_eq!(
             queued,
             json!({
-                "type":"queued", "from":"local", "body":"hello", "timestamp_ms":42,
+                "type":"queued", "schema_version":2,
+                "message_id":"04040404040404040404040404040404",
+                "from":"local", "body":"hello", "timestamp_ms":42,
                 "delivery_acknowledged":false
             })
         );

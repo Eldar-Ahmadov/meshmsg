@@ -99,10 +99,23 @@ wait_log 10 "$ROOT/c2.listen.log" '"type":"connected"'
 M1="integration-c1-$(date +%s%N)"
 M2="integration-c2-$(date +%s%N)"
 printf '%s' "$M1" >"$ROOT/message.txt"
-"$BIN" --state-dir "$ROOT/c1" --json send --message-file "$ROOT/message.txt" | grep -q '"type":"queued"'
-printf '%s' "$M2" | "$BIN" --state-dir "$ROOT/c2" --json send --message-stdin | grep -q '"type":"queued"'
+Q1=$("$BIN" --state-dir "$ROOT/c1" --json send --message-file "$ROOT/message.txt")
+Q2=$(printf '%s' "$M2" | "$BIN" --state-dir "$ROOT/c2" --json send --message-stdin)
+python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["schema_version"] == 2 and len(v["message_id"]) == 32' "$Q1"
+python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["schema_version"] == 2 and len(v["message_id"]) == 32' "$Q2"
 wait_log 30 "$ROOT/c2.listen.log" "\"body\":\"$M1\""
 wait_log 30 "$ROOT/c1.listen.log" "\"body\":\"$M2\""
+python3 - "$Q1" "$Q2" "$ROOT/c2.listen.log" "$ROOT/c1.listen.log" <<'PY'
+import json, pathlib, sys
+for queued_text, log_path in [(sys.argv[1], sys.argv[3]), (sys.argv[2], sys.argv[4])]:
+    queued = json.loads(queued_text)
+    received = next(v for v in map(json.loads, pathlib.Path(log_path).read_text().splitlines())
+                    if v.get("type") == "message" and v.get("message_id") == queued["message_id"])
+    assert received["schema_version"] == 2
+    assert received["from"] == queued["from"]
+    assert received["timestamp_ms"] == queued["timestamp_ms"]
+    assert received["body"] == queued["body"]
+PY
 
 # A benchmark uses one persistent sender operation and filtered receiver subscriptions.
 BENCH_RUN=0123456789abcdef0123456789abcdef

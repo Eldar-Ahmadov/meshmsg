@@ -25,6 +25,22 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
 
+  windows-rust:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup component add clippy
+      - name: Test native Windows named-pipe IPC and all Rust targets
+        shell: pwsh
+        run: cargo test --locked --all-targets
+      - name: Clippy native Windows targets
+        shell: pwsh
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build native Windows binary
+        shell: pwsh
+        run: cargo build --locked
+
   dependency-policy:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

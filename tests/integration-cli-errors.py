@@ -140,8 +140,8 @@ run_case(
 with tempfile.NamedTemporaryFile() as shared:
     run_case(
         ["share", shared.name],
-        {"type": "attachment_shared", "schema_version": 2, "body": "response-body-secret"},
-        contains("unsupported attachment_shared response version (expected 1, observed 2)"),
+        {"type": "attachment_shared", "schema_version": 1, "body": "response-body-secret"},
+        contains("unsupported attachment_shared response version (expected 2, observed 1)"),
     )
 
 # peers/private-send require capability handshakes and chat is interactive; their

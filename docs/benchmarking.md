@@ -28,7 +28,7 @@ Run each rate several times and increase gradually, for example 10, 25, 50, 100,
 
 Limits:
 
-- rate: 1–10,000 messages/s;
+- scheduler rate: 1–10,000 messages/s; broadcast receivers admit at most the documented 100 messages/s sustained per sender (200 burst) and 1,000 messages/s globally (2,000 burst), so higher settings are intentional overload/rate-limit tests rather than supported loss measurements;
 - duration: 1–86,400 seconds;
 - planned messages: at most 10,000,000;
 - payload: exact complete body size, including the 106-byte benchmark header and bounded by the signed envelope.
