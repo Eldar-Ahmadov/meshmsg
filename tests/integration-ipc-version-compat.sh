@@ -131,10 +131,21 @@ run_scenario() {
   # v0.1.11 parser ignored `to` on command=send and broadcast the body; v0.1.12
   # also predates capability negotiation. Merely checking a reply is too late.
   local private="must-not-broadcast-v${version}-$(date +%s%N)"
-  if "$BIN" --state-dir "$base/sender" --json send --to intended-private-peer "$private" \
-      >"$base/private.out" 2>"$base/private.err"; then
-    fail "current --to unexpectedly succeeded against v${version} daemon"
-  fi
+  set +e
+  timeout 10 "$BIN" --state-dir "$base/sender" --json send --to intended-private-peer "$private" \
+    >"$base/private.out" 2>"$base/private.err"
+  local private_status=$?
+  set -e
+  [[ $private_status -ne 0 ]] \
+    || fail "current --to unexpectedly succeeded against v${version} daemon"
+  [[ $private_status -ne 124 ]] \
+    || fail "current --to negotiation hung against v${version} daemon"
+  [[ ! -s "$base/private.out" ]] \
+    || fail "current --to emitted a success response against v${version} daemon"
+  grep -Fq 'does not advertise retry-safe operation IDs' "$base/private.err" \
+    || fail "current --to did not report the stable capability error against v${version} daemon"
+  grep -Fq 'operation was not submitted' "$base/private.err" \
+    || fail "current --to did not report the stable not-submitted outcome against v${version} daemon"
   sleep 2
   ! grep -Fq "$private" "$listener" \
     || fail "current --to plaintext was broadcast by v${version} daemon"
@@ -143,17 +154,34 @@ run_scenario() {
   ! grep -Fq "$private" "$base/sender.daemon.err" \
     || fail "current --to plaintext reached v${version} daemon diagnostics"
 
-  # The fix must not break the unchanged broadcast IPC wire format.
-  local broadcast="broadcast-compatible-v${version}-$(date +%s%N)"
-  local result
-  result=$("$BIN" --state-dir "$base/sender" --json send "$broadcast")
-  python3 -c \
-    'import json,sys; v=json.load(sys.stdin); assert v["type"] == "queued" and v["body"] == sys.argv[1] and v["delivery_acknowledged"] is False' \
-    "$broadcast" <<<"$result" \
-    || fail "current broadcast was not accepted by v${version} daemon"
-  wait_for 30 "current-to-v${version} broadcast delivery" grep -Fq "\"body\":\"$broadcast\"" "$listener"
-  ! grep -Fq "$private" "$listener" \
-    || fail "current --to plaintext reached v${version} peer before the later broadcast"
+  # All current mutations require retry-safe operation-ID negotiation, including
+  # broadcast. The old wire command remains parseable, but a current client must
+  # not submit it when the daemon lacks idempotent_mutations_v1.
+  local broadcast="must-not-submit-broadcast-v${version}-$(date +%s%N)"
+  set +e
+  timeout 10 "$BIN" --state-dir "$base/sender" --json send "$broadcast" \
+    >"$base/broadcast.out" 2>"$base/broadcast.err"
+  local broadcast_status=$?
+  set -e
+  [[ $broadcast_status -ne 0 ]] \
+    || fail "current broadcast unexpectedly succeeded against v${version} daemon"
+  [[ $broadcast_status -ne 124 ]] \
+    || fail "current broadcast negotiation hung against v${version} daemon"
+  [[ ! -s "$base/broadcast.out" ]] \
+    || fail "current broadcast emitted a success response against v${version} daemon"
+  grep -Fq 'does not advertise retry-safe operation IDs' "$base/broadcast.err" \
+    || fail "current broadcast did not report the stable capability error against v${version} daemon"
+  grep -Fq 'operation was not submitted' "$base/broadcast.err" \
+    || fail "current broadcast did not report the stable not-submitted outcome against v${version} daemon"
+  sleep 2
+  ! grep -Fq "$broadcast" "$listener" \
+    || fail "current broadcast was submitted to a v${version} peer"
+  ! grep -Fq "$broadcast" "$base/sender.daemon.log" \
+    || fail "current broadcast reached v${version} daemon output"
+  ! grep -Fq "$broadcast" "$base/sender.daemon.err" \
+    || fail "current broadcast reached v${version} daemon diagnostics"
+  status_ok "$version" sender \
+    || fail "v${version} daemon stopped responding after rejected mutation negotiations"
 }
 
 # Published immutable archives are checksum-pinned so this downgrade regression
@@ -163,4 +191,4 @@ fetch_release 0.1.12 016c350a22e4d6c7d5b1d75d1982fb158e32aa3fac807b1178cd92b9b9d
 run_scenario 0.1.11
 run_scenario 0.1.12
 
-echo "PASS: peer-directory and private IPC fail closed against published v0.1.11/v0.1.12 daemons without hangs/broadcast, while current-to-old broadcast remains compatible"
+echo "PASS: peer-directory and all current mutations fail closed without submission against published v0.1.11/v0.1.12 daemons lacking retry-safe operation IDs"

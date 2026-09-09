@@ -1206,6 +1206,14 @@ impl Drop for LocalEndpointGuard {
 #[cfg(windows)]
 struct LocalEndpointGuard;
 
+#[cfg(test)]
+impl LocalEndpointGuard {
+    /// Consume the guard before a test removes its state directory. On Unix the
+    /// socket cleanup runs through `Drop`; on Windows the zero-sized ownership
+    /// marker is simply consumed without pretending it owns a closeable handle.
+    fn release_for_test(self) {}
+}
+
 #[cfg(unix)]
 type LocalServerStream = UnixStream;
 #[cfg(unix)]
@@ -1285,10 +1293,9 @@ impl LocalListener {
             .await
             .context("accept local daemon client")?;
         let next = create_pipe_server(&self.pipe_name, false)?;
-        Ok(self
-            .pending
+        self.pending
             .replace(next)
-            .context("named pipe listener missing")?)
+            .context("named pipe listener missing")
     }
 }
 
@@ -1545,7 +1552,7 @@ fn create_pipe_server(name: &str, first: bool) -> Result<NamedPipeServer> {
                 (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
             )
     };
-    unsafe { LocalFree(descriptor as *mut c_void) };
+    unsafe { LocalFree(descriptor) };
     result.context("create owner-only daemon named pipe")
 }
 
@@ -7521,7 +7528,7 @@ mod tests {
         drop(rejected);
         drop(recovered);
         drop(listener);
-        drop(guard);
+        guard.release_for_test();
         drop(state_lock);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -7717,7 +7724,7 @@ mod tests {
         drop(idle);
         drop(subscriber);
         drop(listener);
-        drop(guard);
+        guard.release_for_test();
         drop(state_lock);
         std::fs::remove_dir_all(dir).unwrap();
     }
