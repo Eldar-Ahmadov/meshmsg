@@ -11,7 +11,10 @@ BIN = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/meshm
 LEASE_MS = 150_000
 REMOTE_KEYS = {"public_key", "alias", "online", "last_seen_ms", "expires_at_ms"}
 SELF_KEYS = {"public_key", "alias", "online"}
-EVENT_KEYS = {"type", "schema_version", "directory_epoch", "directory_revision", "peer"}
+EVENT_KEYS = {
+    "type", "schema_version", "request_id", "directory_epoch",
+    "directory_revision", "peer",
+}
 FORBIDDEN_KEYS = {
     "endpoint", "endpoints", "address", "addresses", "addrs", "relay", "socket",
     "local_endpoint", "invite", "token", "ticket", "offer", "path", "record",
@@ -123,10 +126,11 @@ def main():
         def validate_snapshot(value, self_peer, self_alias, remotes):
             assert set(value) == {
                 "type", "schema_version", "generated_at_ms", "directory_epoch",
-                "directory_revision", "self", "peers"
+                "directory_revision", "self", "peers", "request_id"
             }, value
             assert value["type"] == "peers_snapshot"
             assert value["schema_version"] == 2
+            assert len(value["request_id"]) == 32
             assert isinstance(value["generated_at_ms"], int)
             assert len(value["directory_epoch"]) == 32
             assert isinstance(value["directory_revision"], int)
@@ -150,6 +154,7 @@ def main():
         def validate_event(value, kind, alias):
             assert set(value) == EVENT_KEYS, value
             assert value["type"] == kind and value["schema_version"] == 2
+            assert len(value["request_id"]) == 32
             assert len(value["directory_epoch"]) == 32
             assert isinstance(value["directory_revision"], int)
             peer = value["peer"]

@@ -137,11 +137,15 @@ assert sender[-1]["type"] == "bench_send_summary"
 assert all(value["type"] == "bench_send_progress" for value in sender[1:-1])
 assert sender[-1]["planned"] == sender[-1]["attempted"] == sender[-1]["queued"] == 5
 assert sender[-1]["failed"] == 0 and sender[-1]["delivery_acknowledged"] is False
+sender_request_ids = {value["request_id"] for value in sender}
+assert len(sender_request_ids) == 1 and next(iter(sender_request_ids)) != sender[0]["run_id"]
 for path in sys.argv[2:]:
     receiver = [json.loads(line) for line in pathlib.Path(path).read_text().splitlines()]
     assert receiver[0]["type"] == "bench_receive_started"
     assert receiver[-1]["type"] == "bench_receive_summary"
     assert all(value["type"] == "bench_receive_progress" for value in receiver[1:-1])
+    receiver_request_ids = {value["request_id"] for value in receiver}
+    assert len(receiver_request_ids) == 1 and next(iter(receiver_request_ids)) != receiver[0]["run_id"]
     summary = receiver[-1]
     assert summary["run_id"] == "0123456789abcdef0123456789abcdef"
     assert summary["expected"] == summary["unique"] == 5
@@ -198,7 +202,9 @@ if "$BIN" --state-dir "$ROOT/c1" --json send "$OVERSIZED" >"$ROOT/oversized.out"
   fail "oversized message unexpectedly succeeded"
 fi
 ! grep -q '"type":"queued"' "$ROOT/oversized.out" || fail "oversized message was reported queued"
-grep -q 'maximum is 4096 bytes' "$ROOT/oversized.err" || fail "oversized rejection was not actionable"
+grep -q '"type":"error"' "$ROOT/oversized.out" || fail "oversized rejection was not machine-readable"
+grep -q '"code":"command_failed"' "$ROOT/oversized.out" || fail "oversized rejection had the wrong stable code"
+test ! -s "$ROOT/oversized.err" || fail "JSON failure wrote to stderr"
 
 # Stale socket recovery and peer daemon restart.
 stop_node c1

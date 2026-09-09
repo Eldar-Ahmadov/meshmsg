@@ -135,7 +135,7 @@ Stop the daemon cleanly:
 meshmsg stop
 ```
 
-Client commands use owner-only local IPC and never create another Iroh endpoint. The daemon permits at most 64 simultaneous local connections (including listeners and benchmarks), requires an initial request frame within eight seconds, and returns `ipc_capacity` when full. Ordinary commands have a 10-second daemon-side IPC deadline; offer listing, private send, and attachment operations use longer command-appropriate bounds. A `command_timeout` releases the connection slot but can leave the outcome of an already-submitted mutating operation unknown. Clients fail with an actionable error when the daemon is unavailable.
+Client commands use owner-only local IPC and never create another Iroh endpoint. IPC uses the strict nested `typed_contracts_v1` request envelope and exact request/response correlation documented in [Stable contracts](contracts.md); unversioned clients and replies fail closed. The daemon permits at most 64 simultaneous local connections (including listeners and benchmarks), requires an initial request frame within eight seconds, and returns `ipc_capacity` when full. Ordinary commands have a 10-second daemon-side IPC deadline; offer listing, private send, and attachment operations use longer command-appropriate bounds. A `command_timeout` releases the connection slot but can leave the outcome of an already-submitted mutating operation unknown. Clients fail with an actionable error when the daemon is unavailable.
 
 A successful send reports `queued`:
 
@@ -227,13 +227,13 @@ Representative status:
 
 `neighbors` is the current direct broadcast-Gossip-neighbor count. `advertised_aliases` is the number of currently unexpired directory entries carrying an alias, not a trusted contact count or reachability guarantee. `topic_joined` becomes false when no direct neighbors remain, including for a lone first peer. These are local observations, not delivery guarantees.
 
-Startup and bootstrap are bounded. If joining configured peers or becoming online times out, the daemon exits nonzero so a service manager can retry. JSON mode emits a structured `startup_error`.
+Startup and bootstrap are bounded. If joining configured peers or becoming online times out, the daemon exits nonzero so a service manager can retry. JSON mode emits one standard error envelope (`command_timeout` when the bounded outcome is unknown, otherwise `command_failed`) and never emits a second startup record.
 
 `doctor` validates stored state, identity binding, expected public key, topic, and invite invariants offline.
 
 ## JSON automation
 
-The global `--json` option produces JSON for one-shot commands and NDJSON for streams:
+The global `--json` option produces versioned JSON for one-shot commands and NDJSON for streams. Every success has `type`, `schema_version`, and a 32-lowercase-hex `request_id` where a request exists. Every failure uses the [stable error envelope](contracts.md#error-envelope), writes exactly one object to stdout (never stderr), and exits 1:
 
 ```sh
 meshmsg --json daemon
@@ -251,4 +251,4 @@ meshmsg --json offers remove <offer-id> --direction outgoing
 meshmsg --json download '<signed-offer>' --output ./report-copy.pdf
 ```
 
-`listen` and `chat` receive complete messages through owner-only IPC. Slow subscribers receive a `lagged` event when their bounded queue drops events.
+`listen` and `chat` receive complete messages through owner-only IPC. Slow subscribers receive a versioned, request-correlated `lagged` event when their bounded queue drops events. Request IDs correlate transport exchanges; they are intentionally distinct from retry-safe operation IDs and are not replay cursors. See [Stable JSON, IPC, HTTP, and SSE contracts](contracts.md) for the complete DTO inventory, strictness, and upgrade policy.

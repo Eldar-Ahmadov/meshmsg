@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real CLI failure behavior against a local fake daemon (Unix sockets only)."""
+"""Machine-readable CLI failures and malformed daemon replies (Unix sockets)."""
 import json
 import os
 import pathlib
@@ -10,147 +10,91 @@ import tempfile
 import threading
 
 if os.name == "nt" or not hasattr(socket, "AF_UNIX"):
-    raise SystemExit("fake-daemon CLI regression requires Unix sockets (run in Linux CI)")
+    raise SystemExit("fake-daemon CLI regression requires Unix sockets")
 
-binary = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/meshmsg").resolve())
+BINARY = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/meshmsg").resolve())
+REQUEST_ID = "1" * 32
 
 
-def run_case(command, response, check):
+def run_case(command, response):
     with tempfile.TemporaryDirectory(prefix="meshmsg-cli-errors-") as temporary:
         state = pathlib.Path(temporary)
-        path = state / "daemon.sock"
-        ready = threading.Event()
-        stopped = threading.Event()
-        failure = []
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        child = None
+        listener.bind(str(state / "daemon.sock"))
+        listener.listen(1)
+        failure = []
 
         def daemon():
             try:
-                listener.bind(str(path))
-                listener.listen(2)
-                listener.settimeout(0.2)
-                ready.set()
-                expected = command[0]
-                while not stopped.is_set():
-                    try:
-                        connection, _ = listener.accept()
-                    except socket.timeout:
-                        continue
-                    with connection:
-                        request = json.loads(connection.makefile("rb").readline())
-                        if expected in {"send", "share"} and request["command"] == "status":
-                            connection.sendall(json.dumps({
-                                "type": "status",
-                                "ipc_capabilities": ["idempotent_mutations_v1"],
-                                "max_attachment_bytes": 1024 * 1024
-                            }).encode() + b"\n")
-                            continue
-                        assert request["command"] == expected
-                        connection.sendall(json.dumps(response).encode() + b"\n")
-                        break
-            except OSError as error:
-                if not stopped.is_set():
-                    failure.append(error)
-            except BaseException as error:  # propagate thread assertions
+                connection, _ = listener.accept()
+                with connection:
+                    request = json.loads(connection.makefile("rb").readline())
+                    assert request["schema_version"] == 1
+                    assert len(request["request_id"]) == 32
+                    assert "command" in request["request"]
+                    reply = dict(response)
+                    if reply.pop("_correlate", True):
+                        reply.setdefault("schema_version", 1)
+                        reply["request_id"] = request["request_id"]
+                    connection.sendall(json.dumps(reply).encode() + b"\n")
+            except BaseException as error:
                 failure.append(error)
-            finally:
-                ready.set()
 
-        # Last-resort daemonization means a broken fake listener can never pin the test
-        # process; normal teardown below still closes and joins it deterministically.
         thread = threading.Thread(target=daemon, daemon=True)
         thread.start()
-        try:
-            assert ready.wait(5), "fake daemon did not start"
-            if failure:
-                raise failure[0]
-            child = subprocess.Popen(
-                [binary, "--state-dir", str(state), *command],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            try:
-                stdout, stderr = child.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                stdout, stderr = child.communicate(timeout=5)
-                raise AssertionError((command, "CLI timed out", stdout, stderr))
-            assert child.returncode != 0, (command, child.returncode, stdout, stderr)
-            assert stdout == "", (command, stdout)
-            assert "response-body-secret" not in stderr, stderr
-            check(stderr)
-        finally:
-            if child is not None and child.poll() is None:
-                child.kill()
-                child.wait(timeout=5)
-            stopped.set()
-            listener.close()  # closes an accepted socket or interrupts the timeout loop
-            thread.join(2)
-            assert not thread.is_alive(), "fake daemon did not finish"
-            if failure:
-                raise failure[0]
+        child = subprocess.run(
+            [BINARY, "--json", "--state-dir", str(state), *command],
+            text=True, capture_output=True, timeout=10,
+        )
+        listener.close()
+        thread.join(2)
+        if failure:
+            raise failure[0]
+        assert child.returncode == 1, (command, child.returncode, child.stdout, child.stderr)
+        assert child.stderr == "", (command, child.stderr)
+        lines = child.stdout.splitlines()
+        assert len(lines) == 1, (command, child.stdout)
+        error = json.loads(lines[0])
+        assert error["type"] == "error" and error["schema_version"] == 1
+        assert error["code"] == "command_failed"
+        assert error["outcome"] == "not_started" and error["retryable"] is False
+        assert len(error["request_id"]) == 32
+        assert "response-body-secret" not in child.stdout
 
 
-def contains(text):
-    return lambda stderr: (_ for _ in ()).throw(AssertionError(stderr)) if text not in stderr else None
+# Wrong discriminators/types/versions, malformed errors, correlation failures,
+# and duplicate fields all fail closed and become one stable CLI error record.
+run_case(["status"], {"type": "accepted_instead", "body": "response-body-secret"})
+run_case(["status"], {"type": {"nested": "malformed"}, "body": "response-body-secret"})
+run_case(["status"], {"type": "status", "schema_version": 2, "body": "response-body-secret"})
+run_case(["status"], {"type": "error", "message": "response-body-secret"})
+run_case(["status"], {"type": "status", "request_id": "2" * 32, "_correlate": False})
 
-
-run_case(
-    ["send", "hello"],
-    {"type": "accepted_instead", "body": "response-body-secret"},
-    contains('expected queued, observed "accepted_instead"'),
+# Genuine global JSON parse errors remain machine-readable, but a positional
+# literal after `--` must not switch the process-wide error stream contract.
+parse_error = subprocess.run(
+    [BINARY, "--json", "definitely-not-a-command"],
+    text=True, capture_output=True, timeout=10,
 )
-run_case(
-    ["send", "hello"],
-    {"type": {"nested": "malformed"}, "body": "response-body-secret"},
-    contains("expected queued, observed object"),
-)
-run_case(
-    ["send", "hello"],
-    {"type": "left\u009bright", "body": "response-body-secret"},
-    lambda stderr: (
-        contains('expected queued, observed "left\\u009bright"')(stderr),
-        (_ for _ in ()).throw(AssertionError(stderr)) if "\u009b" in stderr else None,
-    ),
-)
-run_case(
-    ["status"],
-    {
-        "type": "error",
-        "message": "status useful\n\x1b[31m" + "x" * 1000,
-        "body": "response-body-secret",
-    },
-    lambda stderr: (
-        contains('daemon rejected request: "status useful\\n\\u001b[31m')(stderr),
-        contains("…")(stderr),
-        (_ for _ in ()).throw(AssertionError(stderr)) if "\x1b" in stderr or len(stderr) > 400 else None,
-    ),
-)
-run_case(
-    ["stop"],
-    {"type": "error", "message": "shutdown denied", "body": "response-body-secret"},
-    contains('daemon rejected request: "shutdown denied"'),
-)
-run_case(
-    ["offers"],
-    {"type": "offers", "body": "response-body-secret"},
-    contains("unsupported offers response version (expected 1, observed missing)"),
-)
-run_case(
-    ["offers"],
-    {"type": "offers", "schema_version": "one", "body": "response-body-secret"},
-    contains('unsupported offers response version (expected 1, observed "one")'),
-)
-with tempfile.NamedTemporaryFile() as shared:
-    run_case(
-        ["share", shared.name],
-        {"type": "attachment_shared", "schema_version": 1, "body": "response-body-secret"},
-        contains("unsupported attachment_shared response version (expected 3, observed 1)"),
+assert parse_error.returncode == 1 and parse_error.stderr == ""
+assert json.loads(parse_error.stdout)["code"] == "command_failed"
+with tempfile.TemporaryDirectory(prefix="meshmsg-cli-literal-json-") as temporary:
+    literal = subprocess.run(
+        [BINARY, "--state-dir", temporary, "send", "--", "--json"],
+        text=True, capture_output=True, timeout=10,
     )
+    assert literal.returncode == 1 and literal.stdout == ""
+    assert "error:" in literal.stderr and not literal.stderr.lstrip().startswith("{")
 
-# peers/private-send require capability handshakes and chat is interactive; their
-# discriminator/schema combinations use the same validate_response helper covered by
-# Rust unit tests. These real-CLI cases cover representative direct mutation paths.
-print("fake-daemon CLI error checks passed")
+# Offline is stable, retryable, and also uses stdout only in JSON mode.
+with tempfile.TemporaryDirectory(prefix="meshmsg-cli-offline-") as temporary:
+    child = subprocess.run(
+        [BINARY, "--json", "--state-dir", temporary, "status"],
+        text=True, capture_output=True, timeout=10,
+    )
+    assert child.returncode == 1 and child.stderr == ""
+    error = json.loads(child.stdout)
+    assert error["code"] == "daemon_offline"
+    assert error["retryable"] is True and error["outcome"] == "not_started"
+
+print("PASS: CLI JSON failures are one bounded versioned stdout record")

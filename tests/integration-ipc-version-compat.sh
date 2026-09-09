@@ -122,9 +122,9 @@ run_scenario() {
   set -e
   [[ $peers_status -ne 0 ]] || fail "current peers unexpectedly succeeded against v${version} daemon"
   [[ $peers_status -ne 124 ]] || fail "current peers hung against v${version} daemon"
-  grep -Eqi 'peer.directory|peer_directory_v2|does not support|upgrade|restart' "$base/peers.err" \
-    || fail "current peers did not return an actionable v${version} compatibility error"
-  [[ ! -s "$base/peers.out" ]] || fail "current peers emitted a partial snapshot against v${version} daemon"
+  [[ ! -s "$base/peers.err" ]] || fail "current JSON peers wrote diagnostics to stderr"
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["type"] == "error" and v["schema_version"] == 1 and v["outcome"] == "not_started"' "$base/peers.out" \
+    || fail "current peers did not fail with the stable JSON contract"
   status_ok "$version" sender || fail "v${version} daemon stopped responding after rejected peers request"
 
   # A current client must negotiate before submitting private plaintext. The
@@ -140,12 +140,9 @@ run_scenario() {
     || fail "current --to unexpectedly succeeded against v${version} daemon"
   [[ $private_status -ne 124 ]] \
     || fail "current --to negotiation hung against v${version} daemon"
-  [[ ! -s "$base/private.out" ]] \
-    || fail "current --to emitted a success response against v${version} daemon"
-  grep -Fq 'does not advertise retry-safe operation IDs' "$base/private.err" \
-    || fail "current --to did not report the stable capability error against v${version} daemon"
-  grep -Fq 'operation was not submitted' "$base/private.err" \
-    || fail "current --to did not report the stable not-submitted outcome against v${version} daemon"
+  [[ ! -s "$base/private.err" ]] || fail "current JSON --to wrote diagnostics to stderr"
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["type"] == "error" and v["outcome"] == "not_started"' "$base/private.out" \
+    || fail "current --to did not report a stable not-started JSON error"
   sleep 2
   ! grep -Fq "$private" "$listener" \
     || fail "current --to plaintext was broadcast by v${version} daemon"
@@ -167,12 +164,9 @@ run_scenario() {
     || fail "current broadcast unexpectedly succeeded against v${version} daemon"
   [[ $broadcast_status -ne 124 ]] \
     || fail "current broadcast negotiation hung against v${version} daemon"
-  [[ ! -s "$base/broadcast.out" ]] \
-    || fail "current broadcast emitted a success response against v${version} daemon"
-  grep -Fq 'does not advertise retry-safe operation IDs' "$base/broadcast.err" \
-    || fail "current broadcast did not report the stable capability error against v${version} daemon"
-  grep -Fq 'operation was not submitted' "$base/broadcast.err" \
-    || fail "current broadcast did not report the stable not-submitted outcome against v${version} daemon"
+  [[ ! -s "$base/broadcast.err" ]] || fail "current JSON broadcast wrote diagnostics to stderr"
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["type"] == "error" and v["outcome"] == "not_started"' "$base/broadcast.out" \
+    || fail "current broadcast did not report a stable not-started JSON error"
   sleep 2
   ! grep -Fq "$broadcast" "$listener" \
     || fail "current broadcast was submitted to a v${version} peer"

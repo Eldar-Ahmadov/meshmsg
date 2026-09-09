@@ -152,10 +152,14 @@ function connection(message, connected) {
 
 async function request(value) {
   const controller = new AbortController();
+  const request_id = operationId();
+  value = { schema_version: 1, request_id, request: value };
   const timer = setTimeout(() => controller.abort(), 12000);
   try {
     const response = await fetch('/api/request', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: {
+        'Content-Type': 'application/json', 'X-Meshmsg-Request-Id': request_id
+      },
       body: JSON.stringify(value), signal: controller.signal,
       // CORS mode makes browsers send the real Origin even under our
       // Referrer-Policy: no-referrer. The URL remains same-origin and the
@@ -190,12 +194,14 @@ async function shareAttachment(file) {
   button.disabled = true;
   outcome.textContent = `Uploading ${file.name} once…`;
   try {
+    const request_id = operationId();
     const response = await fetch('/api/attachment', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/octet-stream',
         'X-Meshmsg-File-Name': encodeURIComponent(file.name),
-        'X-Meshmsg-Operation-Id': operation_id
+        'X-Meshmsg-Operation-Id': operation_id,
+        'X-Meshmsg-Request-Id': request_id
       },
       body: file,
       mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store'
@@ -379,7 +385,8 @@ function connect() {
         addEntry('Feed gap · messages dropped; reconnecting for peer directory', undefined, undefined, 'gap');
         reconnect(nextSource);
         break;
-      case 'offline':
+      case 'error':
+        if (value.code !== 'daemon_offline' && value.code !== 'daemon_disconnected') break;
         byId('status').textContent = 'Daemon offline or restarting.';
         reconnect(nextSource);
         break;

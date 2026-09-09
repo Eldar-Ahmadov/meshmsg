@@ -102,6 +102,7 @@ Downloads are explicit, size-limited, content-verified, persistent across provid
 
 - [Installation](docs/installation.md)
 - [Usage reference](docs/usage.md)
+- [Stable JSON, IPC, HTTP, and SSE contracts](docs/contracts.md)
 - [Mobile web UI](docs/web.md)
 - [Attachments](docs/attachments.md)
 - [Operations and security](docs/operations.md)

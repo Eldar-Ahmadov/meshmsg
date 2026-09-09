@@ -3,13 +3,21 @@ const byId = (id) => document.getElementById(id);
 let statusBusy = false;
 let lastStatus;
 
+function requestId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 async function requestStatus() {
   const controller = new AbortController();
+  const request_id = requestId();
   const timer = setTimeout(() => controller.abort(), 12000);
   try {
     const response = await fetch('/api/request', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command: 'status' }), signal: controller.signal,
+      method: 'POST', headers: {
+        'Content-Type': 'application/json', 'X-Meshmsg-Request-Id': request_id
+      },
+      body: JSON.stringify({ schema_version: 1, request_id, request: { command: 'status' } }), signal: controller.signal,
       // Preserve the real Origin under Referrer-Policy: no-referrer so the
       // server can enforce its exact Host/Origin write policy.
       mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store'

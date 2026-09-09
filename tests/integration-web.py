@@ -22,22 +22,16 @@ EVENT_KEY = '971dafe5454792b588f162818f11df9c2accd649774f19a5c67360a91bacf6de'
 
 
 def malicious_peers_snapshot():
+    # Despite the historical helper name this is now the exact strict DTO;
+    # separate malformed-reply cases verify fail-closed handling.
     return {
         'type': 'peers_snapshot', 'schema_version': 2, 'generated_at_ms': 1000,
         'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 0,
-        'self': {
-            'public_key': SELF_KEY, 'alias': 'local-node', 'online': True,
-            'endpoint': 'private-self-endpoint', 'socket': 'private-socket',
-            'body': 'private-self-body',
-        },
+        'self': {'public_key': SELF_KEY, 'alias': 'local-node', 'online': True},
         'peers': [{
             'public_key': REMOTE_KEY, 'alias': 'remote-node', 'online': True,
             'last_seen_ms': 900, 'expires_at_ms': 150900,
-            'endpoint': 'private-remote-endpoint', 'addresses': ['10.0.0.1:1'],
-            'relay': 'private-relay', 'invite': 'private-invite',
-            'body': 'private-remote-body',
         }],
-        'socket': 'private-top-level-socket', 'invite': 'private-top-level-invite',
     }
 
 
@@ -47,6 +41,10 @@ def canonical_broadcast_event(value):
         value.setdefault('message_id', '0123456789abcdef0123456789abcdef')
         if value.get('type') in {'queued', 'attachment_shared'}:
             value.setdefault('operation_id', value['message_id'])
+        if value.get('type') in {'attachment_offer', 'attachment_shared'}:
+            value['offer_id'] = value['message_id']
+        if value.get('type') == 'attachment_shared':
+            value.setdefault('source_digest', '0' * 64)
     return value
 
 
@@ -61,22 +59,24 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
         self.web_download_attempts = {}
         self.web_download_capability = True
         self.clients = set()
-        self.subscribers = set()
+        self.subscribers = {}
         self.lock = threading.Lock()
         super().__init__(str(path), Handler)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
     def broadcast(self, value):
-        encoded = json.dumps(canonical_broadcast_event(value)).encode() + b'\n'
         with self.lock:
-            subscribers = list(self.subscribers)
-        for client in subscribers:
+            subscribers = list(self.subscribers.items())
+        for client, request_id in subscribers:
             try:
-                client.sendall(encoded)
+                event = canonical_broadcast_event(dict(value))
+                event.setdefault('schema_version', 1)
+                event['request_id'] = request_id
+                client.sendall(json.dumps(event).encode() + b'\n')
             except OSError:
                 with self.lock:
-                    self.subscribers.discard(client)
+                    self.subscribers.pop(client, None)
 
     def close(self):
         self.shutdown()
@@ -94,22 +94,52 @@ class Handler(socketserver.StreamRequestHandler):
         with self.server.lock:
             self.server.clients.add(self.request)
         try:
-            value = json.loads(self.rfile.readline())
+            envelope = json.loads(self.rfile.readline())
+            assert set(envelope) == {'schema_version', 'request_id', 'request'}
+            assert envelope['schema_version'] == 1
+            request_id = envelope['request_id']
+            value = envelope['request']
             self.server.requests.append(value)
 
+
+            assert len(request_id) == 32 and request_id == request_id.lower()
+
             def emit(value):
-                self.wfile.write(json.dumps(canonical_broadcast_event(value)).encode() + b'\n')
+                omit_schema = value.pop('_omit_schema', False)
+                value = canonical_broadcast_event(value)
+                if not omit_schema:
+                    value.setdefault('schema_version', 1)
+                value['request_id'] = request_id
+                self.wfile.write(json.dumps(value).encode() + b'\n')
                 self.wfile.flush()
 
             if value['command'] == 'status':
                 capabilities = ['peer_directory_v2', 'web_share_v1']
                 if self.server.idempotency_capability:
                     capabilities.append('idempotent_mutations_v1')
-                emit({'type': 'status', 'running': True, 'peer': SELF_KEY, 'neighbors': 1,
-                      'endpoint_online': True, 'topic_joined': True,
+                capabilities.append('typed_contracts_v1')
+                emit({'type': 'status', 'running': True, 'peer': SELF_KEY,
+                      'topic': '00' * 32, 'advertises_self': False, 'has_invite': True,
+                      'bootstrap_peer_count': 1, 'self_advertised': False, 'neighbors': 1,
+                      'endpoint_online': True, 'topic_joined': True, 'alias': 'local-node',
+                      'alias_enabled': True, 'captured_hostname': 'local-node',
+                      'custom_alias': None, 'advertised_aliases': 1,
                       'ipc_capabilities': capabilities,
+                      'operation_cache_capacity': 1024, 'operation_cache_ttl_ms': 600000,
+                      'operation_cache_persistent': False, 'direct_replay_available': True,
+                      'direct_replay_error': None, 'direct_replay_capacity': 8192,
+                      'direct_replay_per_sender_capacity': 512, 'direct_replay_queue_capacity': 64,
+                      'direct_replay_global_rate_per_second': 128,
+                      'direct_replay_global_rate_burst': 256,
+                      'direct_replay_sender_rate_per_second': 8,
+                      'direct_replay_sender_rate_burst': 16,
                       'max_attachment_bytes': 1024 * 1024,
-                      'socket': 'private-path', 'invite': 'private-token'})
+                      'attachment_storage': {'tagged_bytes': 0, 'tagged_blobs': 0, 'tags': 0,
+                          'tag_capacity': 8192, 'quota_bytes': 1024 * 1024,
+                          'available_bytes': 1024 * 1024, 'min_free_bytes': 0,
+                          'pressure': False, 'over_quota': False, 'below_min_free': False,
+                          'sampled_at_ms': 1},
+                      'attachment_retention_secs': 0})
             elif value['command'] == 'peers':
                 emit(malicious_peers_snapshot())
             elif value['command'] == 'web_download':
@@ -118,7 +148,7 @@ class Handler(socketserver.StreamRequestHandler):
                 if offer == 'retry-token' and self.server.web_download_attempts[offer] == 1:
                     emit({'type': 'error', 'schema_version': 1,
                           'code': 'attachment_storage_busy',
-                          'message': 'open /home/alice/private/download.bin: database diagnostic',
+                          'message': 'Local capacity is currently unavailable.',
                           'outcome': 'not_started', 'retryable': True})
                     return
                 output = pathlib.Path(value['output'])
@@ -134,14 +164,24 @@ class Handler(socketserver.StreamRequestHandler):
                 assert output.name.endswith('.blob') and '..' not in output.name
                 output.write_bytes(b'browser attachment payload\n')
                 if offer == 'missing-schema-token':
-                    emit({'type': 'download_complete'})
+                    emit({'type': 'download_complete', '_omit_schema': True})
                 elif offer == 'wrong-schema-token':
                     emit({'type': 'download_complete', 'schema_version': 2})
                 elif offer == 'malformed-schema-token':
                     emit({'type': 'download_complete', 'schema_version': '1'})
                 else:
+                    names = {
+                        'private-token': '<incoming>.txt',
+                        'retry-token': 'retry.txt',
+                        'late-token': 'late.txt',
+                    }
                     emit({'type': 'download_complete', 'schema_version': 1,
-                          'name': '<incoming>.txt', 'kind': 'file', 'size': output.stat().st_size})
+                          'offer_id': '0123456789abcdef0123456789abcdef',
+                          'name': names.get(offer, 'schema.txt'), 'kind': 'file',
+                          'size': output.stat().st_size, 'from': REMOTE_KEY,
+                          'output': str(output), 'installed': True, 'pinned': True,
+                          'destination_synced': True, 'cleanup_complete': True,
+                          'warnings': []})
             elif value['command'] == 'share':
                 path = pathlib.Path(value['path'])
                 assert path.parent.parent.parent == pathlib.Path(self.server.server_address).parent / 'web-uploads-v1'
@@ -154,7 +194,7 @@ class Handler(socketserver.StreamRequestHandler):
                     if previous[0] != fingerprint:
                         emit({'type': 'error', 'schema_version': 1,
                               'code': 'operation_id_conflict', 'operation_id': operation_id,
-                              'message': 'operation ID was already used with different inputs',
+                              'message': 'The operation ID is bound to different input.',
                               'outcome': 'not_started', 'retryable': False})
                     else:
                         emit(previous[1])
@@ -162,14 +202,14 @@ class Handler(socketserver.StreamRequestHandler):
                 shared = {'type': 'attachment_shared', 'schema_version': 3,
                           'operation_id': operation_id, 'message_id': operation_id,
                           'offer_id': operation_id, 'source_digest': source_digest,
-                          'from': 'fake-peer',
+                          'from': SELF_KEY,
                           'timestamp_ms': 1700000000001, 'name': path.name, 'kind': 'file',
                           'size': len(payload), 'offer': 'private-offer', 'ticket': 'private-ticket',
                           'delivery_acknowledged': False}
                 if path.name == 'post-broadcast-failure.txt':
                     outcome = {'type': 'error', 'schema_version': 1,
                                'code': 'share_failed', 'operation_id': operation_id,
-                               'message': 'broadcast /srv/meshmsg/private/stage.bin failed: internal route diagnostic',
+                               'message': 'Attachment sharing failed.',
                                'outcome': 'unknown', 'retryable': True}
                     self.server.share_operations[operation_id] = (fingerprint, outcome)
                     self.server.broadcast(shared)
@@ -189,19 +229,19 @@ class Handler(socketserver.StreamRequestHandler):
                     if previous_body != value['body']:
                         emit({'type': 'error', 'schema_version': 1,
                               'code': 'operation_id_conflict', 'operation_id': operation_id,
-                              'message': 'operation ID was already used with different inputs',
+                              'message': 'The operation ID is bound to different input.',
                               'outcome': 'not_started', 'retryable': False})
                     else:
                         emit(previous_outcome)
                     return
                 if value['body'] == 'reject':
                     outcome = {'type': 'error', 'schema_version': 1, 'code': 'send_failed',
-                               'operation_id': operation_id, 'message': 'scripted rejection',
+                               'operation_id': operation_id, 'message': 'Message submission failed.',
                                'outcome': 'unknown', 'retryable': True}
                 else:
                     outcome = {'type': 'queued', 'schema_version': 3,
                                'operation_id': operation_id, 'message_id': operation_id,
-                               'from': 'fake-peer', 'body': value['body'],
+                               'from': SELF_KEY, 'body': value['body'],
                                'timestamp_ms': 1700000000000, 'delivery_acknowledged': False}
                     self.server.broadcast(outcome)
                 self.server.operations[operation_id] = (value['body'], outcome)
@@ -210,30 +250,30 @@ class Handler(socketserver.StreamRequestHandler):
                 emit(outcome)
             elif value['command'] == 'subscribe':
                 capabilities = ['web_download_v1'] if self.server.web_download_capability else []
-                emit({'type': 'connected', 'peer': SELF_KEY,
+                emit({'type': 'connected', 'peer': SELF_KEY, 'endpoint_online': True,
+                      'topic_joined': True, 'alias': 'local-node',
                       'ipc_capabilities': capabilities})
                 emit(malicious_peers_snapshot())
-                emit({'type': 'attachment_offer', 'from': 'other-peer', 'timestamp_ms': 2,
+                emit({'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 2,
                       'name': '<incoming>.txt', 'kind': 'file', 'size': 1536,
-                      'offer_id': 'private-id', 'offer': 'private-token',
-                      'ticket': 'private-ticket', 'path': 'private-path', 'output': 'private-output'})
-                emit({'type': 'message', 'from': 'other-peer', 'body': '<img src=x onerror=alert(1)>\ndata: injected', 'timestamp_ms': 1})
-                emit({'type': 'lagged', 'dropped': 3})
-                emit({'type': 'private_message', 'from': 'other-peer', 'body': 'private-message-body'})
-                emit({'type': 'private_accepted', 'to': 'other-peer', 'body': 'private-accepted-body'})
+                      'offer_id': '0123456789abcdef0123456789abcdef',
+                      'message_id': '0123456789abcdef0123456789abcdef',
+                      'offer': 'private-token', 'ticket': 'private-ticket'})
+                emit({'type': 'message', 'from': REMOTE_KEY,
+                      'message_id': '1123456789abcdef0123456789abcdef',
+                      'body': '<img src=x onerror=alert(1)>\ndata: injected', 'timestamp_ms': 1})
+                emit({'type': 'lagged', 'source': 'local', 'dropped': 3,
+                      'message': 'local listener missed 3 events'})
                 emit({
                     'type': 'peer_discovered', 'schema_version': 2,
                     'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 1,
                     'peer': {
                         'public_key': EVENT_KEY, 'alias': 'event-node', 'online': True,
                         'last_seen_ms': 950, 'expires_at_ms': 150950,
-                        'endpoint': 'private-event-endpoint', 'relay': 'private-event-relay',
-                        'body': 'private-event-body',
                     },
-                    'socket': 'private-event-socket', 'body': 'private-top-event-body',
                 })
                 with self.server.lock:
-                    self.server.subscribers.add(self.request)
+                    self.server.subscribers[self.request] = request_id
                 self.rfile.read(1)  # Remain subscribed until web disconnects.
             else:
                 raise AssertionError(f'web leaked command: {value}')
@@ -241,7 +281,7 @@ class Handler(socketserver.StreamRequestHandler):
             pass
         finally:
             with self.server.lock:
-                self.server.subscribers.discard(self.request)
+                self.server.subscribers.pop(self.request, None)
                 self.server.clients.discard(self.request)
 
 
@@ -258,9 +298,18 @@ def main():
             web = subprocess.Popen([BIN, '--state-dir', str(root), 'web', '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
             streams = []
 
+            request_counter = 0
+
             def request(method='POST', path='/api/request', value=None, headers=None, raw=None):
-                body = raw if raw is not None else json.dumps(value or {'command': 'status'})
-                actual_headers = {'Origin': origin, 'Content-Type': 'application/json'} if headers is None else headers
+                nonlocal request_counter
+                request_counter += 1
+                request_id = f'{request_counter:032x}'
+                command = dict(value or {'command': 'status'})
+                payload = {'schema_version': 1, 'request_id': request_id, 'request': command}
+                body = raw if raw is not None else json.dumps(payload)
+                actual_headers = {'Origin': origin, 'Content-Type': 'application/json'} if headers is None else dict(headers)
+                if method == 'POST' and raw is None:
+                    actual_headers.setdefault('X-Meshmsg-Request-Id', request_id)
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
                 conn.request(method, path, body if method == 'POST' else None, actual_headers)
                 response = conn.getresponse()
@@ -269,9 +318,19 @@ def main():
                 conn.close()
                 return result
 
+            def response_json(data):
+                decoded = json.loads(data)
+                request_id = decoded.pop('request_id')
+                assert len(request_id) == 32 and request_id == request_id.lower()
+                return decoded
+
             def api(value):
-                code, _, data = request(value=value)
-                return code, json.loads(data)
+                code, headers, data = request(value=value)
+                decoded = json.loads(data)
+                request_id = decoded.pop('request_id')
+                assert len(request_id) == 32 and request_id == headers['x-meshmsg-request-id']
+                assert isinstance(decoded.get('schema_version'), int)
+                return code, decoded
 
             def open_feed():
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
@@ -285,7 +344,11 @@ def main():
                     line = response.readline()
                     assert line, 'SSE closed unexpectedly'
                     if line.startswith(b'data: '):
-                        return json.loads(line[6:])
+                        value = json.loads(line[6:])
+                        request_id = value.pop('request_id')
+                        assert len(request_id) == 32 and request_id == request_id.lower()
+                        assert isinstance(value.get('schema_version'), int)
+                        return value
 
             try:
                 deadline = time.monotonic() + 15
@@ -358,12 +421,39 @@ def main():
                     assert request(headers=headers)[0] == 403
                 assert request(headers={'Origin': origin, 'Content-Type': 'text/plain'})[0] == 415
                 assert request(headers={'Origin': origin, 'Content-Type': 'application/json', 'Content-Encoding': 'gzip'})[0] == 415
+                strict_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                strict_body = json.dumps({
+                    'schema_version': 1, 'request_id': strict_id,
+                    'request': {'command': 'status'},
+                })
+                base_headers = {'Origin': origin, 'Content-Type': 'application/json'}
+                assert request(raw=strict_body, headers=base_headers)[0] == 400
+                malformed_headers = dict(base_headers, **{'X-Meshmsg-Request-Id': 'BAD'})
+                assert request(raw=strict_body, headers=malformed_headers)[0] == 400
+                mismatch_headers = dict(base_headers, **{
+                    'X-Meshmsg-Request-Id': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'})
+                assert request(raw=strict_body, headers=mismatch_headers)[0] == 400
+                duplicate = socket.create_connection(('127.0.0.1', port), timeout=5)
+                duplicate.sendall((
+                    'POST /api/request HTTP/1.1\r\n'
+                    f'Host: 127.0.0.1:{port}\r\n'
+                    f'Origin: {origin}\r\n'
+                    'Content-Type: application/json\r\n'
+                    f'Content-Length: {len(strict_body.encode())}\r\n'
+                    f'X-Meshmsg-Request-Id: {strict_id}\r\n'
+                    'X-Meshmsg-Request-Id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n'
+                    'Connection: close\r\n\r\n' + strict_body
+                ).encode())
+                duplicate_response = duplicate.recv(4096)
+                duplicate.close()
+                assert duplicate_response.startswith(b'HTTP/1.1 400')
                 for command in ['stop', 'subscribe', 'share', 'offers', 'download', 'bench_send', 'init', 'join', 'topic']:
                     assert api({'command': command})[0] == 400
                 for value in [{'command': 'status', 'path': '/etc/passwd'}, {'command': 'send', 'operation_id': '00000000000000000000000000000001', 'body': ''}, {'command': 'send', 'operation_id': '00000000000000000000000000000002', 'body': '二' * 1366}, {'command': 'send', 'operation_id': '00000000000000000000000000000003', 'body': 'x', 'extra': True}]:
                     assert api(value)[0] == 400
-                assert request(raw='{bad json')[0] == 400
-                assert request(raw='x' * 30000)[0] == 413
+                raw_headers = dict(base_headers, **{'X-Meshmsg-Request-Id': strict_id})
+                assert request(raw='{bad json', headers=raw_headers)[0] == 400
+                assert request(raw='x' * 30000, headers=raw_headers)[0] == 413
                 assert len(daemon.requests) == before, 'rejected HTTP request reached IPC'
 
                 daemon.idempotency_capability = False
@@ -376,7 +466,7 @@ def main():
                     'type': 'error', 'schema_version': 1,
                     'code': 'idempotency_unsupported',
                     'operation_id': '10000000000000000000000000000000',
-                    'message': 'Daemon does not advertise retry-safe mutations. Upgrade and restart it; the message was not submitted.',
+                    'message': 'Retry-safe mutations are unsupported by the daemon.',
                     'outcome': 'not_started', 'retryable': False}
                 assert sum(r.get('command') == 'send' for r in daemon.requests) == sends_before
                 daemon.idempotency_capability = True
@@ -387,7 +477,7 @@ def main():
                 assert api({'command': 'send', 'operation_id': '10000000000000000000000000000003', 'body': 'reject'}) == (502, {
                     'type': 'error', 'schema_version': 1, 'code': 'send_failed',
                     'operation_id': '10000000000000000000000000000003',
-                    'message': 'scripted rejection', 'outcome': 'unknown', 'retryable': True})
+                    'message': 'Message submission failed.', 'outcome': 'unknown', 'retryable': True})
                 time.sleep(1.05)
                 assert api({'command': 'send', 'operation_id': '10000000000000000000000000000004', 'body': 'lost-reply'})[1]['outcome'] == 'unknown'
                 time.sleep(1.05)
@@ -417,13 +507,12 @@ def main():
                     assert attachment == {
                         'type': 'attachment_offer', 'schema_version': 2,
                         'message_id': '0123456789abcdef0123456789abcdef',
-                        'direction': 'incoming', 'from': 'other-peer',
+                        'direction': 'incoming', 'from': REMOTE_KEY,
                         'timestamp_ms': 2, 'name': '<incoming>.txt', 'kind': 'file', 'size': 1536}
                     assert 'private-token' not in json.dumps(attachment)
                     value = next_event(response)
                     assert value['type'] == 'message' and '\ndata: injected' in value['body']
                     assert next_event(response)['type'] == 'lagged'
-                    # The two private events are dropped; this must be the next frame.
                     assert next_event(response) == {
                         'type': 'peer_discovered', 'schema_version': 2,
                         'directory_epoch': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'directory_revision': 1,
@@ -451,7 +540,7 @@ def main():
                              'X-Meshmsg-File-Name': urllib.parse.quote(upload_name, safe="~()*!.'-"),
                              'X-Meshmsg-Operation-Id': upload_operation_id})
                 assert code == 200
-                assert json.loads(upload_response) == {
+                assert response_json(upload_response) == {
                     'type': 'attachment_shared', 'schema_version': 3,
                     'operation_id': upload_operation_id,
                     'message_id': upload_operation_id, 'offer_id': upload_operation_id,
@@ -463,7 +552,7 @@ def main():
                         'type': 'attachment_shared', 'schema_version': 3,
                         'operation_id': '20000000000000000000000000000001',
                         'message_id': '20000000000000000000000000000001',
-                        'direction': 'outgoing', 'from': 'fake-peer',
+                        'direction': 'outgoing', 'from': SELF_KEY,
                         'timestamp_ms': 1700000000001, 'name': upload_name,
                         'kind': 'file', 'size': len(upload_payload)}
                 upload_request = next(value for value in daemon.requests if value.get('command') == 'share')
@@ -477,7 +566,7 @@ def main():
                     'X-Meshmsg-Operation-Id': upload_operation_id}
                 code, _, retry_body = request(
                     'POST', '/api/attachment', raw=upload_payload, headers=retry_headers)
-                assert code == 200 and json.loads(retry_body)['operation_id'] == upload_operation_id
+                assert code == 200 and response_json(retry_body)['operation_id'] == upload_operation_id
                 retry_request = [value for value in daemon.requests
                                  if value.get('command') == 'share'][-1]
                 assert retry_request['path'] == str(upload_path)
@@ -485,7 +574,7 @@ def main():
                                            if value.get('command') == 'share'])
                 code, _, conflict_body = request(
                     'POST', '/api/attachment', raw=b'x' * len(upload_payload), headers=retry_headers)
-                conflict = json.loads(conflict_body)
+                conflict = response_json(conflict_body)
                 assert code == 409 and conflict['code'] == 'operation_id_conflict'
                 assert conflict['operation_id'] == upload_operation_id
                 assert len([value for value in daemon.requests
@@ -507,7 +596,7 @@ def main():
                     headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
                              'X-Meshmsg-File-Name': 'post-broadcast-failure.txt',
                              'X-Meshmsg-Operation-Id': '20000000000000000000000000000004'})
-                ambiguous = json.loads(ambiguous_body)
+                ambiguous = response_json(ambiguous_body)
                 assert code == 502 and ambiguous == {
                     'type': 'error', 'schema_version': 1, 'code': 'share_failed',
                     'operation_id': '20000000000000000000000000000004',
@@ -527,7 +616,7 @@ def main():
                     headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
                              'X-Meshmsg-File-Name': 'post-broadcast-failure.txt',
                              'X-Meshmsg-Operation-Id': '20000000000000000000000000000004'})
-                assert code == 502 and cached_ambiguous_body == ambiguous_body
+                assert code == 502 and response_json(cached_ambiguous_body) == ambiguous
 
                 forced_conflict_id = '20000000000000000000000000000006'
                 daemon.share_operations[forced_conflict_id] = (
@@ -537,11 +626,11 @@ def main():
                     headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
                              'X-Meshmsg-File-Name': 'conflict.txt',
                              'X-Meshmsg-Operation-Id': forced_conflict_id})
-                assert code == 422 and json.loads(conflict_body) == {
+                assert code == 422 and response_json(conflict_body) == {
                     'type': 'error', 'schema_version': 1,
                     'code': 'operation_id_conflict',
                     'operation_id': forced_conflict_id,
-                    'message': 'The operation ID was already used with different inputs.',
+                    'message': 'The operation ID is bound to different input.',
                     'outcome': 'not_started', 'retryable': False}
 
                 code, _, mismatch_body = request(
@@ -549,7 +638,7 @@ def main():
                     headers={'Origin': origin, 'Content-Type': 'application/octet-stream',
                              'X-Meshmsg-File-Name': 'mismatched-success.txt',
                              'X-Meshmsg-Operation-Id': '20000000000000000000000000000005'})
-                mismatch = json.loads(mismatch_body)
+                mismatch = response_json(mismatch_body)
                 assert code == 502 and mismatch['outcome'] == 'unknown'
                 mismatch_request = next(
                     value for value in daemon.requests
@@ -595,7 +684,7 @@ def main():
                 assert output_path.parent.parent == root / 'web-downloads-v2'
                 assert output_path.exists(), 'retryable ready file was removed after serving'
 
-                retry_offer = {'type': 'attachment_offer', 'from': 'retry-peer', 'timestamp_ms': 5,
+                retry_offer = {'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 5,
                                'name': 'retry.txt', 'kind': 'file', 'size': 27,
                                'offer_id': 'retry-id', 'offer': 'retry-token', 'ticket': 'private-ticket'}
                 daemon.broadcast(retry_offer)
@@ -613,7 +702,7 @@ def main():
                     time.sleep(.01)
                 assert failed['code'] == 'attachment_storage_busy'
                 assert failed['outcome'] == 'not_started' and failed['retryable'] is True
-                assert failed['message'] == 'Attachment storage is busy; retry later.'
+                assert failed['message'] == 'Local capacity is currently unavailable.'
                 assert '/home/alice' not in json.dumps(failed) and 'database diagnostic' not in json.dumps(failed)
                 code, second_retry = api({'command': 'download', 'id': retry_ids[0]})
                 assert code == 202, 'definitely-not-started failure consumed the offer handle'
@@ -627,7 +716,7 @@ def main():
                 assert request('GET', retried['url'])[2] == b'browser attachment payload\n'
 
                 for schema_offer in ['missing-schema-token', 'wrong-schema-token', 'malformed-schema-token']:
-                    daemon.broadcast({'type': 'attachment_offer', 'from': schema_offer,
+                    daemon.broadcast({'type': 'attachment_offer', 'from': REMOTE_KEY,
                                       'timestamp_ms': 6, 'name': 'schema.txt', 'kind': 'file',
                                       'size': 27, 'offer_id': 'schema-id', 'offer': schema_offer,
                                       'ticket': 'private-ticket'})
@@ -646,22 +735,21 @@ def main():
                                           and value.get('offer') == schema_offer)
                     assert not pathlib.Path(schema_request['output']).exists(), 'invalid IPC success exposed a file'
 
-                shared = {'type': 'attachment_shared', 'from': 'fake-peer', 'timestamp_ms': 3,
+                shared = {'type': 'attachment_shared', 'from': SELF_KEY, 'timestamp_ms': 3,
                           'name': 'shared-directory.tar', 'kind': 'directory_tar_v1', 'size': 4096,
                           'offer_id': 'private-id', 'offer': 'private-token',
-                          'ticket': 'private-ticket', 'path': 'private-path', 'output': 'private-output',
-                          'delivery_acknowledged': True}
+                          'ticket': 'private-ticket', 'delivery_acknowledged': False}
                 daemon.broadcast(shared)
                 for response in [feed, other_tab]:
                     assert next_event(response) == {
                         'type': 'attachment_shared', 'schema_version': 3,
                         'operation_id': '0123456789abcdef0123456789abcdef',
                         'message_id': '0123456789abcdef0123456789abcdef',
-                        'direction': 'outgoing', 'from': 'fake-peer',
+                        'direction': 'outgoing', 'from': SELF_KEY,
                         'timestamp_ms': 3, 'name': 'shared-directory.tar',
                         'kind': 'directory_tar_v1', 'size': 4096}
 
-                incoming = {'type': 'attachment_offer', 'from': 'another-peer', 'timestamp_ms': 4,
+                incoming = {'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 4,
                             'name': 'incoming-directory.tar', 'kind': 'directory_tar_v1', 'size': 8192,
                             'offer_id': 'private-id', 'offer': 'private-token', 'ticket': 'private-ticket'}
                 daemon.broadcast(incoming)
@@ -672,7 +760,7 @@ def main():
                     assert directory == {
                         'type': 'attachment_offer', 'schema_version': 2,
                         'message_id': '0123456789abcdef0123456789abcdef',
-                        'direction': 'incoming', 'from': 'another-peer',
+                        'direction': 'incoming', 'from': REMOTE_KEY,
                         'timestamp_ms': 4, 'name': 'incoming-directory.tar',
                         'kind': 'directory_tar_v1', 'size': 8192}
 
@@ -685,12 +773,12 @@ def main():
                         'type': 'queued', 'schema_version': 3,
                         'operation_id': '10000000000000000000000000000005',
                         'message_id': '10000000000000000000000000000005',
-                        'from': 'fake-peer', 'body': synced,
+                        'from': SELF_KEY, 'body': synced,
                         'timestamp_ms': 1700000000000, 'delivery_acknowledged': False}
 
                 with socket.socket(socket.AF_UNIX) as local_cli:
                     local_cli.connect(str(root / 'daemon.sock'))
-                    local_cli.sendall(b'{"command":"send","operation_id":"10000000000000000000000000000006","body":"sent-from-cli"}\n')
+                    local_cli.sendall(b'{"schema_version":1,"request_id":"77777777777777777777777777777777","request":{"command":"send","operation_id":"10000000000000000000000000000006","body":"sent-from-cli"}}\n')
                     assert json.loads(local_cli.recv(4096))['type'] == 'queued'
                 for response in [feed, other_tab]:
                     value = next_event(response)
@@ -707,14 +795,14 @@ def main():
                     value = next_event(response)
                     assert value['type'] == 'queued' and value['schema_version'] == 3
                     assert value['operation_id'] == value['message_id']
-                    assert value['from'] == 'fake-peer' and value['body'] == chat_body
+                    assert value['from'] == SELF_KEY and value['body'] == chat_body
                     assert value['timestamp_ms'] == 1700000000000
                     assert value['delivery_acknowledged'] is False
                     assert value == {
                         'type': 'queued', 'schema_version': 3,
                         'operation_id': value['operation_id'],
                         'message_id': value['operation_id'],
-                        'from': 'fake-peer', 'body': chat_body,
+                        'from': SELF_KEY, 'body': chat_body,
                         'timestamp_ms': 1700000000000, 'delivery_acknowledged': False}
 
                 for _ in range(14):
@@ -733,13 +821,15 @@ def main():
 
                 # A body that never completes must not hold a request indefinitely.
                 with socket.create_connection(('127.0.0.1', port), timeout=10) as slow:
-                    slow.sendall(f'POST /api/request HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{'.encode())
+                    slow.sendall(f'POST /api/request HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nX-Meshmsg-Request-Id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nContent-Length: 100\r\n\r\n{{'.encode())
                     assert b'408' in slow.recv(8192)
 
                 daemon.close()
                 assert api({'command': 'status'})[0] == 503
                 offline = open_feed()
-                assert next_event(offline)['type'] == 'offline'
+                offline_event = next_event(offline)
+                assert offline_event['type'] == 'error' and offline_event['code'] == 'daemon_offline'
+                assert offline_event['retryable'] is True and offline_event['outcome'] == 'unknown'
                 offline.close()
                 daemon = Daemon(root / 'daemon.sock')
                 assert api({'command': 'status'})[0] == 200
@@ -750,12 +840,13 @@ def main():
                 late_feed = open_feed()
                 assert next_event(late_feed)['type'] == 'connected'
                 assert next_event(late_feed)['type'] == 'peers_snapshot'
-                daemon.broadcast({'type': 'attachment_offer', 'from': 'late-peer', 'timestamp_ms': 9,
+                daemon.broadcast({'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 9,
                                   'name': 'late.txt', 'kind': 'file', 'size': 19,
                                   'offer_id': 'late-id', 'offer': 'late-token', 'ticket': 'private-ticket'})
                 while True:
                     late_event = next_event(late_feed)
-                    if late_event.get('from') == 'late-peer':
+                    if late_event.get('name') == 'late.txt':
+                        assert late_event.get('from') == REMOTE_KEY
                         late_id = late_event['download_id']
                         break
                 code, late_started = api({'command': 'download', 'id': late_id})
@@ -791,7 +882,7 @@ def main():
                 # Web shutdown must leave the separate daemon endpoint usable.
                 with socket.socket(socket.AF_UNIX) as client:
                     client.connect(str(root / 'daemon.sock'))
-                    client.sendall(b'{"command":"status"}\n')
+                    client.sendall(b'{"schema_version":1,"request_id":"66666666666666666666666666666666","request":{"command":"status"}}\n')
                     assert json.loads(client.recv(4096))['running'] is True
                 print('PASS: HTTP security/allowlist/assets, bounded browser attachment uploads and negotiated opaque retryable/ranged downloads with safe staging/headers, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
             finally:

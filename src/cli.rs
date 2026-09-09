@@ -329,7 +329,13 @@ pub enum Command {
 impl InviteInput {
     pub fn into_token(self) -> Result<String> {
         let mut token = match (self.token, self.token_file, self.token_stdin) {
-            (Some(token), None, false) => token,
+            (Some(token), None, false) => {
+                anyhow::ensure!(
+                    token.len() <= MAX_CAPABILITY_INPUT_BYTES,
+                    "invite token exceeds the input limit"
+                );
+                token
+            }
             (None, Some(path), false) => {
                 read_file(&path, "invite token", MAX_CAPABILITY_INPUT_BYTES)?
             }
@@ -350,7 +356,13 @@ impl InviteInput {
 impl MessageInput {
     pub fn into_message(self) -> Result<String> {
         match (self.message, self.message_file, self.message_stdin) {
-            (Some(message), None, false) => Ok(message),
+            (Some(message), None, false) => {
+                anyhow::ensure!(
+                    message.len() <= MAX_MESSAGE_INPUT_BYTES,
+                    "message body exceeds the input limit"
+                );
+                Ok(message)
+            }
             (None, Some(path), false) => read_file(&path, "message body", MAX_MESSAGE_INPUT_BYTES),
             (None, None, true) => read_stdin("message body", MAX_MESSAGE_INPUT_BYTES),
             _ => bail!("exactly one message input source is required"),
@@ -361,7 +373,13 @@ impl MessageInput {
 impl OfferInput {
     pub fn into_offer(self) -> Result<String> {
         let mut offer = match (self.offer, self.offer_file, self.offer_stdin) {
-            (Some(offer), None, false) => offer,
+            (Some(offer), None, false) => {
+                anyhow::ensure!(
+                    offer.len() <= MAX_CAPABILITY_INPUT_BYTES,
+                    "attachment offer exceeds the input limit"
+                );
+                offer
+            }
             (None, Some(path), false) => {
                 read_file(&path, "attachment offer", MAX_CAPABILITY_INPUT_BYTES)?
             }
@@ -418,6 +436,7 @@ impl Cli {
 
 pub fn print_result(json: bool, human: &str, value: serde_json::Value) {
     if json {
+        let value = crate::contracts::correlate(value, &crate::contracts::new_request_id());
         println!("{value}");
     } else {
         println!("{human}");

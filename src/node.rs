@@ -1,15 +1,19 @@
+#[cfg(test)]
+use crate::ipc::write_request;
 use crate::{
     alias::AliasConfig,
     attachment::{self, AttachmentKind, AttachmentOffer},
     config::{prepare_state_dir, State, StateLock},
+    contracts::{self, ErrorEnvelopeV1, API_CONTRACT_CAPABILITY},
     direct::{
         self, DirectHandler, Directory, IncomingDirect, PresenceSourceLimiter, DIRECT_ALPN,
         PRESENCE_ALPN,
     },
     invite::Invite,
     ipc::{
-        daemon_error_message, read_frame, send_request_checked, subscribe, valid_content_digest,
-        valid_operation_id, write_request, write_value, BenchConfig, IpcRequest, LifecycleErrorV1,
+        daemon_error_message, read_frame, send_request_checked, subscribe, subscribe_with_id,
+        valid_content_digest, valid_operation_id, validate_success_payload, write_request_with_id,
+        write_value, BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
         SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY,
         MAX_IPC_REQUEST_SIZE, PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY,
         WEB_SHARE_CAPABILITY,
@@ -1804,8 +1808,9 @@ where
                 stats.envelope_bytes += encoded_bytes as u64;
             }
             Some(Ok(Err(error))) => {
+                eprintln!("benchmark send diagnostic: {error}");
                 stats.failed += 1;
-                stats.first_error = Some(error);
+                stats.first_error = Some("Message submission failed.".into());
                 reason = "send_failed";
                 break 'benchmark;
             }
@@ -1872,6 +1877,64 @@ impl Default for LocalIpcTimeouts {
     }
 }
 
+tokio::task_local! {
+    static IPC_REQUEST_ID: std::cell::RefCell<Option<String>>;
+}
+
+fn normalize_ipc_response(value: &serde_json::Value, request_id: &str) -> serde_json::Value {
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+        let code = value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| contracts::known_error_code(code))
+            .unwrap_or("internal_contract_error");
+        let outcome = value
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .filter(|outcome| matches!(*outcome, "not_started" | "unknown" | "partial"))
+            .unwrap_or(match code {
+                "invalid_request" | "unsupported_schema" | "invalid_message"
+                | "invalid_benchmark" | "benchmark_busy" | "private_send_busy" => "not_started",
+                _ => "unknown",
+            });
+        let retryable = value
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(
+                matches!(code, "benchmark_busy" | "private_send_busy") || outcome != "not_started",
+            );
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Daemon request failed.");
+        let mut error = ErrorEnvelopeV1::new(code, message, outcome, retryable);
+        error.request_id = Some(request_id.to_owned());
+        error.operation_id = value
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| valid_operation_id(id))
+            .map(str::to_owned);
+        error.offer_id = value
+            .get("offer_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| valid_operation_id(id))
+            .map(str::to_owned);
+        error.selected_tags = value
+            .get("selected_tags")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok());
+        error.removed_tags = value
+            .get("removed_tags")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok());
+        error.quota_bytes_released = value
+            .get("quota_bytes_released")
+            .and_then(serde_json::Value::as_u64);
+        return error.into_value();
+    }
+    contracts::correlate(value.clone(), request_id)
+}
+
 async fn write_local_response<S>(
     stream: &mut S,
     value: &serde_json::Value,
@@ -1880,9 +1943,21 @@ async fn write_local_response<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    tokio::time::timeout(deadline, write_value(stream, value))
-        .await
-        .context("timed out writing local IPC response")?
+    let correlated = IPC_REQUEST_ID
+        .try_with(|current| {
+            current
+                .borrow()
+                .as_deref()
+                .map(|id| normalize_ipc_response(value, id))
+        })
+        .ok()
+        .flatten();
+    tokio::time::timeout(
+        deadline,
+        write_value(stream, correlated.as_ref().unwrap_or(value)),
+    )
+    .await
+    .context("timed out writing local IPC response")?
 }
 
 fn annotate_operation_response(value: &mut serde_json::Value, operation_id: &str) {
@@ -1967,16 +2042,20 @@ async fn handle_local_client<S>(
 where
     S: SubscriptionStream,
 {
-    handle_local_client_with_timeouts(
-        stream,
-        commands,
-        events,
-        connected,
-        startup_peers,
-        benchmark_busy,
-        LocalIpcTimeouts::default(),
-    )
-    .await
+    IPC_REQUEST_ID
+        .scope(
+            std::cell::RefCell::new(None),
+            handle_local_client_with_timeouts(
+                stream,
+                commands,
+                events,
+                connected,
+                startup_peers,
+                benchmark_busy,
+                LocalIpcTimeouts::default(),
+            ),
+        )
+        .await
 }
 
 async fn handle_local_client_with_timeouts<S>(
@@ -1999,20 +2078,46 @@ where
     {
         Ok(result) => result?,
         Err(_) => {
-            let _ = write_local_response(
-                &mut stream,
-                &serde_json::json!({
-                    "type":"error", "code":"initial_frame_timeout",
-                    "message":"initial local IPC request was not received before the deadline"
-                }),
-                timeouts.response_write,
-            )
-            .await;
+            let error = ErrorEnvelopeV1::new(
+                "initial_frame_timeout",
+                "The initial local request timed out.",
+                "not_started",
+                true,
+            );
+            let _ = write_local_response(&mut stream, &error.into_value(), timeouts.response_write)
+                .await;
             return Ok(());
         }
     };
-    let request: IpcRequest =
-        serde_json::from_slice(&frame).context("invalid local IPC request")?;
+    let request_frame: IpcRequestFrame = match serde_json::from_slice(&frame) {
+        Ok(frame) => frame,
+        Err(_) => {
+            let error = ErrorEnvelopeV1::new(
+                "invalid_request",
+                "Malformed local IPC request.",
+                "not_started",
+                false,
+            );
+            let _ = write_local_response(&mut stream, &error.into_value(), timeouts.response_write)
+                .await;
+            return Ok(());
+        }
+    };
+    let _ = IPC_REQUEST_ID
+        .try_with(|current| *current.borrow_mut() = Some(request_frame.request_id.clone()));
+    if request_frame.validate().is_err() {
+        let mut error = ErrorEnvelopeV1::new(
+            "unsupported_schema",
+            "Unsupported or invalid local IPC contract.",
+            "not_started",
+            false,
+        );
+        error.request_id = contracts::valid_request_id(&request_frame.request_id)
+            .then_some(request_frame.request_id);
+        write_local_response(&mut stream, &error.into_value(), timeouts.response_write).await?;
+        return Ok(());
+    }
+    let request = request_frame.request;
     let operation_id = match &request {
         IpcRequest::Send { operation_id, .. }
         | IpcRequest::PrivateSend { operation_id, .. }
@@ -4151,15 +4256,13 @@ async fn reject_local_client_at_capacity<S>(mut stream: S, write_timeout: Durati
 where
     S: AsyncWrite + Unpin,
 {
-    let _ = write_local_response(
-        &mut stream,
-        &serde_json::json!({
-            "type":"error", "code":"ipc_capacity",
-            "message":"local IPC connection capacity reached; retry later"
-        }),
-        write_timeout,
-    )
-    .await;
+    let error = ErrorEnvelopeV1::new(
+        "ipc_capacity",
+        "Local capacity is currently unavailable.",
+        "not_started",
+        true,
+    );
+    let _ = write_local_response(&mut stream, &error.into_value(), write_timeout).await;
 }
 
 struct LocalClientSession {
@@ -4180,16 +4283,20 @@ where
     S: SubscriptionStream,
 {
     let _permit = permit;
-    handle_local_client_with_timeouts(
-        stream,
-        session.commands,
-        session.events,
-        session.connected,
-        session.startup_peers,
-        session.benchmark_busy,
-        timeouts,
-    )
-    .await
+    IPC_REQUEST_ID
+        .scope(
+            std::cell::RefCell::new(None),
+            handle_local_client_with_timeouts(
+                stream,
+                session.commands,
+                session.events,
+                session.connected,
+                session.startup_peers,
+                session.benchmark_busy,
+                timeouts,
+            ),
+        )
+        .await
 }
 
 /// Admit immediately after the platform listener has accepted/authenticated the
@@ -4380,7 +4487,6 @@ pub async fn run_daemon(
         "type":"daemon_started", "peer":peer, "topic":state.topic,
         "advertises_self":state.advertise_self, "has_invite":has_invite,
         "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
-        "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
         "endpoint_online":true, "topic_joined":node.receiver.is_joined(),
         "alias":alias_config.effective(), "alias_enabled":alias_config.enabled(),
         "max_attachment_bytes":max_attachment_bytes,
@@ -4463,7 +4569,7 @@ pub async fn run_daemon(
                             "type":"connected", "peer":peer, "endpoint_online":true,
                             "topic_joined":node.receiver.is_joined(),
                             "alias":alias_config.effective(),
-                            "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY]
+                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY]
                         });
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
@@ -4633,14 +4739,13 @@ pub async fn run_daemon(
                         "advertises_self":state.advertise_self, "has_invite":has_invite,
                         "bootstrap_peer_count":bootstrap_peer_count,
                         "self_advertised":self_advertised, "neighbors":neighbors,
-                        "socket":local_endpoint(dir), "local_endpoint":local_endpoint(dir),
                         "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined(),
                         "alias":alias_config.effective(),
                         "alias_enabled":alias_config.enabled(),
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY],
+                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY],
                         "operation_cache_capacity":OPERATION_CACHE_CAPACITY,
                         "operation_cache_ttl_ms":OPERATION_CACHE_TTL.as_millis() as u64,
                         "operation_cache_persistent":false,
@@ -4681,17 +4786,11 @@ pub async fn run_daemon(
                         let _permit = permit;
                         let response = match list_pinned_blobs(&store).await {
                             Ok((blobs, has_more, item_errors)) => {
-                                let mut response = serde_json::json!({
-                                    "type":"offers", "schema_version":1, "blobs":blobs
-                                });
-                                if has_more {
-                                    response["truncated"] = true.into();
-                                    response["has_more"] = true.into();
-                                }
-                                if item_errors > 0 {
-                                    response["item_errors"] = item_errors.into();
-                                }
-                                response
+                                serde_json::json!({
+                                    "type":"offers", "schema_version":1, "blobs":blobs,
+                                    "truncated":has_more, "has_more":has_more,
+                                    "item_errors":item_errors
+                                })
                             }
                             Err(error) => serde_json::json!({
                                 "type":"error", "code":"offers_failed", "message":error.to_string()
@@ -5238,6 +5337,7 @@ struct PrivateAcceptedResponse {
     #[serde(rename = "type")]
     kind: String,
     schema_version: u64,
+    request_id: String,
     operation_id: String,
     to: String,
     message_id: String,
@@ -5263,6 +5363,10 @@ fn validate_private_acceptance(
             && !accepted.durable
             && !accepted.read,
         "daemon returned an invalid private-send acceptance"
+    );
+    anyhow::ensure!(
+        contracts::valid_request_id(&accepted.request_id),
+        "private-send acceptance request ID is invalid"
     );
     let _duplicate_accepted = accepted.duplicate_accepted;
     anyhow::ensure!(
@@ -5466,12 +5570,7 @@ async fn send_lifecycle_request(
             expected_offer_id.is_none_or(|id| error.offer_id.as_deref() == Some(id)),
             "daemon lifecycle error offer ID does not match the request"
         );
-        anyhow::bail!(
-            "daemon rejected request [{}; {}]: {}",
-            error.code,
-            error.outcome,
-            error.message
-        );
+        return Err(anyhow::Error::new(contracts::ContractFailure(error)));
     }
     crate::ipc::validate_response(&value, expected_type, Some(expected_schema_version))?;
     Ok(value)
@@ -5545,6 +5644,7 @@ struct LifecycleResponse {
     #[serde(rename = "type")]
     kind: String,
     schema_version: u8,
+    request_id: String,
     dry_run: bool,
     selected_tags: usize,
     removed_tags: usize,
@@ -5559,6 +5659,10 @@ fn validate_lifecycle_response(value: &serde_json::Value, expected: &str) -> Res
     anyhow::ensure!(
         response.kind == expected && response.schema_version == 1,
         "daemon returned an invalid attachment lifecycle response"
+    );
+    anyhow::ensure!(
+        contracts::valid_request_id(&response.request_id),
+        "daemon lifecycle response request ID is invalid"
     );
     anyhow::ensure!(
         response.removed_tags <= response.selected_tags,
@@ -5668,6 +5772,7 @@ fn disconnected_send_summary(
     total: u64,
     latest_progress: Option<&serde_json::Value>,
     elapsed: Duration,
+    request_id: &str,
 ) -> serde_json::Value {
     if let Some(progress) = latest_progress {
         let mut summary = progress.clone();
@@ -5679,12 +5784,15 @@ fn disconnected_send_summary(
         object.insert("first_error".into(), serde_json::Value::Null);
         summary
     } else {
-        bench_send_summary(
-            config,
-            total,
-            &BenchSendStats::default(),
-            "daemon_stopped",
-            elapsed,
+        contracts::correlate(
+            bench_send_summary(
+                config,
+                total,
+                &BenchSendStats::default(),
+                "daemon_stopped",
+                elapsed,
+            ),
+            request_id,
         )
     }
 }
@@ -5716,16 +5824,18 @@ async fn bench_send_events(
         payload_bytes,
     };
     let total = validate_bench_config(&config)?;
+    let request_id = contracts::new_request_id();
     let startup = async {
         let mut stream = connect_daemon(dir).await?;
-        write_request(
+        write_request_with_id(
             &mut stream,
             &IpcRequest::BenchSend {
                 config: config.clone(),
             },
+            &request_id,
         )
         .await?;
-        let mut reader = SubscriptionReader::new(stream);
+        let mut reader = SubscriptionReader::new_correlated(stream, request_id.clone());
         let started = reader
             .read()
             .await?
@@ -5759,6 +5869,7 @@ async fn bench_send_events(
                         total,
                         latest_progress.as_ref(),
                         client_started.elapsed(),
+                        &request_id,
                     );
                     emit_bench_terminal(&events, summary).await;
                     return Err(error);
@@ -6166,8 +6277,9 @@ async fn bench_receive_events(
         "duration must be between 1 and 86400 seconds"
     );
     let mut stats = BenchReceiveStats::new(run_id.clone(), expected)?;
+    let request_id = contracts::new_request_id();
     let startup = async {
-        let mut reader = subscribe(dir).await?;
+        let mut reader = subscribe_with_id(dir, &request_id).await?;
         let connected = reader
             .read()
             .await?
@@ -6180,10 +6292,14 @@ async fn bench_receive_events(
         connected["type"] == "connected",
         "unexpected daemon subscription response"
     );
-    let started_value = serde_json::json!({
-        "type":"bench_receive_started", "schema_version":1,
-        "run_id":run_id, "duration_secs":duration_secs, "expected":expected
-    });
+    let started_value = contracts::correlate(
+        serde_json::json!({
+            "type":"bench_receive_started", "schema_version":1,
+            "run_id":run_id, "duration_secs":duration_secs, "expected":expected
+        }),
+        &request_id,
+    );
+    validate_success_payload(&started_value)?;
     emit_bench_terminal(&events, started_value).await;
     let started = StdInstant::now();
     let deadline = tokio::time::sleep(Duration::from_secs(duration_secs));
@@ -6208,14 +6324,22 @@ async fn bench_receive_events(
                 }
             },
             _ = &mut deadline => break,
-            _ = progress.tick() => emit_bench_progress(&events, stats.progress(started.elapsed())),
+            _ = progress.tick() => {
+                let value = contracts::correlate(stats.progress(started.elapsed()), &request_id);
+                validate_success_payload(&value)?;
+                emit_bench_progress(&events, value);
+            },
             _ = &mut cancellation => {
                 completion_reason = "interrupted";
                 break;
             }
         }
     }
-    let summary = stats.summary(completion_reason, started.elapsed());
+    let summary = contracts::correlate(
+        stats.summary(completion_reason, started.elapsed()),
+        &request_id,
+    );
+    validate_success_payload(&summary)?;
     emit_bench_terminal(&events, summary).await;
     if let Some(error) = daemon_error {
         return Err(error);
@@ -6361,24 +6485,25 @@ pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
         "captured_hostname":alias_config.hostname(), "custom_alias":alias_config.custom()
     });
     if json {
-        println!("{value}");
+        println!(
+            "{}",
+            contracts::correlate(value, &contracts::new_request_id())
+        );
     } else {
         println!("ok: state, identity, topic, and invite are valid");
     }
     Ok(())
 }
 
-fn startup_error_value(phase: &str, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type":"startup_error", "phase":phase, "message":message,
-        "retryable":true
-    })
+#[cfg(test)]
+fn startup_error_value(_phase: &str, message: &str) -> serde_json::Value {
+    let mut error = ErrorEnvelopeV1::new("startup_failed", message, "not_started", true);
+    error.request_id = Some(contracts::new_request_id());
+    error.into_value()
 }
 
-fn startup_error(json: bool, phase: &str, message: &str) {
-    if json {
-        println!("{}", startup_error_value(phase, message));
-    }
+fn startup_error(_json: bool, _phase: &str, _message: &str) {
+    // The top-level JSON failure path emits exactly one standard error record.
 }
 
 fn terminal_safe(value: &str) -> String {
@@ -6408,8 +6533,25 @@ fn offer_listing_warnings(value: &serde_json::Value) -> Vec<String> {
     warnings
 }
 
-fn event(json: bool, value: serde_json::Value) {
+fn event(json: bool, mut value: serde_json::Value) {
     if json {
+        if value.get("schema_version").is_none() {
+            value["schema_version"] = contracts::SCHEMA_VERSION.into();
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+            let request_id = value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("00000000000000000000000000000000");
+            let mut normalized = normalize_ipc_response(&value, request_id);
+            if value.get("request_id").is_none() {
+                normalized
+                    .as_object_mut()
+                    .expect("error object")
+                    .remove("request_id");
+            }
+            value = normalized;
+        }
         println!("{value}");
     } else {
         match value["type"].as_str().unwrap_or("event") {
@@ -7474,8 +7616,13 @@ mod tests {
             },
             Duration::from_millis(400),
         );
-        let summary =
-            disconnected_send_summary(&config, 10, Some(&progress), Duration::from_secs(1));
+        let summary = disconnected_send_summary(
+            &config,
+            10,
+            Some(&progress),
+            Duration::from_secs(1),
+            "11111111111111111111111111111111",
+        );
         assert_eq!(summary["type"], "bench_send_summary");
         assert_eq!(summary["completion_reason"], "daemon_stopped");
         assert_eq!(summary["attempted"], 4);
@@ -7879,6 +8026,7 @@ mod tests {
         let recipient = SecretKey::generate().public().to_string();
         let accepted = serde_json::json!({
             "type":"private_accepted", "schema_version":3,
+            "request_id":"11111111111111111111111111111111",
             "operation_id":"0123456789abcdef0123456789abcdef",
             "to":recipient, "message_id":"0123456789abcdef0123456789abcdef",
             "timestamp_ms":1_700_000_000_000_u64, "body_bytes":6,
@@ -7921,9 +8069,14 @@ mod tests {
     fn startup_errors_are_structured_and_retryable() {
         let value = startup_error_value("topic_join", "bootstrap peer unavailable");
 
-        assert_eq!(value["type"], "startup_error");
-        assert_eq!(value["phase"], "topic_join");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["code"], "startup_failed");
+        assert_eq!(value["outcome"], "not_started");
         assert_eq!(value["retryable"], true);
+        assert!(contracts::valid_request_id(
+            value["request_id"].as_str().unwrap()
+        ));
         assert!(STARTUP_TIMEOUT <= Duration::from_secs(60));
         assert!(ENDPOINT_ONLINE_TIMEOUT <= Duration::from_secs(60));
     }
@@ -9963,7 +10116,7 @@ mod tests {
         assert_eq!(summary["completion_reason"], "send_failed");
         assert_eq!(summary["attempted"], 1);
         assert_eq!(summary["failed"], 1);
-        assert_eq!(summary["first_error"], "scripted broadcast failure");
+        assert_eq!(summary["first_error"], "Message submission failed.");
         task.await.unwrap().unwrap();
         assert!(command_rx.try_recv().is_err());
     }
@@ -10010,10 +10163,13 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&received).unwrap(),
-            event
-        );
+        let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
+        assert_eq!(received["type"], event["type"]);
+        assert_eq!(received["body"], event["body"]);
+        assert_eq!(received["schema_version"], 1);
+        assert!(contracts::valid_request_id(
+            received["request_id"].as_str().unwrap()
+        ));
         drop(client);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -10068,8 +10224,7 @@ mod tests {
             Some(startup.clone()),
             Arc::new(AtomicBool::new(false)),
         ));
-        client
-            .write_all(b"{\"command\":\"subscribe\"}\n")
+        write_request(&mut client, &IpcRequest::Subscribe)
             .await
             .unwrap();
         let connected = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
@@ -10078,10 +10233,12 @@ mod tests {
             "connected"
         );
         let snapshot = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&snapshot).unwrap(),
-            startup
-        );
+        let snapshot: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(snapshot["type"], startup["type"]);
+        assert_eq!(snapshot["peers"], startup["peers"]);
+        assert!(contracts::valid_request_id(
+            snapshot["request_id"].as_str().unwrap()
+        ));
 
         drop(events);
         task.await.unwrap().unwrap();
@@ -10102,8 +10259,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
         ));
-        client
-            .write_all(b"{\"command\":\"subscribe\"}\n")
+        write_request(&mut client, &IpcRequest::Subscribe)
             .await
             .unwrap();
         let _connected = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
@@ -10211,7 +10367,11 @@ mod tests {
         );
         let frame = read_frame(&mut rejected, MAX_IPC_EVENT_SIZE).await.unwrap();
         let rejection: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-        assert_eq!(rejection["code"], "ipc_capacity");
+        let rejection = ErrorEnvelopeV1::from_value(&rejection).unwrap();
+        assert_eq!(rejection.code, "ipc_capacity");
+        assert_eq!(rejection.outcome, "not_started");
+        assert!(rejection.retryable);
+        assert!(rejection.request_id.is_none());
         assert_eq!(tasks.len(), LOCAL_IPC_CONNECTION_CAPACITY);
 
         tokio::time::timeout(Duration::from_secs(7), async {
@@ -10225,10 +10385,12 @@ mod tests {
         let timeout_frame = read_frame(&mut clients[0], MAX_IPC_EVENT_SIZE)
             .await
             .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&timeout_frame).unwrap()["code"],
-            "initial_frame_timeout"
-        );
+        let timeout_error = serde_json::from_slice::<serde_json::Value>(&timeout_frame).unwrap();
+        let timeout_error = ErrorEnvelopeV1::from_value(&timeout_error).unwrap();
+        assert_eq!(timeout_error.code, "initial_frame_timeout");
+        assert_eq!(timeout_error.outcome, "not_started");
+        assert!(timeout_error.retryable);
+        assert!(timeout_error.request_id.is_none());
 
         let (mut recovered, admitted) = accept_and_admit_test_client(
             &mut listener,

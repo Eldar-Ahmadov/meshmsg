@@ -111,7 +111,10 @@ const context = vm.createContext({
       uploaded = { body: options.body, headers: options.headers };
       return uploadReply(options.headers['X-Meshmsg-Operation-Id']);
     }
-    const request = JSON.parse(options.body);
+    const envelope = JSON.parse(options.body);
+    assert.equal(envelope.schema_version, 1);
+    assert.match(envelope.request_id, /^[0-9a-f]{32}$/);
+    const request = envelope.request;
     if (request.command === 'status') return statusReply();
     if (request.command === 'peers') {
       peersRequests += 1;
@@ -302,7 +305,7 @@ function submit(body) {
   await settle();
   await settle();
   Date.now = realDateNow;
-  assert.deepEqual(downloadRequests, [
+  assert.deepEqual(downloadRequests.map(({ command, id }) => ({ command, id })), [
     { command: 'download', id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
     { command: 'download_status', id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
   ]);
@@ -455,7 +458,7 @@ function submit(body) {
   const statusRequests = [];
   let statusInterval;
   const statusContext = vm.createContext({
-    document: statusDocument, window: new EventTarget(), Event, AbortController, console,
+    document: statusDocument, window: new EventTarget(), Event, AbortController, crypto, console,
     setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay, cancelled: false }); return id; },
     clearTimeout: (id) => { const timer = timers.get(id); if (timer) timer.cancelled = true; }, setInterval: (fn) => { statusInterval = fn; },
     fetch: async (_, options) => {
@@ -469,7 +472,9 @@ function submit(body) {
   vm.runInContext(settingsJs, statusContext);
   await settle();
   const statusEl = (id) => statusDocument.getElementById(id);
-  assert.deepEqual(statusRequests, [{ command: 'status' }]);
+  assert.deepEqual(statusRequests.map(({ request }) => request), [{ command: 'status' }]);
+  assert.equal(statusRequests[0].schema_version, 1);
+  assert.match(statusRequests[0].request_id, /^[0-9a-f]{32}$/);
   assert.equal(statusEl('daemon-value').textContent, 'Running');
   assert.equal(statusEl('endpoint-value').textContent, 'Online');
   assert.equal(statusEl('topic-value').textContent, 'Joined');

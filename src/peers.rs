@@ -1,4 +1,7 @@
-use serde::Serialize;
+use anyhow::{Context, Result};
+use iroh::PublicKey;
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
 /// locally derived and never extends beyond this bound.
@@ -7,7 +10,8 @@ pub(crate) const PEER_DIRECTORY_CAPABILITY: &str = "peer_directory_v2";
 pub(crate) const PEER_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemotePeer {
     /// Canonical Iroh public-key encoding.
     pub(crate) public_key: String,
@@ -40,6 +44,146 @@ pub(crate) enum PeerTransitionKind {
 pub(crate) struct PeerTransition {
     pub(crate) kind: PeerTransitionKind,
     pub(crate) peer: RemotePeer,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedSelfPeer {
+    public_key: String,
+    alias: Option<String>,
+    online: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotV2 {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    generated_at_ms: u64,
+    directory_epoch: String,
+    directory_revision: u64,
+    #[serde(rename = "self")]
+    self_peer: OwnedSelfPeer,
+    peers: Vec<RemotePeer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransitionV2 {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    directory_epoch: String,
+    directory_revision: u64,
+    peer: RemotePeer,
+}
+
+fn valid_epoch(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_remote_identity(peer: &RemotePeer) -> Result<()> {
+    let key = PublicKey::from_str(&peer.public_key).context("invalid remote peer key")?;
+    anyhow::ensure!(
+        key.to_string() == peer.public_key,
+        "noncanonical remote peer key"
+    );
+    if let Some(alias) = &peer.alias {
+        crate::alias::validate_alias(alias)?;
+    }
+    anyhow::ensure!(
+        peer.expires_at_ms >= peer.last_seen_ms
+            && peer.expires_at_ms.saturating_sub(peer.last_seen_ms) <= PEER_LEASE_MS,
+        "invalid remote peer lease"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_transition(value: &serde_json::Value, expected: &str) -> Result<()> {
+    let transition: TransitionV2 = serde_json::from_value(value.clone())
+        .context("daemon returned malformed peer transition")?;
+    anyhow::ensure!(
+        transition.kind == expected
+            && transition.schema_version == PEER_SCHEMA_VERSION
+            && matches!(
+                expected,
+                "peer_discovered" | "peer_updated" | "peer_expired"
+            ),
+        "unsupported peer transition"
+    );
+    anyhow::ensure!(
+        crate::contracts::valid_request_id(&transition.request_id)
+            && valid_epoch(&transition.directory_epoch),
+        "invalid peer transition envelope"
+    );
+    validate_remote_identity(&transition.peer)?;
+    anyhow::ensure!(
+        transition.peer.online == (expected != "peer_expired"),
+        "invalid peer transition online state"
+    );
+    let _ = transition.directory_revision;
+    Ok(())
+}
+
+pub(crate) fn validate_snapshot(value: &serde_json::Value) -> Result<()> {
+    let snapshot: SnapshotV2 =
+        serde_json::from_value(value.clone()).context("daemon returned malformed peer snapshot")?;
+    anyhow::ensure!(
+        snapshot.kind == "peers_snapshot" && snapshot.schema_version == PEER_SCHEMA_VERSION,
+        "unsupported peer snapshot"
+    );
+    anyhow::ensure!(
+        crate::contracts::valid_request_id(&snapshot.request_id),
+        "peer snapshot request ID is invalid"
+    );
+    anyhow::ensure!(
+        valid_epoch(&snapshot.directory_epoch),
+        "peer directory epoch is invalid"
+    );
+    let self_key =
+        PublicKey::from_str(&snapshot.self_peer.public_key).context("invalid self peer key")?;
+    anyhow::ensure!(
+        self_key.to_string() == snapshot.self_peer.public_key,
+        "noncanonical self peer key"
+    );
+    if let Some(alias) = &snapshot.self_peer.alias {
+        crate::alias::validate_alias(alias)?;
+    }
+    anyhow::ensure!(
+        snapshot.peers.len() <= crate::direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
+        "peer snapshot is too large"
+    );
+    let mut previous: Option<&str> = None;
+    for peer in &snapshot.peers {
+        validate_remote_identity(peer)?;
+        anyhow::ensure!(
+            peer.public_key != snapshot.self_peer.public_key,
+            "invalid remote peer identity"
+        );
+        anyhow::ensure!(
+            previous.is_none_or(|old| old < peer.public_key.as_str()),
+            "peer snapshot is unsorted or duplicated"
+        );
+        if let Some(alias) = &peer.alias {
+            crate::alias::validate_alias(alias)?;
+        }
+        anyhow::ensure!(
+            peer.online
+                && peer.last_seen_ms <= snapshot.generated_at_ms
+                && peer.expires_at_ms >= snapshot.generated_at_ms
+                && peer.expires_at_ms.saturating_sub(peer.last_seen_ms) <= PEER_LEASE_MS,
+            "invalid remote peer lease"
+        );
+        previous = Some(&peer.public_key);
+    }
+    let _ = (snapshot.directory_revision, snapshot.self_peer.online);
+    Ok(())
 }
 
 pub(crate) fn snapshot_value(
@@ -149,6 +293,112 @@ mod tests {
             serde_json::to_vec(&snapshot).unwrap().len() <= crate::ipc::MAX_IPC_EVENT_SIZE,
             "maximum complete peer snapshot exceeds IPC frame"
         );
+    }
+
+    #[test]
+    fn snapshot_dto_rejects_unknown_missing_wrong_version_and_semantics() {
+        let self_peer = iroh::SecretKey::generate().public().to_string();
+        let remote_peer = iroh::SecretKey::generate().public().to_string();
+        let value = crate::contracts::correlate(
+            snapshot_value(
+                &self_peer,
+                Some("self-node"),
+                true,
+                150,
+                "11111111111111111111111111111111",
+                1,
+                vec![RemotePeer {
+                    public_key: remote_peer,
+                    alias: Some("remote-node".into()),
+                    online: true,
+                    last_seen_ms: 100,
+                    expires_at_ms: 200,
+                }],
+            ),
+            "22222222222222222222222222222222",
+        );
+        validate_snapshot(&value).unwrap();
+        for malformed in [
+            {
+                let mut v = value.clone();
+                v["extra"] = true.into();
+                v
+            },
+            {
+                let mut v = value.clone();
+                v.as_object_mut().unwrap().remove("generated_at_ms");
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["schema_version"] = 3.into();
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["peers"][0]["online"] = false.into();
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["peers"][0]["expires_at_ms"] = 99.into();
+                v
+            },
+        ] {
+            assert!(validate_snapshot(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn transition_dto_rejects_unknown_missing_wrong_version_and_semantics() {
+        let peer = RemotePeer {
+            public_key: iroh::SecretKey::generate().public().to_string(),
+            alias: Some("remote".into()),
+            online: true,
+            last_seen_ms: 100,
+            expires_at_ms: 200,
+        };
+        let value = crate::contracts::correlate(
+            transition_value(
+                PeerTransition {
+                    kind: PeerTransitionKind::Discovered,
+                    peer,
+                },
+                "11111111111111111111111111111111",
+                1,
+            ),
+            "22222222222222222222222222222222",
+        );
+        validate_transition(&value, "peer_discovered").unwrap();
+        for malformed in [
+            {
+                let mut v = value.clone();
+                v["extra"] = true.into();
+                v
+            },
+            {
+                let mut v = value.clone();
+                v.as_object_mut().unwrap().remove("request_id");
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["schema_version"] = 3.into();
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["peer"]["online"] = false.into();
+                v
+            },
+            {
+                let mut v = value.clone();
+                v["peer"]["alias"] = "bad\talias".into();
+                v
+            },
+        ] {
+            assert!(validate_transition(&malformed, "peer_discovered").is_err());
+        }
     }
 
     #[test]

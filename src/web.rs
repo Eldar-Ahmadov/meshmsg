@@ -4,6 +4,7 @@ use crate::{
     alias::validate_alias,
     attachment::{validate_display_name, AttachmentKind},
     config::prepare_state_dir,
+    contracts::{self, ErrorEnvelopeV1},
     direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
     ipc::{self, IpcRequest, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY},
     peers::PEER_LEASE_MS,
@@ -63,6 +64,7 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; conn
 
 #[derive(Clone)]
 struct StoredOffer {
+    offer_id: String,
     offer: String,
     name: String,
     created: Instant,
@@ -323,8 +325,18 @@ impl WebState {
         true
     }
 
-    fn remember_offer(&self, offer: &str, name: &str, now: Instant) -> Option<String> {
-        if offer.is_empty() || offer.len() > REQUEST_LIMIT || name.is_empty() {
+    fn remember_offer(
+        &self,
+        offer_id: &str,
+        offer: &str,
+        name: &str,
+        now: Instant,
+    ) -> Option<String> {
+        if !ipc::valid_operation_id(offer_id)
+            || offer.is_empty()
+            || offer.len() > REQUEST_LIMIT
+            || name.is_empty()
+        {
             return None;
         }
         let mut offers = self.offers.lock().expect("offer registry mutex poisoned");
@@ -342,6 +354,7 @@ impl WebState {
         offers.insert(
             id.clone(),
             StoredOffer {
+                offer_id: offer_id.to_owned(),
                 offer: offer.to_owned(),
                 name: name.to_owned(),
                 created: now,
@@ -398,6 +411,27 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     Some(value)
 }
 
+enum RequestIdHeader {
+    Missing,
+    One(String),
+    Invalid,
+    Duplicate,
+}
+
+fn request_id_header(headers: &HeaderMap) -> RequestIdHeader {
+    let mut values = headers.get_all("x-meshmsg-request-id").iter();
+    let Some(first) = values.next() else {
+        return RequestIdHeader::Missing;
+    };
+    if values.next().is_some() {
+        return RequestIdHeader::Duplicate;
+    }
+    match first.to_str() {
+        Ok(value) if contracts::valid_request_id(value) => RequestIdHeader::One(value.to_owned()),
+        _ => RequestIdHeader::Invalid,
+    }
+}
+
 // Deliberately independent of IpcRequest: new daemon commands cannot become web APIs.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -417,6 +451,7 @@ struct MutationErrorDto {
     schema_version: u8,
     code: String,
     message: String,
+    request_id: String,
     operation_id: String,
     retryable: bool,
     outcome: String,
@@ -424,10 +459,12 @@ struct MutationErrorDto {
 
 impl MutationErrorDto {
     fn parse(value: Value, operation_id: &str) -> Option<Self> {
+        ErrorEnvelopeV1::from_value(&value).ok()?;
         let error: Self = serde_json::from_value(value).ok()?;
         (error.kind == "error"
             && error.schema_version == 1
             && error.operation_id == operation_id
+            && contracts::valid_request_id(&error.request_id)
             && ipc::valid_operation_id(&error.operation_id)
             && matches!(error.outcome.as_str(), "not_started" | "unknown"))
         .then_some(error)
@@ -450,6 +487,7 @@ struct QueuedMutationDto {
     #[serde(rename = "type")]
     kind: String,
     schema_version: u8,
+    request_id: String,
     operation_id: String,
     from: String,
     message_id: String,
@@ -464,6 +502,7 @@ struct SharedMutationDto {
     #[serde(rename = "type")]
     kind: String,
     schema_version: u8,
+    request_id: String,
     operation_id: String,
     from: String,
     message_id: String,
@@ -479,6 +518,64 @@ struct SharedMutationDto {
     delivery_acknowledged: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectedEventDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    peer: String,
+    endpoint_online: bool,
+    topic_joined: bool,
+    alias: Option<String>,
+    ipc_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageEventDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    from: String,
+    message_id: String,
+    timestamp_ms: u64,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfferEventDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    from: String,
+    message_id: String,
+    timestamp_ms: u64,
+    offer_id: String,
+    name: String,
+    #[serde(rename = "kind")]
+    kind_name: AttachmentKind,
+    size: u64,
+    ticket: String,
+    offer: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaggedEventDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    source: String,
+    dropped: Option<u64>,
+    message: String,
+}
+
 impl SharedMutationDto {
     fn parse(
         value: Value,
@@ -491,6 +588,7 @@ impl SharedMutationDto {
         (shared.kind == "attachment_shared"
             && shared.schema_version == 3
             && shared.operation_id == operation_id
+            && contracts::valid_request_id(&shared.request_id)
             && shared.message_id == operation_id
             && shared.offer_id == operation_id
             && shared.source_digest == source_digest
@@ -508,8 +606,31 @@ impl SharedMutationDto {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebRequestFrame {
+    schema_version: u8,
+    request_id: String,
+    request: WebRequest,
+}
+
 fn parse_request(bytes: &[u8]) -> Result<WebRequest> {
-    let request: WebRequest = serde_json::from_slice(bytes)?;
+    let frame: WebRequestFrame = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(
+        frame.schema_version == contracts::SCHEMA_VERSION,
+        "unsupported HTTP request schema"
+    );
+    anyhow::ensure!(
+        contracts::valid_request_id(&frame.request_id),
+        "invalid HTTP request ID"
+    );
+    if let Ok(expected) = HTTP_REQUEST_ID.try_with(Clone::clone) {
+        anyhow::ensure!(
+            frame.request_id == expected,
+            "HTTP request IDs do not match"
+        );
+    }
+    let request = frame.request;
     match &request {
         WebRequest::Send { operation_id, body } => {
             anyhow::ensure!(
@@ -543,6 +664,16 @@ fn valid_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+tokio::task_local! {
+    static HTTP_REQUEST_ID: String;
+}
+
+fn http_request_id() -> String {
+    HTTP_REQUEST_ID
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| contracts::new_request_id())
+}
+
 fn response(
     status: StatusCode,
     content_type: &'static str,
@@ -564,17 +695,83 @@ fn response(
     );
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    if let Ok(value) = HeaderValue::from_str(&http_request_id()) {
+        headers.insert("x-meshmsg-request-id", value);
+    }
     response
 }
 
-fn json_response(status: StatusCode, value: Value) -> Response<Body> {
+fn json_response(status: StatusCode, mut value: Value) -> Response<Body> {
+    let request_id = http_request_id();
+    if value.get("type").and_then(Value::as_str) == Some("error") {
+        let code = value
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|code| contracts::known_error_code(code))
+            .unwrap_or("request_failed");
+        let outcome = value
+            .get("outcome")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "not_started" | "unknown" | "partial"))
+            .unwrap_or("not_started");
+        let retryable = value.get("retryable").and_then(Value::as_bool).unwrap_or(
+            status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::SERVICE_UNAVAILABLE
+                || status == StatusCode::REQUEST_TIMEOUT
+                || outcome == "unknown",
+        );
+        let mut envelope = ErrorEnvelopeV1::new(
+            code,
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Request failed."),
+            outcome,
+            retryable,
+        );
+        envelope.request_id = Some(request_id.clone());
+        envelope.operation_id = value
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .filter(|id| ipc::valid_operation_id(id))
+            .map(str::to_owned);
+        envelope.offer_id = value
+            .get("offer_id")
+            .and_then(Value::as_str)
+            .filter(|id| ipc::valid_operation_id(id))
+            .map(str::to_owned);
+        envelope.selected_tags = value
+            .get("selected_tags")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok());
+        envelope.removed_tags = value
+            .get("removed_tags")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok());
+        envelope.quota_bytes_released = value.get("quota_bytes_released").and_then(Value::as_u64);
+        value = envelope.into_value();
+    } else {
+        value = contracts::correlate(value, &request_id);
+    }
     response(status, "application/json", value.to_string())
 }
 
 fn error(status: StatusCode, outcome: &str, message: &str) -> Response<Body> {
+    let code = match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "invalid_request",
+        StatusCode::FORBIDDEN => "request_forbidden",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::TOO_MANY_REQUESTS => "request_throttled",
+        StatusCode::REQUEST_TIMEOUT => "request_timeout",
+        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+        StatusCode::RANGE_NOT_SATISFIABLE => "invalid_range",
+        StatusCode::SERVICE_UNAVAILABLE => "capacity_or_offline",
+        _ => "request_failed",
+    };
     json_response(
         status,
-        json!({"type":"error", "outcome":outcome, "message":message}),
+        json!({"type":"error", "schema_version":1, "code":code, "outcome":outcome, "message":message}),
     )
 }
 
@@ -680,7 +877,77 @@ fn directory_position(value: &Value) -> Option<(&str, u64)> {
     Some((epoch, value["directory_revision"].as_u64()?))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerSourceDto {
+    public_key: String,
+    alias: Option<String>,
+    online: bool,
+    last_seen_ms: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelfPeerSourceDto {
+    public_key: String,
+    alias: Option<String>,
+    online: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeersSnapshotSourceDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    generated_at_ms: u64,
+    directory_epoch: String,
+    directory_revision: u64,
+    #[serde(rename = "self")]
+    self_peer: SelfPeerSourceDto,
+    peers: Vec<PeerSourceDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerTransitionSourceDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    request_id: String,
+    directory_epoch: String,
+    directory_revision: u64,
+    peer: PeerSourceDto,
+}
+
 fn public_peers_snapshot(value: &Value) -> Option<Value> {
+    let decoded: PeersSnapshotSourceDto = serde_json::from_value(value.clone()).ok()?;
+    if decoded.kind != "peers_snapshot"
+        || decoded.schema_version != 2
+        || !contracts::valid_request_id(&decoded.request_id)
+    {
+        return None;
+    }
+    let _validated_shape = (
+        decoded.generated_at_ms,
+        decoded.directory_epoch,
+        decoded.directory_revision,
+        decoded.self_peer.public_key,
+        decoded.self_peer.alias,
+        decoded.self_peer.online,
+        decoded.peers.len(),
+    );
+    for peer in &decoded.peers {
+        let _ = (
+            &peer.public_key,
+            &peer.alias,
+            peer.online,
+            peer.last_seen_ms,
+            peer.expires_at_ms,
+        );
+    }
     if value["type"] != "peers_snapshot" || value["schema_version"] != 2 {
         return None;
     }
@@ -723,6 +990,22 @@ fn public_peers_snapshot(value: &Value) -> Option<Value> {
 }
 
 fn public_peer_transition(value: &Value, event_type: &str) -> Option<Value> {
+    let decoded: PeerTransitionSourceDto = serde_json::from_value(value.clone()).ok()?;
+    if decoded.kind != event_type
+        || decoded.schema_version != 2
+        || !contracts::valid_request_id(&decoded.request_id)
+    {
+        return None;
+    }
+    let _validated_shape = (
+        decoded.directory_epoch,
+        decoded.directory_revision,
+        decoded.peer.public_key,
+        decoded.peer.alias,
+        decoded.peer.online,
+        decoded.peer.last_seen_ms,
+        decoded.peer.expires_at_ms,
+    );
     if value["schema_version"] != 2 {
         return None;
     }
@@ -743,8 +1026,17 @@ async fn bounded_download_ipc<F: Future>(
     timeout(limit, future).await
 }
 
-fn compatible_download_complete(value: &Value) -> bool {
-    value["type"] == "download_complete" && value["schema_version"] == 1
+fn compatible_download_complete(
+    value: &Value,
+    expected_offer_id: &str,
+    expected_name: &str,
+    expected_output: &Path,
+) -> bool {
+    ipc::DownloadCompleteV1::from_value(value).is_ok_and(|complete| {
+        complete.offer_id == expected_offer_id
+            && complete.name == expected_name
+            && complete.output() == expected_output
+    })
 }
 
 fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
@@ -801,10 +1093,11 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
     let jobs = state.jobs.clone();
     let download_root = state.download_root.clone();
     let ready_id = job_id.clone();
-    tokio::spawn(async move {
+    let request_id = http_request_id();
+    tokio::spawn(HTTP_REQUEST_ID.scope(request_id, async move {
         let _permit = permit;
         let result = bounded_download_ipc(
-            ipc::send_request(
+            web_ipc_request(
                 &dir,
                 &IpcRequest::WebDownload {
                     offer: stored.offer,
@@ -815,9 +1108,19 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
         )
         .await;
         let job = match result {
-            Ok(Ok(value)) if compatible_download_complete(&value) => {
+            Ok(Ok(value))
+                if compatible_download_complete(
+                    &value,
+                    &stored.offer_id,
+                    &stored.name,
+                    &output,
+                ) =>
+            {
                 match open_download_file(&output) {
-                    Ok((file, size)) if touch_download_root(&download_root).is_ok() => {
+                    Ok((file, size))
+                        if value["size"].as_u64() == Some(size)
+                            && touch_download_root(&download_root).is_ok() =>
+                    {
                         drop(file);
                         DownloadJob::Ready {
                             path: output,
@@ -899,7 +1202,7 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
         } else if let DownloadJob::Ready { path, .. } = job {
             let _ = fs::remove_file(path);
         }
-    });
+    }));
     json_response(
         StatusCode::ACCEPTED,
         json!({
@@ -909,32 +1212,9 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
     )
 }
 
-fn public_lifecycle_error(mut error: ipc::LifecycleErrorV1) -> ipc::LifecycleErrorV1 {
-    error.message = match error.code.as_str() {
-        "attachment_storage_busy" => "Attachment storage is busy; retry later.",
-        "attachment_command_timeout" => {
-            "Attachment processing timed out; retry to reconcile the outcome."
-        }
-        "attachment_storage_shutdown" => "Attachment storage is unavailable.",
-        "attachment_removal_partial" => {
-            "Attachment removal was only partially completed; retry to reconcile."
-        }
-        "attachment_quota_exceeded" => "Attachment storage quota would be exceeded.",
-        "attachment_min_free_space" => {
-            "Attachment storage does not have enough reserved free space."
-        }
-        "attachment_tag_capacity" => "Attachment pin capacity has been reached.",
-        "invalid_offer_selector" => "The attachment selector is invalid.",
-        "invalid_prune_request" => "The attachment prune request is invalid.",
-        "operation_id_conflict" => "The operation ID was already used with different inputs.",
-        "operation_capacity" => "Attachment operation capacity has been reached.",
-        "invalid_operation_id" => "The attachment operation ID is invalid.",
-        "invalid_source_digest" => "The attachment source digest is invalid.",
-        "share_failed" => "Attachment sharing failed.",
-        "download_failed" => "Attachment download failed.",
-        _ => "Attachment processing failed.",
-    }
-    .into();
+fn public_lifecycle_error(error: ipc::LifecycleErrorV1) -> ipc::LifecycleErrorV1 {
+    // ErrorEnvelopeV1 construction and decoding already enforce fixed public
+    // text for every admitted code. Never rewrite it from an internal cause.
     error
 }
 
@@ -989,6 +1269,7 @@ fn local_mutation_error(
         schema_version: 1,
         code: code.into(),
         message: message.into(),
+        request_id: http_request_id(),
         operation_id: operation_id.into(),
         retryable,
         outcome: outcome.into(),
@@ -1028,11 +1309,13 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
     if let WebRequest::Send { operation_id, .. } = &request {
         let negotiated = timeout(
             IPC_TIMEOUT,
-            ipc::send_request(&state.dir, &IpcRequest::Status),
+            web_ipc_request(&state.dir, &IpcRequest::Status),
         )
         .await;
         match negotiated {
-            Ok(Ok(status)) if daemon_supports_idempotent_mutations(&status) => {}
+            Ok(Ok(status))
+                if ipc::StatusV1::from_value(&status).is_ok()
+                    && daemon_supports_idempotent_mutations(&status) => {}
             Ok(Ok(_)) => {
                 return mutation_error_response(local_mutation_error(
                     operation_id,
@@ -1074,7 +1357,7 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         WebRequest::Peers {} => IpcRequest::Peers,
         WebRequest::Download { .. } | WebRequest::DownloadStatus { .. } => unreachable!(),
     };
-    match timeout(IPC_TIMEOUT, ipc::send_request(&state.dir, &request)).await {
+    match timeout(IPC_TIMEOUT, web_ipc_request(&state.dir, &request)).await {
         Ok(Ok(value)) if is_send && value["type"] == "error" => {
             let operation_id = &send_expected.as_ref().expect("send metadata exists").0;
             match MutationErrorDto::parse(value, operation_id) {
@@ -1095,7 +1378,9 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
                 Ok(queued)
                     if queued.kind == "queued"
                         && queued.schema_version == 3
+                        && contracts::valid_request_id(&queued.request_id)
                         && queued.operation_id == *operation_id
+                        && contracts::valid_request_id(&queued.request_id)
                         && queued.message_id == *operation_id
                         && queued.body == *expected_body
                         && ipc::valid_operation_id(&queued.message_id)
@@ -1122,7 +1407,7 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
                 )),
             }
         }
-        Ok(Ok(value)) if !is_send && !is_peers && value["type"] == "status" => {
+        Ok(Ok(value)) if !is_send && !is_peers && ipc::StatusV1::from_value(&value).is_ok() => {
             json_response(StatusCode::OK, public_status(&value))
         }
         Ok(Ok(value)) if is_peers => match public_peers_snapshot(&value) {
@@ -1153,12 +1438,51 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
 
 fn sse_frame(value: &Value) -> Bytes {
     // JSON encoding escapes message newlines; untrusted text cannot inject SSE fields.
+    let request_id = http_request_id();
+    let value = if value.get("type").and_then(Value::as_str) == Some("error") {
+        let mut error = ErrorEnvelopeV1::new(
+            value
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("feed_error"),
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Live feed failed."),
+            value
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            value
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        );
+        error.request_id = Some(request_id);
+        error.into_value()
+    } else {
+        contracts::correlate(value.clone(), &request_id)
+    };
     Bytes::from(format!("data: {value}\n\n"))
+}
+
+async fn web_ipc_request(dir: &Path, request: &IpcRequest) -> Result<Value> {
+    ipc::send_request_with_id(dir, request, &http_request_id()).await
 }
 
 fn public_event(state: &WebState, value: Value, download_supported: bool) -> Option<Value> {
     match value["type"].as_str()? {
         "connected" => {
+            let decoded: ConnectedEventDto = serde_json::from_value(value.clone()).ok()?;
+            if decoded.kind != "connected"
+                || decoded.schema_version != 1
+                || !contracts::valid_request_id(&decoded.request_id)
+                || !decoded.endpoint_online
+                || decoded.ipc_capabilities.len() > 64
+            {
+                return None;
+            }
+            let _validated = (decoded.peer, decoded.topic_joined, decoded.alias);
             let mut connected = json!({"type":"connected"});
             if let Some(peer) = public_key(&value["peer"]) {
                 connected["peer"] = peer.into();
@@ -1167,6 +1491,17 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
             Some(connected)
         }
         "message" => {
+            let decoded: MessageEventDto = serde_json::from_value(value.clone()).ok()?;
+            if decoded.kind != "message"
+                || decoded.schema_version != 2
+                || !contracts::valid_request_id(&decoded.request_id)
+                || decoded.from.is_empty()
+                || decoded.timestamp_ms == 0
+                || decoded.body.len() > 4096
+            {
+                return None;
+            }
+            let _validated_message_id = decoded.message_id;
             let message_id = value["message_id"].as_str()?;
             if value["schema_version"] != 2 || !valid_id(message_id) {
                 return None;
@@ -1178,6 +1513,17 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
             }))
         }
         "queued" => {
+            let decoded: QueuedMutationDto = serde_json::from_value(value.clone()).ok()?;
+            if decoded.kind != "queued"
+                || decoded.schema_version != 3
+                || !contracts::valid_request_id(&decoded.request_id)
+                || decoded.from.is_empty()
+                || decoded.timestamp_ms == 0
+                || decoded.body.len() > 4096
+                || decoded.delivery_acknowledged
+            {
+                return None;
+            }
             let message_id = value["message_id"].as_str()?;
             let operation_id = value["operation_id"].as_str()?;
             if value["schema_version"] != 3 || !valid_id(message_id) || operation_id != message_id {
@@ -1190,6 +1536,21 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
             }))
         }
         "attachment_offer" => {
+            let decoded: OfferEventDto = serde_json::from_value(value.clone()).ok()?;
+            if decoded.kind != "attachment_offer"
+                || decoded.schema_version != 2
+                || !contracts::valid_request_id(&decoded.request_id)
+                || decoded.from.is_empty()
+                || decoded.timestamp_ms == 0
+                || !ipc::valid_operation_id(&decoded.message_id)
+                || !ipc::valid_operation_id(&decoded.offer_id)
+                || decoded.name.is_empty()
+                || decoded.ticket.is_empty()
+                || decoded.offer.is_empty()
+            {
+                return None;
+            }
+            let _validated = (decoded.kind_name, decoded.size);
             let message_id = value["message_id"].as_str()?;
             if value["schema_version"] != 2 || !valid_id(message_id) {
                 return None;
@@ -1207,11 +1568,31 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 "kind":kind, "size":value["size"]
             });
             if download_supported {
-                public["download_id"] = state.remember_offer(offer, name, Instant::now())?.into();
+                public["download_id"] = state
+                    .remember_offer(&decoded.offer_id, offer, name, Instant::now())?
+                    .into();
             }
             Some(public)
         }
         "attachment_shared" => {
+            let decoded: SharedMutationDto = serde_json::from_value(value.clone()).ok()?;
+            if decoded.kind != "attachment_shared"
+                || decoded.schema_version != 3
+                || !contracts::valid_request_id(&decoded.request_id)
+                || decoded.from.is_empty()
+                || decoded.timestamp_ms == 0
+                || decoded.operation_id != decoded.message_id
+                || decoded.offer_id != decoded.message_id
+                || !ipc::valid_operation_id(&decoded.message_id)
+                || !ipc::valid_content_digest(&decoded.source_digest)
+                || decoded.name.is_empty()
+                || decoded.ticket.is_empty()
+                || decoded.offer.is_empty()
+                || decoded.delivery_acknowledged
+            {
+                return None;
+            }
+            let _validated = (decoded.kind_name, decoded.size);
             let message_id = value["message_id"].as_str()?;
             let operation_id = value["operation_id"].as_str()?;
             if value["schema_version"] != 3 || !valid_id(message_id) || operation_id != message_id {
@@ -1229,9 +1610,21 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
         event_type @ ("peer_discovered" | "peer_updated" | "peer_expired") => {
             public_peer_transition(&value, event_type)
         }
-        "lagged" => Some(
-            json!({"type":"lagged", "message":"Feed gap: daemon dropped events. No history or replay is available."}),
-        ),
+        "lagged" => {
+            let decoded: LaggedEventDto = serde_json::from_value(value).ok()?;
+            if decoded.kind != "lagged"
+                || decoded.schema_version != 1
+                || !contracts::valid_request_id(&decoded.request_id)
+                || !matches!(decoded.source.as_str(), "local" | "gossip")
+                || decoded.message.is_empty()
+            {
+                return None;
+            }
+            let _dropped = decoded.dropped;
+            Some(
+                json!({"type":"lagged", "message":"Feed gap: daemon dropped events. No history or replay is available."}),
+            )
+        }
         _ => None,
     }
 }
@@ -1245,10 +1638,11 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
         );
     };
     let (tx, rx) = mpsc::channel::<Bytes>(32);
-    tokio::spawn(async move {
+    let request_id = http_request_id();
+    tokio::spawn(HTTP_REQUEST_ID.scope(request_id.clone(), async move {
         let _permit = permit;
         let opened = timeout(IPC_TIMEOUT, async {
-            let mut reader = ipc::subscribe(&state.dir).await?;
+            let mut reader = ipc::subscribe_with_id(&state.dir, &request_id).await?;
             let first = reader.read().await?.context("daemon closed")?;
             anyhow::ensure!(
                 first["type"] == "connected",
@@ -1258,7 +1652,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
         })
         .await;
         let Ok(Ok((mut reader, first))) = opened else {
-            let _ = tx.send(sse_frame(&json!({"type":"offline", "message":"Daemon offline. Reconnecting; feed gaps have no history."}))).await;
+            let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_offline", "message":"Daemon offline. Reconnecting; feed gaps have no history.", "retryable":true, "outcome":"unknown"}))).await;
             return;
         };
         let download_supported = first["ipc_capabilities"]
@@ -1295,7 +1689,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
             let value = match value {
                 Ok(Some(value)) => public_event(&state, value, download_supported),
                 _ => {
-                    let _ = timeout(Duration::from_secs(5), tx.send(sse_frame(&json!({"type":"offline", "message":"Daemon disconnected. Feed gap; no history. Reconnecting."})))).await;
+                    let _ = timeout(Duration::from_secs(5), tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_disconnected", "message":"Daemon disconnected. Feed gap; no history. Reconnecting.", "retryable":true, "outcome":"unknown"})))).await;
                     return;
                 }
             };
@@ -1308,7 +1702,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
                 }
             }
         }
-    });
+    }));
     let stream = stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
@@ -1610,11 +2004,11 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     };
     let status = match timeout(
         IPC_TIMEOUT,
-        ipc::send_request(&state.dir, &IpcRequest::Status),
+        web_ipc_request(&state.dir, &IpcRequest::Status),
     )
     .await
     {
-        Ok(Ok(status)) => status,
+        Ok(Ok(status)) if ipc::StatusV1::from_value(&status).is_ok() => status,
         _ => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1760,7 +2154,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     let source_digest = data_encoding::HEXLOWER.encode(&digest);
     let result = timeout(
         WEB_SHARE_TIMEOUT,
-        ipc::send_request(
+        web_ipc_request(
             &state.dir,
             &IpcRequest::Share {
                 operation_id: operation_id.clone(),
@@ -1834,7 +2228,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     }
 }
 
-async fn route(
+async fn route_inner(
     request: Request<Incoming>,
     state: Arc<WebState>,
 ) -> Result<Response<Body>, Infallible> {
@@ -1930,6 +2324,38 @@ async fn route(
     Ok(result)
 }
 
+async fn route(
+    request: Request<Incoming>,
+    state: Arc<WebState>,
+) -> Result<Response<Body>, Infallible> {
+    let json_request = request.method() == Method::POST && request.uri().path() == "/api/request";
+    let header = request_id_header(request.headers());
+    let (request_id, header_error) = match header {
+        RequestIdHeader::One(value) => (value, None),
+        RequestIdHeader::Missing if json_request => (
+            contracts::new_request_id(),
+            Some("X-Meshmsg-Request-Id is required for JSON requests."),
+        ),
+        RequestIdHeader::Missing => (contracts::new_request_id(), None),
+        RequestIdHeader::Invalid => (
+            contracts::new_request_id(),
+            Some("X-Meshmsg-Request-Id must be 32 lowercase hexadecimal characters."),
+        ),
+        RequestIdHeader::Duplicate => (
+            contracts::new_request_id(),
+            Some("X-Meshmsg-Request-Id must occur exactly once."),
+        ),
+    };
+    HTTP_REQUEST_ID
+        .scope(request_id, async move {
+            if let Some(message) = header_error {
+                return Ok(error(StatusCode::BAD_REQUEST, "not_started", message));
+            }
+            route_inner(request, state).await
+        })
+        .await
+}
+
 pub(crate) async fn run(dir: &Path, address: SocketAddr, origin: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(address)
         .await
@@ -1987,6 +2413,20 @@ mod tests {
             Some("https://node.example.ts.net".into()),
         )
         .unwrap()
+    }
+
+    fn web_request(value: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version":contracts::SCHEMA_VERSION,
+            "request_id":"11111111111111111111111111111111",
+            "request":value
+        }))
+        .unwrap()
+    }
+
+    fn ipc_event(mut value: Value) -> Value {
+        value["request_id"] = "11111111111111111111111111111111".into();
+        value
     }
 
     fn headers(host: &str, origin: Option<&str>) -> HeaderMap {
@@ -2079,12 +2519,42 @@ mod tests {
     }
 
     #[test]
+    fn request_id_header_distinguishes_missing_duplicate_malformed_and_valid() {
+        let mut headers = HeaderMap::new();
+        assert!(matches!(
+            request_id_header(&headers),
+            RequestIdHeader::Missing
+        ));
+        headers.append(
+            "x-meshmsg-request-id",
+            HeaderValue::from_static("11111111111111111111111111111111"),
+        );
+        assert!(
+            matches!(request_id_header(&headers), RequestIdHeader::One(value) if value == "11111111111111111111111111111111")
+        );
+        headers.append(
+            "x-meshmsg-request-id",
+            HeaderValue::from_static("22222222222222222222222222222222"),
+        );
+        assert!(matches!(
+            request_id_header(&headers),
+            RequestIdHeader::Duplicate
+        ));
+        headers.remove("x-meshmsg-request-id");
+        headers.insert("x-meshmsg-request-id", HeaderValue::from_static("BAD"));
+        assert!(matches!(
+            request_id_header(&headers),
+            RequestIdHeader::Invalid
+        ));
+    }
+
+    #[test]
     fn mutation_error_dto_is_strict_and_operation_bound() {
         let id = "0123456789abcdef0123456789abcdef";
         let value = json!({
             "type":"error", "schema_version":1, "code":"send_failed",
-            "message":"unknown", "operation_id":id,
-            "retryable":true, "outcome":"unknown"
+            "message":"Message submission failed.", "request_id":"11111111111111111111111111111111",
+            "operation_id":id, "retryable":true, "outcome":"unknown"
         });
         let parsed = MutationErrorDto::parse(value.clone(), id).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), value);
@@ -2095,6 +2565,7 @@ mod tests {
 
         let mut lifecycle =
             ipc::LifecycleErrorV1::new("attachment_quota_exceeded", "quota", "not_started", false);
+        lifecycle.request_id = Some("11111111111111111111111111111111".into());
         lifecycle.operation_id = Some(id.into());
         let lifecycle_value = lifecycle.into_value();
         assert!(ipc::LifecycleErrorV1::from_value(&lifecycle_value).is_ok());
@@ -2180,7 +2651,7 @@ mod tests {
             "join",
             "topic",
         ] {
-            assert!(parse_request(json!({"command":command}).to_string().as_bytes()).is_err());
+            assert!(parse_request(&web_request(json!({"command":command}))).is_err());
         }
         for value in [
             json!({"command":"status", "body":"ignored"}),
@@ -2188,20 +2659,21 @@ mod tests {
             json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"a", "path":"/etc/passwd"}),
             json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"二".repeat(1366)}),
         ] {
-            assert!(parse_request(value.to_string().as_bytes()).is_err());
+            assert!(parse_request(&web_request(value)).is_err());
         }
-        assert!(parse_request(br#"{"command":"send","command":"status","body":"a"}"#).is_err());
-        assert!(parse_request(br#"{"command":"status"}"#).is_ok());
-        assert!(parse_request(br#"{"command":"peers"}"#).is_ok());
-        assert!(parse_request(
-            br#"{"command":"download","id":"0123456789abcdef0123456789abcdef"}"#
-        )
+        assert!(parse_request(br#"{"schema_version":1,"request_id":"11111111111111111111111111111111","request":{"command":"send","command":"status","body":"a"}}"#).is_err());
+        assert!(parse_request(&web_request(json!({"command":"status"}))).is_ok());
+        assert!(parse_request(&web_request(json!({"command":"peers"}))).is_ok());
+        assert!(parse_request(&web_request(
+            json!({"command":"download","id":"0123456789abcdef0123456789abcdef"})
+        ))
         .is_ok());
-        assert!(parse_request(br#"{"command":"download","id":"../../secret"}"#).is_err());
+        assert!(parse_request(&web_request(
+            json!({"command":"download","id":"../../secret"})
+        ))
+        .is_err());
         assert!(parse_request(
-            json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"二".repeat(1365)})
-                .to_string()
-                .as_bytes()
+            &web_request(json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"二".repeat(1365)}))
         )
         .is_ok());
     }
@@ -2213,7 +2685,12 @@ mod tests {
         assert_ne!(state.download_root, second.download_root);
         let now = Instant::now();
         let id = state
-            .remember_offer("signed-secret", "résumé\r\n.txt", now)
+            .remember_offer(
+                "11111111111111111111111111111111",
+                "signed-secret",
+                "résumé\r\n.txt",
+                now,
+            )
             .unwrap();
         assert!(valid_id(&id));
         let stored = state.get_offer(&id, now).unwrap();
@@ -2225,6 +2702,7 @@ mod tests {
         assert!(header.contains("filename*=UTF-8''r%C3%A9sum%C3%A9%0D%0A.txt"));
         let expired = state
             .remember_offer(
+                "22222222222222222222222222222222",
                 "expired",
                 "old.txt",
                 now - DOWNLOAD_TTL - Duration::from_secs(1),
@@ -2255,16 +2733,56 @@ mod tests {
         assert!(result.is_err());
         assert!(semaphore.try_acquire().is_ok());
 
-        for value in [
-            json!({"type":"download_complete"}),
-            json!({"type":"download_complete", "schema_version":2}),
-            json!({"type":"download_complete", "schema_version":"1"}),
-            json!({"type":"other", "schema_version":1}),
-        ] {
-            assert!(!compatible_download_complete(&value));
-        }
+        let output = PathBuf::from("/tmp/expected.blob");
+        let complete = json!({
+            "type":"download_complete", "schema_version":1,
+            "request_id":"11111111111111111111111111111111",
+            "offer_id":"22222222222222222222222222222222",
+            "kind":"file", "name":"safe.txt", "size":4,
+            "from":"0000000000000000000000000000000000000000000000000000000000000000",
+            "output":output.clone(), "installed":true, "pinned":true,
+            "destination_synced":true, "cleanup_complete":true, "warnings":[]
+        });
         assert!(compatible_download_complete(
-            &json!({"type":"download_complete", "schema_version":1})
+            &complete,
+            "22222222222222222222222222222222",
+            "safe.txt",
+            &output,
+        ));
+        for mutation in [
+            ("schema_version", json!(2)),
+            ("request_id", json!("bad")),
+            ("offer_id", json!("bad")),
+            ("kind", json!("unknown")),
+            ("name", json!("bad\nname")),
+            ("from", json!("peer")),
+            ("output", json!("")),
+            ("installed", json!(false)),
+            ("pinned", json!(false)),
+            ("warnings", json!(["bad\twarning"])),
+        ] {
+            let mut malformed = complete.clone();
+            malformed[mutation.0] = mutation.1;
+            assert!(!compatible_download_complete(
+                &malformed,
+                "22222222222222222222222222222222",
+                "safe.txt",
+                &output,
+            ));
+        }
+        let mut unknown = complete.clone();
+        unknown["extra"] = true.into();
+        assert!(!compatible_download_complete(
+            &unknown,
+            "22222222222222222222222222222222",
+            "safe.txt",
+            &output,
+        ));
+        assert!(!compatible_download_complete(
+            &complete,
+            "33333333333333333333333333333333",
+            "safe.txt",
+            &output,
         ));
     }
 
@@ -2321,7 +2839,7 @@ mod tests {
         let digest = "01".repeat(32);
         let valid = json!({
             "type":"attachment_shared", "schema_version":3,
-            "operation_id":id, "message_id":id, "offer_id":id,
+            "request_id":"11111111111111111111111111111111", "operation_id":id, "message_id":id, "offer_id":id,
             "source_digest":digest, "from":"peer", "timestamp_ms":1,
             "kind":"file", "name":"report.txt", "size":7,
             "ticket":"ticket", "offer":"offer", "delivery_acknowledged":false
@@ -2381,14 +2899,14 @@ mod tests {
         let state = state();
         let public_event = |value| public_event(&state, value, true);
         assert!(public_event(json!({"type":"download_progress", "path":"secret"})).is_none());
-        let incoming = public_event(json!({
+        let incoming = public_event(ipc_event(json!({
             "type":"attachment_offer", "schema_version":2,
             "message_id":"01010101010101010101010101010101",
             "from":"peer", "timestamp_ms":42,
             "name":"<report>.pdf", "kind":"file", "size":1234,
-            "offer_id":"private-id", "offer":"signed-secret", "ticket":"blob-secret",
-            "path":"private-path", "output":"private-output"
-        }))
+            "offer_id":"01010101010101010101010101010101",
+            "offer":"signed-secret", "ticket":"blob-secret"
+        })))
         .unwrap();
         assert!(valid_id(incoming["download_id"].as_str().unwrap()));
         let legacy = super::public_event(
@@ -2415,14 +2933,16 @@ mod tests {
                 "timestamp_ms":42, "name":"<report>.pdf", "kind":"file", "size":1234
             })
         );
-        let outgoing = public_event(json!({
+        let outgoing = public_event(ipc_event(json!({
             "type":"attachment_shared", "schema_version":3,
             "operation_id":"02020202020202020202020202020202",
             "message_id":"02020202020202020202020202020202",
+            "offer_id":"02020202020202020202020202020202",
+            "source_digest":"02".repeat(32),
             "from":"local", "timestamp_ms":43,
             "name":"folder.tar", "kind":"directory_tar_v1", "size":5678,
-            "offer":"signed-secret", "ticket":"blob-secret", "delivery_acknowledged":true
-        }))
+            "offer":"signed-secret", "ticket":"blob-secret", "delivery_acknowledged":false
+        })))
         .unwrap();
         assert_eq!(
             outgoing,
@@ -2449,14 +2969,16 @@ mod tests {
             "type":"peer_up", "peer":{"endpoint":"private-route", "body":"secret"}
         }))
         .is_none());
-        let connected = public_event(json!({
+        assert!(public_event(json!({
             "type":"connected", "peer":{"endpoint":"private-route", "body":"secret"}
         }))
-        .unwrap();
-        assert_eq!(
-            connected,
-            json!({"type":"connected", "download_supported":true})
-        );
+        .is_none());
+        let connected = public_event(ipc_event(json!({
+            "type":"connected", "schema_version":1, "peer":iroh::SecretKey::generate().public().to_string(),
+            "endpoint_online":true, "topic_joined":true, "alias":null,
+            "ipc_capabilities":[WEB_DOWNLOAD_CAPABILITY]
+        }))).unwrap();
+        assert!(connected["download_supported"].as_bool().unwrap());
         for low_level_neighbor_event in [
             json!({"type":"peer_up", "peer":"2su5Z4MwjA5XsXQFa4c8sEqi2zS6SLLXv4k7Fv9VwK8"}),
             json!({"type":"peer_down", "peer":"10.0.0.1:443"}),
@@ -2475,23 +2997,22 @@ mod tests {
         );
         assert!(!malformed_status.to_string().contains("private"));
         assert!(!malformed_status.to_string().contains("body"));
-        let value = public_event(json!({
+        let value = public_event(ipc_event(json!({
             "type":"message", "schema_version":2,
             "message_id":"03030303030303030303030303030303",
-            "body":"<script>\ndata: injected\n", "from":"peer", "timestamp_ms":41,
-            "private":"secret"
-        }))
+            "body":"<script>\ndata: injected\n", "from":"peer", "timestamp_ms":41
+        })))
         .unwrap();
         let frame = String::from_utf8(sse_frame(&value).to_vec()).unwrap();
         assert_eq!(frame.lines().count(), 2);
         assert!(!frame.contains("secret"));
-        let queued = public_event(json!({
+        let queued = public_event(ipc_event(json!({
             "type":"queued", "schema_version":3,
             "operation_id":"04040404040404040404040404040404",
             "message_id":"04040404040404040404040404040404",
             "from":"local", "body":"hello", "timestamp_ms":42,
-            "delivery_acknowledged":true, "private":"secret"
-        }))
+            "delivery_acknowledged":false
+        })))
         .unwrap();
         assert_eq!(
             queued,
@@ -2527,20 +3048,15 @@ mod tests {
 
         let self_key = iroh::SecretKey::generate().public().to_string();
         let remote_key = iroh::SecretKey::generate().public().to_string();
-        let injected = json!({
+        let injected = ipc_event(json!({
             "type":"peers_snapshot", "schema_version":2, "generated_at_ms":1_000,
             "directory_epoch":"0123456789abcdef0123456789abcdef", "directory_revision":0,
-            "self":{
-                "public_key":self_key, "alias":"local", "online":true,
-                "endpoint":"self-route", "socket":"private"
-            },
+            "self":{"public_key":self_key, "alias":"local", "online":true},
             "peers":[{
                 "public_key":remote_key, "alias":null, "online":true,
-                "last_seen_ms":900, "expires_at_ms":1_100,
-                "endpoint":"remote-route", "address":"10.0.0.1", "body":"private"
-            }],
-            "invite":"secret", "ipc_capabilities":["private"]
-        });
+                "last_seen_ms":900, "expires_at_ms":1_100
+            }]
+        }));
         let sanitized = public_peers_snapshot(&injected).unwrap();
         assert_eq!(sanitized["type"], "peers_snapshot");
         assert_eq!(sanitized["self"]["public_key"], self_key);
@@ -2560,15 +3076,14 @@ mod tests {
                 "leaked {forbidden}"
             );
         }
-        let transition = public_event(json!({
+        let transition = public_event(ipc_event(json!({
             "type":"peer_updated", "schema_version":2,
             "directory_epoch":"0123456789abcdef0123456789abcdef", "directory_revision":1,
             "peer":{
                 "public_key":remote_key, "alias":"renamed", "online":true,
-                "last_seen_ms":1_000, "expires_at_ms":151_000,
-                "endpoint":"hidden", "body":"private"
+                "last_seen_ms":1_000, "expires_at_ms":151_000
             }
-        }))
+        })))
         .unwrap();
         assert_eq!(transition["type"], "peer_updated");
         assert!(transition["peer"].get("endpoint").is_none());

@@ -74,8 +74,11 @@ json_invite() {
 python3 - "$ROOT/alias-default.json" <<'PY'
 import json, pathlib, socket, sys
 shown = json.loads(pathlib.Path(sys.argv[1]).read_text())
+request_id = shown.pop("request_id")
+assert len(request_id) == 32
 hostname = socket.gethostname().split('.', 1)[0].lower()
 assert shown == {
+    "schema_version": 1,
     "type": "alias", "enabled": True, "hostname": hostname,
     "custom": None, "alias": hostname,
 }
@@ -108,7 +111,7 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["peer"] != sys.arg
   || fail "forced replacement retained stale alias state"
 "$BIN" --state-dir "$ROOT/no-alias" --json init --no-default-alias >/dev/null
 "$BIN" --state-dir "$ROOT/no-alias" --json alias show | python3 -c \
-  'import json,sys; v=json.load(sys.stdin); assert v == {"type":"alias","enabled":False,"hostname":None,"custom":None,"alias":None}' \
+  'import json,sys; v=json.load(sys.stdin); r=v.pop("request_id"); assert len(r) == 32 and v == {"type":"alias","schema_version":1,"enabled":False,"hostname":None,"custom":None,"alias":None}' \
   || fail "init --no-default-alias did not persist explicit opt-out"
 cp "$ROOT/no-alias/alias.json" "$ROOT/no-alias/alias.json.saved"
 cp "$ROOT/alias-lifecycle/alias.json" "$ROOT/no-alias/alias.json"
@@ -228,7 +231,7 @@ target_absent() {
       >"$ROOT/old-alias.out" 2>"$ROOT/old-alias.err"; then
     return 1
   fi
-  grep -q 'no peer advertises that alias' "$ROOT/old-alias.err"
+  grep -q 'recipient_unresolved' "$ROOT/old-alias.err"
 }
 wait_for 45 "superseded signed alias to disappear" target_absent
 COLLISION="collision-secret-$(date +%s%N)"
@@ -236,7 +239,8 @@ if "$BIN" --state-dir "$ROOT/sender" --json send --to collision-node "$COLLISION
     >"$ROOT/collision.out" 2>"$ROOT/collision.err"; then
   fail "colliding alias selected a recipient"
 fi
-grep -q 'multiple peers' "$ROOT/collision.err" || fail "alias collision error was not actionable"
+grep -q '"code":"recipient_unresolved"' "$ROOT/collision.out" || fail "alias collision lacked a stable error code"
+test ! -s "$ROOT/collision.err" || fail "JSON alias collision wrote to stderr"
 sleep 2
 ! grep -Fq "$COLLISION" "$ROOT/receiver-restarted.listen.log" || fail "colliding alias delivered to one claimant"
 ! grep -Fq "$COLLISION" "$ROOT/spy.listen.log" || fail "colliding alias delivered to another claimant"

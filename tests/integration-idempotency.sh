@@ -38,8 +38,9 @@ stop_node() {
 }
 ipc() {
   python3 - "$ROOT/$1/daemon.sock" "$2" <<'PY'
-import socket,sys
-s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()+b'\n')
+import json,socket,sys
+request=json.loads(sys.argv[2]); envelope={'schema_version':1,'request_id':'9'*32,'request':request}
+s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(json.dumps(envelope).encode()+b'\n')
 data=b''
 while not data.endswith(b'\n'):
     chunk=s.recv(65536)
@@ -65,7 +66,8 @@ SEND_ID=11111111111111111111111111111111
 python3 - "$ROOT/sender/daemon.sock" "$SEND_ID" <<'PY'
 import json,socket,sys
 s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
-s.sendall((json.dumps({'command':'send','operation_id':sys.argv[2],'body':'lost-response-message'})+'\n').encode())
+request={'command':'send','operation_id':sys.argv[2],'body':'lost-response-message'}
+s.sendall((json.dumps({'schema_version':1,'request_id':'8'*32,'request':request})+'\n').encode())
 s.close()
 PY
 wait_for 30 "lost-response broadcast" grep -q '"body":"lost-response-message"' "$ROOT/receiver.listen"
@@ -85,7 +87,11 @@ PRIVATE_ID=22222222222222222222222222222222
 "$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$PRIVATE_ID" --to "$RECEIVER" private-idempotent >"$ROOT/private.1" & P1=$!
 "$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$PRIVATE_ID" --to "$RECEIVER" private-idempotent >"$ROOT/private.2" & P2=$!
 wait "$P1"; wait "$P2"
-cmp "$ROOT/private.1" "$ROOT/private.2" || fail "concurrent private duplicates returned different outcomes"
+python3 - "$ROOT/private.1" "$ROOT/private.2" <<'PY' || fail "concurrent private duplicates returned different outcomes"
+import json,sys
+left=json.load(open(sys.argv[1])); right=json.load(open(sys.argv[2]))
+left.pop('request_id'); right.pop('request_id'); assert left == right
+PY
 python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["schema_version"] == 3 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2] and v["duplicate_accepted"] is False' "$ROOT/private.1" "$PRIVATE_ID" \
   || fail "private operation ID did not reach the wire response"
 wait_for 30 "private delivery" grep -q '"body":"private-idempotent"' "$ROOT/receiver.listen"
@@ -99,13 +105,21 @@ SHARE_ID=33333333333333333333333333333333
 "$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/source.txt" >"$ROOT/share.1" & P1=$!
 "$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/source.txt" >"$ROOT/share.2" & P2=$!
 wait "$P1"; wait "$P2"
-cmp "$ROOT/share.1" "$ROOT/share.2" || fail "concurrent share duplicates returned different outcomes"
+python3 - "$ROOT/share.1" "$ROOT/share.2" <<'PY' || fail "concurrent share duplicates returned different outcomes"
+import json,sys
+left=json.load(open(sys.argv[1])); right=json.load(open(sys.argv[2]))
+left.pop('request_id'); right.pop('request_id'); assert left == right
+PY
 python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["schema_version"] == 3 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2] and v["offer_id"] == sys.argv[2]' "$ROOT/share.1" "$SHARE_ID" \
   || fail "share operation ID did not reach offer and wire IDs"
 python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len([x for x in b if x["offer_id"] == sys.argv[1]]) == 1' "$SHARE_ID" \
   <<<"$("$BIN" --state-dir "$ROOT/sender" --json offers)" || fail "duplicate share created duplicate permanent tags"
 REPLAY=$("$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/source.txt")
-[[ "$REPLAY" == "$(<"$ROOT/share.1")" ]] || fail "exact-path share retry did not replay"
+python3 - "$ROOT/share.1" "$REPLAY" <<'PY' || fail "exact-path share retry did not replay"
+import json,sys
+left=json.load(open(sys.argv[1])); right=json.loads(sys.argv[2])
+left.pop('request_id'); right.pop('request_id'); assert left == right
+PY
 python3 - "$ROOT/source.txt" <<'PY'
 import pathlib,sys
 path = pathlib.Path(sys.argv[1])
@@ -114,12 +128,14 @@ PY
 if "$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/source.txt" >"$ROOT/share.changed" 2>"$ROOT/share.changed.err"; then
   fail "same-size changed attachment reused an operation ID"
 fi
-grep -q 'already used with different inputs' "$ROOT/share.changed.err" || fail "changed attachment conflict was not reported"
+[[ ! -s "$ROOT/share.changed.err" ]] || fail "JSON conflict wrote to stderr"
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "operation_id_conflict" and v["outcome"] == "not_started"' "$ROOT/share.changed" || fail "changed attachment conflict was not reported"
 printf 'idempotent attachment\n' >"$ROOT/source.txt"
 if "$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/./source.txt" >"$ROOT/share.spelling" 2>"$ROOT/share.spelling.err"; then
   fail "equivalent but differently submitted absolute path reused an operation ID"
 fi
-grep -q 'already used with different inputs' "$ROOT/share.spelling.err" || fail "submitted-path spelling conflict was not reported"
+[[ ! -s "$ROOT/share.spelling.err" ]] || fail "JSON path conflict wrote to stderr"
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "operation_id_conflict" and v["outcome"] == "not_started"' "$ROOT/share.spelling" || fail "submitted-path spelling conflict was not reported"
 
 # Terminal failures are cached exactly and do not become a fresh attempt.
 FAIL_ID=44444444444444444444444444444444

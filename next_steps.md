@@ -47,24 +47,11 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 7. The JSON, HTTP, and IPC contracts are only partially versioned
 
-- Mutation successes and operation errors are now versioned, but status, connected events, several non-mutation errors, and several HTTP responses remain unversioned.
-- HTTP errors have `outcome` but no stable `code`, version, request ID, or retryability field: `src/web.rs:385-389`.
-- `--json` failures still produce plain text on stderr and nothing on stdout: `src/main.rs:21-24`.
-- Standardize a versioned envelope, for example:
-
-```json
-{
-  "type": "error",
-  "schema_version": 1,
-  "code": "daemon_offline",
-  "message": "...",
-  "retryable": true,
-  "outcome": "not_started",
-  "request_id": "..."
-}
-```
-
-- Deserialize responses into strict typed DTOs. Most clients currently validate only `type` and version, then silently default malformed fields.
+- [x] **Status: completed with an intentional local-API compatibility boundary.** `src/contracts.rs` defines the shared schema/version, cryptographically random 128-bit request IDs, bounded control-free public messages, and one strict deny-unknown-fields error DTO. Errors carry stable lowercase `code`, `retryable`, exact `outcome`, request correlation where applicable, and separate operation/offer IDs and lifecycle counts where relevant.
+- Every IPC request now uses a strict nested schema-1 envelope. Missing, unknown, duplicate, wrong-typed, malformed-ID, and unsupported-version requests fail closed. Every reply and subscription event echoes that request ID; response metadata, errors, status, mutation results, lifecycle results, and web-exposed event families are typed/strictly checked. The daemon advertises `typed_contracts_v1`. Status/start output no longer exposes local endpoint paths.
+- HTTP accepts/generates `X-Meshmsg-Request-Id`, propagates it through IPC, and returns it in the header and all JSON/SSE records. JSON HTTP requests have a strict nested schema-1 DTO; HTTP errors and SSE disconnects use the common envelope. Public event DTOs are strictly decoded before allowlist reconstruction, so unknown/missing fields and incompatible versions are dropped rather than defaulted.
+- `--json` one-shot failures are exactly one error object on stdout, no stderr, exit 1; help/version remain successful. Request IDs correlate attempts and are never conflated with retry-safe operation IDs, preserving operation-cache, signed-wire-ID, lifecycle, and unknown-outcome semantics.
+- Compatibility is deliberately fail-closed: current client/web/daemon components must be upgraded and restarted together; old uncorrelated IPC replies and unversioned requests are rejected without mutation fallback. Family versions remain exact and future evolution requires a new capability/version and explicit migration. The complete inventory and policy are in `docs/contracts.md`; focused DTO/duplicate/correlation tests plus fake-daemon CLI/HTTP/SSE integrations cover the boundary.
 
 ### 8. Validation rules have drifted across layers
 
@@ -141,7 +128,7 @@ Native Windows execution was unavailable locally. A Windows cross-check was atte
 1. [x] Versioned, topic-bound envelope plus operation IDs, including bounded concurrent/terminal outcome deduplication and documented nonpersistent retry scope.
 2. [x] Bound and time out daemon IPC connections.
 3. [x] Correct download transaction ordering.
-4. Introduce stable typed API and error contracts.
+4. [x] Introduce stable typed API and error contracts.
 5. [x] Add attachment lifecycle and quota controls.
 6. Replace synchronous daemon logging with bounded nonblocking structured output.
 7. Add fuzzing, slowloris/load tests, crash fault injection, and cross-platform no-clobber tests.

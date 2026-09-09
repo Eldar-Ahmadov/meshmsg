@@ -3,6 +3,7 @@ mod attachment;
 mod bench_tui;
 mod cli;
 mod config;
+mod contracts;
 mod direct;
 mod direct_replay;
 mod invite;
@@ -18,16 +19,69 @@ use cli::{AliasCommand, Cli, Command, OffersCommand};
 use config::State;
 use invite::Invite;
 
+fn json_mode_requested(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    arguments
+        .into_iter()
+        .skip(1)
+        .take_while(|argument| argument != "--")
+        .any(|argument| argument == "--json")
+}
+
 #[tokio::main]
 async fn main() {
+    let json = json_mode_requested(std::env::args_os());
     if let Err(error) = run().await {
-        eprintln!("error: {error:#}");
+        if json {
+            // JSON failures use stdout, the same documented stream as JSON
+            // successes/NDJSON events. Internal causes and local paths remain on
+            // the human-only diagnostic path.
+            let authoritative = error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<contracts::ContractFailure>()
+                    .map(|failure| failure.0.clone())
+            });
+            let envelope = authoritative.unwrap_or_else(|| {
+                let diagnostic = format!("{error:#}");
+                let (code, retryable, outcome) = if diagnostic.contains("connect to local daemon") {
+                    ("daemon_offline", true, "not_started")
+                } else if diagnostic.contains("timed out")
+                    || diagnostic.contains("outcome may be unknown")
+                {
+                    ("command_timeout", true, "unknown")
+                } else {
+                    ("command_failed", false, "not_started")
+                };
+                let mut envelope = contracts::ErrorEnvelopeV1::new(
+                    code,
+                    "Command failed. Run without --json for a local diagnostic.",
+                    outcome,
+                    retryable,
+                );
+                envelope.request_id = Some(contracts::new_request_id());
+                envelope
+            });
+            println!("{}", envelope.into_value());
+        } else {
+            eprintln!("error: {error:#}");
+        }
         std::process::exit(1);
     }
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            print!("{error}");
+            return Ok(());
+        }
+        Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+    };
     let is_bench_tui = matches!(&cli.command, Command::BenchTui);
     anyhow::ensure!(
         !(is_bench_tui && cli.json),
@@ -96,7 +150,7 @@ async fn run() -> Result<()> {
                 "alias":config.effective()
             });
             if cli.json {
-                println!("{value}");
+                cli::print_result(true, "", value);
             } else if let Some(alias) = config.effective() {
                 println!("{alias}");
             } else {
@@ -132,14 +186,15 @@ async fn run() -> Result<()> {
                 .iter()
                 .any(|peer| peer.id == secret.public());
             if cli.json {
-                println!(
-                    "{}",
+                cli::print_result(
+                    true,
+                    "",
                     serde_json::json!({
                         "type":"invite", "token":token,
                         "advertises_self":state.advertise_self, "has_invite":true,
                         "bootstrap_peer_count":invite.bootstrap_peers.len(),
                         "self_advertised":self_advertised
-                    })
+                    }),
                 );
             } else {
                 println!("{token}");
@@ -247,6 +302,26 @@ fn save_joined_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_error_mode_ignores_literals_after_positional_terminator() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(json_mode_requested(args(&[
+            "meshmsg", "send", "--json", "hello"
+        ])));
+        assert!(json_mode_requested(args(&["meshmsg", "--json", "status"])));
+        assert!(!json_mode_requested(args(&[
+            "meshmsg", "send", "--", "--json"
+        ])));
+        assert!(!json_mode_requested(args(&[
+            "meshmsg", "send", "--", "text", "--json"
+        ])));
+    }
     use crate::invite::MAX_BOOTSTRAP_PEERS;
     use iroh::{EndpointAddr, SecretKey};
     use iroh_gossip::proto::TopicId;

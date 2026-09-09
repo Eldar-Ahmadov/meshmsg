@@ -69,12 +69,24 @@ def main():
                 port = reservation.getsockname()[1]
             origin = f'http://127.0.0.1:{port}'
             web, _ = spawn('one', 'web', '--listen', f'127.0.0.1:{port}')
+            request_counter = 100000
+
+            def request_payload(value):
+                nonlocal request_counter
+                request_counter += 1
+                request_id = f'{request_counter:032x}'
+                return {'schema_version': 1, 'request_id': request_id, 'request': value}, request_id
 
             def post(value):
+                payload, request_id = request_payload(value)
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
-                conn.request('POST', '/api/request', json.dumps(value), {'Origin': origin, 'Content-Type': 'application/json'})
+                conn.request('POST', '/api/request', json.dumps(payload), {
+                    'Origin': origin, 'Content-Type': 'application/json',
+                    'X-Meshmsg-Request-Id': request_id})
                 response = conn.getresponse()
-                result = response.status, json.loads(response.read())
+                decoded = json.loads(response.read())
+                assert decoded.pop('request_id') == request_id
+                result = response.status, decoded
                 conn.close()
                 return result
 
@@ -86,20 +98,25 @@ def main():
 
             def upload(name, payload, op_id=None):
                 op_id = op_id or operation_id()
+                _, request_id = request_payload({})
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
                 conn.request('POST', '/api/attachment', payload, {
                     'Origin': origin, 'Content-Type': 'application/octet-stream',
                     'X-Meshmsg-File-Name': urllib.parse.quote(name, safe="~()*!.'-"),
-                    'X-Meshmsg-Operation-Id': op_id})
+                    'X-Meshmsg-Operation-Id': op_id,
+                    'X-Meshmsg-Request-Id': request_id})
                 response = conn.getresponse()
-                result = response.status, json.loads(response.read())
+                decoded = json.loads(response.read())
+                assert decoded.pop('request_id') == request_id
+                result = response.status, decoded
                 conn.close()
                 return result, op_id
 
             def submit_without_reply(value):
                 with socket.socket(socket.AF_UNIX) as client:
                     client.connect(str(root / 'one' / 'daemon.sock'))
-                    client.sendall(json.dumps(value).encode() + b'\n')
+                    payload, _ = request_payload(value)
+                    client.sendall(json.dumps(payload).encode() + b'\n')
 
             def get(path):
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
@@ -164,7 +181,10 @@ def main():
                     line = feed.readline()
                     assert line, 'SSE ended'
                     if line.startswith(b'data: '):
-                        return json.loads(line[6:])
+                        value = json.loads(line[6:])
+                        request_id = value.pop('request_id')
+                        assert len(request_id) == 32 and request_id == request_id.lower()
+                        return value
 
             for feed, _ in feeds:
                 assert event(feed)['type'] == 'connected'
@@ -276,7 +296,7 @@ def main():
                 'type': 'error', 'schema_version': 1,
                 'code': 'operation_id_conflict',
                 'operation_id': conflict_operation_id,
-                'message': 'The operation ID was already used with different inputs.',
+                'message': 'The operation ID is bound to different input.',
                 'outcome': 'not_started', 'retryable': False}
             (retry_code, retry_conflict), _ = upload(
                 conflict_path.name, conflict_payload, conflict_operation_id)
