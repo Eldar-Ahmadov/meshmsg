@@ -75,8 +75,16 @@ deserialized into a deny-unknown-fields DTO with semantic and bounded-value chec
 Unknown families, unsupported versions, and unknown/missing/wrong-typed fields fail
 closed. This applies to every command response and subscription event, including
 stop, attachment share/download metadata, lifecycle/progress/loss/peer events, and
-all benchmark records. Listen/chat therefore never print an unrecognized daemon
-event. Error objects are strictly decoded against the closed error contract. Status
+all benchmark records. Download progress permits `0/0` only for an empty blob;
+otherwise `total_bytes` is positive and `received_bytes <= total_bytes`. A CLI
+download accepts completion only when `output` has the exact retained OS-string/byte
+representation it submitted; Path-equivalent dot components, repeated/trailing
+separators, and other lexical rewrites are rejected. A benchmark send summary
+requires `queued + failed == attempted`. `send_failed` requires a positive `failed`
+count and the fixed control-free `first_error` text `Message submission failed.`;
+all other completion reasons require `first_error:null`. Daemon diagnostics and paths
+are never accepted there. Listen/chat therefore never print an unrecognized
+daemon event. Error objects are strictly decoded against the closed error contract. Status
 includes capabilities, replay limits, mutation-cache semantics, attachment limits,
 and attachment-storage pressure.
 
@@ -113,8 +121,13 @@ SSE `data` records are JSON DTOs with the SSE connection's request ID. Connected
 message, queued, attachment, lag, peer snapshot, and peer transition source DTOs are
 strictly deserialized before reconstruction from a public allowlist. A malformed or
 unsupported daemon event terminates that IPC subscription and yields a sanitized
-SSE disconnect error; it is never skipped in a way that could hide a contract gap. Offline/disconnect notices use the standard
-error envelope (`daemon_offline` or `daemon_disconnected`) rather than an ad-hoc
+SSE disconnect error; it is never skipped in a way that could hide a contract gap. A
+connected handshake that cannot be reconstructed as a valid public connected event,
+including `endpoint_online:false`, yields a correlated `invalid_daemon_response`
+error and closes the feed cleanly. IPC connection establishment and reading this
+first frame share one eight-second startup deadline; the read receives only the
+remaining budget. Offline/disconnect notices use the standard error
+envelope (`daemon_offline` or `daemon_disconnected`) rather than an ad-hoc
 event shape. SSE has no replay IDs because request IDs are correlation identifiers,
 not event cursors.
 

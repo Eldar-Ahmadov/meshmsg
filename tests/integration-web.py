@@ -58,6 +58,7 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
         self.idempotency_capability = True
         self.web_download_attempts = {}
         self.web_download_capability = True
+        self.malformed_handshake = False
         self.clients = set()
         self.subscribers = {}
         self.lock = threading.Lock()
@@ -250,7 +251,8 @@ class Handler(socketserver.StreamRequestHandler):
                 emit(outcome)
             elif value['command'] == 'subscribe':
                 capabilities = ['web_download_v1'] if self.server.web_download_capability else []
-                emit({'type': 'connected', 'peer': SELF_KEY, 'endpoint_online': True,
+                emit({'type': 'connected', 'peer': SELF_KEY,
+                      'endpoint_online': not self.server.malformed_handshake,
                       'topic_joined': True, 'alias': 'local-node',
                       'ipc_capabilities': capabilities})
                 emit(malicious_peers_snapshot())
@@ -392,6 +394,23 @@ def main():
                 legacy_feed.close()
                 streams.pop()[1].close()
                 daemon.web_download_capability = True
+
+                # A structurally valid handshake that cannot represent a public
+                # connected state must become one correlated sanitized error,
+                # not panic the bridge or claim connection success.
+                daemon.malformed_handshake = True
+                malformed_feed = open_feed()
+                malformed = next_event(malformed_feed)
+                assert malformed == {
+                    'type': 'error', 'schema_version': 1,
+                    'code': 'invalid_daemon_response',
+                    'message': 'The daemon returned an invalid response.',
+                    'outcome': 'unknown', 'retryable': True}
+                assert malformed_feed.readline() == b'\n'
+                assert malformed_feed.readline() == b'', 'invalid handshake feed stayed open'
+                malformed_feed.close()
+                streams.pop()[1].close()
+                daemon.malformed_handshake = False
 
                 code, status = api({'command': 'status'})
                 assert code == 200 and status['peer'] == SELF_KEY

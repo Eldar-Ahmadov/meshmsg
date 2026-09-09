@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const SCHEMA_VERSION: u8 = 1;
 pub(crate) const API_CONTRACT_CAPABILITY: &str = "typed_contracts_v1";
 pub(crate) const MAX_PUBLIC_MESSAGE_BYTES: usize = 1024;
+pub(crate) const BENCHMARK_SEND_FAILED_MESSAGE: &str = "Message submission failed.";
 
 pub(crate) fn new_request_id() -> String {
     data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>())
@@ -39,6 +40,7 @@ pub(crate) fn known_error_code(code: &str) -> bool {
             | "share_failed"
             | "download_failed"
             | "offers_failed"
+            | "offers_busy"
             | "attachment_lifecycle_internal"
             | "send_failed"
             | "private_send_failed"
@@ -140,6 +142,7 @@ fn stable_message(code: &str) -> &'static str {
         "invalid_attachment_offer" | "invalid_offer_selector" | "invalid_prune_request" => {
             "The attachment request is invalid."
         }
+        "offers_busy" => "Attachment listing is currently busy.",
         "offers_failed" | "attachment_lifecycle_internal" => {
             "The attachment lifecycle operation failed."
         }

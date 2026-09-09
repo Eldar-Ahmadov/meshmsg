@@ -1810,7 +1810,7 @@ where
             Some(Ok(Err(error))) => {
                 eprintln!("benchmark send diagnostic: {error}");
                 stats.failed += 1;
-                stats.first_error = Some("Message submission failed.".into());
+                stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
                 reason = "send_failed";
                 break 'benchmark;
             }
@@ -3631,6 +3631,20 @@ fn try_admit_transfer(
         .map_err(|_| serde_json::json!({"type":"error", "code":busy_code, "message":busy_message}))
 }
 
+fn try_admit_offer_listing(
+    limit: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, serde_json::Value> {
+    limit.clone().try_acquire_owned().map_err(|_| {
+        LifecycleErrorV1::new(
+            "offers_busy",
+            "Attachment listing is currently busy.",
+            "not_started",
+            true,
+        )
+        .into_value()
+    })
+}
+
 struct ShareResources {
     store: Store,
     storage: AttachmentStorage,
@@ -4098,7 +4112,9 @@ async fn download_attachment(
                         anyhow::bail!("attachment download failed")
                     }
                     DownloadProgressItem::Progress(received_bytes)
-                        if received_bytes >= next_report || received_bytes == verified_size =>
+                        if verified_size > 0
+                            && (received_bytes >= next_report
+                                || received_bytes == verified_size) =>
                     {
                         let _ = events.send(serde_json::json!({
                             "type":"download_progress", "schema_version":1,
@@ -4123,6 +4139,12 @@ async fn download_attachment(
             _ => anyhow::bail!("download did not produce a complete blob"),
         }
     };
+    if size == 0 {
+        let _ = events.send(serde_json::json!({
+            "type":"download_progress", "schema_version":1,
+            "received_bytes":0, "total_bytes":0, "output":output
+        }));
+    }
     anyhow::ensure!(
         size <= max_attachment_bytes,
         "download exceeds the configured size limit of {max_attachment_bytes} bytes"
@@ -4772,9 +4794,7 @@ pub async fn run_daemon(
                     ));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
-                    let permit = match try_admit_transfer(
-                        &offer_list_limit, "offers_busy", "attachment listing already in progress"
-                    ) {
+                    let permit = match try_admit_offer_listing(&offer_list_limit) {
                         Ok(permit) => permit,
                         Err(response) => {
                             let _ = reply.send(response);
@@ -5678,11 +5698,14 @@ fn validate_lifecycle_response(value: &serde_json::Value, expected: &str) -> Res
 }
 
 pub async fn download(dir: &Path, offer: &str, output: &Path, json: bool) -> Result<()> {
+    // Retain the exact absolute representation submitted to the daemon. Do not
+    // canonicalize through symlinks or require the not-yet-created destination.
+    let requested_output = caller_path(output)?;
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::Download {
             offer: offer.to_owned(),
-            output: caller_path(output)?,
+            output: requested_output.clone(),
         },
         "download_complete",
         1,
@@ -5690,6 +5713,11 @@ pub async fn download(dir: &Path, offer: &str, output: &Path, json: bool) -> Res
         None,
     )
     .await?;
+    let completed = crate::ipc::DownloadCompleteV1::from_value(&value)?;
+    anyhow::ensure!(
+        completed.output().as_os_str() == requested_output.as_os_str(),
+        "daemon download response output does not exactly match the submitted path representation"
+    );
     event(json, value);
     Ok(())
 }
@@ -6834,6 +6862,23 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_offer_listing_returns_the_stable_retryable_busy_contract() {
+        let limit = Arc::new(Semaphore::new(1));
+        let active_listing = try_admit_offer_listing(&limit).unwrap();
+        let busy = try_admit_offer_listing(&limit).unwrap_err();
+        let request_id = "11111111111111111111111111111111";
+        let normalized = normalize_ipc_response(&busy, request_id);
+        let error = ErrorEnvelopeV1::from_value(&normalized).unwrap();
+        assert_eq!(error.code, "offers_busy");
+        assert_eq!(error.message, "Attachment listing is currently busy.");
+        assert_eq!(error.outcome, "not_started");
+        assert!(error.retryable);
+        assert_eq!(error.request_id.as_deref(), Some(request_id));
+        drop(active_listing);
+        assert!(try_admit_offer_listing(&limit).is_ok());
+    }
+
+    #[test]
     fn pinned_blob_tags_preserve_names_and_kinds() {
         let id = "0123456789abcdef0123456789abcdef";
         let provider = SecretKey::generate().public();
@@ -7678,7 +7723,7 @@ mod tests {
             schedule_missed: 2,
             body_bytes: 768,
             envelope_bytes: 1_200,
-            first_error: Some("scripted failure".into()),
+            first_error: Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into()),
         };
         let progress = bench_send_progress(&config, 10, &stats, Duration::from_millis(500));
         assert_object_keys(
@@ -7747,7 +7792,10 @@ mod tests {
         assert_eq!(summary["schedule_missed"], 2);
         assert_eq!(summary["queued_body_bytes"], 768);
         assert_eq!(summary["completion_reason"], "send_failed");
-        assert_eq!(summary["first_error"], "scripted failure");
+        assert_eq!(
+            summary["first_error"],
+            contracts::BENCHMARK_SEND_FAILED_MESSAGE
+        );
         assert_eq!(summary["delivery_acknowledged"], false);
         assert_eq!(summary["achieved_messages_per_second"], 12.0);
     }

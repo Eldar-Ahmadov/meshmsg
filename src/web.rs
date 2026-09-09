@@ -40,7 +40,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::TcpListener,
     sync::{mpsc, Semaphore},
-    time::{interval, timeout},
+    time::{interval, timeout, Instant as TokioInstant},
 };
 
 type Body = BoxBody<Bytes, std::io::Error>;
@@ -1629,6 +1629,17 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
     }
 }
 
+async fn within_startup_deadline<T>(
+    deadline: TokioInstant,
+    future: impl Future<Output = T>,
+) -> std::result::Result<T, tokio::time::error::Elapsed> {
+    timeout(
+        deadline.saturating_duration_since(TokioInstant::now()),
+        future,
+    )
+    .await
+}
+
 async fn events(state: Arc<WebState>) -> Response<Body> {
     let Ok(permit) = state.subscriptions.clone().try_acquire_owned() else {
         return error(
@@ -1641,19 +1652,30 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
     let request_id = http_request_id();
     tokio::spawn(HTTP_REQUEST_ID.scope(request_id.clone(), async move {
         let _permit = permit;
-        let opened = timeout(IPC_TIMEOUT, async {
-            let mut reader = ipc::subscribe_with_id(&state.dir, &request_id).await?;
-            let first = reader.read().await?.context("daemon closed")?;
-            anyhow::ensure!(
-                first["type"] == "connected",
-                "invalid subscription handshake"
-            );
-            Result::<_>::Ok((reader, first))
-        })
+        let startup_deadline = TokioInstant::now() + IPC_TIMEOUT;
+        let opened = within_startup_deadline(
+            startup_deadline,
+            ipc::subscribe_with_id(&state.dir, &request_id),
+        )
         .await;
-        let Ok(Ok((mut reader, first))) = opened else {
+        let Ok(Ok(mut reader)) = opened else {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_offline", "message":"Daemon offline. Reconnecting; feed gaps have no history.", "retryable":true, "outcome":"unknown"}))).await;
             return;
+        };
+        let first = match within_startup_deadline(startup_deadline, reader.read()).await {
+            Ok(Ok(Some(first))) => first,
+            Ok(Ok(None)) => {
+                let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_disconnected", "message":"Daemon disconnected. Feed gap; no history. Reconnecting.", "retryable":true, "outcome":"unknown"}))).await;
+                return;
+            }
+            Ok(Err(_)) => {
+                let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
+                return;
+            }
+            Err(_) => {
+                let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_offline", "message":"Daemon offline. Reconnecting; feed gaps have no history.", "retryable":true, "outcome":"unknown"}))).await;
+                return;
+            }
         };
         let download_supported = first["ipc_capabilities"]
             .as_array()
@@ -1662,13 +1684,11 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
                     .iter()
                     .any(|value| value.as_str() == Some(WEB_DOWNLOAD_CAPABILITY))
             });
-        if tx
-            .send(sse_frame(
-                &public_event(&state, first, download_supported).unwrap(),
-            ))
-            .await
-            .is_err()
-        {
+        let Some(connected) = public_event(&state, first, download_supported) else {
+            let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
+            return;
+        };
+        if tx.send(sse_frame(&connected)).await.is_err() {
             return;
         }
         let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
@@ -2438,6 +2458,21 @@ mod tests {
         headers
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn sse_startup_connection_and_first_frame_share_one_timeout_budget() {
+        let started = TokioInstant::now();
+        let deadline = started + IPC_TIMEOUT;
+        within_startup_deadline(deadline, tokio::time::sleep(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(TokioInstant::now() - started, Duration::from_secs(5));
+
+        let second =
+            within_startup_deadline(deadline, tokio::time::sleep(Duration::from_secs(4))).await;
+        assert!(second.is_err());
+        assert_eq!(TokioInstant::now() - started, IPC_TIMEOUT);
+    }
+
     #[test]
     fn upload_fingerprint_ttl_starts_after_long_completion_and_latest_retry() {
         let state = state();
@@ -2973,12 +3008,16 @@ mod tests {
             "type":"connected", "peer":{"endpoint":"private-route", "body":"secret"}
         }))
         .is_none());
-        let connected = public_event(ipc_event(json!({
+        let connected_source = ipc_event(json!({
             "type":"connected", "schema_version":1, "peer":iroh::SecretKey::generate().public().to_string(),
             "endpoint_online":true, "topic_joined":true, "alias":null,
             "ipc_capabilities":[WEB_DOWNLOAD_CAPABILITY]
-        }))).unwrap();
+        }));
+        let connected = public_event(connected_source.clone()).unwrap();
         assert!(connected["download_supported"].as_bool().unwrap());
+        let mut offline_handshake = connected_source;
+        offline_handshake["endpoint_online"] = false.into();
+        assert!(public_event(offline_handshake).is_none());
         for low_level_neighbor_event in [
             json!({"type":"peer_up", "peer":"2su5Z4MwjA5XsXQFa4c8sEqi2zS6SLLXv4k7Fv9VwK8"}),
             json!({"type":"peer_down", "peer":"10.0.0.1:443"}),

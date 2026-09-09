@@ -727,8 +727,8 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
             anyhow::ensure!(
                 valid_family(&dto.family, family, dto.schema_version, &dto.request_id)
                     && !dto.output.as_os_str().is_empty()
-                    && dto.total_bytes > 0
-                    && dto.received_bytes <= dto.total_bytes,
+                    && dto.received_bytes <= dto.total_bytes
+                    && (dto.total_bytes > 0 || dto.received_bytes == 0),
                 "invalid download-progress event"
             );
         }
@@ -802,6 +802,7 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                     && dto.payload_bytes > 0
                     && dto.queued <= dto.attempted
                     && dto.failed <= dto.attempted
+                    && dto.queued.checked_add(dto.failed) == Some(dto.attempted)
                     && dto.attempted <= dto.planned
                     && dto.queued_body_bytes <= dto.queued.saturating_mul(dto.payload_bytes as u64)
                     && dto.achieved_messages_per_second.is_finite()
@@ -831,7 +832,9 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                     && dto.payload_bytes > 0
                     && dto.queued <= dto.attempted
                     && dto.failed <= dto.attempted
+                    && dto.queued.checked_add(dto.failed) == Some(dto.attempted)
                     && dto.attempted <= dto.planned
+                    && dto.queued_body_bytes <= dto.queued.saturating_mul(dto.payload_bytes as u64)
                     && dto.achieved_messages_per_second.is_finite()
                     && dto.achieved_body_bytes_per_second.is_finite()
                     && !dto.delivery_acknowledged
@@ -841,12 +844,18 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                     ),
                 "invalid benchmark summary"
             );
-            anyhow::ensure!(
-                dto.first_error
-                    .as_deref()
-                    .is_none_or(|text| text.len() <= contracts::MAX_PUBLIC_MESSAGE_BYTES),
-                "invalid benchmark error"
-            );
+            let coherent_error = match dto.completion_reason.as_str() {
+                "send_failed" => {
+                    dto.failed > 0
+                        && dto.first_error.as_deref()
+                            == Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE)
+                        && dto.first_error.as_deref().is_some_and(|text| {
+                            valid_public_text(text, contracts::MAX_PUBLIC_MESSAGE_BYTES)
+                        })
+                }
+                _ => dto.first_error.is_none(),
+            };
+            anyhow::ensure!(coherent_error, "invalid benchmark error state");
             let _ = (
                 dto.schema_version,
                 dto.schedule_missed,
@@ -1901,6 +1910,7 @@ mod tests {
             serde_json::json!({"type":"offers_pruned","schema_version":1,"request_id":request_id,"dry_run":true,"selected_tags":1,"removed_tags":0,"released_bytes":4,"limited":false,"cutoff_ms":1}),
             serde_json::json!({"type":"download_started","schema_version":1,"request_id":request_id,"output":"/tmp/file"}),
             serde_json::json!({"type":"download_progress","schema_version":1,"request_id":request_id,"received_bytes":2,"total_bytes":4,"output":"/tmp/file"}),
+            serde_json::json!({"type":"download_progress","schema_version":1,"request_id":request_id,"received_bytes":0,"total_bytes":0,"output":"/tmp/empty"}),
             serde_json::json!({"type":"download_complete","schema_version":1,"request_id":request_id,"offer_id":operation_id,"kind":"file","name":"safe.txt","size":4,"from":peer,"output":"/tmp/file","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}),
             serde_json::json!({"type":"stopping","schema_version":1,"request_id":request_id,"outcome":"accepted"}),
             serde_json::json!({"type":"peer_up","schema_version":1,"request_id":request_id,"peer":peer}),
@@ -1949,6 +1959,67 @@ mod tests {
             &serde_json::json!({"type":"future_event","schema_version":1,"request_id":request_id})
         )
         .is_err());
+
+        let mut failed_summary = base_send_progress;
+        failed_summary["type"] = "bench_send_summary".into();
+        failed_summary["completion_reason"] = "send_failed".into();
+        failed_summary["attempted"] = 2.into();
+        failed_summary["queued"] = 1.into();
+        failed_summary["failed"] = 1.into();
+        failed_summary["queued_body_bytes"] = 128.into();
+        failed_summary["first_error"] = contracts::BENCHMARK_SEND_FAILED_MESSAGE.into();
+        validate_success_payload(&failed_summary).unwrap();
+        for unsafe_error in [
+            "/home/alice/private/benchmark.log",
+            "submission failed\t/private/path",
+            "submission failed\nforged record",
+            "submission failed\u{001b}[31m",
+            "x",
+        ] {
+            let mut malformed = failed_summary.clone();
+            malformed["first_error"] = unsafe_error.into();
+            assert!(
+                validate_success_payload(&malformed).is_err(),
+                "unsafe benchmark error accepted: {unsafe_error:?}"
+            );
+        }
+        let mut oversized = failed_summary.clone();
+        oversized["first_error"] = "x".repeat(contracts::MAX_PUBLIC_MESSAGE_BYTES + 1).into();
+        assert!(validate_success_payload(&oversized).is_err());
+
+        for malformed in [
+            {
+                let mut value = failed_summary.clone();
+                value["failed"] = 0.into();
+                value["queued"] = 2.into();
+                value
+            },
+            {
+                let mut value = failed_summary.clone();
+                value["first_error"] = serde_json::Value::Null;
+                value
+            },
+            {
+                let mut value = failed_summary.clone();
+                value["completion_reason"] = "deadline".into();
+                value
+            },
+            {
+                let mut value = failed_summary.clone();
+                value["attempted"] = 1.into();
+                value
+            },
+        ] {
+            assert!(validate_success_payload(&malformed).is_err());
+        }
+
+        let mut completed_summary = failed_summary;
+        completed_summary["completion_reason"] = "deadline".into();
+        completed_summary["first_error"] = serde_json::Value::Null;
+        completed_summary["queued"] = 2.into();
+        completed_summary["failed"] = 0.into();
+        completed_summary["queued_body_bytes"] = 256.into();
+        validate_success_payload(&completed_summary).unwrap();
     }
 
     #[test]

@@ -332,6 +332,36 @@ def main():
             assert any(item['direction'] == 'incoming' and item['name'] == 'reverse-attachment.txt'
                        for item in pinned), 'web preparation did not retain its documented inbound blob pin'
 
+            # A real empty transfer emits the one valid 0/0 progress state. The
+            # CLI subscription observes it while both web SSE subscriptions
+            # validate and intentionally filter progress, then remain usable.
+            _, empty_listener_log = spawn('one', 'listen')
+            wait_for(lambda: '"type":"connected"' in pathlib.Path(empty_listener_log.name).read_text(),
+                     'empty-transfer CLI listener', 10)
+            empty_path = root / 'empty.bin'
+            empty_path.write_bytes(b'')
+            empty_shared = cli('two', 'share', str(empty_path))
+            empty_offer_id = None
+            for feed, _ in feeds:
+                while True:
+                    incoming = event(feed)
+                    if incoming['type'] == 'attachment_offer' and incoming['name'] == 'empty.bin':
+                        break
+                current_id = incoming.pop('download_id')
+                empty_offer_id = empty_offer_id or current_id
+                assert incoming['size'] == 0 and incoming['message_id'] == empty_shared['message_id']
+            _, empty_body = browser_download(empty_offer_id)
+            assert empty_body == b''
+
+            def empty_progress_observed():
+                values = [json.loads(line) for line in pathlib.Path(empty_listener_log.name).read_text().splitlines()]
+                return any(value.get('type') == 'download_progress'
+                           and value.get('received_bytes') == 0
+                           and value.get('total_bytes') == 0
+                           for value in values)
+
+            wait_for(empty_progress_observed, 'valid zero-byte CLI progress', 10)
+
             directory_path = root / 'reverse-directory'
             directory_path.mkdir()
             (directory_path / 'inside.txt').write_text('browser directory payload\n')
@@ -374,7 +404,7 @@ def main():
             web.send_signal(signal.SIGINT)
             assert web.wait(timeout=5) == 0
             assert running('one') and running('two')
-            print('PASS: real sanitized peer snapshot reached HTTP and both SSE handshakes without routes; web messages and a real browser attachment upload reached the distinct peer and both feeds as canonical events; safe metadata and verified browser file/directory-tar downloads passed; reverse peer send, daemon offline/restart, and independent web shutdown passed')
+            print('PASS: real sanitized peer snapshot reached HTTP and both SSE handshakes without routes; web messages and a real browser attachment upload reached the distinct peer and both feeds as canonical events; safe metadata and verified zero-byte/file/directory-tar downloads passed with active CLI/SSE subscriptions; reverse peer send, daemon offline/restart, and independent web shutdown passed')
         except BaseException:
             for log in logs:
                 log.flush()
