@@ -878,6 +878,7 @@ struct RunningNode {
     downloader: Downloader,
     lookup: MemoryLookup,
     presence_lookup: MemoryLookup,
+    direct_replay: direct::ReplayWorker,
 }
 
 async fn start(
@@ -923,8 +924,9 @@ async fn start(
     let blob_store: Store = fs_store.into();
     let downloader = blob_store.downloader(&endpoint);
     let blobs = BlobsProtocol::new(&blob_store, None);
-    let direct = DirectHandler::new(secret.clone(), topic, direct_incoming, state_dir)
-        .context("open persistent direct replay state")?;
+    let (direct, direct_replay) =
+        DirectHandler::new(secret.clone(), topic, direct_incoming, state_dir)
+            .context("open persistent direct replay state")?;
     let router = Router::builder(endpoint.clone())
         .accept(BROADCAST_ALPN_V2, gossip.clone())
         .accept(PRESENCE_ALPN, presence_gossip.clone())
@@ -975,6 +977,7 @@ async fn start(
         downloader,
         lookup,
         presence_lookup,
+        direct_replay,
     })
 }
 
@@ -3081,6 +3084,13 @@ fn emit_peer_transitions(
     }
 }
 
+fn direct_replay_status(health: crate::direct_replay::ReplayHealth) -> serde_json::Value {
+    serde_json::json!({
+        "available":health.available,
+        "error":health.error,
+    })
+}
+
 pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Result<()> {
     anyhow::ensure!(
         max_attachment_bytes > 0,
@@ -3124,6 +3134,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
         result = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, node.endpoint.online()) => result,
         _ = shutdown.recv() => {
             node.router.shutdown().await?;
+            node.direct_replay.shutdown().await?;
             return Ok(());
         }
     };
@@ -3134,6 +3145,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
             "endpoint did not become online before the deadline",
         );
         node.router.shutdown().await?;
+        node.direct_replay.shutdown().await?;
         anyhow::bail!(
             "endpoint did not become online within {}s; check internet, DNS, firewall, and relay access",
             ENDPOINT_ONLINE_TIMEOUT.as_secs()
@@ -3329,15 +3341,42 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                             endpoint, secret, topic, address, body,
                             operation_id_bytes(&operation_id),
                         ).await {
-                            Ok(accepted) => serde_json::json!({
-                                "type":"private_accepted", "schema_version":2,
+                            Ok(direct::DirectSendOutcome::Accepted(accepted)) => serde_json::json!({
+                                "type":"private_accepted", "schema_version":3,
                                 "to":accepted.recipient.to_string(),
                                 "message_id":direct::id_string(&accepted.id),
                                 "timestamp_ms":accepted.timestamp_ms,
                                 "body_bytes":accepted.body_bytes,
                                 "acceptance_acknowledged":true,
+                                "duplicate_accepted":accepted.duplicate,
                                 "durable":false, "read":false
                             }),
+                            Ok(direct::DirectSendOutcome::Rejected(rejection)) => match rejection {
+                                direct::DirectRejection::Conflict => serde_json::json!({
+                                    "type":"error", "schema_version":1,
+                                    "code":"private_message_conflict",
+                                    "message":"recipient has the same message ID bound to different content",
+                                    "outcome":"not_started", "retryable":false
+                                }),
+                                direct::DirectRejection::Busy => serde_json::json!({
+                                    "type":"error", "schema_version":1,
+                                    "code":"private_recipient_busy",
+                                    "message":"recipient replay or delivery capacity is busy",
+                                    "outcome":"not_started", "retryable":true
+                                }),
+                                direct::DirectRejection::Unavailable => serde_json::json!({
+                                    "type":"error", "schema_version":1,
+                                    "code":"private_replay_unavailable",
+                                    "message":"recipient replay persistence is unavailable",
+                                    "outcome":"not_started", "retryable":true
+                                }),
+                                direct::DirectRejection::DeliveryOutcomeUnknown => serde_json::json!({
+                                    "type":"error", "schema_version":1,
+                                    "code":"private_delivery_unknown",
+                                    "message":"recipient durably recorded this message ID but cannot prove whether its volatile delivery was queued",
+                                    "outcome":"unknown", "retryable":false
+                                }),
+                            },
                             Err(error) => serde_json::json!({
                                 "type":"error", "schema_version":1,
                                 "code":"private_send_failed", "message":format!("{error:#}"),
@@ -3374,6 +3413,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                     let endpoint_online = node.endpoint.home_relay_status().get()
                         .iter().any(|status| status.is_connected());
                     let neighbors = node.receiver.neighbors().count();
+                    let replay_status = direct_replay_status(node.direct_replay.health());
                     let _ = reply.send(serde_json::json!({
                         "type":"status", "running":true, "peer":peer, "topic":state.topic,
                         "advertises_self":state.advertise_self, "has_invite":has_invite,
@@ -3390,6 +3430,15 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         "operation_cache_capacity":OPERATION_CACHE_CAPACITY,
                         "operation_cache_ttl_ms":OPERATION_CACHE_TTL.as_millis() as u64,
                         "operation_cache_persistent":false,
+                        "direct_replay_available":replay_status["available"],
+                        "direct_replay_error":replay_status["error"],
+                        "direct_replay_capacity":crate::direct_replay::MAX_REPLAY_ENTRIES,
+                        "direct_replay_per_sender_capacity":crate::direct_replay::MAX_REPLAY_ENTRIES_PER_SENDER,
+                        "direct_replay_queue_capacity":crate::direct_replay::REPLAY_QUEUE_CAPACITY,
+                        "direct_replay_global_rate_per_second":crate::direct_replay::GLOBAL_RATE_PER_SECOND as u64,
+                        "direct_replay_global_rate_burst":crate::direct_replay::GLOBAL_RATE_BURST as u64,
+                        "direct_replay_sender_rate_per_second":crate::direct_replay::SENDER_RATE_PER_SECOND as u64,
+                        "direct_replay_sender_rate_burst":crate::direct_replay::SENDER_RATE_BURST as u64,
                         "max_attachment_bytes":max_attachment_bytes
                     }));
                 }
@@ -3655,6 +3704,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
     while offer_list_tasks.join_next().await.is_some() {}
     drain_local_client_tasks(&mut local_client_tasks, LOCAL_IPC_SHUTDOWN_GRACE).await;
     node.router.shutdown().await?;
+    node.direct_replay.shutdown().await?;
     Ok(())
 }
 
@@ -3874,6 +3924,7 @@ struct PrivateAcceptedResponse {
     timestamp_ms: u64,
     body_bytes: usize,
     acceptance_acknowledged: bool,
+    duplicate_accepted: bool,
     durable: bool,
     read: bool,
 }
@@ -3887,12 +3938,13 @@ fn validate_private_acceptance(
         .context("daemon returned an invalid private-send acceptance")?;
     anyhow::ensure!(
         accepted.kind == "private_accepted"
-            && accepted.schema_version == 2
+            && accepted.schema_version == 3
             && accepted.acceptance_acknowledged
             && !accepted.durable
             && !accepted.read,
         "daemon returned an invalid private-send acceptance"
     );
+    let _duplicate_accepted = accepted.duplicate_accepted;
     anyhow::ensure!(
         accepted.operation_id == operation_id && accepted.message_id == operation_id,
         "private-send acceptance operation ID does not match the request"
@@ -3963,7 +4015,7 @@ pub async fn send_once(
                 body: body.to_owned(),
             },
             "private_accepted",
-            Some(2),
+            Some(3),
         )
         .await
         .with_context(|| format!("operation {operation_id}"))?;
@@ -4921,6 +4973,10 @@ fn event(json: bool, value: serde_json::Value) {
                 "private from {}: {}",
                 value["from"].as_str().unwrap_or("peer"),
                 terminal_safe(value["body"].as_str().unwrap_or(""))
+            ),
+            "private_accepted" if value["duplicate_accepted"].as_bool() == Some(true) => println!(
+                "private message was previously accepted by {} (not redelivered; not durable or read)",
+                value["to"].as_str().unwrap_or("peer")
             ),
             "private_accepted" => println!(
                 "private message accepted by {} (acceptance only; not durable or read)",
@@ -6350,11 +6406,12 @@ mod tests {
 
         let recipient = SecretKey::generate().public().to_string();
         let accepted = serde_json::json!({
-            "type":"private_accepted", "schema_version":2,
+            "type":"private_accepted", "schema_version":3,
             "operation_id":"0123456789abcdef0123456789abcdef",
             "to":recipient, "message_id":"0123456789abcdef0123456789abcdef",
             "timestamp_ms":1_700_000_000_000_u64, "body_bytes":6,
-            "acceptance_acknowledged":true, "durable":false, "read":false
+            "acceptance_acknowledged":true, "duplicate_accepted":false,
+            "durable":false, "read":false
         });
         validate_private_acceptance(&accepted, "0123456789abcdef0123456789abcdef", "秘密".len())
             .unwrap();
@@ -6419,6 +6476,16 @@ mod tests {
 
         assert!(error.to_string().contains("cannot advertise self"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_replay_terminal_health_has_stable_status_fields() {
+        let status = direct_replay_status(crate::direct_replay::ReplayHealth {
+            available: false,
+            error: Some("direct replay persistence worker failed".into()),
+        });
+        assert_eq!(status["available"], false);
+        assert_eq!(status["error"], "direct replay persistence worker failed");
     }
 
     #[test]

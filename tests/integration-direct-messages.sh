@@ -153,7 +153,7 @@ wait_for 40 "sender presence at receiver" status_aliases receiver 2
 
 SENDER_STATUS=$("$BIN" --state-dir "$ROOT/sender" --json status)
 SENDER_PEER=$(python3 -c \
-  'import json,sys; v=json.load(sys.stdin); assert "private_send_v1" in v["ipc_capabilities"]; print(v["peer"])' \
+  'import json,sys; v=json.load(sys.stdin); assert "private_send_v2" in v["ipc_capabilities"]; print(v["peer"])' \
   <<<"$SENDER_STATUS") || fail "current daemon did not advertise safe private-send IPC"
 
 # The receiver learned the sender from its invite. Exercise that identity after
@@ -183,7 +183,7 @@ wait_for 10 "web SSE subscription" grep -Fq '"type":"connected"' "$ROOT/web.sse"
 
 PRIVATE="private-alias-$(date +%s%N)"
 PRIVATE_RESULT=$("$BIN" --state-dir "$ROOT/sender" --json send --to target-node "$PRIVATE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["schema_version"] == 2; assert v["operation_id"] == v["message_id"]; assert v["acceptance_acknowledged"] is True and v["durable"] is False and v["read"] is False; assert v["body_bytes"] == int(sys.argv[1]) and "body" not in v; assert len(v["message_id"]) == 32' "${#PRIVATE}" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["schema_version"] == 3; assert v["operation_id"] == v["message_id"]; assert v["acceptance_acknowledged"] is True and v["duplicate_accepted"] is False and v["durable"] is False and v["read"] is False; assert v["body_bytes"] == int(sys.argv[1]) and "body" not in v; assert len(v["message_id"]) == 32' "${#PRIVATE}" \
   <<<"$PRIVATE_RESULT" || fail "private alias send did not return the bounded acceptance acknowledgement"
 wait_for 30 "private alias delivery" grep -Fq "\"body\":\"$PRIVATE\"" "$ROOT/receiver.listen.log"
 sleep 1

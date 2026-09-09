@@ -1,6 +1,6 @@
 use crate::{
     alias::{normalize_alias, validate_alias},
-    config::atomic_write,
+    direct_replay::{self, ReplayClient, ReplayDecision},
     peers::{PeerTransition, PeerTransitionKind, RemotePeer, PEER_LEASE_MS},
 };
 use anyhow::{Context, Result};
@@ -17,17 +17,19 @@ use serde_byte_array::ByteArray;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
+    path::Path,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 
-pub(crate) const DIRECT_ALPN: &[u8] = b"/meshmsg/direct/1";
+pub(crate) use crate::direct_replay::ReplayWorker;
+
+pub(crate) const DIRECT_ALPN: &[u8] = b"/meshmsg/direct/2";
 pub(crate) const PRESENCE_ALPN: &[u8] = b"/meshmsg/presence-gossip/1";
-const VERSION: u8 = 1;
+const PRESENCE_VERSION: u8 = 1;
+const DIRECT_VERSION: u8 = 2;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 const MAX_DIRECT_FRAME: usize = 6 * 1024;
 const MAX_BODY_BYTES: usize = 4096;
@@ -46,129 +48,13 @@ const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLAY_SAFETY_MARGIN: Duration = Duration::from_secs(30);
 const REPLAY_LIFETIME: Duration =
     Duration::from_secs(DIRECT_ACCEPTANCE_WINDOW.as_secs() * 2 + REPLAY_SAFETY_MARGIN.as_secs());
-// Whole-file atomic commits keep crash semantics simple; cap the journal so an
-// authenticated sender cannot turn each acceptance into an unbounded rewrite.
-const MAX_REPLAY_ENTRIES: usize = 4_096;
 const PRESENCE_DOMAIN: &[u8] = b"meshmsg-presence-v1";
-const MESSAGE_DOMAIN: &[u8] = b"meshmsg-direct-message-v1";
-const ACK_DOMAIN: &[u8] = b"meshmsg-direct-ack-v1";
+const MESSAGE_DOMAIN: &[u8] = b"meshmsg-direct-message-v2";
+const ACK_DOMAIN: &[u8] = b"meshmsg-direct-ack-v2";
+const REPLAY_FINGERPRINT_DOMAIN: &[u8] = b"meshmsg-direct-replay-fingerprint-v2";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
-type ReplayCache = Arc<Mutex<PersistentReplayCache>>;
 
 const _: () = assert!(REPLAY_LIFETIME.as_secs() >= DIRECT_ACCEPTANCE_WINDOW.as_secs() * 2);
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReplayState {
-    version: u8,
-    recipient: String,
-    topic: String,
-    entries: Vec<ReplayStateEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReplayStateEntry {
-    sender: String,
-    id: String,
-    expires_at_ms: u64,
-}
-
-#[derive(Debug)]
-struct PersistentReplayCache {
-    path: PathBuf,
-    recipient: PublicKey,
-    topic: TopicId,
-    entries: HashMap<(PublicKey, [u8; 16]), u64>,
-}
-
-impl PersistentReplayCache {
-    fn load(path: PathBuf, recipient: PublicKey, topic: TopicId) -> Result<Self> {
-        let mut cache = Self {
-            path,
-            recipient,
-            topic,
-            entries: HashMap::new(),
-        };
-        match fs::read(&cache.path) {
-            Ok(bytes) => {
-                anyhow::ensure!(
-                    bytes.len() <= 1024 * 1024,
-                    "direct replay state is too large"
-                );
-                let state: ReplayState =
-                    serde_json::from_slice(&bytes).context("parse direct replay state")?;
-                anyhow::ensure!(
-                    state.version == 1,
-                    "unsupported direct replay state version"
-                );
-                anyhow::ensure!(
-                    state.recipient == recipient.to_string(),
-                    "direct replay state recipient mismatch"
-                );
-                anyhow::ensure!(
-                    state.topic == topic.to_string(),
-                    "direct replay state topic mismatch"
-                );
-                anyhow::ensure!(
-                    state.entries.len() <= MAX_REPLAY_ENTRIES,
-                    "direct replay state capacity exceeded"
-                );
-                let now = now_ms()?;
-                for entry in state.entries {
-                    let sender =
-                        PublicKey::from_str(&entry.sender).context("invalid replay sender")?;
-                    let id_bytes = data_encoding::HEXLOWER
-                        .decode(entry.id.as_bytes())
-                        .context("invalid replay id")?;
-                    let id: [u8; 16] = id_bytes
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("invalid replay id length"))?;
-                    if entry.expires_at_ms > now {
-                        anyhow::ensure!(
-                            cache
-                                .entries
-                                .insert((sender, id), entry.expires_at_ms)
-                                .is_none(),
-                            "duplicate replay entry"
-                        );
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("read direct replay state"),
-        }
-        Ok(cache)
-    }
-
-    fn persist(&self) -> Result<()> {
-        let state = ReplayState {
-            version: 1,
-            recipient: self.recipient.to_string(),
-            topic: self.topic.to_string(),
-            entries: self
-                .entries
-                .iter()
-                .map(|((sender, id), expires_at_ms)| ReplayStateEntry {
-                    sender: sender.to_string(),
-                    id: id_string(id),
-                    expires_at_ms: *expires_at_ms,
-                })
-                .collect(),
-        };
-        let dir = self
-            .path
-            .parent()
-            .context("direct replay state has no parent")?;
-        let name = self
-            .path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .context("invalid direct replay state filename")?;
-        atomic_write(dir, name, &serde_json::to_vec(&state)?, 0o600)
-            .context("persist direct replay state")
-    }
-}
 
 fn now_ms() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
@@ -255,7 +141,7 @@ impl SignedPresence {
         validate_endpoint_addr(&endpoint, secret.public())?;
         let alias = alias.map(normalize_alias).transpose()?;
         let payload = PresencePayload {
-            version: VERSION,
+            version: PRESENCE_VERSION,
             topic,
             sender: secret.public(),
             alias,
@@ -291,7 +177,7 @@ impl SignedPresence {
             "presence record contains trailing bytes"
         );
         anyhow::ensure!(
-            record.payload.version == VERSION,
+            record.payload.version == PRESENCE_VERSION,
             "unsupported presence version"
         );
         anyhow::ensure!(record.payload.topic == topic, "presence topic mismatch");
@@ -619,6 +505,21 @@ struct DirectFrame {
     signature: Signature,
 }
 
+fn replay_fingerprint(payload: &DirectPayload) -> Result<[u8; 32]> {
+    // Timestamp is intentionally excluded: a caller can reconstruct the same
+    // semantic operation after sender restart without knowing the first attempt's
+    // generated timestamp. All caller-controlled and routing fields are bound.
+    let canonical = postcard::to_stdvec(&(
+        REPLAY_FINGERPRINT_DOMAIN,
+        payload.sender,
+        payload.recipient,
+        payload.topic,
+        payload.id,
+        &payload.body,
+    ))?;
+    Ok(Sha256::digest(canonical).into())
+}
+
 impl DirectFrame {
     #[cfg(test)]
     fn new(secret: &SecretKey, recipient: PublicKey, topic: TopicId, body: String) -> Result<Self> {
@@ -638,7 +539,7 @@ impl DirectFrame {
             "private message exceeds {MAX_BODY_BYTES} UTF-8 bytes"
         );
         let payload = DirectPayload {
-            version: VERSION,
+            version: DIRECT_VERSION,
             sender: secret.public(),
             recipient,
             topic,
@@ -674,7 +575,7 @@ impl DirectFrame {
             "private message contains trailing bytes"
         );
         anyhow::ensure!(
-            frame.payload.version == VERSION,
+            frame.payload.version == DIRECT_VERSION,
             "unsupported private message version"
         );
         anyhow::ensure!(
@@ -706,9 +607,13 @@ impl DirectFrame {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-enum AckReason {
+enum AckResult {
     Accepted,
+    DuplicateAccepted,
+    Conflict,
     Busy,
+    Unavailable,
+    DeliveryOutcomeUnknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -718,8 +623,7 @@ struct AckPayload {
     recipient: PublicKey,
     topic: TopicId,
     id: [u8; 16],
-    accepted: bool,
-    reason: AckReason,
+    result: AckResult,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -729,20 +633,14 @@ struct AckFrame {
 }
 
 impl AckFrame {
-    fn new(
-        secret: &SecretKey,
-        message: &DirectPayload,
-        accepted: bool,
-        reason: AckReason,
-    ) -> Result<Self> {
+    fn new(secret: &SecretKey, message: &DirectPayload, result: AckResult) -> Result<Self> {
         let payload = AckPayload {
-            version: VERSION,
+            version: DIRECT_VERSION,
             sender: secret.public(),
             recipient: message.sender,
             topic: message.topic,
             id: message.id,
-            accepted,
-            reason,
+            result,
         };
         let signed = postcard::to_stdvec(&(ACK_DOMAIN, &payload))?;
         Ok(Self {
@@ -772,7 +670,7 @@ impl AckFrame {
             "private acknowledgement contains trailing bytes"
         );
         anyhow::ensure!(
-            ack.payload.version == VERSION,
+            ack.payload.version == DIRECT_VERSION,
             "unsupported private acknowledgement version"
         );
         anyhow::ensure!(
@@ -786,13 +684,6 @@ impl AckFrame {
         anyhow::ensure!(
             ack.payload.topic == message.topic && ack.payload.id == message.id,
             "private acknowledgement does not match message"
-        );
-        anyhow::ensure!(
-            matches!(
-                (ack.payload.accepted, ack.payload.reason),
-                (true, AckReason::Accepted) | (false, AckReason::Busy)
-            ),
-            "private acknowledgement status is inconsistent"
         );
         let signed = postcard::to_stdvec(&(ACK_DOMAIN, &ack.payload))?;
         ack.payload
@@ -816,7 +707,7 @@ pub(crate) struct DirectHandler {
     secret: SecretKey,
     topic: TopicId,
     incoming: mpsc::Sender<IncomingDirect>,
-    replay: ReplayCache,
+    replay: ReplayClient,
     connections: Arc<tokio::sync::Semaphore>,
 }
 
@@ -826,28 +717,21 @@ impl DirectHandler {
         topic: TopicId,
         incoming: mpsc::Sender<IncomingDirect>,
         state_dir: &Path,
-    ) -> Result<Self> {
-        // Keep the state filename short for Windows MAX_PATH compatibility while
-        // binding the file contents to the full recipient and topic below.
-        let mut path_hasher = Sha256::new();
-        path_hasher.update(secret.public().as_bytes());
-        path_hasher.update(topic.as_bytes());
-        let replay_name = format!(
-            "direct-replay-v1-{}.json",
-            data_encoding::HEXLOWER.encode(&path_hasher.finalize())
-        );
-        let replay =
-            PersistentReplayCache::load(state_dir.join(replay_name), secret.public(), topic)?;
-        Ok(Self {
-            secret,
-            topic,
-            incoming,
-            replay: Arc::new(Mutex::new(replay)),
-            connections: Arc::new(tokio::sync::Semaphore::new(32)),
-        })
+    ) -> Result<(Self, ReplayWorker)> {
+        let (replay, worker) = direct_replay::start(state_dir, secret.public(), topic)?;
+        Ok((
+            Self {
+                secret,
+                topic,
+                incoming,
+                replay,
+                connections: Arc::new(tokio::sync::Semaphore::new(32)),
+            },
+            worker,
+        ))
     }
 
-    fn accept_message(&self, remote: PublicKey, bytes: &[u8]) -> Result<AckFrame> {
+    async fn accept_message(&self, remote: PublicKey, bytes: &[u8]) -> Result<AckFrame> {
         let frame = DirectFrame::decode(bytes)?;
         anyhow::ensure!(
             frame.payload.sender == remote,
@@ -862,45 +746,49 @@ impl DirectHandler {
             "private message has wrong topic"
         );
 
-        let key = (frame.payload.sender, frame.payload.id);
-        let mut replay = self
+        // Reserve volatile delivery capacity before asking the worker to make a new
+        // ID durable. The worker still recognizes duplicates when no permit is
+        // available, so an already accepted request can always be re-acknowledged.
+        // The delivery closure travels in the bounded in-memory worker request but
+        // is never serialized. The worker invokes it only after sync, making the
+        // commit+delivery sequence safe even if this protocol future is cancelled.
+        let delivery = self
+            .incoming
+            .clone()
+            .try_reserve_owned()
+            .ok()
+            .map(|permit| {
+                let payload = frame.payload.clone();
+                Box::new(move || {
+                    permit.send(IncomingDirect {
+                        from: payload.sender,
+                        id: payload.id,
+                        timestamp_ms: payload.timestamp_ms,
+                        body: payload.body,
+                    });
+                }) as Box<dyn FnOnce() + Send + 'static>
+            });
+        let expires_at_ms = now_ms()?.saturating_add(REPLAY_LIFETIME.as_millis() as u64);
+        let fingerprint = replay_fingerprint(&frame.payload)?;
+        let decision = self
             .replay
-            .lock()
-            .map_err(|_| anyhow::anyhow!("replay cache poisoned"))?;
-        let now = now_ms()?;
-        replay
-            .entries
-            .retain(|_, expires_at_ms| *expires_at_ms > now);
-        if replay.entries.contains_key(&key) {
-            // The original request was already accepted into this daemon's queue.
-            // Re-acknowledge it without delivering the plaintext a second time.
-            return AckFrame::new(&self.secret, &frame.payload, true, AckReason::Accepted);
-        }
-        // Never evict a still-valid ID: doing so would permit a replay after
-        // cache-pressure eviction. Capacity exhaustion fails closed until TTL
-        // pruning makes room.
-        if replay.entries.len() >= MAX_REPLAY_ENTRIES {
-            return AckFrame::new(&self.secret, &frame.payload, false, AckReason::Busy);
-        }
-        let permit = match self.incoming.try_reserve() {
-            Ok(permit) => permit,
-            Err(_) => return AckFrame::new(&self.secret, &frame.payload, false, AckReason::Busy),
+            .admit(
+                frame.payload.sender,
+                frame.payload.id,
+                fingerprint,
+                expires_at_ms,
+                delivery,
+            )
+            .await?;
+        let result = match decision {
+            ReplayDecision::Accepted => AckResult::Accepted,
+            ReplayDecision::DuplicateAccepted => AckResult::DuplicateAccepted,
+            ReplayDecision::Conflict => AckResult::Conflict,
+            ReplayDecision::DeliveryOutcomeUnknown => AckResult::DeliveryOutcomeUnknown,
+            ReplayDecision::Busy => AckResult::Busy,
+            ReplayDecision::Unavailable => AckResult::Unavailable,
         };
-        let incoming = IncomingDirect {
-            from: frame.payload.sender,
-            id: frame.payload.id,
-            timestamp_ms: frame.payload.timestamp_ms,
-            body: frame.payload.body.clone(),
-        };
-        replay
-            .entries
-            .insert(key, now.saturating_add(REPLAY_LIFETIME.as_millis() as u64));
-        if let Err(error) = replay.persist() {
-            replay.entries.remove(&key);
-            return Err(error);
-        }
-        permit.send(incoming);
-        AckFrame::new(&self.secret, &frame.payload, true, AckReason::Accepted)
+        AckFrame::new(&self.secret, &frame.payload, result)
     }
 }
 
@@ -915,7 +803,7 @@ impl ProtocolHandler for DirectHandler {
             tokio::time::timeout(DIRECT_TIMEOUT, async {
                 let (mut send, mut recv) = connection.accept_bi().await?;
                 let request = recv.read_to_end(MAX_DIRECT_FRAME).await?;
-                let ack = self.accept_message(remote, &request)?.encode()?;
+                let ack = self.accept_message(remote, &request).await?.encode()?;
                 send.write_all(&ack).await?;
                 send.finish()?;
                 // Keep the connection alive until the authenticated peer has
@@ -938,6 +826,21 @@ pub(crate) struct AcceptedDirect {
     pub(crate) id: [u8; 16],
     pub(crate) timestamp_ms: u64,
     pub(crate) body_bytes: usize,
+    pub(crate) duplicate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectRejection {
+    Conflict,
+    Busy,
+    Unavailable,
+    DeliveryOutcomeUnknown,
+}
+
+#[derive(Debug)]
+pub(crate) enum DirectSendOutcome {
+    Accepted(AcceptedDirect),
+    Rejected(DirectRejection),
 }
 
 pub(crate) async fn send(
@@ -947,7 +850,7 @@ pub(crate) async fn send(
     address: EndpointAddr,
     body: String,
     operation_id: [u8; 16],
-) -> Result<AcceptedDirect> {
+) -> Result<DirectSendOutcome> {
     validate_endpoint_addr(&address, address.id)?;
     let frame = DirectFrame::new_with_id(&secret, address.id, topic, body, operation_id)?;
     let encoded = frame.encode()?;
@@ -977,17 +880,23 @@ pub(crate) async fn send(
             .await
             .context("read private-message acknowledgement")?;
         let ack = AckFrame::decode(&bytes, &frame.payload)?;
-        anyhow::ensure!(
-            ack.payload.accepted,
-            "recipient rejected private message ({:?})",
-            ack.payload.reason
-        );
-        Ok(AcceptedDirect {
-            recipient,
-            id,
-            timestamp_ms,
-            body_bytes,
-        })
+        match ack.payload.result {
+            AckResult::Accepted | AckResult::DuplicateAccepted => {
+                Ok(DirectSendOutcome::Accepted(AcceptedDirect {
+                    recipient,
+                    id,
+                    timestamp_ms,
+                    body_bytes,
+                    duplicate: ack.payload.result == AckResult::DuplicateAccepted,
+                }))
+            }
+            AckResult::Conflict => Ok(DirectSendOutcome::Rejected(DirectRejection::Conflict)),
+            AckResult::Busy => Ok(DirectSendOutcome::Rejected(DirectRejection::Busy)),
+            AckResult::Unavailable => Ok(DirectSendOutcome::Rejected(DirectRejection::Unavailable)),
+            AckResult::DeliveryOutcomeUnknown => Ok(DirectSendOutcome::Rejected(
+                DirectRejection::DeliveryOutcomeUnknown,
+            )),
+        }
     };
     tokio::time::timeout(DIRECT_TIMEOUT, operation)
         .await
@@ -1403,38 +1312,122 @@ mod tests {
         assert_eq!(limiter.sources.len(), 1);
     }
 
-    #[test]
-    fn replay_is_reacknowledged_without_redelivery() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_is_reacknowledged_without_redelivery() {
         let sender = SecretKey::generate();
         let receiver = SecretKey::generate();
         let topic = TopicId::from_bytes([9; 32]);
         let (tx, mut rx) = mpsc::channel(2);
         let dir =
             std::env::temp_dir().join(format!("meshmsg-replay-test-{}", rand::random::<u64>()));
-        fs::create_dir_all(&dir).unwrap();
-        let handler = DirectHandler::new(receiver.clone(), topic, tx, &dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (handler, mut worker) = DirectHandler::new(receiver.clone(), topic, tx, &dir).unwrap();
         let frame =
             DirectFrame::new(&sender, receiver.public(), topic, "deliver once".into()).unwrap();
         let bytes = frame.encode().unwrap();
 
         for _ in 0..2 {
-            let ack = handler.accept_message(sender.public(), &bytes).unwrap();
-            assert!(ack.payload.accepted);
+            let ack = handler
+                .accept_message(sender.public(), &bytes)
+                .await
+                .unwrap();
+            assert!(matches!(
+                ack.payload.result,
+                AckResult::Accepted | AckResult::DuplicateAccepted
+            ));
             assert_eq!(ack.payload.id, frame.payload.id);
         }
         assert_eq!(rx.try_recv().unwrap().body, "deliver once");
         assert!(rx.try_recv().is_err());
+        let conflict = DirectFrame::new_with_id(
+            &sender,
+            receiver.public(),
+            topic,
+            "different signed body".into(),
+            frame.payload.id,
+        )
+        .unwrap();
+        let conflict_ack = handler
+            .accept_message(sender.public(), &conflict.encode().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(conflict_ack.payload.result, AckResult::Conflict);
+        assert!(rx.try_recv().is_err());
         drop(handler);
+        worker.shutdown().await.unwrap();
 
         // Restarting the handler reloads the accepted ID and re-acknowledges it
         // without placing the plaintext into the new process queue.
         let (restart_tx, mut restart_rx) = mpsc::channel(2);
-        let restarted = DirectHandler::new(receiver.clone(), topic, restart_tx, &dir).unwrap();
-        let ack = restarted.accept_message(sender.public(), &bytes).unwrap();
-        assert!(ack.payload.accepted);
+        let (restarted, mut restarted_worker) =
+            DirectHandler::new(receiver.clone(), topic, restart_tx, &dir).unwrap();
+        let ack = restarted
+            .accept_message(sender.public(), &bytes)
+            .await
+            .unwrap();
+        assert_eq!(ack.payload.result, AckResult::DuplicateAccepted);
+        let conflict_ack = restarted
+            .accept_message(sender.public(), &conflict.encode().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(conflict_ack.payload.result, AckResult::Conflict);
         assert!(restart_rx.try_recv().is_err());
         drop(restarted);
-        fs::remove_dir_all(dir).unwrap();
+        restarted_worker.shutdown().await.unwrap();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!bytes
+                    .windows(b"deliver once".len())
+                    .any(|value| value == b"deliver once"));
+                assert!(!bytes
+                    .windows(b"different signed body".len())
+                    .any(|value| value == b"different signed body"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_v2_fingerprint_is_retry_stable_body_sensitive_and_ack_results_are_signed() {
+        let sender = SecretKey::generate();
+        let receiver = SecretKey::generate();
+        let topic = TopicId::from_bytes([13; 32]);
+        let id = [13; 16];
+        let frame =
+            DirectFrame::new_with_id(&sender, receiver.public(), topic, "same body".into(), id)
+                .unwrap();
+        let mut later = frame.payload.clone();
+        later.timestamp_ms += 1;
+        assert_eq!(
+            replay_fingerprint(&frame.payload).unwrap(),
+            replay_fingerprint(&later).unwrap()
+        );
+        later.body.push('!');
+        assert_ne!(
+            replay_fingerprint(&frame.payload).unwrap(),
+            replay_fingerprint(&later).unwrap()
+        );
+
+        for result in [
+            AckResult::Accepted,
+            AckResult::DuplicateAccepted,
+            AckResult::Conflict,
+            AckResult::Busy,
+            AckResult::Unavailable,
+            AckResult::DeliveryOutcomeUnknown,
+        ] {
+            let ack = AckFrame::new(&receiver, &frame.payload, result).unwrap();
+            let decoded = AckFrame::decode(&ack.encode().unwrap(), &frame.payload).unwrap();
+            assert_eq!(decoded.payload.result, result);
+        }
+        let mut legacy_version =
+            AckFrame::new(&receiver, &frame.payload, AckResult::Accepted).unwrap();
+        legacy_version.payload.version = 1;
+        let signed = postcard::to_stdvec(&(ACK_DOMAIN, &legacy_version.payload)).unwrap();
+        legacy_version.signature = ByteArray::new(receiver.sign(&signed).to_bytes());
+        assert!(AckFrame::decode(&legacy_version.encode().unwrap(), &frame.payload).is_err());
     }
 
     #[test]

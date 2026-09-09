@@ -12,7 +12,7 @@ pub(crate) const MAX_IPC_REQUEST_SIZE: usize = 4096 * 6 + 1024;
 // remote identities. Individual live events remain tiny reconstructed objects,
 // while this hard frame limit accommodates the proven worst-case snapshot.
 pub(crate) const MAX_IPC_EVENT_SIZE: usize = 512 * 1024;
-pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v1";
+pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v2";
 pub(crate) const WEB_DOWNLOAD_CAPABILITY: &str = "web_download_v1";
 pub(crate) const WEB_SHARE_CAPABILITY: &str = "web_share_v1";
 pub(crate) const IDEMPOTENT_MUTATIONS_CAPABILITY: &str = "idempotent_mutations_v1";

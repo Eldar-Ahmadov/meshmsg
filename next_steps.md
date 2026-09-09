@@ -33,10 +33,9 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 5. Direct-message replay persistence is an availability bottleneck
 
-- Relevant code: `src/direct.rs:144-163`, `src/direct.rs:839-891`
-- Each accepted message serializes and atomically fsyncs the entire replay map while holding a synchronous mutex inside async protocol handling.
-- The global 4,096-entry cache can be filled with roughly 6.5 accepted messages per second over its 10.5-minute lifetime, denying all private sends until entries expire.
-- Use an append-only/WAL or embedded database on a dedicated blocking worker, plus global and per-sender rate limits and quotas.
+- [x] **Status: completed.** Direct protocol v2 and replay-state v2 persist only a domain-separated SHA-256 semantic-payload fingerprint plus sender, ID, expiration, and state—never the body. The dedicated blocking worker uses a bounded 64-request queue and owns all filesystem I/O. A new transaction syncs `recorded`, inserts the body into its pre-reserved volatile queue, then syncs `delivery_confirmed` before signed `Accepted`; exact confirmed retries return signed `DuplicateAccepted`, changed fingerprints return signed `Conflict`, and no replay redelivers.
+- The crash interval is explicit rather than hidden: a recovered `recorded` entry returns signed `DeliveryOutcomeUnknown` forever until expiry because the body is unavailable and queue insertion cannot be proved. Failpoint subprocesses exit immediately after the first sync, after queue delivery but before transition, and after transition sync; recovery verifies unknown/unknown/duplicate-accepted respectively and no redelivery. Checksummed WAL/snapshot recovery, torn-tail truncation, transition validation, compaction ordering, v1 conservative migration, concurrent/restart conflicts, cancellation, and append/compaction faults are covered.
+- Live IDs are never evicted. New IDs have an 8,192 global quota, 512 per sender, global 128/second burst 256 and per-sender 8/second burst 16 token buckets. Capacity pressure returns signed `Busy`. A terminal worker error publishes `direct_replay_available:false` plus a stable error in status, returns signed unavailable for a known pre-append failure or unknown for append/delivery ambiguity, and unavailable for queued/subsequent requests, and is reported again by shutdown. Rotating identities can still share/exhaust the global budget, so this is bounded isolation rather than Sybil resistance.
 
 ### 6. Persistent attachment storage is unbounded
 
@@ -130,9 +129,10 @@ These are acceptable for a trusted ephemeral tool, but blockers for a general pr
 Passed locally for these completed findings:
 
 - `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo build --locked`;
-- `cargo test --locked --all-targets`: 161 passed, including EnvelopeV2/replay, IPC capacity, attachment transaction/fault/crash coverage, and operation-cache join/conflict/expiry/eviction behavior;
+- `cargo test --locked --all-targets`: 177 passed, including EnvelopeV2/replay, IPC capacity, attachment transaction/fault/crash coverage, operation-cache behavior, and direct-replay fingerprints, two-phase crash recovery, worker health, WAL recovery/compaction, rate/quota, load, and backpressure coverage;
 - `tests/integration-attachments.sh`: passed with raw/signed file downloads, signed-directory extraction, no-clobber, durability metadata, and inbound-pin restart recovery;
-- `tests/integration-idempotency.sh`, `tests/integration-direct-messages.sh`, `tests/integration-web.py`, `tests/integration-web-peer.py`, and `node tests/web-ui.cjs`: passed with response-loss retries, concurrent duplicate joins, stable wire IDs, conflicts, terminal failures, restart semantics, and HTTP/browser propagation.
+- `tests/integration-idempotency.sh` and `tests/integration-direct-messages.sh`: passed with response-loss retries, concurrent duplicate joins, stable private wire IDs, recipient WAL persistence across sender restart, duplicate classification, signed changed-body conflicts, authenticated direct delivery, and no replay redelivery;
+- `tests/integration-web.py`, `tests/integration-web-peer.py`, and `node tests/web-ui.cjs`: passed with conflicts, terminal failures, restart semantics, and HTTP/browser propagation.
 
 Native Windows execution was unavailable locally. A Windows cross-check was attempted but dependency build scripts stopped before meshmsg compilation because `ml64.exe`/`lib.exe` are unavailable; regular CI runs the platform-gated tests, Clippy, and build on Windows Server 2022. A musl cross-check was likewise blocked before meshmsg compilation by the absent `x86_64-linux-musl-gcc`. Unsupported-target directory-install behavior has cfg-gated test coverage but was not executed locally. The longer five-peer and version-compatibility scenarios were not rerun; native Windows execution remains CI-only. `cargo-audit` and `cargo-deny` were unavailable locally and remain CI checks.
 
@@ -143,6 +143,6 @@ Native Windows execution was unavailable locally. A Windows cross-check was atte
 3. [x] Correct download transaction ordering.
 4. Introduce stable typed API and error contracts.
 5. Add attachment lifecycle and quota controls.
-6. Replace replay JSON rewrites and synchronous logging.
+6. Replace synchronous daemon logging with bounded nonblocking structured output.
 7. Add fuzzing, slowloris/load tests, crash fault injection, and cross-platform no-clobber tests.
 8. Pin the Rust toolchain and add signed provenance/SBOM. `SHA256SUMS` hosted beside the artifacts protects against corruption, not release-account compromise.

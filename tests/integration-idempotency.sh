@@ -23,6 +23,7 @@ wait_for() {
   done
 }
 status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"running":true'; }
+knows_peer() { "$BIN" --state-dir "$ROOT/$1" --json status | python3 -c 'import json,sys; assert json.load(sys.stdin)["advertised_aliases"] >= 1'; }
 start_node() {
   local node=$1
   timeout 300 "$BIN" --state-dir "$ROOT/$node" --json daemon >"$ROOT/$node.daemon.log" 2>"$ROOT/$node.daemon.err" &
@@ -85,7 +86,7 @@ PRIVATE_ID=22222222222222222222222222222222
 "$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$PRIVATE_ID" --to "$RECEIVER" private-idempotent >"$ROOT/private.2" & P2=$!
 wait "$P1"; wait "$P2"
 cmp "$ROOT/private.1" "$ROOT/private.2" || fail "concurrent private duplicates returned different outcomes"
-python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["schema_version"] == 2 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2]' "$ROOT/private.1" "$PRIVATE_ID" \
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["schema_version"] == 3 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2] and v["duplicate_accepted"] is False' "$ROOT/private.1" "$PRIVATE_ID" \
   || fail "private operation ID did not reach the wire response"
 wait_for 30 "private delivery" grep -q '"body":"private-idempotent"' "$ROOT/receiver.listen"
 sleep 1
@@ -131,9 +132,33 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "recipi
 # Restart semantics are explicit rather than pretending this volatile cache is durable.
 stop_node sender
 start_node sender
-"$BIN" --state-dir "$ROOT/sender" --json status | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_cache_persistent"] is False and v["operation_cache_capacity"] == 1024 and v["operation_cache_ttl_ms"] == 600000' \
-  || fail "status omitted operation-cache restart semantics"
+"$BIN" --state-dir "$ROOT/sender" --json status | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_cache_persistent"] is False and v["operation_cache_capacity"] == 1024 and v["operation_cache_ttl_ms"] == 600000; assert v["direct_replay_available"] is True and v["direct_replay_error"] is None; assert v["direct_replay_capacity"] == 8192 and v["direct_replay_per_sender_capacity"] == 512 and v["direct_replay_queue_capacity"] == 64' \
+  || fail "status omitted operation/replay cache bounds"
+
+# The sender cache was cleared by restart, so this retry reaches the recipient.
+# Its durable replay WAL must acknowledge the same wire ID without redelivery.
+wait_for 30 "receiver presence after sender restart" knows_peer sender
+PRIVATE_RETRY=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$PRIVATE_ID" --to "$RECEIVER" private-idempotent)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_id"] == v["message_id"] == sys.argv[1] and v["duplicate_accepted"] is True' "$PRIVATE_ID" \
+  <<<"$PRIVATE_RETRY" || fail "post-restart private retry was not identified as a duplicate acceptance"
+sleep 1
+grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
+  || fail "recipient replay persistence redelivered after sender restart"
+
+# Clear the sender's volatile outcome again, then change the body under the same
+# wire ID. The recipient's persisted fingerprint must return a signed conflict.
+stop_node sender
+start_node sender
+wait_for 30 "receiver presence before conflict retry" knows_peer sender
+PRIVATE_CONFLICT=$(ipc sender "{\"command\":\"private_send\",\"operation_id\":\"$PRIVATE_ID\",\"to\":\"$RECEIVER\",\"body\":\"changed-private-body\"}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "private_message_conflict" and v["outcome"] == "not_started" and v["retryable"] is False' \
+  <<<"$PRIVATE_CONFLICT" || fail "recipient did not reject changed content under a persisted private ID"
+sleep 1
+grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
+  || fail "private conflict altered original delivery count"
+! grep -q '"body":"changed-private-body"' "$ROOT/receiver.listen" \
+  || fail "private conflict delivered changed content"
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: CLI/IPC broadcast response-loss retry, concurrent private/share joins, wire IDs, conflicts, terminal failures, bounded-cache status, and restart semantics"
+echo "PASS: CLI/IPC broadcast response-loss retry, concurrent private/share joins, wire IDs, conflicts, terminal failures, bounded-cache status, sender restarts, recipient WAL replay persistence, duplicate classification, and signed fingerprint conflicts"

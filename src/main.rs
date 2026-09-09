@@ -4,6 +4,7 @@ mod bench_tui;
 mod cli;
 mod config;
 mod direct;
+mod direct_replay;
 mod invite;
 mod ipc;
 mod node;
