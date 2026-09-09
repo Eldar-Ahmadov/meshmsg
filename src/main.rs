@@ -27,6 +27,12 @@ fn json_mode_requested(arguments: impl IntoIterator<Item = std::ffi::OsString>) 
         .any(|argument| argument == "--json")
 }
 
+fn authoritative_contract_failure(error: &anyhow::Error) -> Option<contracts::ErrorEnvelopeV1> {
+    error
+        .downcast_ref::<contracts::ContractFailure>()
+        .map(|failure| failure.0.clone())
+}
+
 #[tokio::main]
 async fn main() {
     let json = json_mode_requested(std::env::args_os());
@@ -35,11 +41,7 @@ async fn main() {
             // JSON failures use stdout, the same documented stream as JSON
             // successes/NDJSON events. Internal causes and local paths remain on
             // the human-only diagnostic path.
-            let authoritative = error.chain().find_map(|cause| {
-                cause
-                    .downcast_ref::<contracts::ContractFailure>()
-                    .map(|failure| failure.0.clone())
-            });
+            let authoritative = authoritative_contract_failure(&error);
             let envelope = authoritative.unwrap_or_else(|| {
                 let diagnostic = format!("{error:#}");
                 let (code, retryable, outcome) = if diagnostic.contains("connect to local daemon") {
@@ -302,6 +304,16 @@ fn save_joined_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextual_contract_failure_remains_authoritative() {
+        let mut expected =
+            contracts::ErrorEnvelopeV1::new("daemon_disconnected", "", "partial", true);
+        expected.request_id = Some("11111111111111111111111111111111".into());
+        let error = anyhow::anyhow!("private transport diagnostic")
+            .context(contracts::ContractFailure(expected.clone()));
+        assert_eq!(authoritative_contract_failure(&error), Some(expected));
+    }
 
     #[test]
     fn json_error_mode_ignores_literals_after_positional_terminator() {

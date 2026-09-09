@@ -135,8 +135,13 @@ sender = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().spl
 assert sender[0]["type"] == "bench_send_started"
 assert sender[-1]["type"] == "bench_send_summary"
 assert all(value["type"] == "bench_send_progress" for value in sender[1:-1])
+assert all(value["schema_version"] == 2 for value in sender)
 assert sender[-1]["planned"] == sender[-1]["attempted"] == sender[-1]["queued"] == 5
-assert sender[-1]["failed"] == 0 and sender[-1]["delivery_acknowledged"] is False
+assert sender[-1]["failed"] == sender[-1]["incomplete"] == 0
+assert sender[-1]["accounting_complete"] is True
+assert sender[-1]["queued_body_bytes"] == sender[-1]["queued"] * sender[-1]["payload_bytes"]
+assert sender[-1]["queued_envelope_bytes"] > sender[-1]["queued_body_bytes"]
+assert sender[-1]["delivery_acknowledged"] is False
 sender_request_ids = {value["request_id"] for value in sender}
 assert len(sender_request_ids) == 1 and next(iter(sender_request_ids)) != sender[0]["run_id"]
 for path in sys.argv[2:]:

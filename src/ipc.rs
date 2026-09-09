@@ -312,7 +312,7 @@ struct PeerConnectivityV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BenchSendStartedV1 {
+struct BenchSendStartedV2 {
     #[serde(rename = "type")]
     family: String,
     schema_version: u8,
@@ -327,7 +327,7 @@ struct BenchSendStartedV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BenchSendProgressV1 {
+struct BenchSendProgressV2 {
     #[serde(rename = "type")]
     family: String,
     schema_version: u8,
@@ -340,6 +340,7 @@ struct BenchSendProgressV1 {
     attempted: u64,
     queued: u64,
     failed: u64,
+    incomplete: u64,
     schedule_missed: u64,
     queued_body_bytes: u64,
     queued_envelope_bytes: u64,
@@ -351,7 +352,7 @@ struct BenchSendProgressV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BenchSendSummaryV1 {
+struct BenchSendSummaryV2 {
     #[serde(rename = "type")]
     family: String,
     schema_version: u8,
@@ -364,6 +365,7 @@ struct BenchSendSummaryV1 {
     attempted: u64,
     queued: u64,
     failed: u64,
+    incomplete: u64,
     schedule_missed: u64,
     queued_body_bytes: u64,
     queued_envelope_bytes: u64,
@@ -371,6 +373,7 @@ struct BenchSendSummaryV1 {
     achieved_messages_per_second: f64,
     achieved_body_bytes_per_second: f64,
     delivery_acknowledged: bool,
+    accounting_complete: bool,
     completion_reason: String,
     first_error: Option<String>,
 }
@@ -532,42 +535,145 @@ fn validate_bench_base(
     Ok(())
 }
 
-fn validate_bench_metrics(
-    expected: Option<u64>,
-    unique: u64,
-    missing: Option<u64>,
-    highest: Option<u64>,
-    latency: &BenchLatencyV1,
-    lag: &BenchLagV1,
-    rates: (f64, f64),
+fn coherent_benchmark_rate(reported: f64, count: u64, elapsed_ms: u64) -> bool {
+    if !reported.is_finite() || reported < 0.0 {
+        return false;
+    }
+    let expected = count as f64 * 1000.0 / elapsed_ms.max(1) as f64;
+    let tolerance = expected.abs().mul_add(1e-12, 1e-9);
+    (reported - expected).abs() <= tolerance
+}
+
+fn benchmark_eligible_slot_bounds(rate: u32, elapsed_ms: u64, planned: u64) -> (u64, u64) {
+    let period_ns = 1_000_000_000 / u64::from(rate);
+    let lower_ns = u128::from(elapsed_ms) * 1_000_000;
+    let upper_ns = lower_ns + 999_999;
+    let eligible = |elapsed_ns: u128| {
+        u64::try_from(elapsed_ns / u128::from(period_ns))
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+            .min(planned)
+    };
+    (eligible(lower_ns), eligible(upper_ns))
+}
+
+fn validate_send_metrics(
+    config: (u32, u64, usize, u64),
+    counts: (u64, u64, u64, u64, u64),
+    bytes: (u64, u64),
+    timing: (u64, f64, f64),
+    final_record: bool,
 ) -> Result<()> {
+    let (rate, duration_secs, payload_bytes, planned) = config;
+    let (attempted, queued, failed, incomplete, schedule_missed) = counts;
+    let (queued_body_bytes, queued_envelope_bytes) = bytes;
+    let (elapsed_ms, achieved_messages_per_second, achieved_body_bytes_per_second) = timing;
+    let payload_bytes = u64::try_from(payload_bytes).context("invalid benchmark payload size")?;
+    let expected_planned = u64::from(rate)
+        .checked_mul(duration_secs)
+        .context("invalid benchmark planned count")?;
+    let accounted = queued
+        .checked_add(failed)
+        .and_then(|count| count.checked_add(incomplete));
+    let scheduled = attempted.checked_add(schedule_missed);
+    let eligible = benchmark_eligible_slot_bounds(rate, elapsed_ms, planned);
+    let expected_body_bytes = queued.checked_mul(payload_bytes);
+    let minimum_envelope_bytes = expected_body_bytes.and_then(|bytes| bytes.checked_add(queued));
+    let maximum_envelope_bytes = queued.checked_mul(4096);
     anyhow::ensure!(
-        rates.0.is_finite() && rates.0 >= 0.0 && rates.1.is_finite() && rates.1 >= 0.0,
+        planned == expected_planned
+            && accounted == Some(attempted)
+            && scheduled.is_some_and(|count| {
+                count <= eligible.1 && (!final_record || count >= eligible.0)
+            })
+            && failed <= 1
+            && incomplete <= 1
+            && expected_body_bytes == Some(queued_body_bytes)
+            && minimum_envelope_bytes.is_some_and(|minimum| {
+                queued_envelope_bytes >= minimum
+                    && maximum_envelope_bytes
+                        .is_some_and(|maximum| queued_envelope_bytes <= maximum)
+            })
+            && coherent_benchmark_rate(achieved_messages_per_second, queued, elapsed_ms)
+            && coherent_benchmark_rate(
+                achieved_body_bytes_per_second,
+                queued_body_bytes,
+                elapsed_ms,
+            ),
+        "invalid benchmark send metrics"
+    );
+    Ok(())
+}
+
+fn validate_bench_metrics(
+    delivery: (Option<u64>, u64, Option<u64>, Option<u64>, u64, u64),
+    timing: (u64, f64, f64),
+    latency: (&BenchLatencyV1, usize),
+    lag: &BenchLagV1,
+) -> Result<()> {
+    let (expected, unique, missing, highest, body_bytes, duplicates) = delivery;
+    let (elapsed_ms, achieved_messages_per_second, achieved_body_bytes_per_second) = timing;
+    let (latency, maximum_latency_samples) = latency;
+    let coherent_expected = match expected {
+        Some(count) => unique <= count,
+        None => unique == 0,
+    };
+    let coherent_highest = match (unique, highest) {
+        (0, None) => true,
+        (0, Some(_)) | (_, None) => false,
+        (count, Some(value)) => {
+            value.checked_add(1).is_some_and(|range| count <= range)
+                && expected.is_none_or(|expected| value < expected)
+        }
+    };
+    let minimum_body_bytes = unique.checked_mul(106);
+    let maximum_body_bytes = unique.checked_mul(4096);
+    let coherent_percentiles = match (latency.p50_ms, latency.p95_ms, latency.p99_ms) {
+        (None, None, None) => latency.samples == 0,
+        (Some(p50), Some(p95), Some(p99)) => {
+            let rank = |percentile: usize| (percentile * latency.samples).div_ceil(100);
+            latency.samples > 0
+                && p50 <= p95
+                && p95 <= p99
+                && p99 <= 86_400_000
+                && (rank(50) != rank(95) || p50 == p95)
+                && (rank(95) != rank(99) || p95 == p99)
+        }
+        _ => false,
+    };
+    anyhow::ensure!(
+        coherent_benchmark_rate(achieved_messages_per_second, unique, elapsed_ms)
+            && coherent_benchmark_rate(achieved_body_bytes_per_second, body_bytes, elapsed_ms),
         "invalid benchmark rates"
     );
     anyhow::ensure!(
-        expected.map(|count| count.saturating_sub(unique)) == missing,
+        coherent_expected && expected.map(|count| count - unique) == missing,
         "invalid benchmark missing count"
     );
+    anyhow::ensure!(coherent_highest, "invalid benchmark highest sequence");
     anyhow::ensure!(
-        highest.is_none_or(|value| expected.is_none_or(|count| value < count)),
-        "invalid benchmark highest sequence"
+        minimum_body_bytes.is_some_and(|minimum| body_bytes >= minimum)
+            && maximum_body_bytes.is_some_and(|maximum| body_bytes <= maximum),
+        "invalid benchmark body-byte count"
     );
     anyhow::ensure!(
-        latency.samples <= 4096 && latency.samples as u64 <= latency.observations,
+        latency.samples <= maximum_latency_samples
+            && latency.samples as u64 <= latency.observations
+            && (latency.observations == 0 || latency.samples > 0)
+            && latency.sampled == (latency.samples as u64 != latency.observations)
+            && latency.observations.checked_add(latency.clock_invalid) == Some(unique)
+            && coherent_percentiles,
         "invalid benchmark latency counts"
     );
     anyhow::ensure!(
-        lag.incomplete == (lag.local_events > 0 || lag.gossip_events > 0),
+        lag.incomplete == (lag.local_events > 0 || lag.gossip_events > 0)
+            && ((lag.local_events == 0 && lag.local_dropped == 0)
+                || (lag.local_events > 0 && lag.local_dropped >= lag.local_events)),
         "invalid benchmark lag state"
     );
-    let _ = (
-        latency.sampled,
-        latency.clock_invalid,
-        latency.p50_ms,
-        latency.p95_ms,
-        latency.p99_ms,
-        lag.local_dropped,
+    anyhow::ensure!(
+        unique > 0 || duplicates == 0,
+        "invalid benchmark duplicate count"
     );
     Ok(())
 }
@@ -769,8 +875,8 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 "invalid lag event"
             );
         }
-        ("bench_send_started", 1) => {
-            let dto: BenchSendStartedV1 =
+        ("bench_send_started", 2) => {
+            let dto: BenchSendStartedV2 =
                 serde_json::from_value(value.clone()).context("malformed benchmark start")?;
             validate_bench_base(
                 &dto.run_id,
@@ -780,15 +886,16 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
             )?;
             anyhow::ensure!(
                 dto.family == family
-                    && dto.schema_version == 1
+                    && dto.schema_version == 2
                     && (1..=10_000).contains(&dto.rate)
-                    && dto.payload_bytes > 0
+                    && (106..=4096).contains(&dto.payload_bytes)
+                    && u64::from(dto.rate).checked_mul(dto.duration_secs) == Some(dto.planned)
                     && !dto.delivery_acknowledged,
                 "invalid benchmark start"
             );
         }
-        ("bench_send_progress", 1) => {
-            let dto: BenchSendProgressV1 =
+        ("bench_send_progress", 2) => {
+            let dto: BenchSendProgressV2 =
                 serde_json::from_value(value.clone()).context("malformed benchmark progress")?;
             validate_bench_base(
                 &dto.run_id,
@@ -796,29 +903,36 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 Some(dto.planned),
                 &dto.request_id,
             )?;
+            validate_send_metrics(
+                (dto.rate, dto.duration_secs, dto.payload_bytes, dto.planned),
+                (
+                    dto.attempted,
+                    dto.queued,
+                    dto.failed,
+                    dto.incomplete,
+                    dto.schedule_missed,
+                ),
+                (dto.queued_body_bytes, dto.queued_envelope_bytes),
+                (
+                    dto.elapsed_ms,
+                    dto.achieved_messages_per_second,
+                    dto.achieved_body_bytes_per_second,
+                ),
+                false,
+            )?;
             anyhow::ensure!(
                 dto.family == family
+                    && dto.schema_version == 2
                     && (1..=10_000).contains(&dto.rate)
-                    && dto.payload_bytes > 0
-                    && dto.queued <= dto.attempted
-                    && dto.failed <= dto.attempted
-                    && dto.queued.checked_add(dto.failed) == Some(dto.attempted)
-                    && dto.attempted <= dto.planned
-                    && dto.queued_body_bytes <= dto.queued.saturating_mul(dto.payload_bytes as u64)
-                    && dto.achieved_messages_per_second.is_finite()
-                    && dto.achieved_body_bytes_per_second.is_finite()
+                    && (106..=4096).contains(&dto.payload_bytes)
+                    && dto.failed == 0
+                    && dto.incomplete == 0
                     && !dto.delivery_acknowledged,
                 "invalid benchmark progress"
             );
-            let _ = (
-                dto.schema_version,
-                dto.schedule_missed,
-                dto.queued_envelope_bytes,
-                dto.elapsed_ms,
-            );
         }
-        ("bench_send_summary", 1) => {
-            let dto: BenchSendSummaryV1 =
+        ("bench_send_summary", 2) => {
+            let dto: BenchSendSummaryV2 =
                 serde_json::from_value(value.clone()).context("malformed benchmark summary")?;
             validate_bench_base(
                 &dto.run_id,
@@ -826,17 +940,28 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 Some(dto.planned),
                 &dto.request_id,
             )?;
+            validate_send_metrics(
+                (dto.rate, dto.duration_secs, dto.payload_bytes, dto.planned),
+                (
+                    dto.attempted,
+                    dto.queued,
+                    dto.failed,
+                    dto.incomplete,
+                    dto.schedule_missed,
+                ),
+                (dto.queued_body_bytes, dto.queued_envelope_bytes),
+                (
+                    dto.elapsed_ms,
+                    dto.achieved_messages_per_second,
+                    dto.achieved_body_bytes_per_second,
+                ),
+                dto.accounting_complete,
+            )?;
             anyhow::ensure!(
                 dto.family == family
+                    && dto.schema_version == 2
                     && (1..=10_000).contains(&dto.rate)
-                    && dto.payload_bytes > 0
-                    && dto.queued <= dto.attempted
-                    && dto.failed <= dto.attempted
-                    && dto.queued.checked_add(dto.failed) == Some(dto.attempted)
-                    && dto.attempted <= dto.planned
-                    && dto.queued_body_bytes <= dto.queued.saturating_mul(dto.payload_bytes as u64)
-                    && dto.achieved_messages_per_second.is_finite()
-                    && dto.achieved_body_bytes_per_second.is_finite()
+                    && (106..=4096).contains(&dto.payload_bytes)
                     && !dto.delivery_acknowledged
                     && matches!(
                         dto.completion_reason.as_str(),
@@ -844,25 +969,28 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                     ),
                 "invalid benchmark summary"
             );
-            let coherent_error = match dto.completion_reason.as_str() {
+            let coherent_completion = match dto.completion_reason.as_str() {
                 "send_failed" => {
-                    dto.failed > 0
+                    dto.accounting_complete
+                        && dto.failed == 1
+                        && dto.incomplete == 0
                         && dto.first_error.as_deref()
                             == Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE)
                         && dto.first_error.as_deref().is_some_and(|text| {
                             valid_public_text(text, contracts::MAX_PUBLIC_MESSAGE_BYTES)
                         })
                 }
-                _ => dto.first_error.is_none(),
+                "deadline" => {
+                    dto.accounting_complete
+                        && dto.failed == 0
+                        && dto.attempted.checked_add(dto.schedule_missed) == Some(dto.planned)
+                        && dto.elapsed_ms >= dto.duration_secs.saturating_mul(1_000)
+                        && dto.first_error.is_none()
+                }
+                "interrupted" | "daemon_stopped" => dto.failed == 0 && dto.first_error.is_none(),
+                _ => false,
             };
-            anyhow::ensure!(coherent_error, "invalid benchmark error state");
-            let _ = (
-                dto.schema_version,
-                dto.schedule_missed,
-                dto.queued_body_bytes,
-                dto.queued_envelope_bytes,
-                dto.elapsed_ms,
-            );
+            anyhow::ensure!(coherent_completion, "invalid benchmark completion state");
         }
         ("bench_receive_started", 1) => {
             let dto: BenchReceiveStartedV1 = serde_json::from_value(value.clone())
@@ -883,19 +1011,26 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 .context("malformed receive benchmark progress")?;
             validate_bench_base(&dto.run_id, 1, dto.expected, &dto.request_id)?;
             validate_bench_metrics(
-                dto.expected,
-                dto.unique,
-                dto.missing,
-                dto.highest_sequence,
-                &dto.latency,
-                &dto.lag,
                 (
+                    dto.expected,
+                    dto.unique,
+                    dto.missing,
+                    dto.highest_sequence,
+                    dto.body_bytes,
+                    dto.duplicates,
+                ),
+                (
+                    dto.elapsed_ms,
                     dto.achieved_messages_per_second,
                     dto.achieved_body_bytes_per_second,
                 ),
+                (&dto.latency, 4_096),
+                &dto.lag,
             )?;
             anyhow::ensure!(
-                dto.family == family && dto.out_of_order <= dto.unique,
+                dto.family == family
+                    && dto.schema_version == 1
+                    && dto.out_of_order <= dto.unique.saturating_sub(1),
                 "invalid receive benchmark progress"
             );
             let _ = (
@@ -911,28 +1046,45 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 .context("malformed receive benchmark summary")?;
             validate_bench_base(&dto.run_id, 1, dto.expected, &dto.request_id)?;
             validate_bench_metrics(
-                dto.expected,
-                dto.unique,
-                dto.missing,
-                dto.highest_sequence,
-                &dto.latency,
-                &dto.lag,
                 (
+                    dto.expected,
+                    dto.unique,
+                    dto.missing,
+                    dto.highest_sequence,
+                    dto.body_bytes,
+                    dto.duplicates,
+                ),
+                (
+                    dto.elapsed_ms,
                     dto.achieved_messages_per_second,
                     dto.achieved_body_bytes_per_second,
                 ),
+                (&dto.latency, 1_000_000),
+                &dto.lag,
             )?;
+            let expected_sample_len = dto.missing.map_or(0, |missing| missing.min(100) as usize);
+            let coherent_missing_sample = dto.missing_sequence_sample.len() == expected_sample_len
+                && dto
+                    .missing_sequence_sample
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                && dto.missing_sequence_sample.iter().all(|sequence| {
+                    dto.expected.is_some_and(|expected| *sequence < expected)
+                        && Some(*sequence) != dto.highest_sequence
+                });
+            let complete = dto.expected.is_some_and(|count| count == dto.unique);
             anyhow::ensure!(
                 dto.family == family
+                    && dto.schema_version == 1
                     && matches!(
                         dto.completion_reason.as_str(),
                         "deadline" | "interrupted" | "daemon_stopped"
                     )
-                    && dto.complete == dto.expected.is_some_and(|count| count == dto.unique)
-                    && (!dto.measurement_valid
-                        || (dto.complete && !dto.lag.incomplete && dto.malformed_messages == 0))
-                    && dto.missing_sequence_sample.len() <= 128
-                    && dto.out_of_order <= dto.unique,
+                    && dto.complete == complete
+                    && dto.measurement_valid
+                        == (complete && !dto.lag.incomplete && dto.malformed_messages == 0)
+                    && coherent_missing_sample
+                    && dto.out_of_order <= dto.unique.saturating_sub(1),
                 "invalid receive benchmark summary"
             );
             let _ = (
@@ -1339,10 +1491,6 @@ fn diagnostic_string(value: Option<&serde_json::Value>, fallback: &str) -> Strin
 
 fn observed_string(value: Option<&serde_json::Value>) -> String {
     diagnostic_string(value, json_kind(value))
-}
-
-pub(crate) fn daemon_error_message(value: &serde_json::Value) -> String {
-    diagnostic_string(value.get("message"), "unknown error")
 }
 
 /// Validate the common response envelope before command-specific code consumes it.
@@ -1883,9 +2031,9 @@ mod tests {
         let digest = "3".repeat(64);
         let peer = "4".repeat(64);
         let base_send_progress = serde_json::json!({
-            "type":"bench_send_progress", "schema_version":1, "request_id":request_id,
+            "type":"bench_send_progress", "schema_version":2, "request_id":request_id,
             "run_id":operation_id, "rate":10, "duration_secs":1, "payload_bytes":128,
-            "planned":10, "attempted":2, "queued":2, "failed":0,
+            "planned":10, "attempted":2, "queued":2, "failed":0, "incomplete":0,
             "schedule_missed":0, "queued_body_bytes":256, "queued_envelope_bytes":512,
             "elapsed_ms":200, "achieved_messages_per_second":10.0,
             "achieved_body_bytes_per_second":1280.0, "delivery_acknowledged":false
@@ -1916,18 +2064,20 @@ mod tests {
             serde_json::json!({"type":"peer_up","schema_version":1,"request_id":request_id,"peer":peer}),
             serde_json::json!({"type":"peer_down","schema_version":1,"request_id":request_id,"peer":peer}),
             serde_json::json!({"type":"lagged","schema_version":1,"request_id":request_id,"source":"local","dropped":2,"message":"listener missed events"}),
-            serde_json::json!({"type":"bench_send_started","schema_version":1,"request_id":request_id,"run_id":operation_id,"rate":10,"duration_secs":1,"payload_bytes":128,"planned":10,"delivery_acknowledged":false}),
+            serde_json::json!({"type":"bench_send_started","schema_version":2,"request_id":request_id,"run_id":operation_id,"rate":10,"duration_secs":1,"payload_bytes":128,"planned":10,"delivery_acknowledged":false}),
             base_send_progress.clone(),
             {
                 let mut value = base_send_progress.clone();
                 value["type"] = "bench_send_summary".into();
-                value["completion_reason"] = "deadline".into();
+                value["accounting_complete"] = true.into();
+                value["completion_reason"] = "interrupted".into();
+                value["schedule_missed"] = 1.into();
                 value["first_error"] = serde_json::Value::Null;
                 value
             },
             serde_json::json!({"type":"bench_receive_started","schema_version":1,"request_id":request_id,"run_id":operation_id,"duration_secs":1,"expected":10}),
-            serde_json::json!({"type":"bench_receive_progress","schema_version":1,"request_id":request_id,"run_id":operation_id,"elapsed_ms":1,"expected":10,"unique":1,"missing":9,"duplicates":0,"out_of_order":0,"highest_sequence":0,"body_bytes":128,"achieved_messages_per_second":1.0,"achieved_body_bytes_per_second":128.0,"latency":latency,"lag":lag,"malformed_messages":0}),
-            serde_json::json!({"type":"bench_receive_summary","schema_version":1,"request_id":request_id,"run_id":operation_id,"completion_reason":"deadline","elapsed_ms":1,"expected":1,"complete":true,"measurement_valid":true,"unique":1,"missing":0,"missing_sequence_sample":[],"duplicates":0,"out_of_order":0,"highest_sequence":0,"body_bytes":128,"achieved_messages_per_second":1.0,"achieved_body_bytes_per_second":128.0,"latency":latency,"lag":lag,"peer_up":0,"peer_down":0,"ignored_messages":0,"malformed_messages":0}),
+            serde_json::json!({"type":"bench_receive_progress","schema_version":1,"request_id":request_id,"run_id":operation_id,"elapsed_ms":1,"expected":10,"unique":1,"missing":9,"duplicates":0,"out_of_order":0,"highest_sequence":0,"body_bytes":128,"achieved_messages_per_second":1000.0,"achieved_body_bytes_per_second":128000.0,"latency":latency,"lag":lag,"malformed_messages":0}),
+            serde_json::json!({"type":"bench_receive_summary","schema_version":1,"request_id":request_id,"run_id":operation_id,"completion_reason":"deadline","elapsed_ms":1,"expected":1,"complete":true,"measurement_valid":true,"unique":1,"missing":0,"missing_sequence_sample":[],"duplicates":0,"out_of_order":0,"highest_sequence":0,"body_bytes":128,"achieved_messages_per_second":1000.0,"achieved_body_bytes_per_second":128000.0,"latency":latency,"lag":lag,"peer_up":0,"peer_down":0,"ignored_messages":0,"malformed_messages":0}),
         ];
         for fixture in fixtures {
             validate_success_payload(&fixture).unwrap_or_else(|error| {
@@ -1962,11 +2112,16 @@ mod tests {
 
         let mut failed_summary = base_send_progress;
         failed_summary["type"] = "bench_send_summary".into();
+        failed_summary["accounting_complete"] = true.into();
         failed_summary["completion_reason"] = "send_failed".into();
         failed_summary["attempted"] = 2.into();
         failed_summary["queued"] = 1.into();
         failed_summary["failed"] = 1.into();
+        failed_summary["schedule_missed"] = 1.into();
         failed_summary["queued_body_bytes"] = 128.into();
+        failed_summary["queued_envelope_bytes"] = 256.into();
+        failed_summary["achieved_messages_per_second"] = 5.0.into();
+        failed_summary["achieved_body_bytes_per_second"] = 640.0.into();
         failed_summary["first_error"] = contracts::BENCHMARK_SEND_FAILED_MESSAGE.into();
         validate_success_payload(&failed_summary).unwrap();
         for unsafe_error in [
@@ -2019,7 +2174,220 @@ mod tests {
         completed_summary["queued"] = 2.into();
         completed_summary["failed"] = 0.into();
         completed_summary["queued_body_bytes"] = 256.into();
+        completed_summary["queued_envelope_bytes"] = 512.into();
+        completed_summary["elapsed_ms"] = 1000.into();
+        completed_summary["achieved_messages_per_second"] = 2.0.into();
+        completed_summary["achieved_body_bytes_per_second"] = 256.0.into();
+        completed_summary["schedule_missed"] = 8.into();
         validate_success_payload(&completed_summary).unwrap();
+    }
+
+    #[test]
+    fn benchmark_metric_validation_fails_closed_on_adversarial_boundaries() {
+        let request_id = "11111111111111111111111111111111";
+        let run_id = "22222222222222222222222222222222";
+        let send = serde_json::json!({
+            "type":"bench_send_summary", "schema_version":2, "request_id":request_id,
+            "run_id":run_id, "rate":10, "duration_secs":1, "payload_bytes":128,
+            "planned":10, "attempted":10, "queued":10, "failed":0, "incomplete":0,
+            "schedule_missed":0, "queued_body_bytes":1280, "queued_envelope_bytes":2560,
+            "elapsed_ms":1000, "achieved_messages_per_second":10.0,
+            "achieved_body_bytes_per_second":1280.0, "delivery_acknowledged":false,
+            "accounting_complete":true, "completion_reason":"deadline", "first_error":null
+        });
+        validate_success_payload(&send).unwrap();
+        let mut early_progress = send.clone();
+        early_progress["type"] = "bench_send_progress".into();
+        early_progress
+            .as_object_mut()
+            .unwrap()
+            .remove("completion_reason");
+        early_progress
+            .as_object_mut()
+            .unwrap()
+            .remove("first_error");
+        early_progress
+            .as_object_mut()
+            .unwrap()
+            .remove("accounting_complete");
+        early_progress["elapsed_ms"] = 100.into();
+        early_progress["attempted"] = 1.into();
+        early_progress["queued"] = 1.into();
+        early_progress["schedule_missed"] = 5.into();
+        early_progress["queued_body_bytes"] = 128.into();
+        early_progress["queued_envelope_bytes"] = 256.into();
+        early_progress["achieved_messages_per_second"] = 10.0.into();
+        early_progress["achieved_body_bytes_per_second"] = 1280.0.into();
+        assert!(validate_success_payload(&early_progress).is_err());
+
+        for (field, value) in [
+            ("queued_body_bytes", serde_json::json!(0)),
+            ("queued_body_bytes", serde_json::json!(1279)),
+            ("queued_envelope_bytes", serde_json::json!(1280)),
+            ("queued_envelope_bytes", serde_json::json!(40961)),
+            ("achieved_messages_per_second", serde_json::json!(-0.1)),
+            ("achieved_body_bytes_per_second", serde_json::json!(-1.0)),
+            ("achieved_messages_per_second", serde_json::json!(9.0)),
+            ("schedule_missed", serde_json::json!(u64::MAX)),
+            ("attempted", serde_json::json!(u64::MAX)),
+            ("planned", serde_json::json!(u64::MAX)),
+            ("incomplete", serde_json::json!(2)),
+            ("accounting_complete", serde_json::json!(false)),
+        ] {
+            let mut malformed = send.clone();
+            malformed[field] = value;
+            assert!(
+                validate_success_payload(&malformed).is_err(),
+                "adversarial send field {field} was accepted"
+            );
+        }
+
+        let latency = serde_json::json!({
+            "observations":1,"samples":1,"sampled":false,"clock_invalid":0,
+            "p50_ms":1,"p95_ms":1,"p99_ms":1
+        });
+        let receive = serde_json::json!({
+            "type":"bench_receive_summary", "schema_version":1, "request_id":request_id,
+            "run_id":run_id, "completion_reason":"deadline", "elapsed_ms":1000,
+            "expected":2, "complete":false, "measurement_valid":false,
+            "unique":1, "missing":1, "missing_sequence_sample":[1],
+            "duplicates":0, "out_of_order":0, "highest_sequence":0,
+            "body_bytes":128, "achieved_messages_per_second":1.0,
+            "achieved_body_bytes_per_second":128.0, "latency":latency,
+            "lag":{"local_events":0,"local_dropped":0,"gossip_events":0,"incomplete":false},
+            "peer_up":0,"peer_down":0,"ignored_messages":0,"malformed_messages":0
+        });
+        validate_success_payload(&receive).unwrap();
+        let contradictions = [
+            ("zero body for a unique message", {
+                let mut v = receive.clone();
+                v["body_bytes"] = 0.into();
+                v
+            }),
+            ("negative message rate", {
+                let mut v = receive.clone();
+                v["achieved_messages_per_second"] = (-1.0).into();
+                v
+            }),
+            ("incoherent body rate", {
+                let mut v = receive.clone();
+                v["achieved_body_bytes_per_second"] = 127.0.into();
+                v
+            }),
+            ("unique exceeds expected", {
+                let mut v = receive.clone();
+                v["unique"] = 3.into();
+                v
+            }),
+            ("positive unique without highest", {
+                let mut v = receive.clone();
+                v["highest_sequence"] = serde_json::Value::Null;
+                v
+            }),
+            ("highest is listed as missing", {
+                let mut v = receive.clone();
+                v["missing_sequence_sample"] = serde_json::json!([0]);
+                v
+            }),
+            ("missing sample has wrong cardinality", {
+                let mut v = receive.clone();
+                v["missing_sequence_sample"] = serde_json::json!([]);
+                v
+            }),
+            ("validity contradicts incomplete delivery", {
+                let mut v = receive.clone();
+                v["measurement_valid"] = true.into();
+                v
+            }),
+            ("latency count overflow", {
+                let mut v = receive.clone();
+                v["latency"]["observations"] = u64::MAX.into();
+                v
+            }),
+            ("positive observations without retained samples", {
+                let mut v = receive.clone();
+                v["latency"]["samples"] = 0.into();
+                v["latency"]["sampled"] = true.into();
+                v["latency"]["p50_ms"] = serde_json::Value::Null;
+                v["latency"]["p95_ms"] = serde_json::Value::Null;
+                v["latency"]["p99_ms"] = serde_json::Value::Null;
+                v
+            }),
+            ("partial null percentiles", {
+                let mut v = receive.clone();
+                v["latency"]["p95_ms"] = serde_json::Value::Null;
+                v
+            }),
+            ("percentiles out of order", {
+                let mut v = receive.clone();
+                v["latency"]["p95_ms"] = 0.into();
+                v
+            }),
+            ("one-sample percentiles disagree", {
+                let mut v = receive.clone();
+                v["latency"]["p95_ms"] = 2.into();
+                v["latency"]["p99_ms"] = 2.into();
+                v
+            }),
+            ("local drop sum below event count", {
+                let mut v = receive.clone();
+                v["lag"]["local_events"] = 2.into();
+                v["lag"]["local_dropped"] = 1.into();
+                v["lag"]["incomplete"] = true.into();
+                v
+            }),
+            ("out of order before a second unique", {
+                let mut v = receive.clone();
+                v["out_of_order"] = 1.into();
+                v
+            }),
+            ("duplicate before any unique", {
+                let mut v = receive.clone();
+                v["unique"] = 0.into();
+                v["missing"] = 2.into();
+                v["missing_sequence_sample"] = serde_json::json!([0, 1]);
+                v["highest_sequence"] = serde_json::Value::Null;
+                v["body_bytes"] = 0.into();
+                v["achieved_messages_per_second"] = 0.0.into();
+                v["achieved_body_bytes_per_second"] = 0.0.into();
+                v["duplicates"] = 1.into();
+                v["latency"] = serde_json::json!({
+                    "observations":0,"samples":0,"sampled":false,"clock_invalid":0,
+                    "p50_ms":null,"p95_ms":null,"p99_ms":null
+                });
+                v
+            }),
+            ("highest range cannot contain unique count", {
+                let mut v = receive.clone();
+                v["unique"] = 2.into();
+                v["missing"] = 0.into();
+                v["missing_sequence_sample"] = serde_json::json!([]);
+                v["complete"] = true.into();
+                v["measurement_valid"] = true.into();
+                v["body_bytes"] = 256.into();
+                v["achieved_messages_per_second"] = 2.0.into();
+                v["achieved_body_bytes_per_second"] = 256.0.into();
+                v["latency"]["observations"] = 2.into();
+                v["latency"]["samples"] = 2.into();
+                v
+            }),
+            ("sample capacity overflow", {
+                let mut v = receive.clone();
+                v["latency"]["samples"] = 1_000_001.into();
+                v
+            }),
+            ("body byte overflow boundary", {
+                let mut v = receive.clone();
+                v["body_bytes"] = u64::MAX.into();
+                v
+            }),
+        ];
+        for (name, malformed) in contradictions {
+            assert!(
+                validate_success_payload(&malformed).is_err(),
+                "receive contradiction accepted: {name}"
+            );
+        }
     }
 
     #[test]

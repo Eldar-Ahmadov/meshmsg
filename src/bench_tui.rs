@@ -520,15 +520,19 @@ fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
         match app.role {
             Role::Sender => {
                 lines.push(Line::from(format!(
-                    "attempted {} / planned {}   queued {}   failed {}",
+                    "attempted {} / planned {}   queued {}   failed {}   incomplete {}",
                     number(value, "attempted"),
                     number(value, "planned"),
                     number(value, "queued"),
-                    number(value, "failed")
+                    number(value, "failed"),
+                    number(value, "incomplete")
                 )));
                 lines.push(Line::from(format!(
-                    "schedule missed: {}   achieved: {:.2} messages/s, {:.2} body bytes/s",
+                    "schedule missed: {}   accounting complete: {}   achieved: {:.2} messages/s, {:.2} body bytes/s",
                     number(value, "schedule_missed"),
+                    value["accounting_complete"]
+                        .as_bool()
+                        .map_or("in progress", |complete| if complete { "yes" } else { "no" }),
                     value["achieved_messages_per_second"]
                         .as_f64()
                         .unwrap_or(0.0),

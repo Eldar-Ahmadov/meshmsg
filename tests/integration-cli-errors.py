@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import signal
 import socket
 import subprocess
 import sys
@@ -132,7 +133,8 @@ run_case(
 # Benchmark summaries are streamed contracts. Incoherent daemon summaries must
 # be rejected, replaced by a safe disconnected summary, and end with failure;
 # coherent deadline/sending-failure summaries retain their documented exits.
-def run_benchmark_case(changes, expected_exit, expected_reason):
+def run_benchmark_case(changes, expected_exit, expected_reason,
+                       expected_code=None, expected_outcome=None):
     with tempfile.TemporaryDirectory(prefix="meshmsg-cli-benchmark-") as temporary:
         state = pathlib.Path(temporary)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -155,18 +157,25 @@ def run_benchmark_case(changes, expected_exit, expected_reason):
                         "payload_bytes": config["payload_bytes"], "planned": 1,
                     }
                     started = dict(common, type="bench_send_started",
-                                   delivery_acknowledged=False)
+                                   schema_version=2, delivery_acknowledged=False)
                     summary = dict(
-                        common, type="bench_send_summary", attempted=1,
-                        queued=1, failed=0, schedule_missed=0,
+                        common, type="bench_send_summary", schema_version=2, attempted=1,
+                        queued=1, failed=0, incomplete=0, schedule_missed=0,
                         queued_body_bytes=128, queued_envelope_bytes=256,
                         elapsed_ms=1000, achieved_messages_per_second=1.0,
                         achieved_body_bytes_per_second=128.0,
-                        delivery_acknowledged=False,
+                        delivery_acknowledged=False, accounting_complete=True,
                         completion_reason="deadline", first_error=None,
                     )
-                    summary.update(changes)
                     connection.sendall(json.dumps(started).encode() + b"\n")
+                    if changes.get("_disconnect"):
+                        return
+                    if "_error" in changes:
+                        terminal_error = dict(changes["_error"], schema_version=1,
+                                              request_id=request_id, type="error")
+                        connection.sendall(json.dumps(terminal_error).encode() + b"\n")
+                        return
+                    summary.update(changes)
                     connection.sendall(json.dumps(summary).encode() + b"\n")
             except BaseException as error:
                 failure.append(error)
@@ -188,9 +197,13 @@ def run_benchmark_case(changes, expected_exit, expected_reason):
         values = [json.loads(line) for line in child.stdout.splitlines()]
         assert values[0]["type"] == "bench_send_started"
         summaries = [value for value in values if value["type"] == "bench_send_summary"]
-        assert len(summaries) == 1 and summaries[0]["completion_reason"] == expected_reason
+        assert len(summaries) == 1 and summaries[0]["completion_reason"] == expected_reason, (changes, values)
+        benchmark_request_id = values[0]["request_id"]
+        assert all(value["request_id"] == benchmark_request_id for value in values), (changes, values)
         if expected_exit == 1:
-            assert values[-1]["type"] == "error" and values[-1]["code"] == "command_failed"
+            assert values[-1]["type"] == "error"
+            assert values[-1]["code"] == expected_code, (changes, values)
+            assert values[-1]["outcome"] == expected_outcome, (changes, values)
         else:
             assert values[-1]["type"] == "bench_send_summary"
         assert "/home/alice/private" not in child.stdout
@@ -200,21 +213,128 @@ def run_benchmark_case(changes, expected_exit, expected_reason):
 for incoherent in [
     {"completion_reason": "send_failed", "first_error": "Message submission failed."},
     {"completion_reason": "send_failed", "queued": 0, "failed": 1,
-     "queued_body_bytes": 0, "first_error": None},
+     "incomplete": 0, "queued_body_bytes": 0, "queued_envelope_bytes": 0,
+     "achieved_messages_per_second": 0.0,
+     "achieved_body_bytes_per_second": 0.0, "first_error": None},
     {"completion_reason": "deadline", "queued": 0, "failed": 1,
-     "queued_body_bytes": 0,
+     "incomplete": 0, "queued_body_bytes": 0, "queued_envelope_bytes": 0,
+     "achieved_messages_per_second": 0.0,
+     "achieved_body_bytes_per_second": 0.0,
      "first_error": "/home/alice/private/bench.log\tforged-record"},
     {"completion_reason": "deadline", "queued": 0, "failed": 0,
-     "queued_body_bytes": 0, "first_error": None},
+     "incomplete": 0, "queued_body_bytes": 0, "queued_envelope_bytes": 0,
+     "achieved_messages_per_second": 0.0,
+     "achieved_body_bytes_per_second": 0.0, "first_error": None},
+    {"queued_body_bytes": 0},
+    {"queued_envelope_bytes": 0},
+    {"queued_envelope_bytes": 128},
+    {"queued_envelope_bytes": 4097},
+    {"achieved_messages_per_second": -1.0},
+    {"achieved_body_bytes_per_second": -1.0},
+    {"achieved_messages_per_second": 2.0},
+    {"achieved_body_bytes_per_second": 127.0},
+    {"schedule_missed": 1},
+    {"schedule_missed": 2**64 - 1},
+    {"attempted": 2**64 - 1, "queued": 2**64 - 1,
+     "queued_body_bytes": 2**64 - 1, "queued_envelope_bytes": 2**64 - 1},
+    {"planned": 2},
+    {"duration_secs": 2, "planned": 2, "attempted": 1,
+     "schedule_missed": 1, "elapsed_ms": 2000,
+     "achieved_messages_per_second": 0.5,
+     "achieved_body_bytes_per_second": 64.0},
+    {"run_id": "5" * 32},
+    {"incomplete": 1},
 ]:
-    run_benchmark_case(incoherent, 1, "daemon_stopped")
+    run_benchmark_case(
+        incoherent, 1, "daemon_stopped", "invalid_daemon_response", "partial"
+    )
 
 run_benchmark_case({}, 0, "deadline")
 run_benchmark_case(
-    {"completion_reason": "send_failed", "queued": 0, "failed": 1,
-     "queued_body_bytes": 0, "first_error": "Message submission failed."},
-    1, "send_failed",
+    {"_disconnect": True}, 1, "daemon_stopped", "daemon_disconnected", "partial"
 )
+run_benchmark_case(
+    {"_error": {"code": "command_timeout",
+                "message": "The request timed out; reconcile before retrying.",
+                "outcome": "unknown", "retryable": True}},
+    1, "daemon_stopped", "command_timeout", "unknown",
+)
+run_benchmark_case(
+    {"completion_reason": "interrupted", "queued": 0, "failed": 0,
+     "incomplete": 1, "queued_body_bytes": 0, "queued_envelope_bytes": 0,
+     "achieved_messages_per_second": 0.0,
+     "achieved_body_bytes_per_second": 0.0},
+    1, "daemon_stopped", "invalid_daemon_response", "partial",
+)
+run_benchmark_case(
+    {"completion_reason": "send_failed", "queued": 0, "failed": 1,
+     "incomplete": 0, "queued_body_bytes": 0, "queued_envelope_bytes": 0,
+     "achieved_messages_per_second": 0.0,
+     "achieved_body_bytes_per_second": 0.0,
+     "first_error": "Message submission failed."},
+    1, "send_failed", "send_failed", "partial",
+)
+
+# Only a cancellation initiated by this client may yield an interrupted summary.
+with tempfile.TemporaryDirectory(prefix="meshmsg-cli-benchmark-cancel-") as temporary:
+    state = pathlib.Path(temporary)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(state / "daemon.sock"))
+    listener.listen(1)
+    failure = []
+
+    def cancellation_daemon():
+        try:
+            connection, _ = listener.accept()
+            with connection:
+                request = json.loads(connection.makefile("rb").readline())
+                request_id = request["request_id"]
+                config = request["request"]["config"]
+                common = {
+                    "schema_version": 2, "request_id": request_id,
+                    "run_id": config["run_id"], "rate": 1,
+                    "duration_secs": 1, "payload_bytes": 128, "planned": 1,
+                }
+                connection.sendall(json.dumps(dict(
+                    common, type="bench_send_started",
+                    delivery_acknowledged=False,
+                )).encode() + b"\n")
+                assert connection.recv(1) == b"\n"
+                connection.sendall(json.dumps(dict(
+                    common, type="bench_send_summary", attempted=1, queued=0,
+                    failed=0, incomplete=1, schedule_missed=0,
+                    queued_body_bytes=0, queued_envelope_bytes=0, elapsed_ms=100,
+                    achieved_messages_per_second=0.0,
+                    achieved_body_bytes_per_second=0.0,
+                    delivery_acknowledged=False, accounting_complete=True,
+                    completion_reason="interrupted",
+                    first_error=None,
+                )).encode() + b"\n")
+        except BaseException as error:
+            failure.append(error)
+
+    thread = threading.Thread(target=cancellation_daemon, daemon=True)
+    thread.start()
+    child = subprocess.Popen(
+        [BINARY, "--json", "--state-dir", str(state), "bench-send",
+         "--run-id", "4" * 32, "--rate", "1", "--duration-secs", "1",
+         "--payload-bytes", "128"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    started_line = child.stdout.readline()
+    child.send_signal(signal.SIGINT)
+    remaining_stdout, stderr = child.communicate(timeout=10)
+    listener.close()
+    thread.join(2)
+    if failure:
+        raise failure[0]
+    values = [json.loads(line) for line in (started_line + remaining_stdout).splitlines()]
+    assert child.returncode == 0 and stderr == "", (values, stderr)
+    assert [value["type"] for value in values] == [
+        "bench_send_started", "bench_send_summary"
+    ]
+    assert values[-1]["completion_reason"] == "interrupted"
+    assert len({value["request_id"] for value in values}) == 1
 
 # Genuine global JSON parse errors remain machine-readable, but a positional
 # literal after `--` must not switch the process-wide error stream contract.

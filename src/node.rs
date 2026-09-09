@@ -11,12 +11,11 @@ use crate::{
     },
     invite::Invite,
     ipc::{
-        daemon_error_message, read_frame, send_request_checked, subscribe, subscribe_with_id,
-        valid_content_digest, valid_operation_id, validate_success_payload, write_request_with_id,
-        write_value, BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
-        SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY,
-        MAX_IPC_REQUEST_SIZE, PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY,
-        WEB_SHARE_CAPABILITY,
+        read_frame, send_request_checked, subscribe, subscribe_with_id, valid_content_digest,
+        valid_operation_id, validate_success_payload, write_request_with_id, write_value,
+        BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1, SubscriptionReader,
+        ATTACHMENT_LIFECYCLE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, MAX_IPC_REQUEST_SIZE,
+        PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY,
     },
     peers::{
         self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
@@ -1614,6 +1613,7 @@ struct BenchSendStats {
     attempted: u64,
     queued: u64,
     failed: u64,
+    incomplete: u64,
     schedule_missed: u64,
     body_bytes: u64,
     envelope_bytes: u64,
@@ -1640,11 +1640,12 @@ fn bench_send_progress(
     let elapsed_ms = elapsed.as_millis() as u64;
     let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
     serde_json::json!({
-        "type":"bench_send_progress", "schema_version":1,
+        "type":"bench_send_progress", "schema_version":2,
         "run_id":config.run_id, "rate":config.rate,
         "duration_secs":config.duration_secs, "payload_bytes":config.payload_bytes,
         "planned":total, "attempted":stats.attempted, "queued":stats.queued,
-        "failed":stats.failed, "schedule_missed":stats.schedule_missed,
+        "failed":stats.failed, "incomplete":stats.incomplete,
+        "schedule_missed":stats.schedule_missed,
         "queued_body_bytes":stats.body_bytes, "queued_envelope_bytes":stats.envelope_bytes,
         "elapsed_ms":elapsed_ms,
         "achieved_messages_per_second":stats.queued as f64 / elapsed_seconds,
@@ -1665,6 +1666,7 @@ fn bench_send_summary(
         .as_object_mut()
         .expect("benchmark progress is an object");
     object.insert("type".into(), "bench_send_summary".into());
+    object.insert("accounting_complete".into(), true.into());
     object.insert("completion_reason".into(), reason.into());
     object.insert("first_error".into(), stats.first_error.clone().into());
     value
@@ -1705,7 +1707,7 @@ where
     write_local_response(
         stream,
         &serde_json::json!({
-            "type":"bench_send_started", "schema_version":1,
+            "type":"bench_send_started", "schema_version":2,
             "run_id":config.run_id, "rate":config.rate,
             "duration_secs":config.duration_secs, "payload_bytes":config.payload_bytes,
             "planned":total, "delivery_acknowledged":false
@@ -1745,14 +1747,32 @@ where
         let sequence =
             advance_benchmark_slot(due_slots, &mut next_slot, &mut stats.schedule_missed);
         stats.attempted += 1;
-        let timestamp_ms = unix_timestamp_ms()?;
-        let body = build_bench_body(
+        let timestamp_ms = match unix_timestamp_ms() {
+            Ok(timestamp_ms) => timestamp_ms,
+            Err(error) => {
+                eprintln!("benchmark send diagnostic: {error:#}");
+                stats.failed += 1;
+                stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
+                reason = "send_failed";
+                break 'benchmark;
+            }
+        };
+        let body = match build_bench_body(
             &config.run_id,
             sequence,
             total,
             timestamp_ms,
             config.payload_bytes,
-        )?;
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("benchmark send diagnostic: {error:#}");
+                stats.failed += 1;
+                stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
+                reason = "send_failed";
+                break 'benchmark;
+            }
+        };
         let (reply, response) = oneshot::channel();
         let (cancel, cancellation) = oneshot::channel();
         let command = DaemonCommand::BenchMessage {
@@ -1782,6 +1802,7 @@ where
             }
         };
         if !sent {
+            stats.incomplete += 1;
             break;
         }
         let response = tokio::select! {
@@ -1815,10 +1836,14 @@ where
                 break 'benchmark;
             }
             Some(Err(_)) => {
+                stats.incomplete += 1;
                 reason = "daemon_stopped";
                 break 'benchmark;
             }
-            None => break 'benchmark,
+            None => {
+                stats.incomplete += 1;
+                break 'benchmark;
+            }
         }
         let elapsed = started.elapsed();
         if elapsed >= next_progress {
@@ -5346,7 +5371,8 @@ pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
 
 fn ensure_success(value: &serde_json::Value) -> Result<()> {
     if value["type"] == "error" {
-        anyhow::bail!("daemon rejected request: {}", daemon_error_message(value));
+        let error = ErrorEnvelopeV1::from_value(value)?;
+        return Err(anyhow::Error::new(contracts::ContractFailure(error)));
     }
     Ok(())
 }
@@ -5741,12 +5767,18 @@ fn print_bench_value(json: bool, value: &serde_json::Value) {
             value["planned"].as_u64().unwrap_or(0)
         ),
         Some("bench_send_summary") => println!(
-            "benchmark send complete ({})\nattempted: {}\nqueued locally: {}\nfailed: {}\nschedule missed: {}\nachieved: {:.2} messages/s\ndelivery acknowledged: no",
+            "benchmark send complete ({})\nattempted: {}\nqueued locally: {}\nfailed: {}\nincomplete: {}\nschedule missed: {}\naccounting complete: {}\nachieved: {:.2} messages/s\ndelivery acknowledged: no",
             value["completion_reason"].as_str().unwrap_or("unknown"),
             value["attempted"].as_u64().unwrap_or(0),
             value["queued"].as_u64().unwrap_or(0),
             value["failed"].as_u64().unwrap_or(0),
+            value["incomplete"].as_u64().unwrap_or(0),
             value["schedule_missed"].as_u64().unwrap_or(0),
+            if value["accounting_complete"].as_bool().unwrap_or(false) {
+                "yes"
+            } else {
+                "no"
+            },
             value["achieved_messages_per_second"].as_f64().unwrap_or(0.0),
         ),
         Some("bench_send_progress" | "bench_receive_progress") => {}
@@ -5783,6 +5815,7 @@ async fn await_bench_startup<T>(
     }
 }
 
+#[cfg(test)]
 fn benchmark_subscription_value(
     result: Result<Option<serde_json::Value>>,
     stopped_message: &'static str,
@@ -5801,6 +5834,7 @@ fn disconnected_send_summary(
     latest_progress: Option<&serde_json::Value>,
     elapsed: Duration,
     request_id: &str,
+    completion_reason: &str,
 ) -> serde_json::Value {
     if let Some(progress) = latest_progress {
         let mut summary = progress.clone();
@@ -5808,21 +5842,75 @@ fn disconnected_send_summary(
             .as_object_mut()
             .expect("benchmark progress is an object");
         object.insert("type".into(), "bench_send_summary".into());
-        object.insert("completion_reason".into(), "daemon_stopped".into());
+        object.insert("accounting_complete".into(), false.into());
+        object.insert("completion_reason".into(), completion_reason.into());
         object.insert("first_error".into(), serde_json::Value::Null);
         summary
     } else {
-        contracts::correlate(
+        let mut summary = contracts::correlate(
             bench_send_summary(
                 config,
                 total,
                 &BenchSendStats::default(),
-                "daemon_stopped",
+                completion_reason,
                 elapsed,
             ),
             request_id,
-        )
+        );
+        summary["accounting_complete"] = false.into();
+        summary
     }
+}
+
+fn validate_send_record_config(
+    value: &serde_json::Value,
+    config: &BenchConfig,
+    total: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        value["run_id"].as_str() == Some(&config.run_id)
+            && value["rate"].as_u64() == Some(u64::from(config.rate))
+            && value["duration_secs"].as_u64() == Some(config.duration_secs)
+            && value["payload_bytes"].as_u64() == u64::try_from(config.payload_bytes).ok()
+            && value["planned"].as_u64() == Some(total),
+        "daemon benchmark record does not match the submitted configuration"
+    );
+    Ok(())
+}
+
+fn validate_send_record_progress(
+    previous: Option<&serde_json::Value>,
+    current: &serde_json::Value,
+) -> Result<()> {
+    if let Some(previous) = previous {
+        for field in [
+            "attempted",
+            "queued",
+            "failed",
+            "incomplete",
+            "schedule_missed",
+            "queued_body_bytes",
+            "queued_envelope_bytes",
+            "elapsed_ms",
+        ] {
+            anyhow::ensure!(
+                current[field].as_u64() >= previous[field].as_u64(),
+                "daemon benchmark counters moved backwards"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn benchmark_contract_failure(
+    request_id: &str,
+    code: &str,
+    outcome: &str,
+    retryable: bool,
+) -> contracts::ContractFailure {
+    let mut error = ErrorEnvelopeV1::new(code, "", outcome, retryable);
+    error.request_id = Some(request_id.to_owned());
+    contracts::ContractFailure(error)
 }
 
 fn emit_bench_progress(events: &mpsc::Sender<serde_json::Value>, value: serde_json::Value) {
@@ -5877,6 +5965,7 @@ async fn bench_send_events(
         started["type"] == "bench_send_started",
         "unexpected benchmark response"
     );
+    validate_send_record_config(&started, &config, total)?;
     let client_started = StdInstant::now();
     emit_bench_terminal(&events, started).await;
 
@@ -5885,12 +5974,22 @@ async fn bench_send_events(
     let mut interrupted_deadline = None;
     let summary = loop {
         let value = tokio::select! {
-            value = reader.read() => match benchmark_subscription_value(
-                value,
-                "local daemon stopped before benchmark summary",
-                "read benchmark summary from local daemon",
-            ) {
-                Ok(value) => value,
+            value = reader.read() => match value {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    let summary = disconnected_send_summary(
+                        &config,
+                        total,
+                        latest_progress.as_ref(),
+                        client_started.elapsed(),
+                        &request_id,
+                        if interrupted { "interrupted" } else { "daemon_stopped" },
+                    );
+                    emit_bench_terminal(&events, summary).await;
+                    return Err(anyhow::Error::new(benchmark_contract_failure(
+                        &request_id, "daemon_disconnected", "partial", true,
+                    )));
+                }
                 Err(error) => {
                     let summary = disconnected_send_summary(
                         &config,
@@ -5898,15 +5997,39 @@ async fn bench_send_events(
                         latest_progress.as_ref(),
                         client_started.elapsed(),
                         &request_id,
+                        if interrupted { "interrupted" } else { "daemon_stopped" },
                     );
                     emit_bench_terminal(&events, summary).await;
-                    return Err(error);
+                    let code = if error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+                    {
+                        "daemon_disconnected"
+                    } else {
+                        "invalid_daemon_response"
+                    };
+                    return Err(error.context(benchmark_contract_failure(
+                        &request_id, code, "partial", code == "daemon_disconnected",
+                    )));
                 }
             },
             result = &mut cancellation, if !interrupted => {
                 let _ = result;
-                reader.get_mut().write_all(b"\n").await?;
                 interrupted = true;
+                if let Err(error) = reader.get_mut().write_all(b"\n").await {
+                    let summary = disconnected_send_summary(
+                        &config,
+                        total,
+                        latest_progress.as_ref(),
+                        client_started.elapsed(),
+                        &request_id,
+                        "interrupted",
+                    );
+                    emit_bench_terminal(&events, summary).await;
+                    return Err(anyhow::Error::new(error).context(benchmark_contract_failure(
+                        &request_id, "daemon_disconnected", "partial", true,
+                    )));
+                }
                 interrupted_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
                 continue;
             }
@@ -5916,33 +6039,127 @@ async fn bench_send_events(
                     None => std::future::pending().await,
                 }
             }, if interrupted => {
-                anyhow::bail!("timed out waiting for interrupted benchmark summary")
+                let summary = disconnected_send_summary(
+                    &config,
+                    total,
+                    latest_progress.as_ref(),
+                    client_started.elapsed(),
+                    &request_id,
+                    "interrupted",
+                );
+                emit_bench_terminal(&events, summary).await;
+                return Err(anyhow::Error::new(benchmark_contract_failure(
+                    &request_id, "command_timeout", "partial", true,
+                )));
             }
         };
-        ensure_success(&value)?;
+        if value["type"] == "error" {
+            let error = ErrorEnvelopeV1::from_value(&value)?;
+            let summary = disconnected_send_summary(
+                &config,
+                total,
+                latest_progress.as_ref(),
+                client_started.elapsed(),
+                &request_id,
+                if interrupted {
+                    "interrupted"
+                } else {
+                    "daemon_stopped"
+                },
+            );
+            emit_bench_terminal(&events, summary).await;
+            return Err(anyhow::Error::new(contracts::ContractFailure(error)));
+        }
         match value["type"].as_str() {
             Some("bench_send_progress") => {
+                if let Err(error) = validate_send_record_config(&value, &config, total)
+                    .and_then(|()| validate_send_record_progress(latest_progress.as_ref(), &value))
+                {
+                    let summary = disconnected_send_summary(
+                        &config,
+                        total,
+                        latest_progress.as_ref(),
+                        client_started.elapsed(),
+                        &request_id,
+                        if interrupted {
+                            "interrupted"
+                        } else {
+                            "daemon_stopped"
+                        },
+                    );
+                    emit_bench_terminal(&events, summary).await;
+                    return Err(error.context(benchmark_contract_failure(
+                        &request_id,
+                        "invalid_daemon_response",
+                        "partial",
+                        false,
+                    )));
+                }
                 latest_progress = Some(value.clone());
                 emit_bench_progress(&events, value);
             }
-            Some("bench_send_summary") => break value,
-            _ => anyhow::bail!("unexpected benchmark response"),
+            Some("bench_send_summary") => {
+                if value["completion_reason"] == "interrupted" && !interrupted {
+                    let summary = disconnected_send_summary(
+                        &config,
+                        total,
+                        latest_progress.as_ref(),
+                        client_started.elapsed(),
+                        &request_id,
+                        "daemon_stopped",
+                    );
+                    emit_bench_terminal(&events, summary).await;
+                    return Err(anyhow::Error::new(benchmark_contract_failure(
+                        &request_id,
+                        "invalid_daemon_response",
+                        "partial",
+                        false,
+                    )));
+                }
+                if let Err(error) = validate_send_record_config(&value, &config, total)
+                    .and_then(|()| validate_send_record_progress(latest_progress.as_ref(), &value))
+                {
+                    let summary = disconnected_send_summary(
+                        &config,
+                        total,
+                        latest_progress.as_ref(),
+                        client_started.elapsed(),
+                        &request_id,
+                        if interrupted {
+                            "interrupted"
+                        } else {
+                            "daemon_stopped"
+                        },
+                    );
+                    emit_bench_terminal(&events, summary).await;
+                    return Err(error.context(benchmark_contract_failure(
+                        &request_id,
+                        "invalid_daemon_response",
+                        "partial",
+                        false,
+                    )));
+                }
+                break value;
+            }
+            _ => unreachable!("strict response validation rejects unknown benchmark records"),
         }
     };
     emit_bench_terminal(&events, summary.clone()).await;
-    if summary["failed"].as_u64() != Some(0) {
-        anyhow::bail!(
-            "benchmark send failed: {}",
-            summary["first_error"]
-                .as_str()
-                .unwrap_or("unknown broadcast error")
-        );
+    match summary["completion_reason"].as_str() {
+        Some("send_failed") => Err(anyhow::Error::new(benchmark_contract_failure(
+            &request_id,
+            "send_failed",
+            "partial",
+            false,
+        ))),
+        Some("daemon_stopped") => Err(anyhow::Error::new(benchmark_contract_failure(
+            &request_id,
+            "daemon_disconnected",
+            "partial",
+            true,
+        ))),
+        _ => Ok(()),
     }
-    anyhow::ensure!(
-        summary["completion_reason"].as_str() != Some("daemon_stopped"),
-        "local daemon stopped during benchmark send"
-    );
-    Ok(())
 }
 
 fn bench_output_worker(
@@ -6316,6 +6533,7 @@ async fn bench_receive_events(
     };
     let (mut reader, connected) =
         await_bench_startup(startup, &mut cancellation, BENCH_CLIENT_STARTUP_TIMEOUT).await?;
+    ensure_success(&connected)?;
     anyhow::ensure!(
         connected["type"] == "connected",
         "unexpected daemon subscription response"
@@ -6336,18 +6554,38 @@ async fn bench_receive_events(
     progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     progress.tick().await;
     let mut completion_reason = "deadline";
-    let mut daemon_error = None;
+    let mut terminal_error = None;
     loop {
         tokio::select! {
-            value = reader.read() => match benchmark_subscription_value(
-                value,
-                "local daemon stopped during benchmark receive",
-                "read benchmark events from local daemon",
-            ) {
-                Ok(value) => stats.record_event(&value),
+            value = reader.read() => match value {
+                Ok(Some(value)) if value["type"] == "error" => {
+                    completion_reason = "daemon_stopped";
+                    terminal_error = Some(anyhow::Error::new(contracts::ContractFailure(
+                        ErrorEnvelopeV1::from_value(&value)?,
+                    )));
+                    break;
+                }
+                Ok(Some(value)) => stats.record_event(&value),
+                Ok(None) => {
+                    completion_reason = "daemon_stopped";
+                    terminal_error = Some(anyhow::Error::new(benchmark_contract_failure(
+                        &request_id, "daemon_disconnected", "partial", true,
+                    )));
+                    break;
+                }
                 Err(error) => {
                     completion_reason = "daemon_stopped";
-                    daemon_error = Some(error);
+                    let code = if error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+                    {
+                        "daemon_disconnected"
+                    } else {
+                        "invalid_daemon_response"
+                    };
+                    terminal_error = Some(error.context(benchmark_contract_failure(
+                        &request_id, code, "partial", code == "daemon_disconnected",
+                    )));
                     break;
                 }
             },
@@ -6369,7 +6607,7 @@ async fn bench_receive_events(
     );
     validate_success_payload(&summary)?;
     emit_bench_terminal(&events, summary).await;
-    if let Some(error) = daemon_error {
+    if let Some(error) = terminal_error {
         return Err(error);
     }
     Ok(())
@@ -7650,16 +7888,21 @@ mod tests {
             duration_secs: 1,
             payload_bytes: 128,
         };
-        let progress = bench_send_progress(
-            &config,
-            10,
-            &BenchSendStats {
-                attempted: 4,
-                queued: 3,
-                schedule_missed: 1,
-                ..BenchSendStats::default()
-            },
-            Duration::from_millis(400),
+        let progress = contracts::correlate(
+            bench_send_progress(
+                &config,
+                10,
+                &BenchSendStats {
+                    attempted: 3,
+                    queued: 3,
+                    schedule_missed: 1,
+                    body_bytes: 384,
+                    envelope_bytes: 900,
+                    ..BenchSendStats::default()
+                },
+                Duration::from_millis(400),
+            ),
+            "11111111111111111111111111111111",
         );
         let summary = disconnected_send_summary(
             &config,
@@ -7667,13 +7910,16 @@ mod tests {
             Some(&progress),
             Duration::from_secs(1),
             "11111111111111111111111111111111",
+            "daemon_stopped",
         );
         assert_eq!(summary["type"], "bench_send_summary");
         assert_eq!(summary["completion_reason"], "daemon_stopped");
-        assert_eq!(summary["attempted"], 4);
+        assert_eq!(summary["attempted"], 3);
         assert_eq!(summary["queued"], 3);
         assert_eq!(summary["schedule_missed"], 1);
+        assert_eq!(summary["accounting_complete"], false);
         assert!(summary["first_error"].is_null());
+        validate_success_payload(&summary).unwrap();
     }
 
     #[test]
@@ -7720,6 +7966,7 @@ mod tests {
             attempted: 7,
             queued: 6,
             failed: 1,
+            incomplete: 0,
             schedule_missed: 2,
             body_bytes: 768,
             envelope_bytes: 1_200,
@@ -7739,6 +7986,7 @@ mod tests {
                 "attempted",
                 "queued",
                 "failed",
+                "incomplete",
                 "schedule_missed",
                 "queued_body_bytes",
                 "queued_envelope_bytes",
@@ -7749,7 +7997,7 @@ mod tests {
             ],
         );
         assert_eq!(progress["type"], "bench_send_progress");
-        assert_eq!(progress["schema_version"], 1);
+        assert_eq!(progress["schema_version"], 2);
         assert_eq!(progress["delivery_acknowledged"], false);
 
         let summary = bench_send_summary(
@@ -7772,25 +8020,28 @@ mod tests {
                 "attempted",
                 "queued",
                 "failed",
+                "incomplete",
                 "schedule_missed",
                 "queued_body_bytes",
                 "queued_envelope_bytes",
                 "elapsed_ms",
                 "achieved_messages_per_second",
                 "achieved_body_bytes_per_second",
+                "accounting_complete",
                 "completion_reason",
                 "first_error",
                 "delivery_acknowledged",
             ],
         );
         assert_eq!(summary["type"], "bench_send_summary");
-        assert_eq!(summary["schema_version"], 1);
+        assert_eq!(summary["schema_version"], 2);
         assert_eq!(summary["planned"], 10);
         assert_eq!(summary["attempted"], 7);
         assert_eq!(summary["queued"], 6);
         assert_eq!(summary["failed"], 1);
         assert_eq!(summary["schedule_missed"], 2);
         assert_eq!(summary["queued_body_bytes"], 768);
+        assert_eq!(summary["accounting_complete"], true);
         assert_eq!(summary["completion_reason"], "send_failed");
         assert_eq!(
             summary["first_error"],
@@ -10071,8 +10322,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn benchmark_sender_cancels_while_daemon_reply_is_pending() {
+    async fn benchmark_sender_cancellation_round_trips_through_strict_ipc_client() {
         let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
+        let request_id = "11111111111111111111111111111111";
         let (commands, mut command_rx) = mpsc::channel(1);
         let (_events, receiver) = broadcast::channel(1);
         let busy = Arc::new(AtomicBool::new(false));
@@ -10084,7 +10336,7 @@ mod tests {
             None,
             busy.clone(),
         ));
-        write_request(
+        write_request_with_id(
             &mut client,
             &IpcRequest::BenchSend {
                 config: BenchConfig {
@@ -10094,12 +10346,14 @@ mod tests {
                     payload_bytes: 128,
                 },
             },
+            request_id,
         )
         .await
         .unwrap();
-        let started = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
-        let started: serde_json::Value = serde_json::from_slice(&started).unwrap();
+        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
+        let started = reader.read().await.unwrap().unwrap();
         assert_eq!(started["type"], "bench_send_started");
+        assert_eq!(started["schema_version"], 2);
         let command = tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
             .await
             .unwrap()
@@ -10107,27 +10361,27 @@ mod tests {
         let DaemonCommand::BenchMessage { cancel, reply, .. } = command else {
             panic!("expected benchmark message")
         };
-        client.write_all(b"\n").await.unwrap();
+        reader.get_mut().write_all(b"\n").await.unwrap();
         assert!(cancel.await.is_ok());
         drop(reply);
-        let summary = tokio::time::timeout(
-            Duration::from_secs(1),
-            read_frame(&mut client, MAX_IPC_EVENT_SIZE),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let summary: serde_json::Value = serde_json::from_slice(&summary).unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(summary["completion_reason"], "interrupted");
         assert_eq!(summary["attempted"], 1);
         assert_eq!(summary["queued"], 0);
+        assert_eq!(summary["failed"], 0);
+        assert_eq!(summary["incomplete"], 1);
         task.await.unwrap().unwrap();
         assert!(!busy.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn benchmark_sender_stops_at_first_send_failure() {
+    async fn benchmark_sender_deadline_round_trips_through_strict_ipc_client() {
         let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
+        let request_id = "11111111111111111111111111111111";
         let (commands, mut command_rx) = mpsc::channel(1);
         let (_events, receiver) = broadcast::channel(1);
         let task = tokio::spawn(handle_local_client(
@@ -10138,7 +10392,153 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
         ));
-        write_request(
+        write_request_with_id(
+            &mut client,
+            &IpcRequest::BenchSend {
+                config: BenchConfig {
+                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    rate: 1,
+                    duration_secs: 1,
+                    payload_bytes: 128,
+                },
+            },
+            request_id,
+        )
+        .await
+        .unwrap();
+        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
+        assert_eq!(
+            reader.read().await.unwrap().unwrap()["type"],
+            "bench_send_started"
+        );
+        let command = command_rx.recv().await.unwrap();
+        let DaemonCommand::BenchMessage { reply, .. } = command else {
+            panic!("expected benchmark message")
+        };
+        reply.send(Ok(256)).unwrap();
+        let summary = tokio::time::timeout(Duration::from_secs(2), reader.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["completion_reason"], "deadline");
+        assert_eq!(summary["attempted"], 1);
+        assert_eq!(summary["queued"], 1);
+        assert_eq!(summary["incomplete"], 0);
+        assert_eq!(summary["queued_body_bytes"], 128);
+        assert_eq!(summary["queued_envelope_bytes"], 256);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn benchmark_sender_reply_channel_loss_round_trips_as_incomplete() {
+        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
+        let request_id = "11111111111111111111111111111111";
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (_events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        write_request_with_id(
+            &mut client,
+            &IpcRequest::BenchSend {
+                config: BenchConfig {
+                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    rate: 1,
+                    duration_secs: 10,
+                    payload_bytes: 128,
+                },
+            },
+            request_id,
+        )
+        .await
+        .unwrap();
+        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
+        assert_eq!(
+            reader.read().await.unwrap().unwrap()["type"],
+            "bench_send_started"
+        );
+        let command = command_rx.recv().await.unwrap();
+        let DaemonCommand::BenchMessage { reply, .. } = command else {
+            panic!("expected benchmark message")
+        };
+        drop(reply);
+        let summary = tokio::time::timeout(Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["completion_reason"], "daemon_stopped");
+        assert_eq!(summary["attempted"], 1);
+        assert_eq!(summary["queued"], 0);
+        assert_eq!(summary["failed"], 0);
+        assert_eq!(summary["incomplete"], 1);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn benchmark_sender_command_admission_loss_round_trips_as_incomplete() {
+        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
+        let request_id = "11111111111111111111111111111111";
+        let (commands, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        let (_events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        write_request_with_id(
+            &mut client,
+            &IpcRequest::BenchSend {
+                config: BenchConfig {
+                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    rate: 1,
+                    duration_secs: 10,
+                    payload_bytes: 128,
+                },
+            },
+            request_id,
+        )
+        .await
+        .unwrap();
+        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
+        assert_eq!(
+            reader.read().await.unwrap().unwrap()["type"],
+            "bench_send_started"
+        );
+        let summary = reader.read().await.unwrap().unwrap();
+        assert_eq!(summary["completion_reason"], "daemon_stopped");
+        assert_eq!(summary["attempted"], 1);
+        assert_eq!(summary["queued"], 0);
+        assert_eq!(summary["failed"], 0);
+        assert_eq!(summary["incomplete"], 1);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn benchmark_sender_failure_round_trips_through_strict_ipc_client() {
+        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
+        let request_id = "11111111111111111111111111111111";
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (_events, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(handle_local_client(
+            server,
+            commands,
+            receiver,
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        write_request_with_id(
             &mut client,
             &IpcRequest::BenchSend {
                 config: BenchConfig {
@@ -10148,10 +10548,15 @@ mod tests {
                     payload_bytes: 128,
                 },
             },
+            request_id,
         )
         .await
         .unwrap();
-        let _started = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
+        assert_eq!(
+            reader.read().await.unwrap().unwrap()["type"],
+            "bench_send_started"
+        );
         let command = command_rx.recv().await.unwrap();
         let DaemonCommand::BenchMessage { reply, .. } = command else {
             panic!("expected benchmark message")
@@ -10159,8 +10564,7 @@ mod tests {
         reply
             .send(Err("scripted broadcast failure".into()))
             .unwrap();
-        let summary = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
-        let summary: serde_json::Value = serde_json::from_slice(&summary).unwrap();
+        let summary = reader.read().await.unwrap().unwrap();
         assert_eq!(summary["completion_reason"], "send_failed");
         assert_eq!(summary["attempted"], 1);
         assert_eq!(summary["failed"], 1);

@@ -79,12 +79,26 @@ all benchmark records. Download progress permits `0/0` only for an empty blob;
 otherwise `total_bytes` is positive and `received_bytes <= total_bytes`. A CLI
 download accepts completion only when `output` has the exact retained OS-string/byte
 representation it submitted; Path-equivalent dot components, repeated/trailing
-separators, and other lexical rewrites are rejected. A benchmark send summary
-requires `queued + failed == attempted`. `send_failed` requires a positive `failed`
-count and the fixed control-free `first_error` text `Message submission failed.`;
-all other completion reasons require `first_error:null`. Daemon diagnostics and paths
-are never accepted there. Listen/chat therefore never print an unrecognized
-daemon event. Error objects are strictly decoded against the closed error contract. Status
+separators, and other lexical rewrites are rejected. Benchmark send records are
+version 2: `attempted = queued + failed + incomplete`, where the bounded `incomplete`
+count identifies the one serial in-flight submission abandoned by cancellation or a
+deadline, or for which the daemon reply was lost; no queued/failed classification was
+received.
+Fixed-payload body bytes are exact, envelope bytes are bounded by complete encoded
+envelopes, and scheduler accounting is bounded by monotonic-clock slots eligible at
+the reported elapsed milliseconds—not merely by the final plan. Finite nonnegative
+achieved rates must agree with counts, bytes, and elapsed time.
+`send_failed` requires exactly one failure and the fixed control-free `first_error`
+text `Message submission failed.`; all other completion reasons require
+`first_error:null`. Daemon diagnostics and paths are never accepted there. Receive
+metrics likewise enforce possible unique/highest/duplicate/out-of-order relationships,
+body-byte and elapsed-rate coherence, retained latency samples and feasible percentile
+ranks, local lag event/drop sums, exact bounded missing samples, and completion/validity
+state. A send client accepts `interrupted` only after it initiated cancellation. Once
+a benchmark started, synthesized partial summaries set `accounting_complete:false`,
+retain only the latest validated counters, and preserve the request ID; terminal
+errors use partial/unknown outcomes and strict daemon errors are preserved.
+Listen/chat therefore never print an unrecognized daemon event. Error objects are strictly decoded against the closed error contract. Status
 includes capabilities, replay limits, mutation-cache semantics, attachment limits,
 and attachment-storage pressure.
 
@@ -100,8 +114,9 @@ IPC success/event families are:
 - attachment: `attachment_offer` v2, `attachment_shared` v3, `offers` v1,
   `offer_removed`/`offers_pruned` v1, `download_started`/`download_progress`/
   `download_complete` v1;
-- benchmark: send/receive `started`, `progress`, and `summary` v1 (one explicit
-  request ID is preserved across each complete benchmark stream);
+- benchmark: send `started`, `progress`, and `summary` v2; receive `started`,
+  `progress`, and `summary` v1 (one explicit request ID is preserved across each
+  complete benchmark stream);
 - loss indication: `lagged` v1.
 
 Local filesystem paths are no longer present in status/daemon-started contracts.
