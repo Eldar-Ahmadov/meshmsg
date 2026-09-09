@@ -85,12 +85,19 @@ const sent = [];
 const downloadRequests = [];
 let downloadedHref = null;
 let uploaded = null;
-let uploadReply = async () => ({ ok: true, json: async () => ({ type: 'attachment_shared' }) });
+let uploadReply = async (operationId) => ({ ok: true, json: async () => ({
+  type: 'attachment_shared', schema_version: 3, operation_id: operationId
+}) });
 let peersRequests = 0;
 let statusReply = async () => ({ ok: true, json: async () => ({ type: 'status', peer: 'local-peer', running: true, endpoint_online: true, topic_joined: true, neighbors: 1 }) });
-let sendReply = async () => ({ ok: true, json: async () => ({ type: 'queued' }) });
+let sendReply = async (request) => ({ ok: true, json: async () => ({
+  type: 'queued', schema_version: 3,
+  operation_id: request.operation_id, message_id: request.operation_id
+}) });
+let operationByte = 0;
+const crypto = { getRandomValues: (bytes) => { bytes.fill(++operationByte); return bytes; } };
 const context = vm.createContext({
-  document, window, EventSource, Event, TextEncoder, AbortController, console,
+  document, window, EventSource, Event, TextEncoder, AbortController, crypto, console,
   Math: deterministicMath,
   setTimeout: (fn, delay) => {
     const id = ++timerId;
@@ -102,7 +109,7 @@ const context = vm.createContext({
   fetch: async (url, options) => {
     if (url === '/api/attachment') {
       uploaded = { body: options.body, headers: options.headers };
-      return uploadReply();
+      return uploadReply(options.headers['X-Meshmsg-Operation-Id']);
     }
     const request = JSON.parse(options.body);
     if (request.command === 'status') return statusReply();
@@ -125,7 +132,7 @@ const context = vm.createContext({
       return { ok: true, json: async () => ({ type: 'download_ready', url: downloadedHref }) };
     }
     sent.push(request);
-    return sendReply();
+    return sendReply(request);
   }
 });
 vm.runInContext(js, context);
@@ -207,6 +214,7 @@ function submit(body) {
   submit('hello <script>text only</script>');
   await settle();
   assert.equal(sent.length, 1);
+  assert.match(sent[0].operation_id, /^[0-9a-f]{32}$/);
   assert.equal(el('draft').value, '');
   assert.equal(el('outcome').textContent, '');
 
@@ -231,6 +239,7 @@ function submit(body) {
   assert.equal(uploaded.body, file);
   assert.equal(uploaded.headers['Content-Type'], 'application/octet-stream');
   assert.equal(uploaded.headers['X-Meshmsg-File-Name'], 'browser%20r%C3%A9sum%C3%A9.txt');
+  assert.match(uploaded.headers['X-Meshmsg-Operation-Id'], /^[0-9a-f]{32}$/);
   assert.equal(el('attachment').value, '');
   assert.match(el('outcome').textContent, /shared locally.*delivery unconfirmed.*live feed/);
   assert.equal(el('feed').children.length, 0, 'upload response created an optimistic attachment');
@@ -253,7 +262,14 @@ function submit(body) {
   el('composer').dispatchEvent(new Event('submit', { cancelable: true }));
   await settle();
   assert.equal(el('attachment').value, 'ambiguous-preserved');
-  assert.match(el('outcome').textContent, /outcome unknown.*Check the live feed before retrying.*duplicates/i);
+  assert.match(el('outcome').textContent, /outcome unknown.*retry ID preserved.*retry unchanged/i);
+  const ambiguousOperationId = uploaded.headers['X-Meshmsg-Operation-Id'];
+  uploadReply = async (operationId) => ({ ok: true, json: async () => ({
+    type: 'attachment_shared', schema_version: 3, operation_id: operationId
+  }) });
+  el('composer').dispatchEvent(new Event('submit', { cancelable: true }));
+  await settle();
+  assert.equal(uploaded.headers['X-Meshmsg-Operation-Id'], ambiguousOperationId);
   el('remove-attachment').click();
 
   source.emit({ type: 'queued', from: 'local-peer', body: 'hello <script>text only</script>', timestamp_ms: 1700000000000, delivery_acknowledged: false });
@@ -320,22 +336,35 @@ function submit(body) {
   assert.equal(sent.length, 4);
   assert.equal(el('draft').value, 'uncertain draft');
   assert.match(el('outcome').textContent, /Outcome unknown.*No automatic retry/);
+  const uncertainOperationId = sent.at(-1).operation_id;
+  sendReply = async (request) => ({ ok: true, json: async () => ({
+    type: 'queued', schema_version: 3,
+    operation_id: request.operation_id, message_id: request.operation_id
+  }) });
+  submit('uncertain draft');
+  await settle();
+  assert.equal(sent.length, 5);
+  assert.equal(sent.at(-1).operation_id, uncertainOperationId);
 
   let resolve;
   sendReply = () => new Promise((r) => { resolve = r; });
   submit('pending draft');
   assert.equal(el('broadcast').disabled, true);
   el('composer').dispatchEvent(new Event('submit', { cancelable: true }));
-  assert.equal(sent.length, 5, 'double tap sent twice');
+  assert.equal(sent.length, 6, 'double tap sent twice');
   el('draft').value = 'new edits while submitting';
-  resolve({ ok: true, json: async () => ({ type: 'queued' }) });
+  const pendingRequest = sent.at(-1);
+  resolve({ ok: true, json: async () => ({
+    type: 'queued', schema_version: 3,
+    operation_id: pendingRequest.operation_id, message_id: pendingRequest.operation_id
+  }) });
   await settle();
   assert.equal(el('draft').value, 'new edits while submitting');
   assert.equal(el('broadcast').disabled, false);
 
   submit('二'.repeat(1366));
   await settle();
-  assert.equal(sent.length, 5, 'oversized UTF-8 body sent');
+  assert.equal(sent.length, 6, 'oversized UTF-8 body sent');
   for (let i = 0; i < 110; i++) source.emit({ type: 'message', from: '<peer>', body: `<img onerror=alert(1)> ${i}`, timestamp_ms: 1700000000000 + i });
   assert.equal(el('feed').children.length, 100);
   assert.equal(el('feed').children[0].children[1].textContent, '<img onerror=alert(1)> 109');
@@ -380,7 +409,7 @@ function submit(body) {
   assert.equal(el('status').textContent, '2 current peers', 'delayed revision 10 replaced revision 11');
   source.onerror();
   assert.equal(activeTimers().length, 0, 'stale EventSource callback scheduled a reconnect');
-  assert.equal(sent.length, 5, 'peer snapshot recovery was treated as a send');
+  assert.equal(sent.length, 6, 'peer snapshot recovery was treated as a send');
 
   let resolveHiddenStatus;
   statusReply = () => new Promise((resolveStatus) => { resolveHiddenStatus = resolveStatus; });
@@ -417,7 +446,7 @@ function submit(body) {
   runTimer(reconnectTimerId, { stale: true });
   assert.equal(EventSource.instances.at(-1), newestSource, 'stale reconnect timer replaced the newer source');
   await settle();
-  assert.equal(sent.length, 5, 'reconnection retried a send');
+  assert.equal(sent.length, 6, 'reconnection retried a send');
   assert.match(el('gap').textContent, /NOT retried/);
   el('clear').dispatchEvent(new Event('click'));
   assert.equal(el('feed').children.length, 0);
@@ -458,5 +487,5 @@ function submit(body) {
     'Refreshing status…', 'Status refreshed. Read-only; peer count is not delivery proof.'
   ]);
 
-  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, atomic lag recovery without stale snapshot/callback rollback, silent unchanged periodic polling, mobile compose, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon events without optimistic duplicates, browser attachment upload success/rejection and incoming/outgoing cards with safe text, queued/rejected/ambiguous wording, sender/timestamps, draft/file preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect and no retry');
+  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, atomic lag recovery without stale snapshot/callback rollback, silent unchanged periodic polling, mobile compose, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon events without optimistic duplicates, browser attachment upload success/rejection and incoming/outgoing cards with safe text, queued/rejected/ambiguous wording, sender/timestamps, draft/file preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect, no automatic retry, and retained operation IDs');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

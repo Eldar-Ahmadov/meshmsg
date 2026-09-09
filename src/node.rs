@@ -8,8 +8,9 @@ use crate::{
     },
     invite::Invite,
     ipc::{
-        daemon_error_message, read_frame, send_request_checked, subscribe, write_request,
-        write_value, BenchConfig, IpcRequest, SubscriptionReader, MAX_IPC_REQUEST_SIZE,
+        daemon_error_message, read_frame, send_request_checked, subscribe, valid_content_digest,
+        valid_operation_id, write_request, write_value, BenchConfig, IpcRequest,
+        SubscriptionReader, IDEMPOTENT_MUTATIONS_CAPABILITY, MAX_IPC_REQUEST_SIZE,
         PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY,
     },
     peers::{
@@ -50,7 +51,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
@@ -669,7 +670,17 @@ impl Envelope {
         body: String,
         timestamp_ms: u64,
     ) -> Result<Bytes> {
-        let message_id = rand::random();
+        Self::encode_with_id_at(secret, topic, kind, body, rand::random(), timestamp_ms)
+    }
+
+    fn encode_with_id_at(
+        secret: &SecretKey,
+        topic: TopicId,
+        kind: EnvelopeKind,
+        body: String,
+        message_id: [u8; 16],
+        timestamp_ms: u64,
+    ) -> Result<Bytes> {
         let payload = EnvelopeSignaturePayload {
             domain: ENVELOPE_DOMAIN,
             version: ENVELOPE_VERSION,
@@ -876,6 +887,8 @@ async fn start(
     direct_incoming: mpsc::Sender<IncomingDirect>,
 ) -> Result<RunningNode> {
     state.validate()?;
+    attachment::cleanup_stale_state_staging(state_dir)
+        .context("recover stale attachment share staging")?;
     let topic: TopicId = state.topic_id()?;
     // Keep stable invite/attachment routes isolated from expiring presence.
     // Each MemoryLookup owns one source so presence cleanup cannot erase another.
@@ -965,12 +978,168 @@ async fn start(
     })
 }
 
+const OPERATION_CACHE_CAPACITY: usize = 1_024;
+const OPERATION_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+
+struct CompletedOperation {
+    fingerprint: [u8; 32],
+    response: serde_json::Value,
+    expires_at: StdInstant,
+}
+
+struct InFlightOperation {
+    fingerprint: [u8; 32],
+    waiters: Vec<oneshot::Sender<serde_json::Value>>,
+}
+
+struct OperationCache {
+    capacity: usize,
+    ttl: Duration,
+    completed: HashMap<String, CompletedOperation>,
+    order: VecDeque<String>,
+    in_flight: HashMap<String, InFlightOperation>,
+}
+
+impl OperationCache {
+    fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            capacity,
+            ttl,
+            completed: HashMap::new(),
+            order: VecDeque::new(),
+            in_flight: HashMap::new(),
+        }
+    }
+
+    fn prune(&mut self, now: StdInstant) {
+        self.completed.retain(|_, entry| entry.expires_at > now);
+        self.order.retain(|id| self.completed.contains_key(id));
+    }
+
+    fn error(operation_id: &str, code: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type":"error", "schema_version":1, "code":code,
+            "message":message, "operation_id":operation_id,
+            "retryable":false, "outcome":"not_started"
+        })
+    }
+
+    /// Returns true only for the first caller that must execute the operation.
+    fn admit(
+        &mut self,
+        operation_id: String,
+        fingerprint: [u8; 32],
+        reply: oneshot::Sender<serde_json::Value>,
+        now: StdInstant,
+    ) -> bool {
+        self.prune(now);
+        if let Some(entry) = self.completed.get(&operation_id) {
+            let response = if entry.fingerprint == fingerprint {
+                entry.response.clone()
+            } else {
+                Self::error(
+                    &operation_id,
+                    "operation_id_conflict",
+                    "operation ID was already used with different inputs",
+                )
+            };
+            let _ = reply.send(response);
+            return false;
+        }
+        if let Some(entry) = self.in_flight.get_mut(&operation_id) {
+            if entry.fingerprint == fingerprint {
+                entry.waiters.push(reply);
+            } else {
+                let _ = reply.send(Self::error(
+                    &operation_id,
+                    "operation_id_conflict",
+                    "operation ID is in flight with different inputs",
+                ));
+            }
+            return false;
+        }
+        while self.completed.len() + self.in_flight.len() >= self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                let _ = reply.send(Self::error(
+                    &operation_id,
+                    "operation_capacity",
+                    "retry cache is full of in-flight operations",
+                ));
+                return false;
+            };
+            self.completed.remove(&oldest);
+        }
+        self.in_flight.insert(
+            operation_id,
+            InFlightOperation {
+                fingerprint,
+                waiters: vec![reply],
+            },
+        );
+        true
+    }
+
+    fn complete(
+        &mut self,
+        operation_id: &str,
+        mut response: serde_json::Value,
+        now: StdInstant,
+    ) -> serde_json::Value {
+        let Some(in_flight) = self.in_flight.remove(operation_id) else {
+            return response;
+        };
+        if let Some(object) = response.as_object_mut() {
+            object.insert("operation_id".into(), operation_id.into());
+        }
+        for waiter in in_flight.waiters {
+            let _ = waiter.send(response.clone());
+        }
+        self.completed.insert(
+            operation_id.to_owned(),
+            CompletedOperation {
+                fingerprint: in_flight.fingerprint,
+                response,
+                expires_at: now + self.ttl,
+            },
+        );
+        self.order.push_back(operation_id.to_owned());
+        self.completed
+            .get(operation_id)
+            .expect("completed operation was inserted")
+            .response
+            .clone()
+    }
+}
+
+fn operation_id_bytes(operation_id: &str) -> [u8; 16] {
+    data_encoding::HEXLOWER
+        .decode(operation_id.as_bytes())
+        .expect("validated operation ID")
+        .try_into()
+        .expect("validated operation ID length")
+}
+
+fn operation_fingerprint(kind: &str, fields: &[&[u8]]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"meshmsg-operation-v1\0");
+    digest.update(kind.as_bytes());
+    for field in fields {
+        digest.update((field.len() as u64).to_le_bytes());
+        digest.update(field);
+    }
+    digest.finalize().into()
+}
+
 enum DaemonCommand {
     Send {
+        operation_id: String,
         body: String,
         reply: oneshot::Sender<serde_json::Value>,
     },
     PrivateSend {
+        operation_id: String,
         to: String,
         body: String,
         reply: oneshot::Sender<serde_json::Value>,
@@ -991,6 +1160,8 @@ enum DaemonCommand {
         reply: oneshot::Sender<serde_json::Value>,
     },
     Share {
+        operation_id: String,
+        source_digest: String,
         path: PathBuf,
         reply: oneshot::Sender<serde_json::Value>,
     },
@@ -1680,6 +1851,15 @@ where
         .context("timed out writing local IPC response")?
 }
 
+fn annotate_operation_response(value: &mut serde_json::Value, operation_id: &str) {
+    value["operation_id"] = operation_id.into();
+    if value["type"] == "error" && value.get("schema_version").is_none() {
+        value["schema_version"] = 1.into();
+        value["retryable"] = true.into();
+        value["outcome"] = "unknown".into();
+    }
+}
+
 async fn command_response<F>(operation: F, deadline: Duration) -> serde_json::Value
 where
     F: std::future::Future<Output = Result<serde_json::Value>>,
@@ -1763,6 +1943,46 @@ where
     };
     let request: IpcRequest =
         serde_json::from_slice(&frame).context("invalid local IPC request")?;
+    let operation_id = match &request {
+        IpcRequest::Send { operation_id, .. }
+        | IpcRequest::PrivateSend { operation_id, .. }
+        | IpcRequest::Share { operation_id, .. } => Some(operation_id),
+        _ => None,
+    };
+    if operation_id.is_some_and(|id| !valid_operation_id(id)) {
+        let id = operation_id.expect("operation ID was present");
+        write_local_response(
+            &mut stream,
+            &OperationCache::error(
+                id,
+                "invalid_operation_id",
+                "operation ID must be 32 lowercase hexadecimal characters",
+            ),
+            timeouts.response_write,
+        )
+        .await?;
+        return Ok(());
+    }
+    if let IpcRequest::Share {
+        operation_id,
+        source_digest,
+        ..
+    } = &request
+    {
+        if !valid_content_digest(source_digest) {
+            write_local_response(
+                &mut stream,
+                &OperationCache::error(
+                    operation_id,
+                    "invalid_source_digest",
+                    "source digest must be 64 lowercase hexadecimal characters",
+                ),
+                timeouts.response_write,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     match request {
         IpcRequest::Subscribe => {
             write_local_response(&mut stream, &connected, timeouts.response_write).await?;
@@ -1807,26 +2027,47 @@ where
                 }
             }
         }
-        IpcRequest::Send { body } => {
+        IpcRequest::Send { operation_id, body } => {
+            let response_operation_id = operation_id.clone();
             let (reply, response) = oneshot::channel();
-            let value = command_response(
-                send_command(&commands, DaemonCommand::Send { body, reply }, response),
+            let mut value = command_response(
+                send_command(
+                    &commands,
+                    DaemonCommand::Send {
+                        operation_id,
+                        body,
+                        reply,
+                    },
+                    response,
+                ),
                 timeouts.ordinary_command,
             )
             .await;
+            annotate_operation_response(&mut value, &response_operation_id);
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
-        IpcRequest::PrivateSend { to, body } => {
+        IpcRequest::PrivateSend {
+            operation_id,
+            to,
+            body,
+        } => {
+            let response_operation_id = operation_id.clone();
             let (reply, response) = oneshot::channel();
-            let value = command_response(
+            let mut value = command_response(
                 send_command(
                     &commands,
-                    DaemonCommand::PrivateSend { to, body, reply },
+                    DaemonCommand::PrivateSend {
+                        operation_id,
+                        to,
+                        body,
+                        reply,
+                    },
                     response,
                 ),
                 timeouts.private_command,
             )
             .await;
+            annotate_operation_response(&mut value, &response_operation_id);
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::BenchSend { config } => {
@@ -1861,13 +2102,28 @@ where
             .await;
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
-        IpcRequest::Share { path } => {
+        IpcRequest::Share {
+            operation_id,
+            source_digest,
+            path,
+        } => {
+            let response_operation_id = operation_id.clone();
             let (reply, response) = oneshot::channel();
-            let value = command_response(
-                send_command(&commands, DaemonCommand::Share { path, reply }, response),
+            let mut value = command_response(
+                send_command(
+                    &commands,
+                    DaemonCommand::Share {
+                        operation_id,
+                        source_digest,
+                        path,
+                        reply,
+                    },
+                    response,
+                ),
                 timeouts.transfer_command,
             )
             .await;
+            annotate_operation_response(&mut value, &response_operation_id);
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::Download { offer, output } => {
@@ -2130,6 +2386,8 @@ struct ShareResources {
 
 async fn share_attachment(
     resources: ShareResources,
+    operation_id: String,
+    source_digest: String,
     path: PathBuf,
     max_attachment_bytes: u64,
 ) -> Result<serde_json::Value> {
@@ -2159,6 +2417,7 @@ async fn share_attachment(
         if directory { ".tar" } else { ".blob" },
     )?;
     let source = path.clone();
+    let expected_digest = source_digest.clone();
     let staged = tokio::task::spawn_blocking(move || {
         let staged = attachment::StagedFile::new(staging);
         let size = if directory {
@@ -2166,12 +2425,18 @@ async fn share_attachment(
         } else {
             attachment::copy_bounded(&source, staged.path(), max_attachment_bytes)?
         };
+        let actual_digest =
+            attachment::staged_share_digest(staged.path(), directory, max_attachment_bytes)?;
+        anyhow::ensure!(
+            actual_digest == expected_digest,
+            "shared source digest does not match the staged content"
+        );
         Ok::<_, anyhow::Error>((size, staged))
     })
     .await
     .context("attachment staging task failed")??;
     let (size, staged) = staged;
-    let offer_id = generated_run_id();
+    let offer_id = operation_id;
     let kind = if directory {
         AttachmentKind::DirectoryTarV1
     } else {
@@ -2198,11 +2463,12 @@ async fn share_attachment(
         };
         let body = attachment_body(&offer)?;
         let timestamp_ms = unix_timestamp_ms()?;
-        let encoded = Envelope::encode_at(
+        let encoded = Envelope::encode_with_id_at(
             &secret,
             topic,
             EnvelopeKind::AttachmentOffer,
             body,
+            operation_id_bytes(&offer.offer_id),
             timestamp_ms,
         )?;
         let message_id = Envelope::decode(&encoded, topic)
@@ -2226,10 +2492,10 @@ async fn share_attachment(
             .await
             .context("broadcast attachment offer after durable pin")?;
         Ok(serde_json::json!({
-            "type":"attachment_shared", "schema_version":2,
+            "type":"attachment_shared", "schema_version":3,
             "from":secret.public().to_string(),
             "message_id":direct::id_string(&message_id), "timestamp_ms":timestamp_ms,
-            "offer_id":offer.offer_id,
+            "offer_id":offer.offer_id, "source_digest":source_digest,
             "kind":offer.kind, "name":offer.name, "size":offer.size,
             "ticket":offer.ticket, "offer":BASE64URL_NOPAD.encode(&encoded),
             "delivery_acknowledged":false
@@ -2257,6 +2523,31 @@ async fn share_attachment(
     }
 }
 
+fn raw_ticket_offer_id(ticket: &BlobTicket) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"meshmsg-raw-ticket-pin-v1\0");
+    digest.update(ticket.addr().id.to_string().as_bytes());
+    digest.update(b"\0");
+    digest.update(ticket.hash().to_string().as_bytes());
+    digest.update(b"\0raw");
+    direct::id_string(
+        &digest.finalize()[..16]
+            .try_into()
+            .expect("fixed digest prefix"),
+    )
+}
+
+fn raw_ticket_blob_tag(ticket: &BlobTicket) -> String {
+    inbound_blob_tag(
+        ticket.addr().id,
+        &raw_ticket_offer_id(ticket),
+        AttachmentKind::File,
+        "raw-ticket.blob",
+    )
+}
+
 fn validate_declared_attachment_size(declared_size: Option<u64>, actual_size: u64) -> Result<()> {
     if let Some(declared_size) = declared_size {
         anyhow::ensure!(
@@ -2273,6 +2564,162 @@ struct DownloadResources {
     downloader: Downloader,
     endpoint: Endpoint,
     lookup: MemoryLookup,
+}
+
+#[derive(Debug)]
+struct DownloadCommitOutcome {
+    destination_synced: bool,
+    cleanup_complete: bool,
+    warnings: Vec<String>,
+}
+
+struct DownloadCommit<'a> {
+    store: &'a Store,
+    tag_name: &'a [u8],
+    hash_and_format: iroh_blobs::HashAndFormat,
+    staging: attachment::StagedFile,
+    output: &'a Path,
+    kind: AttachmentKind,
+    raw_export: bool,
+    max_attachment_bytes: u64,
+}
+
+/// Commits the local half of a download. The named blob pin is made durable
+/// before the no-clobber destination operation. Once installation succeeds,
+/// subsequent sync/cleanup errors are partial-success metadata, never a false
+/// `download_failed` result that would make a safe retry impossible.
+async fn commit_download(
+    commit: DownloadCommit<'_>,
+    fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
+) -> Result<DownloadCommitOutcome> {
+    let DownloadCommit {
+        store,
+        tag_name,
+        hash_and_format,
+        staging,
+        output,
+        kind,
+        raw_export,
+        max_attachment_bytes,
+    } = commit;
+    fault("blob_tag_persist")?;
+    store.tags().set(tag_name, hash_and_format).await?;
+    fault("after_blob_tag_persist")?;
+    fault("blob_tag_sync")?;
+    store.sync_db().await?;
+    fault("after_blob_tag_sync")?;
+
+    fault("destination_install")?;
+    let directory = !raw_export && kind == AttachmentKind::DirectoryTarV1;
+    let output_for_task = output.to_owned();
+    let staging = tokio::task::spawn_blocking(move || {
+        if directory {
+            attachment::extract_staged_tar_no_clobber(
+                &staging,
+                &output_for_task,
+                max_attachment_bytes,
+            )?;
+        } else {
+            attachment::link_file_no_clobber(staging.path(), &output_for_task)?;
+        }
+        Ok::<_, anyhow::Error>(staging)
+    })
+    .await
+    .context("install task failed")??;
+
+    // The destination now exists. Do not return Err below this line: no-clobber
+    // makes a retry unsuitable, so accurately report any durability/cleanup
+    // degradation as a successful installation with warnings.
+    let mut warnings = Vec::new();
+    if let Err(error) = fault("after_destination_install") {
+        warnings.push(format!(
+            "interrupted after destination installation: {error}"
+        ));
+    }
+    let content_synced = match fault("destination_sync") {
+        Ok(()) => {
+            let output_for_task = output.to_owned();
+            match tokio::task::spawn_blocking(move || {
+                attachment::sync_installed_destination(&output_for_task, directory)
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => {
+                    warnings.push(format!("installed content sync failed: {error}"));
+                    false
+                }
+                Err(error) => {
+                    warnings.push(format!("installed content sync task failed: {error}"));
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            warnings.push(format!("installed content sync failed: {error}"));
+            false
+        }
+    };
+    let parent_synced = match fault("parent_sync") {
+        Ok(()) => {
+            let output_for_task = output.to_owned();
+            match tokio::task::spawn_blocking(move || {
+                attachment::sync_output_parent(&output_for_task)
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => {
+                    warnings.push(format!("installed output parent sync failed: {error}"));
+                    false
+                }
+                Err(error) => {
+                    warnings.push(format!("installed output parent sync task failed: {error}"));
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            warnings.push(format!("installed output parent sync failed: {error}"));
+            false
+        }
+    };
+    let destination_synced = content_synced && parent_synced;
+    if let Err(error) = fault("after_destination_sync") {
+        warnings.push(format!("interrupted after destination sync: {error}"));
+    }
+
+    let cleanup_complete = match fault("staging_cleanup") {
+        Ok(()) => match tokio::task::spawn_blocking(move || staging.cleanup()).await {
+            Ok(Ok(())) => match fault("after_staging_cleanup") {
+                Ok(()) => true,
+                Err(error) => {
+                    warnings.push(format!("interrupted after staging cleanup: {error}"));
+                    true
+                }
+            },
+            Ok(Err(error)) => {
+                warnings.push(format!("installed output staging cleanup failed: {error}"));
+                false
+            }
+            Err(error) => {
+                warnings.push(format!("installed output cleanup task failed: {error}"));
+                false
+            }
+        },
+        Err(error) => {
+            warnings.push(format!("installed output staging cleanup failed: {error}"));
+            // Dropping the guard makes a final best-effort cleanup attempt.
+            drop(staging);
+            false
+        }
+    };
+
+    Ok(DownloadCommitOutcome {
+        destination_synced,
+        cleanup_complete,
+        warnings,
+    })
 }
 
 async fn download_attachment(
@@ -2295,11 +2742,13 @@ async fn download_attachment(
         "output already exists: {}",
         output.display()
     );
+    // Validate the existing durability boundary before network or store work.
+    let staging_path = attachment::staging_file_near(&output, ".download")?;
     let parsed_signed = parse_signed_offer_token(&offer_token, topic);
-    let (offer, ticket, declared_size) = match parsed_signed {
+    let (offer, ticket, declared_size, raw_ticket) = match parsed_signed {
         Ok((offer, ticket)) => {
             let declared_size = Some(offer.size);
-            (offer, ticket, declared_size)
+            (offer, ticket, declared_size, false)
         }
         Err(signed_error) => {
             let ticket: BlobTicket = offer_token.parse().map_err(|_| signed_error)?;
@@ -2314,7 +2763,7 @@ async fn download_attachment(
                 .to_owned();
             (
                 AttachmentOffer {
-                    offer_id: generated_run_id(),
+                    offer_id: raw_ticket_offer_id(&ticket),
                     kind: AttachmentKind::File,
                     name,
                     size: 0,
@@ -2322,6 +2771,7 @@ async fn download_attachment(
                 },
                 ticket,
                 None,
+                true,
             )
         }
     };
@@ -2413,7 +2863,7 @@ async fn download_attachment(
     validate_declared_attachment_size(declared_size, size)
         .context("validate downloaded attachment size")?;
 
-    let staging = attachment::StagedFile::new(attachment::staging_file_near(&output, ".download")?);
+    let staging = attachment::StagedFile::new(staging_path);
     let export_store = store.clone();
     let export_hash = ticket.hash();
     let staging = tokio::spawn(async move {
@@ -2422,43 +2872,38 @@ async fn download_attachment(
             .export(export_hash, staging.path())
             .await
             .context("export downloaded attachment")?;
+        attachment::sync_staged_file(staging.path())?;
         Ok::<_, anyhow::Error>(staging)
     })
     .await
     .context("attachment export task failed")??;
-    match (raw_export, offer.kind) {
-        (true, _) | (false, AttachmentKind::File) => {
-            let output_for_task = output.clone();
-            tokio::task::spawn_blocking(move || {
-                attachment::install_staged_file_no_clobber(staging, &output_for_task)
-            })
-            .await
-            .context("install task failed")??;
-        }
-        (false, AttachmentKind::DirectoryTarV1) => {
-            let output_for_task = output.clone();
-            tokio::task::spawn_blocking(move || {
-                attachment::extract_staged_tar_no_clobber(
-                    staging,
-                    &output_for_task,
-                    max_attachment_bytes,
-                )
-            })
-            .await
-            .context("extraction task failed")??;
-        }
-    }
-    let tag_name = inbound_blob_tag(ticket.addr().id, &offer.offer_id, offer.kind, &offer.name);
-    store
-        .tags()
-        .set(tag_name.as_bytes(), ticket.hash_and_format())
-        .await?;
-    store.sync_db().await?;
+    let tag_name = if raw_ticket {
+        raw_ticket_blob_tag(&ticket)
+    } else {
+        inbound_blob_tag(ticket.addr().id, &offer.offer_id, offer.kind, &offer.name)
+    };
+    let commit = commit_download(
+        DownloadCommit {
+            store: &store,
+            tag_name: tag_name.as_bytes(),
+            hash_and_format: ticket.hash_and_format(),
+            staging,
+            output: &output,
+            kind: offer.kind,
+            raw_export,
+            max_attachment_bytes,
+        },
+        &|_| Ok(()),
+    )
+    .await?;
     Ok(serde_json::json!({
         "type":"download_complete", "schema_version":1,
         "offer_id":offer.offer_id, "kind":offer.kind,
         "name":offer.name, "size":size, "from":ticket.addr().id.to_string(),
-        "output":output
+        "output":output, "installed":true, "pinned":true,
+        "destination_synced":commit.destination_synced,
+        "cleanup_complete":commit.cleanup_complete,
+        "warnings":commit.warnings
     }))
 }
 
@@ -2732,6 +3177,12 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
     let transfer_limit = Arc::new(Semaphore::new(2));
     let offer_list_limit = Arc::new(Semaphore::new(1));
     let direct_limit = Arc::new(Semaphore::new(DIRECT_CONCURRENCY));
+    // Deliberately daemon-lifetime scoped: status advertises the bounded TTL and
+    // restart semantics so callers never infer durable command history.
+    let operation_cache = Arc::new(Mutex::new(OperationCache::new(
+        OPERATION_CACHE_CAPACITY,
+        OPERATION_CACHE_TTL,
+    )));
     let topic = state.topic_id()?;
     let mut directory = Directory::new(node.presence_lookup.clone());
     let directory_epoch = data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>());
@@ -2787,7 +3238,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                             "type":"connected", "peer":peer, "endpoint_online":true,
                             "topic_joined":node.receiver.is_joined(),
                             "alias":alias_config.effective(),
-                            "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY]
+                            "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY]
                         });
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
@@ -2800,58 +3251,86 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                 ).await?;
             }
             command = command_rx.recv() => match command {
-                Some(DaemonCommand::Send { body, reply }) => {
+                Some(DaemonCommand::Send { operation_id, body, reply }) => {
+                    let fingerprint = operation_fingerprint("send", &[body.as_bytes()]);
+                    if !operation_cache.lock().expect("operation cache poisoned").admit(
+                        operation_id.clone(), fingerprint, reply, StdInstant::now()
+                    ) {
+                        continue;
+                    }
                     let response = match unix_timestamp_ms() {
-                        Ok(timestamp_ms) => match Envelope::encode_at(
-                            &node.secret, topic, EnvelopeKind::Message, body.clone(), timestamp_ms,
+                        Ok(timestamp_ms) => match Envelope::encode_with_id_at(
+                            &node.secret, topic, EnvelopeKind::Message, body.clone(),
+                            operation_id_bytes(&operation_id), timestamp_ms,
                         ) {
-                            Ok(envelope) => {
-                                let message_id = Envelope::decode(&envelope, topic)
-                                    .expect("locally encoded envelope must decode")
-                                    .message_id;
-                                match node.sender.broadcast(envelope).await {
-                                    Ok(()) => queued_event(&peer, message_id, body, timestamp_ms),
-                                    Err(error) => serde_json::json!({"type":"error", "code":"send_failed", "message":error.to_string()}),
-                                }
-                            }
-                            Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
+                            Ok(envelope) => match node.sender.broadcast(envelope).await {
+                                Ok(()) => queued_event(
+                                    &peer, operation_id_bytes(&operation_id), body, timestamp_ms
+                                ),
+                                Err(error) => serde_json::json!({"type":"error", "schema_version":1, "code":"send_failed", "message":error.to_string(), "outcome":"unknown", "retryable":true}),
+                            },
+                            Err(error) => serde_json::json!({"type":"error", "schema_version":1, "code":"invalid_message", "message":error.to_string(), "outcome":"not_started", "retryable":false}),
                         },
-                        Err(error) => serde_json::json!({"type":"error", "code":"invalid_message", "message":error.to_string()}),
+                        Err(error) => serde_json::json!({"type":"error", "schema_version":1, "code":"invalid_message", "message":error.to_string(), "outcome":"not_started", "retryable":false}),
                     };
+                    let response = operation_cache.lock().expect("operation cache poisoned")
+                        .complete(&operation_id, response, StdInstant::now());
                     if response["type"] == "queued" {
                         let _ = event_tx.send(response.clone());
                     }
-                    let _ = reply.send(response);
                 }
-                Some(DaemonCommand::PrivateSend { to, body, reply }) => {
+                Some(DaemonCommand::PrivateSend { operation_id, to, body, reply }) => {
+                    let fingerprint = operation_fingerprint(
+                        "private_send", &[to.as_bytes(), body.as_bytes()]
+                    );
+                    if !operation_cache.lock().expect("operation cache poisoned").admit(
+                        operation_id.clone(), fingerprint, reply, StdInstant::now()
+                    ) {
+                        continue;
+                    }
                     emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
                     let address = match directory.resolve(&to) {
                         Ok(address) => address,
                         Err(error) => {
-                            let _ = reply.send(serde_json::json!({
-                                "type":"error", "code":"recipient_unresolved",
-                                "message":error.to_string()
-                            }));
+                            operation_cache.lock().expect("operation cache poisoned").complete(
+                                &operation_id,
+                                serde_json::json!({
+                                    "type":"error", "schema_version":1,
+                                    "code":"recipient_unresolved", "message":error.to_string(),
+                                    "outcome":"not_started", "retryable":false
+                                }),
+                                StdInstant::now(),
+                            );
                             continue;
                         }
                     };
                     let permit = match direct_limit.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            let _ = reply.send(serde_json::json!({
-                                "type":"error", "code":"private_send_busy",
-                                "message":"private-message send capacity reached"
-                            }));
+                            operation_cache.lock().expect("operation cache poisoned").complete(
+                                &operation_id,
+                                serde_json::json!({
+                                    "type":"error", "schema_version":1,
+                                    "code":"private_send_busy",
+                                    "message":"private-message send capacity reached",
+                                    "outcome":"not_started", "retryable":true
+                                }),
+                                StdInstant::now(),
+                            );
                             continue;
                         }
                     };
                     let endpoint = node.endpoint.clone();
                     let secret = node.secret.clone();
+                    let operation_cache = operation_cache.clone();
                     transfer_tasks.spawn(async move {
                         let _permit = permit;
-                        let response = match direct::send(endpoint, secret, topic, address, body).await {
+                        let response = match direct::send(
+                            endpoint, secret, topic, address, body,
+                            operation_id_bytes(&operation_id),
+                        ).await {
                             Ok(accepted) => serde_json::json!({
-                                "type":"private_accepted", "schema_version":1,
+                                "type":"private_accepted", "schema_version":2,
                                 "to":accepted.recipient.to_string(),
                                 "message_id":direct::id_string(&accepted.id),
                                 "timestamp_ms":accepted.timestamp_ms,
@@ -2860,11 +3339,13 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                                 "durable":false, "read":false
                             }),
                             Err(error) => serde_json::json!({
-                                "type":"error", "code":"private_send_failed",
-                                "message":format!("{error:#}")
+                                "type":"error", "schema_version":1,
+                                "code":"private_send_failed", "message":format!("{error:#}"),
+                                "outcome":"unknown", "retryable":true
                             }),
                         };
-                        let _ = reply.send(response);
+                        operation_cache.lock().expect("operation cache poisoned")
+                            .complete(&operation_id, response, StdInstant::now());
                     });
                 }
                 Some(DaemonCommand::BenchMessage { body, timestamp_ms, cancel, reply }) => {
@@ -2905,7 +3386,10 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY],
+                        "ipc_capabilities":[PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY],
+                        "operation_cache_capacity":OPERATION_CACHE_CAPACITY,
+                        "operation_cache_ttl_ms":OPERATION_CACHE_TTL.as_millis() as u64,
+                        "operation_cache_persistent":false,
                         "max_attachment_bytes":max_attachment_bytes
                     }));
                 }
@@ -2951,13 +3435,25 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                         let _ = reply.send(response);
                     });
                 }
-                Some(DaemonCommand::Share { path, reply }) => {
+                Some(DaemonCommand::Share { operation_id, source_digest, path, reply }) => {
+                    let fingerprint = operation_fingerprint(
+                        "share", &[path.as_os_str().as_encoded_bytes(), source_digest.as_bytes()]
+                    );
+                    if !operation_cache.lock().expect("operation cache poisoned").admit(
+                        operation_id.clone(), fingerprint, reply, StdInstant::now()
+                    ) {
+                        continue;
+                    }
                     let permit = match try_admit_transfer(
                         &transfer_limit, "share_busy", "attachment transfer capacity reached"
                     ) {
                         Ok(permit) => permit,
-                        Err(response) => {
-                            let _ = reply.send(response);
+                        Err(mut response) => {
+                            response["schema_version"] = 1.into();
+                            response["outcome"] = "not_started".into();
+                            response["retryable"] = true.into();
+                            operation_cache.lock().expect("operation cache poisoned")
+                                .complete(&operation_id, response, StdInstant::now());
                             continue;
                         }
                     };
@@ -2967,6 +3463,7 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                     let sender = node.sender.clone();
                     let state_dir = dir.to_path_buf();
                     let events = event_tx.clone();
+                    let operation_cache = operation_cache.clone();
                     transfer_tasks.spawn(async move {
                         let _permit = permit;
                         let response = match share_attachment(
@@ -2978,16 +3475,23 @@ pub async fn run_daemon(dir: &Path, json: bool, max_attachment_bytes: u64) -> Re
                                 sender,
                                 state_dir,
                             },
+                            operation_id.clone(),
+                            source_digest,
                             path,
                             max_attachment_bytes,
                         ).await {
                             Ok(value) => value,
-                            Err(error) => serde_json::json!({"type":"error", "code":"share_failed", "message":error.to_string()}),
+                            Err(error) => serde_json::json!({
+                                "type":"error", "schema_version":1,
+                                "code":"share_failed", "message":error.to_string(),
+                                "outcome":"unknown", "retryable":true
+                            }),
                         };
+                        let response = operation_cache.lock().expect("operation cache poisoned")
+                            .complete(&operation_id, response, StdInstant::now());
                         if response["type"] == "attachment_shared" {
-                            let _ = events.send(response.clone());
+                            let _ = events.send(response);
                         }
-                        let _ = reply.send(response);
                     });
                 }
                 Some(DaemonCommand::Download { offer, output, raw_export, reply }) => {
@@ -3264,8 +3768,9 @@ fn queued_event(
     timestamp_ms: u64,
 ) -> serde_json::Value {
     serde_json::json!({
-        "type":"queued", "schema_version":2,
-        "from":peer, "message_id":direct::id_string(&message_id),
+        "type":"queued", "schema_version":3,
+        "from":peer, "operation_id":direct::id_string(&message_id),
+        "message_id":direct::id_string(&message_id),
         "timestamp_ms":timestamp_ms, "body":body,
         "delivery_acknowledged":false
     })
@@ -3363,6 +3868,7 @@ struct PrivateAcceptedResponse {
     #[serde(rename = "type")]
     kind: String,
     schema_version: u64,
+    operation_id: String,
     to: String,
     message_id: String,
     timestamp_ms: u64,
@@ -3372,16 +3878,24 @@ struct PrivateAcceptedResponse {
     read: bool,
 }
 
-fn validate_private_acceptance(value: &serde_json::Value, body_bytes: usize) -> Result<()> {
+fn validate_private_acceptance(
+    value: &serde_json::Value,
+    operation_id: &str,
+    body_bytes: usize,
+) -> Result<()> {
     let accepted: PrivateAcceptedResponse = serde_json::from_value(value.clone())
         .context("daemon returned an invalid private-send acceptance")?;
     anyhow::ensure!(
         accepted.kind == "private_accepted"
-            && accepted.schema_version == 1
+            && accepted.schema_version == 2
             && accepted.acceptance_acknowledged
             && !accepted.durable
             && !accepted.read,
         "daemon returned an invalid private-send acceptance"
+    );
+    anyhow::ensure!(
+        accepted.operation_id == operation_id && accepted.message_id == operation_id,
+        "private-send acceptance operation ID does not match the request"
     );
     let recipient = accepted
         .to
@@ -3421,11 +3935,22 @@ fn advertises_private_send(status: &serde_json::Value) -> bool {
     advertises_capability(status, PRIVATE_SEND_CAPABILITY)
 }
 
-pub async fn send_once(dir: &Path, to: Option<&str>, body: &str, json: bool) -> Result<()> {
+pub async fn send_once(
+    dir: &Path,
+    operation_id: Option<String>,
+    to: Option<&str>,
+    body: &str,
+    json: bool,
+) -> Result<()> {
+    let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
+    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    anyhow::ensure!(
+        advertises_capability(&status, IDEMPOTENT_MUTATIONS_CAPABILITY),
+        "daemon does not advertise retry-safe operation IDs; upgrade and restart the daemon (operation was not submitted)"
+    );
     let value = if let Some(to) = to {
         // Negotiate without the body first. A daemon swap after this check is
         // still safe because private_send is never interpreted as broadcast.
-        let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
         anyhow::ensure!(
             advertises_private_send(&status),
             "daemon does not advertise safe private-send IPC; upgrade and restart the daemon (message was not submitted)"
@@ -3433,25 +3958,34 @@ pub async fn send_once(dir: &Path, to: Option<&str>, body: &str, json: bool) -> 
         let value = send_request_checked(
             dir,
             &IpcRequest::PrivateSend {
+                operation_id: operation_id.clone(),
                 to: to.to_owned(),
                 body: body.to_owned(),
             },
             "private_accepted",
-            Some(1),
+            Some(2),
         )
-        .await?;
-        validate_private_acceptance(&value, body.len())?;
+        .await
+        .with_context(|| format!("operation {operation_id}"))?;
+        validate_private_acceptance(&value, &operation_id, body.len())?;
         value
     } else {
         let value = send_request_checked(
             dir,
             &IpcRequest::Send {
+                operation_id: operation_id.clone(),
                 body: body.to_owned(),
             },
             "queued",
-            None,
+            Some(3),
         )
-        .await?;
+        .await
+        .with_context(|| format!("operation {operation_id}"))?;
+        anyhow::ensure!(
+            value["operation_id"].as_str() == Some(&operation_id)
+                && value["message_id"].as_str() == Some(&operation_id),
+            "daemon returned mismatched broadcast operation metadata"
+        );
         value
     };
     event(json, value);
@@ -3468,16 +4002,46 @@ fn caller_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-pub async fn share(dir: &Path, path: &Path, json: bool) -> Result<()> {
+pub async fn share(
+    dir: &Path,
+    operation_id: Option<String>,
+    path: &Path,
+    json: bool,
+) -> Result<()> {
+    let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
+    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    anyhow::ensure!(
+        advertises_capability(&status, IDEMPOTENT_MUTATIONS_CAPABILITY),
+        "daemon does not advertise retry-safe operation IDs; upgrade and restart the daemon (operation was not submitted)"
+    );
+    let path = caller_path(path)?;
+    let maximum = status["max_attachment_bytes"]
+        .as_u64()
+        .context("daemon status omitted its attachment limit")?;
+    let digest_path = path.clone();
+    let source_digest =
+        tokio::task::spawn_blocking(move || attachment::share_source_digest(&digest_path, maximum))
+            .await
+            .context("attachment digest task failed")??;
     let value = send_request_checked(
         dir,
         &IpcRequest::Share {
-            path: caller_path(path)?,
+            operation_id: operation_id.clone(),
+            source_digest: source_digest.clone(),
+            path,
         },
         "attachment_shared",
-        Some(2),
+        Some(3),
     )
-    .await?;
+    .await
+    .with_context(|| format!("operation {operation_id}"))?;
+    anyhow::ensure!(
+        value["operation_id"].as_str() == Some(&operation_id)
+            && value["message_id"].as_str() == Some(&operation_id)
+            && value["offer_id"].as_str() == Some(&operation_id)
+            && value["source_digest"].as_str() == Some(&source_digest),
+        "daemon returned mismatched share operation metadata"
+    );
     event(json, value);
     Ok(())
 }
@@ -4219,7 +4783,16 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
         tokio::select! {
             line = rx.recv() => match line {
                 Some(body) => {
-                    send_request_checked(dir, &IpcRequest::Send { body }, "queued", None).await?;
+                    send_request_checked(
+                        dir,
+                        &IpcRequest::Send {
+                            operation_id: crate::ipc::new_operation_id(),
+                            body,
+                        },
+                        "queued",
+                        Some(3),
+                    )
+                    .await?;
                 }
                 None => break,
             },
@@ -4479,8 +5052,18 @@ fn event(json: bool, value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn caller_share_path_preserves_the_exact_absolute_representation() {
+        let current = std::env::current_dir().unwrap();
+        let relative = Path::new("./directory/../file.txt");
+        assert_eq!(caller_path(relative).unwrap(), current.join(relative));
+        let absolute = current.join("./directory/../file.txt");
+        assert_eq!(caller_path(&absolute).unwrap(), absolute);
+    }
 
     fn test_topic() -> TopicId {
         TopicId::from_bytes([7; 32])
@@ -4509,6 +5092,65 @@ mod tests {
             .collect();
         let expected: std::collections::BTreeSet<_> = expected.iter().copied().collect();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn operation_cache_joins_conflicts_caches_terminal_outcomes_and_bounds_retention() {
+        let now = StdInstant::now();
+        let mut cache = OperationCache::new(2, Duration::from_secs(10));
+        let id1 = "11111111111111111111111111111111";
+        let id2 = "22222222222222222222222222222222";
+        let id3 = "33333333333333333333333333333333";
+        let fp1 = operation_fingerprint("send", &[b"one"]);
+        let different = operation_fingerprint("send", &[b"different"]);
+
+        let (reply1, response1) = oneshot::channel();
+        assert!(cache.admit(id1.into(), fp1, reply1, now));
+        let (duplicate, duplicate_response) = oneshot::channel();
+        assert!(!cache.admit(id1.into(), fp1, duplicate, now));
+        let (conflict, conflict_response) = oneshot::channel();
+        assert!(!cache.admit(id1.into(), different, conflict, now));
+        assert_eq!(
+            conflict_response.await.unwrap()["code"],
+            "operation_id_conflict"
+        );
+
+        let terminal = serde_json::json!({
+            "type":"error", "schema_version":1, "code":"send_failed"
+        });
+        let stored = cache.complete(id1, terminal, now);
+        assert_eq!(stored["operation_id"], id1);
+        assert_eq!(response1.await.unwrap(), stored);
+        assert_eq!(duplicate_response.await.unwrap(), stored);
+        let (cached, cached_response) = oneshot::channel();
+        assert!(!cache.admit(id1.into(), fp1, cached, now));
+        assert_eq!(cached_response.await.unwrap(), stored);
+
+        let fp2 = operation_fingerprint("send", &[b"two"]);
+        let (reply2, _response2) = oneshot::channel();
+        assert!(cache.admit(id2.into(), fp2, reply2, now));
+        cache.complete(id2, serde_json::json!({"type":"queued"}), now);
+        let fp3 = operation_fingerprint("send", &[b"three"]);
+        let (reply3, _response3) = oneshot::channel();
+        assert!(cache.admit(id3.into(), fp3, reply3, now));
+        assert!(
+            !cache.completed.contains_key(id1),
+            "oldest terminal entry was not evicted"
+        );
+
+        let mut expired = OperationCache::new(2, Duration::from_millis(1));
+        let (reply, _response) = oneshot::channel();
+        assert!(expired.admit(id1.into(), fp1, reply, now));
+        expired.complete(id1, serde_json::json!({"type":"queued"}), now);
+        let (retry, _retry_response) = oneshot::channel();
+        assert!(expired.admit(id1.into(), fp1, retry, now + Duration::from_millis(2)));
+
+        // The cache is intentionally daemon-lifetime scoped. A fresh daemon
+        // admits the same ID again; status/docs tell clients not to infer
+        // restart-persistent idempotency.
+        let mut restarted = OperationCache::new(2, Duration::from_secs(10));
+        let (retry, _retry_response) = oneshot::channel();
+        assert!(restarted.admit(id1.into(), fp1, retry, now));
     }
 
     #[test]
@@ -5672,7 +6314,8 @@ mod tests {
         let value = queued_event("peer", [4; 16], "hello".to_owned(), 1_700_000_000_000);
 
         assert_eq!(value["type"], "queued");
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["operation_id"], "04040404040404040404040404040404");
         assert_eq!(value["message_id"], "04040404040404040404040404040404");
         assert_eq!(value["from"], "peer");
         assert_eq!(value["body"], "hello");
@@ -5684,6 +6327,7 @@ mod tests {
                 "type",
                 "schema_version",
                 "from",
+                "operation_id",
                 "message_id",
                 "timestamp_ms",
                 "body",
@@ -5706,12 +6350,14 @@ mod tests {
 
         let recipient = SecretKey::generate().public().to_string();
         let accepted = serde_json::json!({
-            "type":"private_accepted", "schema_version":1,
+            "type":"private_accepted", "schema_version":2,
+            "operation_id":"0123456789abcdef0123456789abcdef",
             "to":recipient, "message_id":"0123456789abcdef0123456789abcdef",
             "timestamp_ms":1_700_000_000_000_u64, "body_bytes":6,
             "acceptance_acknowledged":true, "durable":false, "read":false
         });
-        validate_private_acceptance(&accepted, "秘密".len()).unwrap();
+        validate_private_acceptance(&accepted, "0123456789abcdef0123456789abcdef", "秘密".len())
+            .unwrap();
 
         for invalid in [
             {
@@ -5735,7 +6381,10 @@ mod tests {
                 value
             },
         ] {
-            assert!(validate_private_acceptance(&invalid, 6).is_err());
+            assert!(
+                validate_private_acceptance(&invalid, "0123456789abcdef0123456789abcdef", 6)
+                    .is_err()
+            );
         }
     }
 
@@ -5777,6 +6426,362 @@ mod tests {
         let escaped = terminal_safe("hello\n\u{1b}]0;owned\u{7}");
         assert_eq!(escaped, "hello\\n\\u{1b}]0;owned\\u{7}");
         assert!(!escaped.chars().any(char::is_control));
+    }
+
+    #[tokio::test]
+    async fn download_commit_process_exit_child() {
+        let Ok(root) = std::env::var("MESHMSG_COMMIT_CRASH_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("MESHMSG_COMMIT_CRASH_PHASE").unwrap();
+        let root = PathBuf::from(root);
+        std::fs::create_dir_all(&root).unwrap();
+        let options = FsStoreOptions::new(&root.join("store"));
+        let store: Store = FsStore::load_with_opts(root.join("blobs.db"), options)
+            .await
+            .unwrap()
+            .into();
+        let provider = SecretKey::from_bytes(&[9; 32]).public();
+        let ticket = BlobTicket::new(
+            iroh::EndpointAddr::new(provider),
+            iroh_blobs::Hash::new(b"crash payload"),
+            BlobFormat::Raw,
+        );
+        let tag = raw_ticket_blob_tag(&ticket);
+        let staging = root.join(".meshmsg-part-1111111111111111.download");
+        std::fs::write(&staging, b"crash payload").unwrap();
+        let output = root.join("output");
+        let _ = commit_download(
+            DownloadCommit {
+                store: &store,
+                tag_name: tag.as_bytes(),
+                hash_and_format: ticket.hash_and_format(),
+                staging: attachment::StagedFile::new(staging),
+                output: &output,
+                kind: AttachmentKind::File,
+                raw_export: true,
+                max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            },
+            &|boundary| {
+                if boundary == phase {
+                    std::process::exit(86);
+                }
+                Ok(())
+            },
+        )
+        .await;
+        panic!("child did not exit at {phase}");
+    }
+
+    #[tokio::test]
+    async fn process_exit_recovery_reopens_raw_pin_retries_without_duplicates_and_tracks_leftovers()
+    {
+        for phase in ["after_blob_tag_sync", "after_destination_install"] {
+            let root = std::env::temp_dir().join(format!(
+                "meshmsg-commit-process-exit-{phase}-{}",
+                rand::random::<u64>()
+            ));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("node::tests::download_commit_process_exit_child")
+                .arg("--nocapture")
+                .env("MESHMSG_COMMIT_CRASH_ROOT", &root)
+                .env("MESHMSG_COMMIT_CRASH_PHASE", phase)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86));
+
+            let provider = SecretKey::from_bytes(&[9; 32]).public();
+            let ticket = BlobTicket::new(
+                iroh::EndpointAddr::new(provider),
+                iroh_blobs::Hash::new(b"crash payload"),
+                BlobFormat::Raw,
+            );
+            let offer_id = raw_ticket_offer_id(&ticket);
+            assert!(valid_offer_id(&offer_id));
+            assert_eq!(offer_id, raw_ticket_offer_id(&ticket));
+            let tag = raw_ticket_blob_tag(&ticket);
+            let options = FsStoreOptions::new(&root.join("store"));
+            let store: Store = FsStore::load_with_opts(root.join("blobs.db"), options)
+                .await
+                .unwrap()
+                .into();
+            let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].direction, "incoming");
+            assert_eq!(pins[0].offer_id, offer_id);
+            assert_eq!(pins[0].hash, ticket.hash().to_string());
+            let output = root.join("output");
+            let staging = root.join(".meshmsg-part-1111111111111111.download");
+            assert_eq!(output.exists(), phase == "after_destination_install");
+            assert!(staging.exists(), "abrupt exit should bypass cleanup guards");
+            // Arbitrary output scopes are not scanned by state startup cleanup.
+            assert_eq!(attachment::cleanup_stale_state_staging(&root).unwrap(), 0);
+            assert!(staging.exists());
+
+            if phase == "after_blob_tag_sync" {
+                let outcome = commit_download(
+                    DownloadCommit {
+                        store: &store,
+                        tag_name: tag.as_bytes(),
+                        hash_and_format: ticket.hash_and_format(),
+                        staging: attachment::StagedFile::new(staging.clone()),
+                        output: &output,
+                        kind: AttachmentKind::File,
+                        raw_export: true,
+                        max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                    },
+                    &|_| Ok(()),
+                )
+                .await
+                .unwrap();
+                assert!(outcome.destination_synced);
+                assert!(outcome.cleanup_complete);
+                let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
+                assert_eq!(pins.len(), 1, "raw retry created a duplicate permanent pin");
+                assert_eq!(std::fs::read(&output).unwrap(), b"crash payload");
+                assert!(!staging.exists());
+            }
+            drop(store);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_commit_fault_boundaries_preserve_retry_and_partial_success_semantics() {
+        for boundary in [
+            "blob_tag_persist",
+            "after_blob_tag_persist",
+            "blob_tag_sync",
+            "after_blob_tag_sync",
+            "destination_install",
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "meshmsg-download-commit-{boundary}-{}",
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let options = FsStoreOptions::new(&root.join("store"));
+            let store: Store = FsStore::load_with_opts(root.join("blobs.db"), options)
+                .await
+                .unwrap()
+                .into();
+            let hash_and_format = iroh_blobs::HashAndFormat::raw(iroh_blobs::Hash::new(b"blob"));
+            let provider = SecretKey::generate().public();
+            let provider_text = provider.to_string();
+            let tag = inbound_blob_tag(
+                provider,
+                "0123456789abcdef0123456789abcdef",
+                AttachmentKind::File,
+                "retry.txt",
+            );
+            let output = root.join("output");
+            let staging = root.join("first.download");
+            std::fs::write(&staging, b"blob").unwrap();
+            let injected = |current| {
+                if current == boundary {
+                    anyhow::bail!("injected {boundary} failure")
+                }
+                Ok(())
+            };
+
+            let error = commit_download(
+                DownloadCommit {
+                    store: &store,
+                    tag_name: tag.as_bytes(),
+                    hash_and_format,
+                    staging: attachment::StagedFile::new(staging.clone()),
+                    output: &output,
+                    kind: AttachmentKind::File,
+                    raw_export: false,
+                    max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                },
+                &injected,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("injected"));
+            assert!(
+                !output.exists(),
+                "{boundary} installed an output on failure"
+            );
+            assert!(
+                !staging.exists(),
+                "{boundary} leaked its failed staging file"
+            );
+            let (failed_pins, _, _) = list_pinned_blobs(&store).await.unwrap();
+            assert_eq!(
+                failed_pins.len(),
+                usize::from(boundary != "blob_tag_persist"),
+                "unexpected pin state at {boundary}"
+            );
+
+            // Retrying repeats the idempotent tag set/sync and then installs to
+            // the still-unused destination. This also recovers an uncertain
+            // tag sync and a durable pin left by an install failure.
+            let retry_staging = root.join("retry.download");
+            std::fs::write(&retry_staging, b"blob").unwrap();
+            let outcome = commit_download(
+                DownloadCommit {
+                    store: &store,
+                    tag_name: tag.as_bytes(),
+                    hash_and_format,
+                    staging: attachment::StagedFile::new(retry_staging),
+                    output: &output,
+                    kind: AttachmentKind::File,
+                    raw_export: false,
+                    max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                },
+                &|_| Ok(()),
+            )
+            .await
+            .unwrap();
+            assert!(outcome.destination_synced);
+            assert!(outcome.cleanup_complete);
+            assert!(outcome.warnings.is_empty());
+            assert_eq!(std::fs::read(&output).unwrap(), b"blob");
+            store.sync_db().await.unwrap();
+            let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].direction, "incoming");
+            assert_eq!(pins[0].provider.as_deref(), Some(provider_text.as_str()));
+            assert_eq!(pins[0].hash, hash_and_format.hash.to_string());
+            drop(store);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        for boundary in [
+            "after_destination_install",
+            "destination_sync",
+            "parent_sync",
+            "after_destination_sync",
+            "staging_cleanup",
+            "after_staging_cleanup",
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "meshmsg-download-partial-{boundary}-{}",
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let options = FsStoreOptions::new(&root.join("store"));
+            let store: Store = FsStore::load_with_opts(root.join("blobs.db"), options)
+                .await
+                .unwrap()
+                .into();
+            let hash_and_format = iroh_blobs::HashAndFormat::raw(iroh_blobs::Hash::new(b"blob"));
+            let provider = SecretKey::generate().public();
+            let provider_text = provider.to_string();
+            let tag = inbound_blob_tag(
+                provider,
+                "fedcba9876543210fedcba9876543210",
+                AttachmentKind::File,
+                "partial.txt",
+            );
+            let output = root.join("output");
+            let staging = root.join("part.download");
+            std::fs::write(&staging, b"blob").unwrap();
+            let injected = |current| {
+                if current == boundary {
+                    anyhow::bail!("injected {boundary} failure")
+                }
+                Ok(())
+            };
+
+            let outcome = commit_download(
+                DownloadCommit {
+                    store: &store,
+                    tag_name: tag.as_bytes(),
+                    hash_and_format,
+                    staging: attachment::StagedFile::new(staging.clone()),
+                    output: &output,
+                    kind: AttachmentKind::File,
+                    raw_export: false,
+                    max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                },
+                &injected,
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&output).unwrap(), b"blob");
+            assert_eq!(
+                outcome.destination_synced,
+                !matches!(boundary, "destination_sync" | "parent_sync")
+            );
+            assert_eq!(outcome.cleanup_complete, boundary != "staging_cleanup");
+            assert_eq!(outcome.warnings.len(), 1);
+            assert!(!staging.exists(), "drop recovery did not remove staging");
+            let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].direction, "incoming");
+            assert_eq!(pins[0].provider.as_deref(), Some(provider_text.as_str()));
+            assert_eq!(pins[0].hash, hash_and_format.hash.to_string());
+            drop(store);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_directory_commit_reports_after_install_fault_without_false_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "meshmsg-signed-directory-commit-{}",
+            rand::random::<u64>()
+        ));
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/file.txt"), b"directory payload").unwrap();
+        let archive = root.join("directory.download");
+        attachment::create_deterministic_tar(&source, &archive, DEFAULT_MAX_ATTACHMENT_BYTES)
+            .unwrap();
+        let bytes = std::fs::read(&archive).unwrap();
+        let hash_and_format = iroh_blobs::HashAndFormat::raw(iroh_blobs::Hash::new(&bytes));
+        let provider = SecretKey::generate().public();
+        let offer_id = "abcdefabcdefabcdefabcdefabcdefab";
+        let tag = inbound_blob_tag(
+            provider,
+            offer_id,
+            AttachmentKind::DirectoryTarV1,
+            "source.tar",
+        );
+        let options = FsStoreOptions::new(&root.join("store"));
+        let store: Store = FsStore::load_with_opts(root.join("blobs.db"), options)
+            .await
+            .unwrap()
+            .into();
+        let output = root.join("installed");
+        let outcome = commit_download(
+            DownloadCommit {
+                store: &store,
+                tag_name: tag.as_bytes(),
+                hash_and_format,
+                staging: attachment::StagedFile::new(archive),
+                output: &output,
+                kind: AttachmentKind::DirectoryTarV1,
+                raw_export: false,
+                max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            },
+            &|boundary| {
+                if boundary == "after_destination_install" {
+                    anyhow::bail!("simulated interruption")
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.destination_synced);
+        assert!(outcome.cleanup_complete);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            std::fs::read(output.join("nested/file.txt")).unwrap(),
+            b"directory payload"
+        );
+        let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].direction, "incoming");
+        assert_eq!(pins[0].offer_id, offer_id);
+        assert_eq!(pins[0].hash, hash_and_format.hash.to_string());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -69,7 +69,7 @@ FILE_TICKET=$(json_field '"ticket"' <<<"$FILE_SHARE")
 FILE_ID=$(json_field '"offer_id"' <<<"$FILE_SHARE")
 FILE_TIMESTAMP=$(json_field '"timestamp_ms"' <<<"$FILE_SHARE")
 FILE_MESSAGE_ID=$(json_field '"message_id"' <<<"$FILE_SHARE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "attachment_shared" and v["schema_version"] == 2 and len(v["message_id"]) == 32 and isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["delivery_acknowledged"] is False' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "attachment_shared" and v["schema_version"] == 3 and len(v["operation_id"]) == 32 and v["message_id"] == v["operation_id"] and isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["delivery_acknowledged"] is False' \
   <<<"$FILE_SHARE" || fail "shared attachment JSON omitted its canonical timestamp or existing fields"
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["name"] == "source.txt" and b["kind"] == "file" and b["status"] == "complete"' "$FILE_ID" \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
@@ -83,9 +83,14 @@ python3 -c 'import json,sys; events=[json.loads(line) for line in open(sys.argv[
   || fail "local attachment_shared timestamp/metadata did not match the received offer"
 [[ ! -e "$ROOT/receiver/source.txt" ]] || fail "receiver automatically exported an offered file"
 
-(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket.txt) \
-  | grep -q '"type":"download_complete"'
+RAW_DOWNLOAD=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket.txt)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["installed"] is True and v["pinned"] is True and v["destination_synced"] is True and v["cleanup_complete"] is True and v["warnings"] == []' \
+  <<<"$RAW_DOWNLOAD" || fail "successful download omitted commit durability metadata"
 cmp "$ROOT/source.txt" "$ROOT/raw-ticket.txt" || fail "raw-ticket download differs"
+RAW_RETRY=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket-retry.txt)
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["offer_id"] == json.loads(sys.argv[2])["offer_id"]' \
+  "$RAW_DOWNLOAD" "$RAW_RETRY" || fail "raw-ticket retry changed its deterministic pin identity"
+cmp "$ROOT/source.txt" "$ROOT/raw-ticket-retry.txt" || fail "raw-ticket retry download differs"
 printf '%s\n' "$FILE_OFFER" >"$ROOT/signed-offer.txt"
 (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download --offer-file signed-offer.txt --output received-from-file.txt) \
   | grep -q '"type":"download_complete"'
@@ -98,9 +103,28 @@ if (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" download "$FILE_OFFER" --o
   fail "download overwrote an existing file"
 fi
 grep -q 'output already exists' "$ROOT/clobber.err" || fail "overwrite refusal was not actionable"
-python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {x["name"] for x in b} == {"raw-ticket.txt", "source.txt"} and all(x["direction"] == "incoming" and x["kind"] == "file" and x["status"] == "complete" for x in b)' \
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {x["name"] for x in b} == {"raw-ticket.blob", "source.txt"} and all(x["direction"] == "incoming" and x["kind"] == "file" and x["status"] == "complete" for x in b)' \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "receiver listing did not include downloaded blobs"
+
+# Download success is acknowledged only after the inbound pins are durable.
+# Restart immediately and verify recovery before performing another transfer.
+kill "$LISTENER" >/dev/null 2>&1 || true
+wait "$LISTENER" >/dev/null 2>&1 || true
+stop_node receiver
+printf stale >"$ROOT/receiver/.meshmsg-part-0123456789abcdef.blob"
+printf keep >"$ROOT/receiver/.meshmsg-part-0123456789abcdef.download"
+mkdir "$ROOT/receiver/.meshmsg-part-fedcba9876543210.tar"
+start_node receiver
+[[ ! -e "$ROOT/receiver/.meshmsg-part-0123456789abcdef.blob" ]] \
+  || fail "startup did not remove validated stale share staging"
+[[ -f "$ROOT/receiver/.meshmsg-part-0123456789abcdef.download" ]] \
+  || fail "startup unsafely removed arbitrary download staging"
+[[ -d "$ROOT/receiver/.meshmsg-part-fedcba9876543210.tar" ]] \
+  || fail "startup unsafely removed a non-regular staging lookalike"
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and all(x["direction"] == "incoming" and x["status"] == "complete" for x in b)' \
+  <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
+  || fail "durable inbound pins did not recover after receiver restart"
 
 # A directory snapshot remains available after the provider daemon restarts.
 mkdir -p "$ROOT/source-dir/nested" "$ROOT/source-dir/empty"
@@ -108,7 +132,7 @@ printf alpha >"$ROOT/source-dir/a.txt"
 printf beta >"$ROOT/source-dir/nested/b.txt"
 DIR_SHARE=$("$BIN" --state-dir "$ROOT/provider" --json share "$ROOT/source-dir")
 DIR_OFFER=$(json_field '"offer"' <<<"$DIR_SHARE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["kind"] == "directory_tar_v1"' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["kind"] == "directory_tar_v1" and v["message_id"] == v["operation_id"]' \
   <<<"$DIR_SHARE" || fail "shared directory JSON omitted its canonical timestamp or kind"
 stop_node provider
 start_node provider
@@ -124,6 +148,4 @@ python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert any(x["name
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "receiver listing did not preserve downloaded directory name and kind"
 
-kill "$LISTENER" >/dev/null 2>&1 || true
-wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: canonical shared/received offer timestamps and metadata, transfers, no-clobber, deterministic extraction, persistent pins, and best-effort blob listing"
+echo "PASS: canonical shared/received offer timestamps and metadata, ordered durable download commits, restart recovery, no-clobber, deterministic extraction, persistent pins, and best-effort blob listing"

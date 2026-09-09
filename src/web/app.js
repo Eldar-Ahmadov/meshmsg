@@ -6,6 +6,8 @@ const encoder = new TextEncoder();
 let sending = false;
 let sharing = false;
 let selectedFile = null;
+let pendingSend = null;
+let pendingShare = null;
 let source = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
@@ -16,6 +18,11 @@ let peerDirectoryReady = false;
 let directoryEpoch = null;
 let directoryRevision = null;
 const currentPeers = new Map();
+
+function operationId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
 
 function prependEntry(item) {
   feed.prepend(item);
@@ -175,6 +182,8 @@ function clearSelectedFile() {
 }
 
 async function shareAttachment(file) {
+  const operation_id = pendingShare?.file === file ? pendingShare.id : operationId();
+  pendingShare = { file, id: operation_id };
   const outcome = byId('outcome');
   const button = byId('broadcast');
   sharing = true;
@@ -185,22 +194,26 @@ async function shareAttachment(file) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/octet-stream',
-        'X-Meshmsg-File-Name': encodeURIComponent(file.name)
+        'X-Meshmsg-File-Name': encodeURIComponent(file.name),
+        'X-Meshmsg-Operation-Id': operation_id
       },
       body: file,
       mode: 'cors', credentials: 'omit', redirect: 'error', cache: 'no-store'
     });
     const value = await response.json();
-    if (response.ok && value.type === 'attachment_shared') {
+    if (response.ok && value.type === 'attachment_shared'
+      && value.schema_version === 3 && value.operation_id === operation_id) {
       outcome.textContent = 'Attachment offer shared locally — delivery unconfirmed and not acknowledged. The live feed uses the daemon event.';
+      pendingShare = null;
       if (selectedFile === file) clearSelectedFile();
-    } else if (value.outcome === 'not_shared') {
+    } else if (value.outcome === 'not_shared' || value.outcome === 'not_started') {
+      pendingShare = null;
       outcome.textContent = `Not shared: ${value.message} File selection preserved.`;
     } else {
-      outcome.textContent = 'Share outcome unknown: the offer may have been published. File selection preserved. Check the live feed before retrying; duplicates are possible.';
+      outcome.textContent = 'Share outcome unknown: the offer may have been published. File selection and retry ID preserved; manually retry unchanged while the same daemon cache is active.';
     }
   } catch (_) {
-    outcome.textContent = 'Share outcome unknown: upload connection failed or the reply was lost. File selection preserved. Check the live feed before retrying; no automatic retry.';
+    outcome.textContent = 'Share outcome unknown: upload connection failed or the reply was lost. File selection and retry ID preserved; no automatic retry.';
   } finally {
     sharing = false;
     button.disabled = false;
@@ -405,8 +418,12 @@ byId('composer').addEventListener('submit', async (event) => {
   byId('broadcast').disabled = true;
   byId('outcome').textContent = 'Submitting once…';
   try {
-    const { ok, value } = await request({ command: 'send', body });
-    if (ok && value.type === 'queued') {
+    const operation_id = pendingSend?.body === body ? pendingSend.id : operationId();
+    pendingSend = { body, id: operation_id };
+    const { ok, value } = await request({ command: 'send', operation_id, body });
+    if (ok && value.type === 'queued' && value.schema_version === 3
+      && value.operation_id === operation_id && value.message_id === operation_id) {
+      pendingSend = null;
       byId('outcome').textContent = '';
       // The daemon's queued event is the one canonical feed entry in every tab.
       // Never erase edits made while the submission was in flight.
@@ -414,10 +431,11 @@ byId('composer').addEventListener('submit', async (event) => {
         draft.value = '';
         draft.dispatchEvent(new Event('input'));
       }
-    } else if (value.outcome === 'not_sent') {
+    } else if (value.outcome === 'not_sent' || value.outcome === 'not_started') {
+      pendingSend = null;
       byId('outcome').textContent = `Not sent: ${value.message} Draft preserved.`;
     } else {
-      byId('outcome').textContent = 'Outcome unknown: it may have queued. Draft preserved. Check with peers before manually resending; duplicates are possible.';
+      byId('outcome').textContent = 'Outcome unknown: it may have queued. Draft and retry ID preserved; manually retry unchanged while the same daemon cache is active.';
     }
   } catch (_) {
     byId('outcome').textContent = 'Outcome unknown: connection failed or timed out; it may have queued. Draft preserved. No automatic retry. Check with peers before resending.';

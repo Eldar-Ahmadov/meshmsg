@@ -12,7 +12,7 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 - [x] **Status: completed for EnvelopeV2 and replay protection.** Broadcasts now use a separate V2 Gossip protocol and sign `{domain, version, topic, sender, message_id, timestamp, kind, body}`. Receivers enforce freshness and exact bounded replay retention with transport-source, per-sender, and global admission limits; legacy topic-unbound signed attachment tokens fail closed.
 - Relevant implementation and focused boundary/load tests are in `src/node.rs`; schema propagation is enforced in `src/web.rs` and the broadcast/attachment integration harnesses. This is intentionally wire-incompatible with pre-V2 peers.
-- Client-generated operation IDs, terminal-outcome caching, and safe retries are **not** part of this completion and remain outstanding under finding 4.
+- Client-generated operation IDs, terminal-outcome caching, and safe retries are completed separately under finding 4.
 
 ### 2. Local IPC accepts unlimited idle clients — High availability risk
 
@@ -21,18 +21,15 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 3. Download commit order can return failure after installing the output — High
 
-- Relevant code: `src/node.rs:1755-1782`
-- The destination is installed before the durable inbound blob tag is written and synced.
-- If tag persistence fails, the CLI reports `download_failed`, but the output already exists and retry is rejected by no-clobber semantics.
-- Persist the pin before final installation, or return an explicit partial-success response such as `installed:true, pinned:false`.
-- Add fault-injection tests around every commit boundary.
+- [x] **Status: completed.** Downloaded bytes are exported and synced, then the inbound blob tag is written and durably synced before the atomic no-clobber destination install. Every ordinary `download_failed` outcome therefore leaves the requested destination uninstalled and safely retryable. Raw-ticket pin IDs and tag names are deterministic from the raw ticket's provider and content hash, so failure/restart/retry does not accumulate permanent pins.
+- Output parents must already exist. Files and extracted directory trees are synced, the destination is atomically installed, and the one changed existing parent is synced. Post-install sync/cleanup failures return explicit `download_complete` partial-success metadata (`installed:true`, `pinned:true`, `destination_synced`, `cleanup_complete`, and `warnings`) rather than a false failure.
+- Before/after-boundary fault injection covers tag set/sync, file and signed-directory installation, destination and parent sync, and cleanup. A subprocess exits without destructors after durable pin and after install; reopening verifies the exact inbound tag/hash, raw retry idempotency, and precise crash leftovers. Daemon startup removes only strictly named regular share staging files in its owner-only state root; arbitrary output siblings are not scanned and are documented for manual cleanup.
 
 ### 4. Mutating operations have no end-to-end idempotency — High API reliability gap
 
-- The documented “outcome unknown; do not blindly retry” behavior affects send, share, and private-send.
-- Add client-generated operation IDs and propagate them through HTTP → IPC → daemon → wire.
-- Cache bounded terminal outcomes so reconnects can safely query or retry.
-- Private messages already have wire IDs, but they are generated after each new request; callers cannot safely reuse one after losing the response.
+- [x] **Status: completed with explicit bounded-cache semantics.** CLI and web callers generate or accept reusable lowercase 128-bit operation IDs for broadcast send, attachment share, and private send. IDs propagate through versioned HTTP/IPC DTOs and become the signed broadcast/private/offer wire IDs; incompatible old mutation clients and daemons fail closed through `idempotent_mutations_v1` negotiation.
+- The daemon joins matching concurrent requests, replays matching terminal successes and failures, and rejects cross-kind or changed-input reuse with a structured `operation_id_conflict`. Shares bind both the exact submitted absolute source-path representation and a domain-separated content digest, detecting equal-size content changes. The HTTP bridge uses strict mutation DTOs, preserves authoritative daemon errors exactly, negotiates capability before sends, and retains upload fingerprints for a complete daemon TTL after completion/latest retry. The cache is bounded to 1,024 entries with a 10-minute terminal TTL; oldest terminal entries are evicted under pressure and in-flight entries are retained.
+- The cache is intentionally memory-only. Status and documentation expose that restart, expiry, or eviction ends the sender-side retry guarantee. Browser drafts/file selections retain their ID after unknown outcomes, and private recipients separately persist wire replay IDs. Focused unit tests and `tests/integration-idempotency.sh` cover response loss, concurrent joins, conflicts, terminal failures, stable wire IDs, and restart semantics.
 
 ### 5. Direct-message replay persistence is an availability bottleneck
 
@@ -51,7 +48,7 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 7. The JSON, HTTP, and IPC contracts are only partially versioned
 
-- Peer and attachment records use `schema_version`; status, queued sends, connected events, errors, and several HTTP responses do not.
+- Mutation successes and operation errors are now versioned, but status, connected events, several non-mutation errors, and several HTTP responses remain unversioned.
 - HTTP errors have `outcome` but no stable `code`, version, request ID, or retryability field: `src/web.rs:385-389`.
 - `--json` failures still produce plain text on stderr and nothing on stdout: `src/main.rs:21-24`.
 - Standardize a versioned envelope, for example:
@@ -108,8 +105,7 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 13. No-clobber is not portable to all compiled Unix targets
 
-- `src/attachment.rs:580-583` falls back to `fs::rename` outside Linux, Android, and Windows, which may replace a concurrently created empty directory.
-- Either implement platform-specific no-replace primitives for macOS/BSD or explicitly reject unsupported targets.
+- [x] **Status: completed with an explicit platform limitation.** Extracted-directory installation uses atomic no-replace primitives on Linux, Android, and Windows. Other targets fail closed with an actionable raw-tar alternative; the replacement-capable `fs::rename` fallback was removed. Documentation and a cfg-gated unsupported-target regression test make the limitation explicit.
 
 ### 14. Large modules increase audit and regression risk
 
@@ -134,16 +130,17 @@ These are acceptable for a trusted ephemeral tool, but blockers for a general pr
 Passed locally for these completed findings:
 
 - `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo build --locked`;
-- `cargo test --locked --all-targets`: 150 passed, including EnvelopeV2/replay boundaries and Unix production-listener IPC capacity, ordering, timeout, stop, and shutdown coverage;
-- JavaScript syntax/UI checks, fake-daemon CLI and HTTP integrations, and the real-Iroh peer-directory integration.
+- `cargo test --locked --all-targets`: 161 passed, including EnvelopeV2/replay, IPC capacity, attachment transaction/fault/crash coverage, and operation-cache join/conflict/expiry/eviction behavior;
+- `tests/integration-attachments.sh`: passed with raw/signed file downloads, signed-directory extraction, no-clobber, durability metadata, and inbound-pin restart recovery;
+- `tests/integration-idempotency.sh`, `tests/integration-direct-messages.sh`, `tests/integration-web.py`, `tests/integration-web-peer.py`, and `node tests/web-ui.cjs`: passed with response-loss retries, concurrent duplicate joins, stable wire IDs, conflicts, terminal failures, restart semantics, and HTTP/browser propagation.
 
-Native Windows execution was unavailable locally because the MSVC tools were absent; regular CI now runs the platform-gated named-pipe tests, Clippy, and build on Windows Server 2022. The longer five-peer, attachment, direct-message, web-peer, and version-compatibility scenarios were not rerun locally for this review. `cargo-audit` and `cargo-deny` were unavailable locally and remain CI checks.
+Native Windows execution was unavailable locally. A Windows cross-check was attempted but dependency build scripts stopped before meshmsg compilation because `ml64.exe`/`lib.exe` are unavailable; regular CI runs the platform-gated tests, Clippy, and build on Windows Server 2022. A musl cross-check was likewise blocked before meshmsg compilation by the absent `x86_64-linux-musl-gcc`. Unsupported-target directory-install behavior has cfg-gated test coverage but was not executed locally. The longer five-peer and version-compatibility scenarios were not rerun; native Windows execution remains CI-only. `cargo-audit` and `cargo-deny` were unavailable locally and remain CI checks.
 
 ## Recommended implementation order
 
-1. [ ] Versioned, topic-bound envelope plus operation IDs. **Partially complete:** the versioned/topic-bound/replay-protected envelope is implemented; client-generated operation IDs, end-to-end propagation, and cached terminal outcomes remain outstanding under finding 4.
+1. [x] Versioned, topic-bound envelope plus operation IDs, including bounded concurrent/terminal outcome deduplication and documented nonpersistent retry scope.
 2. [x] Bound and time out daemon IPC connections.
-3. Correct download transaction ordering.
+3. [x] Correct download transaction ordering.
 4. Introduce stable typed API and error contracts.
 5. Add attachment lifecycle and quota controls.
 6. Replace replay JSON rewrites and synchronous logging.

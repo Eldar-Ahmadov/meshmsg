@@ -132,11 +132,17 @@ async fn run() -> Result<()> {
             }
         }
         Command::Stop => node::stop(&dir, cli.json).await?,
-        Command::Send { to, input } => {
+        Command::Send {
+            operation_id,
+            to,
+            input,
+        } => {
             let message = input.into_message()?;
-            node::send_once(&dir, to.as_deref(), &message, cli.json).await?
+            node::send_once(&dir, operation_id, to.as_deref(), &message, cli.json).await?
         }
-        Command::Share { path } => node::share(&dir, &path, cli.json).await?,
+        Command::Share { operation_id, path } => {
+            node::share(&dir, operation_id, &path, cli.json).await?
+        }
         Command::Offers => node::offers(&dir, cli.json).await?,
         Command::Peers => node::peers(&dir, cli.json).await?,
         Command::Download { input, output } => {

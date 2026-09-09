@@ -119,6 +119,14 @@ fn parse_run_id(value: &str) -> std::result::Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
+fn parse_operation_id(value: &str) -> std::result::Result<String, String> {
+    if crate::ipc::valid_operation_id(value) {
+        Ok(value.to_owned())
+    } else {
+        Err("operation ID must contain exactly 32 lowercase hexadecimal characters".into())
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum AliasCommand {
     /// Show the captured hostname, override, and effective advertised alias
@@ -188,6 +196,9 @@ pub enum Command {
     Stop,
     /// Broadcast a message, or send privately with authenticated acceptance acknowledgement
     Send {
+        /// Retry-safe 128-bit operation ID (generated when omitted)
+        #[arg(long, value_parser = parse_operation_id)]
+        operation_id: Option<String>,
         /// Send privately to one canonical public key or uniquely advertised alias
         #[arg(long, value_name = "RECIPIENT")]
         to: Option<String>,
@@ -196,6 +207,9 @@ pub enum Command {
     },
     /// Share a file or a directory snapshot with the topic
     Share {
+        /// Retry-safe 128-bit operation ID (generated when omitted)
+        #[arg(long, value_parser = parse_operation_id)]
+        operation_id: Option<String>,
         /// File or directory to share
         path: PathBuf,
     },
@@ -357,6 +371,20 @@ mod tests {
         assert!(parse(&["alias", "reset-hostname"]).is_ok());
         assert!(parse(&["send", "message"]).is_ok());
         assert!(parse(&["send", "--to", "node-1", "private"]).is_ok());
+        assert!(parse(&[
+            "send",
+            "--operation-id",
+            "0123456789abcdef0123456789abcdef",
+            "message",
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "send",
+            "--operation-id",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "message",
+        ])
+        .is_err());
         assert!(parse(&["send", "--message-file", "message.txt"]).is_ok());
         assert!(parse(&["send", "--message-stdin"]).is_ok());
         assert!(parse(&["share", "file.txt"]).is_ok());

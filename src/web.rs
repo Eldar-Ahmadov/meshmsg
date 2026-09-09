@@ -2,7 +2,7 @@
 //! Host/Origin checks defend browsers, not hostile local or authorized clients.
 use crate::{
     alias::validate_alias,
-    attachment::validate_display_name,
+    attachment::{validate_display_name, AttachmentKind},
     config::prepare_state_dir,
     direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
     ipc::{self, IpcRequest, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY},
@@ -23,6 +23,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use iroh::PublicKey;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -57,6 +58,7 @@ const MAX_DOWNLOAD_OFFERS: usize = 128;
 const MAX_DOWNLOAD_JOBS: usize = 128;
 const MAX_DOWNLOADS: usize = 2;
 const MAX_UPLOADS: usize = 2;
+const MAX_UPLOAD_OPERATIONS: usize = 1024;
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[derive(Clone)]
@@ -82,6 +84,19 @@ enum DownloadJob {
     },
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct UploadFingerprint {
+    name: String,
+    size: u64,
+    digest: [u8; 32],
+}
+
+struct UploadOperation {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    fingerprint: Option<UploadFingerprint>,
+    created: Instant,
+}
+
 struct WebState {
     dir: PathBuf,
     origins: Vec<String>,
@@ -93,7 +108,8 @@ struct WebState {
     jobs: Arc<Mutex<HashMap<String, DownloadJob>>>,
     download_root: PathBuf,
     upload_root: PathBuf,
-    last_send: Mutex<Option<Instant>>,
+    upload_operations: Mutex<HashMap<String, UploadOperation>>,
+    last_send: Mutex<Option<(String, Instant)>>,
 }
 
 fn restrict_download_directory(path: &Path) -> Result<()> {
@@ -204,6 +220,7 @@ impl WebState {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             download_root,
             upload_root,
+            upload_operations: Mutex::new(HashMap::new()),
             last_send: Mutex::new(None),
         })
     }
@@ -230,12 +247,79 @@ impl WebState {
         })
     }
 
-    fn take_send(&self, now: Instant) -> bool {
+    fn upload_operation_gate(
+        &self,
+        operation_id: &str,
+        now: Instant,
+    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        let mut operations = self
+            .upload_operations
+            .lock()
+            .expect("upload operation mutex poisoned");
+        operations.retain(|_, operation| {
+            now.duration_since(operation.created) < DOWNLOAD_TTL
+                || Arc::strong_count(&operation.gate) > 1
+        });
+        if let Some(operation) = operations.get(operation_id) {
+            return Some(operation.gate.clone());
+        }
+        if operations.len() >= MAX_UPLOAD_OPERATIONS {
+            return None;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        operations.insert(
+            operation_id.to_owned(),
+            UploadOperation {
+                gate: gate.clone(),
+                fingerprint: None,
+                created: now,
+            },
+        );
+        Some(gate)
+    }
+
+    fn check_upload_fingerprint(
+        &self,
+        operation_id: &str,
+        fingerprint: UploadFingerprint,
+        now: Instant,
+    ) -> bool {
+        let mut operations = self
+            .upload_operations
+            .lock()
+            .expect("upload operation mutex poisoned");
+        let Some(operation) = operations.get_mut(operation_id) else {
+            return false;
+        };
+        operation.created = now;
+        match &operation.fingerprint {
+            Some(expected) => expected == &fingerprint,
+            None => {
+                operation.fingerprint = Some(fingerprint);
+                true
+            }
+        }
+    }
+
+    fn refresh_upload_operation(&self, operation_id: &str, now: Instant) {
+        if let Some(operation) = self
+            .upload_operations
+            .lock()
+            .expect("upload operation mutex poisoned")
+            .get_mut(operation_id)
+        {
+            operation.created = now;
+        }
+    }
+
+    fn take_send(&self, operation_id: &str, now: Instant) -> bool {
         let mut last = self.last_send.lock().expect("send throttle mutex poisoned");
-        if last.is_some_and(|previous| now.duration_since(previous) < SEND_INTERVAL) {
+        if last.as_ref().is_some_and(|(previous_id, previous)| {
+            previous_id != operation_id && now.duration_since(*previous) < SEND_INTERVAL
+        }) {
             return false;
         }
-        *last = Some(now);
+        *last = Some((operation_id.to_owned(), now));
         true
     }
 
@@ -318,20 +402,125 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum WebRequest {
-    Send { body: String },
+    Send { operation_id: String, body: String },
     Status {},
     Peers {},
     Download { id: String },
     DownloadStatus { id: String },
 }
 
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct MutationErrorDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    code: String,
+    message: String,
+    operation_id: String,
+    retryable: bool,
+    outcome: String,
+}
+
+impl MutationErrorDto {
+    fn parse(value: Value, operation_id: &str) -> Option<Self> {
+        let error: Self = serde_json::from_value(value).ok()?;
+        (error.kind == "error"
+            && error.schema_version == 1
+            && error.operation_id == operation_id
+            && ipc::valid_operation_id(&error.operation_id)
+            && matches!(error.outcome.as_str(), "not_started" | "unknown"))
+        .then_some(error)
+    }
+
+    fn status(&self) -> StatusCode {
+        if self.outcome == "unknown" {
+            StatusCode::BAD_GATEWAY
+        } else if self.code.ends_with("_busy") || self.code == "operation_capacity" {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueuedMutationDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    operation_id: String,
+    from: String,
+    message_id: String,
+    timestamp_ms: u64,
+    body: String,
+    delivery_acknowledged: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedMutationDto {
+    #[serde(rename = "type")]
+    kind: String,
+    schema_version: u8,
+    operation_id: String,
+    from: String,
+    message_id: String,
+    timestamp_ms: u64,
+    offer_id: String,
+    source_digest: String,
+    #[serde(rename = "kind")]
+    kind_name: AttachmentKind,
+    name: String,
+    size: u64,
+    ticket: String,
+    offer: String,
+    delivery_acknowledged: bool,
+}
+
+impl SharedMutationDto {
+    fn parse(
+        value: Value,
+        operation_id: &str,
+        source_digest: &str,
+        name: &str,
+        size: u64,
+    ) -> Option<Self> {
+        let shared: Self = serde_json::from_value(value).ok()?;
+        (shared.kind == "attachment_shared"
+            && shared.schema_version == 3
+            && shared.operation_id == operation_id
+            && shared.message_id == operation_id
+            && shared.offer_id == operation_id
+            && shared.source_digest == source_digest
+            && shared.kind_name == AttachmentKind::File
+            && shared.name == name
+            && shared.size == size
+            && ipc::valid_operation_id(&shared.message_id)
+            && ipc::valid_content_digest(&shared.source_digest)
+            && !shared.from.is_empty()
+            && shared.timestamp_ms != 0
+            && !shared.ticket.is_empty()
+            && !shared.offer.is_empty()
+            && !shared.delivery_acknowledged)
+            .then_some(shared)
+    }
+}
+
 fn parse_request(bytes: &[u8]) -> Result<WebRequest> {
     let request: WebRequest = serde_json::from_slice(bytes)?;
     match &request {
-        WebRequest::Send { body } => anyhow::ensure!(
-            !body.trim().is_empty() && body.len() <= 4096,
-            "body must be nonblank and at most 4096 UTF-8 bytes"
-        ),
+        WebRequest::Send { operation_id, body } => {
+            anyhow::ensure!(
+                ipc::valid_operation_id(operation_id),
+                "invalid operation ID"
+            );
+            anyhow::ensure!(
+                !body.trim().is_empty() && body.len() <= 4096,
+                "body must be nonblank and at most 4096 UTF-8 bytes"
+            )
+        }
         WebRequest::Download { id } | WebRequest::DownloadStatus { id } => {
             anyhow::ensure!(valid_id(id), "invalid download ID")
         }
@@ -401,6 +590,15 @@ fn public_status(value: &Value) -> Value {
     }
     if let Some(neighbors) = value["neighbors"].as_u64() {
         result["neighbors"] = neighbors.into();
+    }
+    if let Some(capacity) = value["operation_cache_capacity"].as_u64() {
+        result["operation_cache_capacity"] = capacity.into();
+    }
+    if let Some(ttl_ms) = value["operation_cache_ttl_ms"].as_u64() {
+        result["operation_cache_ttl_ms"] = ttl_ms.into();
+    }
+    if let Some(persistent) = value["operation_cache_persistent"].as_bool() {
+        result["operation_cache_persistent"] = persistent.into();
     }
     result
 }
@@ -670,6 +868,43 @@ fn download_status(state: &WebState, id: &str) -> Response<Body> {
     }
 }
 
+fn mutation_error_response(error: MutationErrorDto) -> Response<Body> {
+    let status = error.status();
+    json_response(
+        status,
+        serde_json::to_value(error).expect("mutation error DTO serializes"),
+    )
+}
+
+fn local_mutation_error(
+    operation_id: &str,
+    code: &str,
+    message: &str,
+    retryable: bool,
+    outcome: &str,
+) -> MutationErrorDto {
+    MutationErrorDto {
+        kind: "error".into(),
+        schema_version: 1,
+        code: code.into(),
+        message: message.into(),
+        operation_id: operation_id.into(),
+        retryable,
+        outcome: outcome.into(),
+    }
+}
+
+fn daemon_supports_idempotent_mutations(status: &Value) -> bool {
+    status["type"] == "status"
+        && status["ipc_capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| {
+                capabilities.iter().any(|capability| {
+                    capability.as_str() == Some(ipc::IDEMPOTENT_MUTATIONS_CAPABILITY)
+                })
+            })
+}
+
 async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
     let request = match parse_request(bytes) {
         Ok(request) => request,
@@ -689,29 +924,129 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
     };
     let is_send = matches!(&request, WebRequest::Send { .. });
     let is_peers = matches!(&request, WebRequest::Peers {});
-    if is_send && !state.take_send(Instant::now()) {
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "not_sent",
-            "Wait one second before another broadcast.",
-        );
+    if let WebRequest::Send { operation_id, .. } = &request {
+        let negotiated = timeout(
+            IPC_TIMEOUT,
+            ipc::send_request(&state.dir, &IpcRequest::Status),
+        )
+        .await;
+        match negotiated {
+            Ok(Ok(status)) if daemon_supports_idempotent_mutations(&status) => {}
+            Ok(Ok(_)) => {
+                return mutation_error_response(local_mutation_error(
+                    operation_id,
+                    "idempotency_unsupported",
+                    "Daemon does not advertise retry-safe mutations. Upgrade and restart it; the message was not submitted.",
+                    false,
+                    "not_started",
+                ));
+            }
+            _ => {
+                return mutation_error_response(local_mutation_error(
+                    operation_id,
+                    "daemon_unavailable",
+                    "Daemon unavailable during capability negotiation; the message was not submitted.",
+                    true,
+                    "not_started",
+                ));
+            }
+        }
+        if !state.take_send(operation_id, Instant::now()) {
+            let mut response = mutation_error_response(local_mutation_error(
+                operation_id,
+                "send_throttled",
+                "Wait one second before another broadcast.",
+                true,
+                "not_started",
+            ));
+            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            return response;
+        }
     }
+    let send_expected = match &request {
+        WebRequest::Send { operation_id, body } => Some((operation_id.clone(), body.clone())),
+        _ => None,
+    };
     let request = match request {
-        WebRequest::Send { body } => IpcRequest::Send { body },
+        WebRequest::Send { operation_id, body } => IpcRequest::Send { operation_id, body },
         WebRequest::Status {} => IpcRequest::Status,
         WebRequest::Peers {} => IpcRequest::Peers,
         WebRequest::Download { .. } | WebRequest::DownloadStatus { .. } => unreachable!(),
     };
     match timeout(IPC_TIMEOUT, ipc::send_request(&state.dir, &request)).await {
-        Ok(Ok(value)) if value["type"] == "error" => error(StatusCode::UNPROCESSABLE_ENTITY, "not_sent", value["message"].as_str().unwrap_or("Daemon rejected request.")),
-        Ok(Ok(value)) if is_send && value["type"] == "queued" => json_response(StatusCode::OK, json!({"type":"queued", "delivery_acknowledged":false})),
-        Ok(Ok(value)) if !is_send && !is_peers && value["type"] == "status" => json_response(StatusCode::OK, public_status(&value)),
+        Ok(Ok(value)) if is_send && value["type"] == "error" => {
+            let operation_id = &send_expected.as_ref().expect("send metadata exists").0;
+            match MutationErrorDto::parse(value, operation_id) {
+                Some(error) => mutation_error_response(error),
+                None => mutation_error_response(local_mutation_error(
+                    operation_id,
+                    "invalid_daemon_response",
+                    "Daemon returned an invalid mutation error; outcome unknown.",
+                    true,
+                    "unknown",
+                )),
+            }
+        }
+        Ok(Ok(value)) if is_send => {
+            let (operation_id, expected_body) =
+                send_expected.as_ref().expect("send metadata exists");
+            match serde_json::from_value::<QueuedMutationDto>(value) {
+                Ok(queued)
+                    if queued.kind == "queued"
+                        && queued.schema_version == 3
+                        && queued.operation_id == *operation_id
+                        && queued.message_id == *operation_id
+                        && queued.body == *expected_body
+                        && ipc::valid_operation_id(&queued.message_id)
+                        && !queued.from.is_empty()
+                        && queued.timestamp_ms != 0
+                        && !queued.delivery_acknowledged =>
+                {
+                    json_response(
+                        StatusCode::OK,
+                        json!({
+                            "type":"queued", "schema_version":3,
+                            "operation_id":queued.operation_id,
+                            "message_id":queued.message_id,
+                            "delivery_acknowledged":false
+                        }),
+                    )
+                }
+                _ => mutation_error_response(local_mutation_error(
+                    operation_id,
+                    "invalid_daemon_response",
+                    "Daemon returned an invalid queued response; outcome unknown.",
+                    true,
+                    "unknown",
+                )),
+            }
+        }
+        Ok(Ok(value)) if !is_send && !is_peers && value["type"] == "status" => {
+            json_response(StatusCode::OK, public_status(&value))
+        }
         Ok(Ok(value)) if is_peers => match public_peers_snapshot(&value) {
             Some(value) => json_response(StatusCode::OK, value),
-            None => error(StatusCode::BAD_GATEWAY, "offline", "Daemon returned an invalid peer directory."),
+            None => error(
+                StatusCode::BAD_GATEWAY,
+                "offline",
+                "Daemon returned an invalid peer directory.",
+            ),
         },
-        _ if is_send => error(StatusCode::BAD_GATEWAY, "unknown", "Outcome unknown: daemon unavailable or reply lost. It may have queued. Do not blindly resend."),
-        _ => error(StatusCode::SERVICE_UNAVAILABLE, "offline", "Daemon offline or unresponsive. Start or restart it separately."),
+        _ if is_send => {
+            let operation_id = &send_expected.as_ref().expect("send metadata exists").0;
+            mutation_error_response(local_mutation_error(
+                operation_id,
+                "send_outcome_unknown",
+                "Outcome unknown: daemon unavailable or reply lost. Retry unchanged with this operation ID while the same daemon cache is active.",
+                true,
+                "unknown",
+            ))
+        }
+        _ => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "offline",
+            "Daemon offline or unresponsive. Start or restart it separately.",
+        ),
     }
 }
 
@@ -743,12 +1078,13 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
         }
         "queued" => {
             let message_id = value["message_id"].as_str()?;
-            if value["schema_version"] != 2 || !valid_id(message_id) {
+            let operation_id = value["operation_id"].as_str()?;
+            if value["schema_version"] != 3 || !valid_id(message_id) || operation_id != message_id {
                 return None;
             }
             Some(json!({
-                "type":"queued", "schema_version":2, "from":value["from"],
-                "message_id":message_id, "body":value["body"],
+                "type":"queued", "schema_version":3, "from":value["from"],
+                "operation_id":operation_id, "message_id":message_id, "body":value["body"],
                 "timestamp_ms":value["timestamp_ms"], "delivery_acknowledged":false
             }))
         }
@@ -776,12 +1112,14 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
         }
         "attachment_shared" => {
             let message_id = value["message_id"].as_str()?;
-            if value["schema_version"] != 2 || !valid_id(message_id) {
+            let operation_id = value["operation_id"].as_str()?;
+            if value["schema_version"] != 3 || !valid_id(message_id) || operation_id != message_id {
                 return None;
             }
             Some(json!({
-                "type":"attachment_shared", "schema_version":2,
-                "direction":"outgoing", "from":value["from"], "message_id":message_id,
+                "type":"attachment_shared", "schema_version":3,
+                "direction":"outgoing", "from":value["from"],
+                "operation_id":operation_id, "message_id":message_id,
                 "timestamp_ms":value["timestamp_ms"], "name":value["name"],
                 "kind":value["kind"], "size":value["size"]
             }))
@@ -1098,6 +1436,9 @@ fn daemon_supports_web_share(status: &Value) -> Option<u64> {
             values
                 .iter()
                 .any(|value| value.as_str() == Some(WEB_SHARE_CAPABILITY))
+                && values
+                    .iter()
+                    .any(|value| value.as_str() == Some(ipc::IDEMPOTENT_MUTATIONS_CAPABILITY))
         });
     if !supported {
         return None;
@@ -1107,15 +1448,17 @@ fn daemon_supports_web_share(status: &Value) -> Option<u64> {
         .filter(|limit| *limit > 0)
 }
 
-fn compatible_attachment_shared(value: &Value, name: &str, size: u64) -> bool {
-    value["type"] == "attachment_shared"
-        && value["schema_version"] == 2
-        && value["kind"] == "file"
-        && value["name"].as_str() == Some(name)
-        && value["size"].as_u64() == Some(size)
-}
-
 async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> Response<Body> {
+    let Some(operation_id) = single_header(request.headers(), "x-meshmsg-operation-id")
+        .filter(|value| ipc::valid_operation_id(value))
+        .map(str::to_owned)
+    else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "not_shared",
+            "A 32-character lowercase hexadecimal operation ID is required.",
+        );
+    };
     let Some(encoded_name) = single_header(request.headers(), "x-meshmsg-file-name") else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -1193,6 +1536,18 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             "Attachment exceeds the daemon's configured size limit.",
         );
     }
+    let Some(operation_gate) = state.upload_operation_gate(&operation_id, Instant::now()) else {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "type":"error", "schema_version":1,
+                "code":"share_operation_capacity", "outcome":"not_shared",
+                "operation_id":operation_id,
+                "message":"Web attachment operation cache is full."
+            }),
+        );
+    };
+    let _operation_guard = operation_gate.lock().await;
     if touch_download_root(&state.upload_root).is_err() {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1200,7 +1555,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             "Web upload staging is unavailable.",
         );
     }
-    let operation_root = state.upload_root.join(random_id());
+    let operation_root = state.upload_root.join(&operation_id);
     if restrict_download_directory(&operation_root).is_err() {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1208,7 +1563,9 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             "Web upload staging is unavailable.",
         );
     }
-    let path = operation_root.join(&name);
+    // Always receive a retry into a fresh sibling. Only matching bytes are
+    // allowed to reuse the stable source path submitted to the daemon.
+    let retry_path = operation_root.join(format!(".retry-{}", random_id()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1216,10 +1573,10 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = match options.open(&path) {
+    let file = match options.open(&retry_path) {
         Ok(file) => file,
         Err(_) => {
-            let _ = fs::remove_dir_all(&operation_root);
+            let _ = fs::remove_file(&retry_path);
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "not_shared",
@@ -1230,6 +1587,9 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     let receive = async {
         let mut file = tokio::fs::File::from_std(file);
         let mut received = 0_u64;
+        let mut hasher = Sha256::new();
+        hasher.update(b"meshmsg-share-source-v1\0");
+        hasher.update(b"file\0");
         while let Some(frame) = request.body_mut().frame().await {
             let frame = frame.context("read upload body")?;
             let data = frame
@@ -1239,6 +1599,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
                 .checked_add(data.len() as u64)
                 .context("upload size overflow")?;
             anyhow::ensure!(received <= maximum, "upload exceeds size limit");
+            hasher.update(&data);
             file.write_all(&data).await.context("stage upload")?;
         }
         anyhow::ensure!(
@@ -1246,12 +1607,12 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             "incomplete upload"
         );
         file.sync_all().await.context("sync staged upload")?;
-        Result::<u64>::Ok(received)
+        Result::<(u64, [u8; 32])>::Ok((received, hasher.finalize().into()))
     };
-    let received = match timeout(WEB_SHARE_TIMEOUT, receive).await {
-        Ok(Ok(size)) => size,
+    let (received, digest) = match timeout(WEB_SHARE_TIMEOUT, receive).await {
+        Ok(Ok(result)) => result,
         Ok(Err(_)) => {
-            let _ = fs::remove_dir_all(&operation_root);
+            let _ = fs::remove_file(&retry_path);
             return error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "not_shared",
@@ -1259,7 +1620,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             );
         }
         Err(_) => {
-            let _ = fs::remove_dir_all(&operation_root);
+            let _ = fs::remove_file(&retry_path);
             return error(
                 StatusCode::REQUEST_TIMEOUT,
                 "not_shared",
@@ -1267,41 +1628,100 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             );
         }
     };
+    let fingerprint = UploadFingerprint {
+        name: name.clone(),
+        size: received,
+        digest,
+    };
+    if !state.check_upload_fingerprint(&operation_id, fingerprint, Instant::now()) {
+        let _ = fs::remove_file(&retry_path);
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "type":"error", "schema_version":1,
+                "code":"operation_id_conflict", "outcome":"not_started",
+                "retryable":false, "operation_id":operation_id,
+                "message":"operation ID was already used with different attachment input"
+            }),
+        );
+    }
+    let path = operation_root.join(&name);
+    if path.exists() {
+        let _ = fs::remove_file(&retry_path);
+    } else if fs::rename(&retry_path, &path).is_err() {
+        let _ = fs::remove_file(&retry_path);
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "not_shared",
+            "Web upload staging is unavailable.",
+        );
+    }
+    let source_digest = data_encoding::HEXLOWER.encode(&digest);
     let result = timeout(
         WEB_SHARE_TIMEOUT,
-        ipc::send_request(&state.dir, &IpcRequest::Share { path: path.clone() }),
+        ipc::send_request(
+            &state.dir,
+            &IpcRequest::Share {
+                operation_id: operation_id.clone(),
+                source_digest: source_digest.clone(),
+                path: path.clone(),
+            },
+        ),
     )
     .await;
+    // A long upload/share cannot consume the browser-side binding's TTL: its
+    // retention begins again at the latest terminal or unknown outcome.
+    state.refresh_upload_operation(&operation_id, Instant::now());
     match result {
-        Ok(Ok(value)) if compatible_attachment_shared(&value, &name, received) => {
+        Ok(Ok(value)) if value["type"] == "error" => {
             let _ = fs::remove_dir_all(&operation_root);
-            json_response(
-                StatusCode::OK,
-                json!({
-                    "type":"attachment_shared", "name":name, "size":received,
-                    "delivery_acknowledged":false
-                }),
-            )
+            match MutationErrorDto::parse(value, &operation_id) {
+                Some(error) => mutation_error_response(error),
+                None => mutation_error_response(local_mutation_error(
+                    &operation_id,
+                    "invalid_daemon_response",
+                    "Daemon returned an invalid share error; outcome unknown.",
+                    true,
+                    "unknown",
+                )),
+            }
         }
-        Ok(Ok(value)) if value["type"] == "error" && value["code"] == "share_busy" => {
+        Ok(Ok(value)) => {
+            let valid =
+                SharedMutationDto::parse(value, &operation_id, &source_digest, &name, received);
             let _ = fs::remove_dir_all(&operation_root);
-            error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "not_shared",
-                "Daemon attachment sharing is busy.",
-            )
-        }
-        Ok(Ok(_)) => {
-            // `share_failed` can be returned after broadcast was attempted, and a
-            // success-shaped reply is authoritative only when all staged metadata
-            // matches. In both cases a retry could publish a duplicate offer.
-            let _ = fs::remove_dir_all(&operation_root);
-            error(StatusCode::BAD_GATEWAY, "unknown", "Share outcome unknown: the daemon reported a failure or incompatible result after submission. Check the live feed before retrying.")
+            match valid {
+                Some(shared) => json_response(
+                    StatusCode::OK,
+                    json!({
+                        "type":"attachment_shared", "schema_version":3,
+                        "operation_id":shared.operation_id,
+                        "message_id":shared.message_id,
+                        "offer_id":shared.offer_id,
+                        "source_digest":shared.source_digest,
+                        "name":shared.name, "size":shared.size,
+                        "delivery_acknowledged":false
+                    }),
+                ),
+                None => mutation_error_response(local_mutation_error(
+                    &operation_id,
+                    "invalid_daemon_response",
+                    "Daemon returned an invalid share response; outcome unknown.",
+                    true,
+                    "unknown",
+                )),
+            }
         }
         Ok(Err(_)) | Err(_) => {
             // The daemon may still have opened the source or published its offer.
             // Retain the isolated staging directory for stale-startup cleanup.
-            error(StatusCode::BAD_GATEWAY, "unknown", "Share outcome unknown: daemon unavailable or reply lost. Check the live feed before retrying.")
+            mutation_error_response(local_mutation_error(
+                &operation_id,
+                "share_outcome_unknown",
+                "Share outcome unknown: daemon unavailable or reply lost. Retry the unchanged file with this operation ID while the same daemon cache is active.",
+                true,
+                "unknown",
+            ))
         }
     }
 }
@@ -1471,6 +1891,65 @@ mod tests {
     }
 
     #[test]
+    fn upload_fingerprint_ttl_starts_after_long_completion_and_latest_retry() {
+        let state = state();
+        let id = "0123456789abcdef0123456789abcdef";
+        let start = Instant::now();
+        let first_gate = state.upload_operation_gate(id, start).unwrap();
+        let original = UploadFingerprint {
+            name: "same.bin".into(),
+            size: 4,
+            digest: [1; 32],
+        };
+        let changed_same_size = UploadFingerprint {
+            name: "same.bin".into(),
+            size: 4,
+            digest: [2; 32],
+        };
+        let after_long_upload = start + Duration::from_secs(70 * 60);
+        assert!(state.check_upload_fingerprint(id, original, after_long_upload));
+        let completion = after_long_upload + Duration::from_secs(70 * 60);
+        state.refresh_upload_operation(id, completion);
+        drop(first_gate);
+
+        let before_expiry = completion + DOWNLOAD_TTL - Duration::from_millis(1);
+        let retry_gate = state.upload_operation_gate(id, before_expiry).unwrap();
+        assert!(!state.check_upload_fingerprint(id, changed_same_size.clone(), before_expiry));
+        drop(retry_gate);
+        let after_original_expiry = completion + DOWNLOAD_TTL + Duration::from_secs(1);
+        assert!(state
+            .upload_operation_gate(id, after_original_expiry)
+            .is_some());
+        assert!(!state.check_upload_fingerprint(
+            id,
+            changed_same_size.clone(),
+            after_original_expiry,
+        ));
+
+        let after_latest_retry_expiry = before_expiry + DOWNLOAD_TTL + Duration::from_secs(2);
+        assert!(state
+            .upload_operation_gate(id, after_latest_retry_expiry)
+            .is_some());
+        assert!(state.check_upload_fingerprint(id, changed_same_size, after_latest_retry_expiry,));
+    }
+
+    #[test]
+    fn mutation_error_dto_is_strict_and_operation_bound() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let value = json!({
+            "type":"error", "schema_version":1, "code":"send_failed",
+            "message":"unknown", "operation_id":id,
+            "retryable":true, "outcome":"unknown"
+        });
+        let parsed = MutationErrorDto::parse(value.clone(), id).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        let mut extra = value.clone();
+        extra["extra"] = true.into();
+        assert!(MutationErrorDto::parse(extra, id).is_none());
+        assert!(MutationErrorDto::parse(value, "fedcba9876543210fedcba9876543210").is_none());
+    }
+
+    #[test]
     fn host_origin_pairs_are_explicit_and_forwarded_headers_do_not_authorize() {
         let state = state();
         assert!(state.allowed(&headers("127.0.0.1:8787", None), false));
@@ -1550,9 +2029,9 @@ mod tests {
         }
         for value in [
             json!({"command":"status", "body":"ignored"}),
-            json!({"command":"send", "body":" "}),
-            json!({"command":"send", "body":"a", "path":"/etc/passwd"}),
-            json!({"command":"send", "body":"二".repeat(1366)}),
+            json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":" "}),
+            json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"a", "path":"/etc/passwd"}),
+            json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"二".repeat(1366)}),
         ] {
             assert!(parse_request(value.to_string().as_bytes()).is_err());
         }
@@ -1565,7 +2044,7 @@ mod tests {
         .is_ok());
         assert!(parse_request(br#"{"command":"download","id":"../../secret"}"#).is_err());
         assert!(parse_request(
-            json!({"command":"send", "body":"二".repeat(1365)})
+            json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"二".repeat(1365)})
                 .to_string()
                 .as_bytes()
         )
@@ -1666,7 +2145,7 @@ mod tests {
         }
         assert_eq!(
             daemon_supports_web_share(&json!({
-                "type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY],
+                "type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY, ipc::IDEMPOTENT_MUTATIONS_CAPABILITY],
                 "max_attachment_bytes":123
             })),
             Some(123)
@@ -1683,19 +2162,31 @@ mod tests {
 
     #[test]
     fn upload_success_metadata_must_match_the_staged_file() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let digest = "01".repeat(32);
         let valid = json!({
-            "type":"attachment_shared", "schema_version":2,
-            "kind":"file", "name":"report.txt", "size":7
+            "type":"attachment_shared", "schema_version":3,
+            "operation_id":id, "message_id":id, "offer_id":id,
+            "source_digest":digest, "from":"peer", "timestamp_ms":1,
+            "kind":"file", "name":"report.txt", "size":7,
+            "ticket":"ticket", "offer":"offer", "delivery_acknowledged":false
         });
-        assert!(compatible_attachment_shared(&valid, "report.txt", 7));
-        for mismatch in [
-            json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"report.txt", "size":7}),
-            json!({"type":"attachment_shared", "schema_version":2, "kind":"directory_tar_v1", "name":"report.txt", "size":7}),
-            json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"other.txt", "size":7}),
-            json!({"type":"attachment_shared", "schema_version":1, "kind":"file", "name":"report.txt", "size":8}),
+        assert!(SharedMutationDto::parse(valid.clone(), id, &digest, "report.txt", 7).is_some());
+        for (field, replacement) in [
+            ("operation_id", json!("fedcba9876543210fedcba9876543210")),
+            ("message_id", json!("fedcba9876543210fedcba9876543210")),
+            ("offer_id", json!("fedcba9876543210fedcba9876543210")),
+            ("source_digest", json!("02".repeat(32))),
+            ("name", json!("other.txt")),
+            ("size", json!(8)),
         ] {
-            assert!(!compatible_attachment_shared(&mismatch, "report.txt", 7));
+            let mut mismatch = valid.clone();
+            mismatch[field] = replacement;
+            assert!(SharedMutationDto::parse(mismatch, id, &digest, "report.txt", 7).is_none());
         }
+        let mut extra = valid;
+        extra["extra"] = true.into();
+        assert!(SharedMutationDto::parse(extra, id, &digest, "report.txt", 7).is_none());
     }
 
     #[test]
@@ -1722,10 +2213,12 @@ mod tests {
     fn sends_are_globally_throttled_without_automatic_retries() {
         let state = state();
         let now = Instant::now();
-        assert!(state.take_send(now));
-        assert!(!state.take_send(now));
-        assert!(!state.take_send(now + Duration::from_millis(999)));
-        assert!(state.take_send(now + SEND_INTERVAL));
+        let first = "0123456789abcdef0123456789abcdef";
+        let second = "fedcba9876543210fedcba9876543210";
+        assert!(state.take_send(first, now));
+        assert!(state.take_send(first, now));
+        assert!(!state.take_send(second, now + Duration::from_millis(999)));
+        assert!(state.take_send(second, now + SEND_INTERVAL));
     }
 
     #[test]
@@ -1768,7 +2261,8 @@ mod tests {
             })
         );
         let outgoing = public_event(json!({
-            "type":"attachment_shared", "schema_version":2,
+            "type":"attachment_shared", "schema_version":3,
+            "operation_id":"02020202020202020202020202020202",
             "message_id":"02020202020202020202020202020202",
             "from":"local", "timestamp_ms":43,
             "name":"folder.tar", "kind":"directory_tar_v1", "size":5678,
@@ -1778,8 +2272,9 @@ mod tests {
         assert_eq!(
             outgoing,
             json!({
-                "type":"attachment_shared", "schema_version":2,
+                "type":"attachment_shared", "schema_version":3,
                 "direction":"outgoing", "from":"local",
+                "operation_id":"02020202020202020202020202020202",
                 "message_id":"02020202020202020202020202020202",
                 "timestamp_ms":43, "name":"folder.tar", "kind":"directory_tar_v1", "size":5678
             })
@@ -1836,7 +2331,8 @@ mod tests {
         assert_eq!(frame.lines().count(), 2);
         assert!(!frame.contains("secret"));
         let queued = public_event(json!({
-            "type":"queued", "schema_version":2,
+            "type":"queued", "schema_version":3,
+            "operation_id":"04040404040404040404040404040404",
             "message_id":"04040404040404040404040404040404",
             "from":"local", "body":"hello", "timestamp_ms":42,
             "delivery_acknowledged":true, "private":"secret"
@@ -1845,7 +2341,8 @@ mod tests {
         assert_eq!(
             queued,
             json!({
-                "type":"queued", "schema_version":2,
+                "type":"queued", "schema_version":3,
+                "operation_id":"04040404040404040404040404040404",
                 "message_id":"04040404040404040404040404040404",
                 "from":"local", "body":"hello", "timestamp_ms":42,
                 "delivery_acknowledged":false

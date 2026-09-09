@@ -620,7 +620,18 @@ struct DirectFrame {
 }
 
 impl DirectFrame {
+    #[cfg(test)]
     fn new(secret: &SecretKey, recipient: PublicKey, topic: TopicId, body: String) -> Result<Self> {
+        Self::new_with_id(secret, recipient, topic, body, rand::random())
+    }
+
+    fn new_with_id(
+        secret: &SecretKey,
+        recipient: PublicKey,
+        topic: TopicId,
+        body: String,
+        id: [u8; 16],
+    ) -> Result<Self> {
         anyhow::ensure!(!body.is_empty(), "private message cannot be empty");
         anyhow::ensure!(
             body.len() <= MAX_BODY_BYTES,
@@ -631,7 +642,7 @@ impl DirectFrame {
             sender: secret.public(),
             recipient,
             topic,
-            id: rand::random(),
+            id,
             timestamp_ms: now_ms()?,
             body,
         };
@@ -935,9 +946,10 @@ pub(crate) async fn send(
     topic: TopicId,
     address: EndpointAddr,
     body: String,
+    operation_id: [u8; 16],
 ) -> Result<AcceptedDirect> {
     validate_endpoint_addr(&address, address.id)?;
-    let frame = DirectFrame::new(&secret, address.id, topic, body)?;
+    let frame = DirectFrame::new_with_id(&secret, address.id, topic, body, operation_id)?;
     let encoded = frame.encode()?;
     let body_bytes = frame.payload.body.len();
     let recipient = frame.payload.recipient;

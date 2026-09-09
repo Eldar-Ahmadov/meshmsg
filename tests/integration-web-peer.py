@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real two-peer web receipt check. Requires working Iroh networking; no Tailscale changes."""
 import contextlib
+import hashlib
 import http.client
 import io
 import json
@@ -77,15 +78,28 @@ def main():
                 conn.close()
                 return result
 
-            def upload(name, payload):
+            operation_counter = 0
+            def operation_id():
+                nonlocal operation_counter
+                operation_counter += 1
+                return f'{operation_counter:032x}'
+
+            def upload(name, payload, op_id=None):
+                op_id = op_id or operation_id()
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
                 conn.request('POST', '/api/attachment', payload, {
                     'Origin': origin, 'Content-Type': 'application/octet-stream',
-                    'X-Meshmsg-File-Name': urllib.parse.quote(name, safe="~()*!.'-")})
+                    'X-Meshmsg-File-Name': urllib.parse.quote(name, safe="~()*!.'-"),
+                    'X-Meshmsg-Operation-Id': op_id})
                 response = conn.getresponse()
                 result = response.status, json.loads(response.read())
                 conn.close()
-                return result
+                return result, op_id
+
+            def submit_without_reply(value):
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(str(root / 'one' / 'daemon.sock'))
+                    client.sendall(json.dumps(value).encode() + b'\n')
 
             def get(path):
                 conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
@@ -156,8 +170,12 @@ def main():
                 assert event(feed)['type'] == 'connected'
                 assert_peer_snapshot(event(feed))
             marker = f'web-peer-receipt-{time.time_ns()}'
-            code, queued = post({'command': 'send', 'body': marker})
-            assert code == 200 and queued == {'type': 'queued', 'delivery_acknowledged': False}
+            send_operation_id = operation_id()
+            code, queued = post({'command': 'send', 'operation_id': send_operation_id, 'body': marker})
+            assert code == 200 and queued == {
+                'type': 'queued', 'schema_version': 3,
+                'operation_id': send_operation_id, 'message_id': send_operation_id,
+                'delivery_acknowledged': False}
             canonical = None
             for feed, _ in feeds:
                 local = event(feed)
@@ -170,10 +188,30 @@ def main():
             wait_for(lambda: marker in pathlib.Path(peer_log.name).read_text(), 'web broadcast received on distinct peer', 30)
             received = [json.loads(line) for line in pathlib.Path(peer_log.name).read_text().splitlines() if marker in line]
             remote = next(value for value in received if value['type'] == 'message' and value['body'] == marker)
-            assert canonical['schema_version'] == remote['schema_version'] == 2
-            assert canonical['message_id'] == remote['message_id']
+            assert canonical['schema_version'] == 3 and remote['schema_version'] == 2
+            assert canonical['operation_id'] == canonical['message_id'] == remote['message_id']
             assert remote['from'] == canonical['from']
             assert remote['timestamp_ms'] == canonical['timestamp_ms']
+
+            # Lose the local IPC response, then recover the real daemon's cached
+            # terminal success through HTTP without another wire delivery.
+            lost_operation_id = operation_id()
+            lost_body = marker + '-lost-ipc-reply'
+            submit_without_reply({
+                'command': 'send', 'operation_id': lost_operation_id,
+                'body': lost_body})
+            wait_for(lambda: lost_body in pathlib.Path(peer_log.name).read_text(),
+                     'lost-response broadcast', 30)
+            time.sleep(1.05)
+            code, recovered = post({
+                'command': 'send', 'operation_id': lost_operation_id,
+                'body': lost_body})
+            assert code == 200 and recovered['operation_id'] == lost_operation_id
+            time.sleep(1)
+            assert pathlib.Path(peer_log.name).read_text().count(lost_body) == 1
+            for feed, _ in feeds:
+                local = event(feed)
+                assert local['type'] == 'queued' and local['body'] == lost_body
 
             local_cli = marker + '-local-cli'
             assert cli('one', 'send', local_cli)['type'] == 'queued'
@@ -183,15 +221,22 @@ def main():
 
             attachment_name = 'web-attachment.txt'
             attachment_payload = b'real web attachment upload\n'
-            code, shared_reply = upload(attachment_name, attachment_payload)
+            (code, shared_reply), share_operation_id = upload(attachment_name, attachment_payload)
+            share_digest = hashlib.sha256(
+                b'meshmsg-share-source-v1\0file\0' + attachment_payload).hexdigest()
             assert code == 200 and shared_reply == {
-                'type': 'attachment_shared', 'name': attachment_name,
+                'type': 'attachment_shared', 'schema_version': 3,
+                'operation_id': share_operation_id,
+                'message_id': share_operation_id, 'offer_id': share_operation_id,
+                'source_digest': share_digest, 'name': attachment_name,
                 'size': len(attachment_payload), 'delivery_acknowledged': False}
             safe_shared = None
             for feed, _ in feeds:
                 local = event(feed)
-                assert set(local) == {'type', 'schema_version', 'message_id', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
-                assert local['type'] == 'attachment_shared' and local['direction'] == 'outgoing'
+                assert set(local) == {'type', 'schema_version', 'operation_id', 'message_id', 'direction', 'from', 'timestamp_ms', 'name', 'kind', 'size'}
+                assert local['type'] == 'attachment_shared' and local['schema_version'] == 3
+                assert local['operation_id'] == local['message_id'] == share_operation_id
+                assert local['direction'] == 'outgoing'
                 assert local['name'] == attachment_name and local['kind'] == 'file'
                 assert local['size'] == len(attachment_payload) and isinstance(local['timestamp_ms'], int)
                 if safe_shared is None:
@@ -210,6 +255,32 @@ def main():
             downloaded = cli('two', 'download', '--offer-file', str(offer_file), '--output', str(received_upload))
             assert downloaded['type'] == 'download_complete'
             assert received_upload.read_bytes() == attachment_payload
+
+            # A real daemon conflict (not the bridge's local fingerprint check)
+            # must cross IPC and HTTP without being rewritten as unknown.
+            conflict_path = root / 'http-conflict.txt'
+            conflict_payload = b'real daemon attachment conflict\n'
+            conflict_path.write_bytes(conflict_payload)
+            conflict_operation_id = operation_id()
+            shared_cli = cli(
+                'one', 'share', '--operation-id', conflict_operation_id,
+                str(conflict_path))
+            assert shared_cli['operation_id'] == conflict_operation_id
+            for feed, _ in feeds:
+                local = event(feed)
+                assert local['type'] == 'attachment_shared'
+                assert local['operation_id'] == conflict_operation_id
+            (code, conflict), _ = upload(
+                conflict_path.name, conflict_payload, conflict_operation_id)
+            assert code == 422 and conflict == {
+                'type': 'error', 'schema_version': 1,
+                'code': 'operation_id_conflict',
+                'operation_id': conflict_operation_id,
+                'message': 'operation ID was already used with different inputs',
+                'outcome': 'not_started', 'retryable': False}
+            (retry_code, retry_conflict), _ = upload(
+                conflict_path.name, conflict_payload, conflict_operation_id)
+            assert retry_code == code and retry_conflict == conflict
 
             reverse_attachment_path = root / 'reverse-attachment.txt'
             reverse_attachment_path.write_text('reverse real attachment metadata\n')

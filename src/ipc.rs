@@ -15,6 +15,25 @@ pub(crate) const MAX_IPC_EVENT_SIZE: usize = 512 * 1024;
 pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v1";
 pub(crate) const WEB_DOWNLOAD_CAPABILITY: &str = "web_download_v1";
 pub(crate) const WEB_SHARE_CAPABILITY: &str = "web_share_v1";
+pub(crate) const IDEMPOTENT_MUTATIONS_CAPABILITY: &str = "idempotent_mutations_v1";
+
+pub(crate) fn valid_operation_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn valid_content_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn new_operation_id() -> String {
+    data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BenchConfig {
@@ -28,9 +47,11 @@ pub(crate) struct BenchConfig {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum IpcRequest {
     Send {
+        operation_id: String,
         body: String,
     },
     PrivateSend {
+        operation_id: String,
         to: String,
         body: String,
     },
@@ -42,6 +63,8 @@ pub(crate) enum IpcRequest {
     Peers,
     Offers,
     Share {
+        operation_id: String,
+        source_digest: String,
         path: PathBuf,
     },
     Download {
@@ -389,15 +412,17 @@ mod tests {
         write_request(
             &mut bytes,
             &IpcRequest::Send {
+                operation_id: "0123456789abcdef0123456789abcdef".into(),
                 body: "a\nb".into(),
             },
         )
         .await
         .unwrap();
-        assert_eq!(bytes, b"{\"command\":\"send\",\"body\":\"a\\nb\"}\n");
+        assert_eq!(bytes, b"{\"command\":\"send\",\"operation_id\":\"0123456789abcdef0123456789abcdef\",\"body\":\"a\\nb\"}\n");
         assert!(write_request(
             &mut bytes,
             &IpcRequest::Send {
+                operation_id: "0123456789abcdef0123456789abcdef".into(),
                 body: "x".repeat(MAX_IPC_REQUEST_SIZE),
             }
         )
@@ -445,6 +470,7 @@ mod tests {
         write_request(
             &mut bytes,
             &IpcRequest::PrivateSend {
+                operation_id: "0123456789abcdef0123456789abcdef".into(),
                 to: "peer".into(),
                 body: "private text".into(),
             },
@@ -453,7 +479,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             bytes,
-            b"{\"command\":\"private_send\",\"to\":\"peer\",\"body\":\"private text\"}\n"
+            b"{\"command\":\"private_send\",\"operation_id\":\"0123456789abcdef0123456789abcdef\",\"to\":\"peer\",\"body\":\"private text\"}\n"
         );
 
         #[allow(dead_code)]
@@ -471,10 +497,14 @@ mod tests {
     fn ambiguous_legacy_send_with_recipient_is_rejected() {
         let ambiguous = br#"{"command":"send","body":"private text","to":"peer"}"#;
         assert!(serde_json::from_slice::<IpcRequest>(ambiguous).is_err());
-        assert!(matches!(
+        assert!(
             serde_json::from_slice::<IpcRequest>(br#"{"command":"send","body":"broadcast"}"#)
+                .is_err()
+        );
+        assert!(matches!(
+            serde_json::from_slice::<IpcRequest>(br#"{"command":"send","operation_id":"0123456789abcdef0123456789abcdef","body":"broadcast"}"#)
                 .unwrap(),
-            IpcRequest::Send { body } if body == "broadcast"
+            IpcRequest::Send { body, .. } if body == "broadcast"
         ));
     }
 }

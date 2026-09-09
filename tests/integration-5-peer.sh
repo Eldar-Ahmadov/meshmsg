@@ -101,8 +101,8 @@ M2="integration-c2-$(date +%s%N)"
 printf '%s' "$M1" >"$ROOT/message.txt"
 Q1=$("$BIN" --state-dir "$ROOT/c1" --json send --message-file "$ROOT/message.txt")
 Q2=$(printf '%s' "$M2" | "$BIN" --state-dir "$ROOT/c2" --json send --message-stdin)
-python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["schema_version"] == 2 and len(v["message_id"]) == 32' "$Q1"
-python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["schema_version"] == 2 and len(v["message_id"]) == 32' "$Q2"
+python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["schema_version"] == 3 and v["operation_id"] == v["message_id"] and len(v["message_id"]) == 32' "$Q1"
+python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["schema_version"] == 3 and v["operation_id"] == v["message_id"] and len(v["message_id"]) == 32' "$Q2"
 wait_log 30 "$ROOT/c2.listen.log" "\"body\":\"$M1\""
 wait_log 30 "$ROOT/c1.listen.log" "\"body\":\"$M2\""
 python3 - "$Q1" "$Q2" "$ROOT/c2.listen.log" "$ROOT/c1.listen.log" <<'PY'

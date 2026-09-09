@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, Metadata, OpenOptions},
@@ -253,8 +254,8 @@ fn collect_entries(
 }
 
 #[cfg(unix)]
-fn append_directory_from_handle(
-    builder: &mut tar::Builder<File>,
+fn append_directory_from_handle<W: Write>(
+    builder: &mut tar::Builder<W>,
     directory: &File,
     prefix: &Path,
     count: &mut usize,
@@ -367,17 +368,12 @@ fn normalized_header(path: &str, size: u64, directory: bool) -> Result<tar::Head
     Ok(header)
 }
 
-pub fn create_deterministic_tar(
+fn write_deterministic_tar<W: Write>(
     source: &Path,
-    output: &Path,
+    writer: W,
     max_attachment_bytes: u64,
-) -> Result<u64> {
-    let output_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(output)
-        .with_context(|| format!("create staging archive {}", output.display()))?;
-    let mut builder = tar::Builder::new(output_file);
+) -> Result<W> {
+    let mut builder = tar::Builder::new(writer);
     builder.mode(tar::HeaderMode::Deterministic);
 
     #[cfg(unix)]
@@ -446,7 +442,20 @@ pub fn create_deterministic_tar(
     }
 
     builder.finish()?;
-    let file = builder.into_inner()?;
+    Ok(builder.into_inner()?)
+}
+
+pub fn create_deterministic_tar(
+    source: &Path,
+    output: &Path,
+    max_attachment_bytes: u64,
+) -> Result<u64> {
+    let output_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(output)
+        .with_context(|| format!("create staging archive {}", output.display()))?;
+    let file = write_deterministic_tar(source, output_file, max_attachment_bytes)?;
     file.sync_all()?;
     let size = file.metadata()?.len();
     anyhow::ensure!(
@@ -455,6 +464,99 @@ pub fn create_deterministic_tar(
         max_attachment_bytes
     );
     Ok(size)
+}
+
+struct DigestWriter {
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl Write for DigestWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.digest.update(buffer);
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::other("digest size overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn regular_file_digest(
+    source: &Path,
+    kind_domain: &[u8],
+    max_attachment_bytes: u64,
+) -> Result<String> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspect shared path {}", source.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "shared path is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= max_attachment_bytes,
+        "file exceeds the {}-byte limit",
+        max_attachment_bytes
+    );
+    let mut writer = DigestWriter {
+        digest: Sha256::new(),
+        bytes: 0,
+    };
+    writer.digest.update(b"meshmsg-share-source-v1\0");
+    writer.digest.update(kind_domain);
+    let (mut file, before) = open_regular_file_no_follow(source)?;
+    anyhow::ensure!(before.len() == metadata.len(), "file changed while hashing");
+    io::copy(&mut file, &mut writer)?;
+    anyhow::ensure!(
+        writer.bytes == metadata.len() && file.metadata()?.len() == metadata.len(),
+        "file changed while hashing"
+    );
+    Ok(data_encoding::HEXLOWER.encode(&writer.digest.finalize()))
+}
+
+pub fn staged_share_digest(
+    staged: &Path,
+    directory: bool,
+    max_attachment_bytes: u64,
+) -> Result<String> {
+    regular_file_digest(
+        staged,
+        if directory {
+            b"directory_tar_v1\0"
+        } else {
+            b"file\0"
+        },
+        max_attachment_bytes,
+    )
+}
+
+pub fn share_source_digest(source: &Path, max_attachment_bytes: u64) -> Result<String> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspect shared path {}", source.display()))?;
+    if metadata.is_file() && !metadata.file_type().is_symlink() {
+        return regular_file_digest(source, b"file\0", max_attachment_bytes);
+    }
+    let mut writer = DigestWriter {
+        digest: Sha256::new(),
+        bytes: 0,
+    };
+    writer.digest.update(b"meshmsg-share-source-v1\0");
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        writer.digest.update(b"directory_tar_v1\0");
+        writer = write_deterministic_tar(source, writer, max_attachment_bytes)?;
+        anyhow::ensure!(
+            writer.bytes <= max_attachment_bytes,
+            "archive exceeds the {}-byte limit",
+            max_attachment_bytes
+        );
+    } else {
+        anyhow::bail!("shared path is not a regular file or directory");
+    }
+    Ok(data_encoding::HEXLOWER.encode(&writer.digest.finalize()))
 }
 
 fn unique_staging_path(parent: &Path, suffix: &str) -> PathBuf {
@@ -471,31 +573,102 @@ fn unique_staging_path(parent: &Path, suffix: &str) -> PathBuf {
 
 pub fn staging_file_near(destination: &Path, suffix: &str) -> Result<PathBuf> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create output parent {}", parent.display()))?;
+    let metadata = fs::metadata(parent)
+        .with_context(|| format!("output parent does not exist: {}", parent.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "output parent is not a directory: {}",
+        parent.display()
+    );
     Ok(unique_staging_path(parent, suffix))
 }
 
+fn state_staging_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".meshmsg-part-") else {
+        return false;
+    };
+    let Some((id, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    id.len() == 16
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && matches!(suffix, "blob" | "tar")
+}
+
+/// Removes only regular share-staging files in meshmsg's owner-only state root.
+/// Arbitrary output directories are intentionally never scanned.
+pub fn cleanup_stale_state_staging(state_dir: &Path) -> Result<usize> {
+    let mut removed = 0;
+    for item in fs::read_dir(state_dir)
+        .with_context(|| format!("inspect state staging in {}", state_dir.display()))?
+    {
+        let item = item?;
+        let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !state_staging_name(&name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(item.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        fs::remove_file(item.path())
+            .with_context(|| format!("remove stale state staging file {name}"))?;
+        removed += 1;
+    }
+    if removed != 0 {
+        sync_directory(state_dir)?;
+    }
+    Ok(removed)
+}
+
 /// Owns a staging path so detached blocking work cleans up its output on drop.
-pub struct StagedFile(PathBuf);
+pub struct StagedFile(Option<PathBuf>);
 
 impl StagedFile {
     pub fn new(path: PathBuf) -> Self {
-        Self(path)
+        Self(Some(path))
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
+        self.0.as_deref().expect("staged file path was consumed")
+    }
+
+    /// Removes the staging name after the destination has committed.
+    pub fn cleanup(mut self) -> Result<()> {
+        let path = self.0.take().expect("staged file path was consumed");
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Restore ownership so Drop performs one final best-effort retry.
+                self.0 = Some(path.clone());
+                Err(error).with_context(|| format!("remove staging file {}", path.display()))
+            }
+        }
     }
 }
 
 impl Drop for StagedFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
-pub fn install_file_no_clobber(staging: &Path, destination: &Path) -> Result<()> {
+/// Flushes an exported file before it participates in the durable commit.
+pub fn sync_staged_file(staging: &Path) -> Result<()> {
+    File::open(staging)
+        .with_context(|| format!("open staged output {}", staging.display()))?
+        .sync_all()
+        .with_context(|| format!("sync staged output {}", staging.display()))
+}
+
+/// Atomically creates the destination name without removing the staging name.
+pub fn link_file_no_clobber(staging: &Path, destination: &Path) -> Result<()> {
     anyhow::ensure!(
         !destination.exists(),
         "output already exists: {}",
@@ -506,14 +679,7 @@ pub fn install_file_no_clobber(staging: &Path, destination: &Path) -> Result<()>
             "install output without overwriting {}",
             destination.display()
         )
-    })?;
-    fs::remove_file(staging).context("remove staging file")?;
-    Ok(())
-}
-
-/// Installs an owned download staging file and cleans it on every exit path.
-pub fn install_staged_file_no_clobber(staging: StagedFile, destination: &Path) -> Result<()> {
-    install_file_no_clobber(staging.path(), destination)
+    })
 }
 
 struct RemoveOnDrop(PathBuf);
@@ -569,7 +735,13 @@ fn rename_directory_no_replace(staging: &Path, destination: &Path) -> Result<()>
             .collect();
         // Unlike std::fs::rename on Windows, omitting MOVEFILE_REPLACE_EXISTING
         // fails atomically when the destination already exists.
-        let result = unsafe { MoveFileExW(staging_wide.as_ptr(), destination_wide.as_ptr(), 0) };
+        let result = unsafe {
+            MoveFileExW(
+                staging_wide.as_ptr(),
+                destination_wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
         if result == 0 {
             return Err(io::Error::last_os_error())
                 .with_context(|| format!("install extracted directory {}", destination.display()));
@@ -579,8 +751,10 @@ fn rename_directory_no_replace(staging: &Path, destination: &Path) -> Result<()>
 
     #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
     {
-        fs::rename(staging, destination)
-            .with_context(|| format!("install extracted directory {}", destination.display()))
+        let _ = staging;
+        anyhow::bail!(
+            "atomic no-replace directory installation is unsupported on this target; download the raw tar instead"
+        )
     }
 }
 
@@ -618,8 +792,13 @@ pub fn extract_tar_no_clobber(
         destination.display()
     );
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create output parent {}", parent.display()))?;
+    let parent_metadata = fs::metadata(parent)
+        .with_context(|| format!("output parent does not exist: {}", parent.display()))?;
+    anyhow::ensure!(
+        parent_metadata.is_dir(),
+        "output parent is not a directory: {}",
+        parent.display()
+    );
     let staging = unique_staging_path(parent, "");
     fs::create_dir(&staging).context("create extraction staging directory")?;
     let guard = RemoveOnDrop(staging.clone());
@@ -667,6 +846,10 @@ pub fn extract_tar_no_clobber(
             output.sync_all()?;
         }
     }
+    // Files were synced as they were extracted. Sync every staging directory
+    // before its root is atomically renamed so the installed tree is not only
+    // namespace-atomic but also crash durable when the platform supports it.
+    sync_directory_tree(&staging)?;
     anyhow::ensure!(
         !destination.exists(),
         "output already exists: {}",
@@ -679,11 +862,83 @@ pub fn extract_tar_no_clobber(
 
 /// Extracts an owned download staging archive and cleans it on every exit path.
 pub fn extract_staged_tar_no_clobber(
-    staging: StagedFile,
+    staging: &StagedFile,
     destination: &Path,
     max_attachment_bytes: u64,
 ) -> Result<()> {
     extract_tar_no_clobber(staging.path(), destination, max_attachment_bytes)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("open directory for sync {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    OpenOptions::new()
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .with_context(|| format!("open directory for sync {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))
+}
+
+fn sync_directory_tree(root: &Path) -> Result<()> {
+    for entry in fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))? {
+        let path = entry?.path();
+        if fs::symlink_metadata(&path)?.is_dir() {
+            sync_directory_tree(&path)?;
+        }
+    }
+    sync_directory(root)
+}
+
+#[cfg(not(windows))]
+fn sync_installed_file(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("open installed output {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync installed output {}", path.display()))
+}
+
+#[cfg(windows)]
+fn sync_installed_file(path: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    // FlushFileBuffers requires write access even though no content is changed.
+    OpenOptions::new()
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .with_context(|| format!("open installed output {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync installed output {}", path.display()))
+}
+
+/// Flushes installed content after the atomic no-clobber operation.
+pub fn sync_installed_destination(destination: &Path, directory: bool) -> Result<()> {
+    if directory {
+        sync_directory(destination)
+    } else {
+        sync_installed_file(destination)
+    }
+}
+
+/// Flushes the existing parent whose namespace gained the destination entry.
+pub fn sync_output_parent(destination: &Path) -> Result<()> {
+    sync_directory(destination.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 pub fn file_name(path: &Path, directory: bool) -> Result<String> {
@@ -762,6 +1017,40 @@ mod tests {
     }
 
     #[test]
+    fn share_source_digest_is_kind_bound_deterministic_and_content_sensitive() {
+        let root = temp_dir("share-digest");
+        let file = root.join("same.bin");
+        fs::write(&file, b"aaaa").unwrap();
+        let first = share_source_digest(&file, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(
+            first,
+            share_source_digest(&file, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap()
+        );
+        fs::write(&file, b"bbbb").unwrap();
+        let changed = share_source_digest(&file, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
+        assert_ne!(first, changed, "equal-size content change was not detected");
+
+        let directory = root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("same.bin"), b"bbbb").unwrap();
+        let directory_digest =
+            share_source_digest(&directory, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
+        assert_ne!(
+            changed, directory_digest,
+            "source kind was not digest-bound"
+        );
+        let archive = root.join("directory.tar");
+        create_deterministic_tar(&directory, &archive, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
+        assert_eq!(
+            directory_digest,
+            staged_share_digest(&archive, true, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap(),
+            "directory source and staged archive digests diverged"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn extraction_rejects_traversal_and_leaves_destination_absent() {
         let root = temp_dir("unsafe-tar");
         let tar_path = root.join("bad.tar");
@@ -802,13 +1091,58 @@ mod tests {
     }
 
     #[test]
+    fn staging_and_extraction_require_an_existing_output_parent() {
+        let root = temp_dir("missing-output-parent");
+        let destination = root.join("missing").join("out");
+        assert!(staging_file_near(&destination, ".download")
+            .unwrap_err()
+            .to_string()
+            .contains("output parent does not exist"));
+
+        let archive = root.join("empty.tar");
+        let file = File::create(&archive).unwrap();
+        tar::Builder::new(file).finish().unwrap();
+        assert!(
+            extract_tar_no_clobber(&archive, &destination, DEFAULT_MAX_ATTACHMENT_BYTES)
+                .unwrap_err()
+                .to_string()
+                .contains("output parent does not exist")
+        );
+        assert!(!root.join("missing").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_state_recovery_removes_only_owned_regular_share_staging() {
+        let root = temp_dir("stale-state-staging");
+        let stale_blob = root.join(".meshmsg-part-0123456789abcdef.blob");
+        let stale_tar = root.join(".meshmsg-part-fedcba9876543210.tar");
+        let download = root.join(".meshmsg-part-0123456789abcdef.download");
+        let malformed = root.join(".meshmsg-part-NOT-OURS.blob");
+        let directory = root.join(".meshmsg-part-aaaaaaaaaaaaaaaa.blob");
+        for path in [&stale_blob, &stale_tar, &download, &malformed] {
+            fs::write(path, b"stale").unwrap();
+        }
+        fs::create_dir(&directory).unwrap();
+
+        assert_eq!(cleanup_stale_state_staging(&root).unwrap(), 2);
+        assert!(!stale_blob.exists());
+        assert!(!stale_tar.exists());
+        assert!(download.exists());
+        assert!(malformed.exists());
+        assert!(directory.is_dir());
+        assert_eq!(cleanup_stale_state_staging(&root).unwrap(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn install_file_refuses_existing_destination() {
         let root = temp_dir("existing-file-output");
         let staging = root.join("staging");
         let destination = root.join("out");
         fs::write(&staging, b"new").unwrap();
         fs::write(&destination, b"keep").unwrap();
-        assert!(install_file_no_clobber(&staging, &destination).is_err());
+        assert!(link_file_no_clobber(&staging, &destination).is_err());
         assert_eq!(fs::read(destination).unwrap(), b"keep");
         assert_eq!(fs::read(staging).unwrap(), b"new");
         let _ = fs::remove_dir_all(root);
@@ -825,6 +1159,20 @@ mod tests {
         assert!(rename_directory_no_replace(&staging, &destination).is_err());
         assert!(staging.join("file").exists());
         assert!(destination.read_dir().unwrap().next().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    #[test]
+    fn unsupported_directory_install_target_fails_closed() {
+        let root = temp_dir("unsupported-directory-install");
+        let staging = root.join("staging");
+        let destination = root.join("out");
+        fs::create_dir(&staging).unwrap();
+        let error = rename_directory_no_replace(&staging, &destination).unwrap_err();
+        assert!(error.to_string().contains("unsupported on this target"));
+        assert!(staging.is_dir());
+        assert!(!destination.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -903,20 +1251,18 @@ mod tests {
         fs::write(&staging, b"new").unwrap();
         fs::write(&destination, b"keep").unwrap();
 
-        assert!(
-            install_staged_file_no_clobber(StagedFile::new(staging.clone()), &destination).is_err()
-        );
+        let guard = StagedFile::new(staging.clone());
+        assert!(link_file_no_clobber(guard.path(), &destination).is_err());
+        drop(guard);
         assert!(!staging.exists());
         assert_eq!(fs::read(destination).unwrap(), b"keep");
 
         let successful_staging = root.join("successful.download");
         let successful_destination = root.join("installed");
         fs::write(&successful_staging, b"installed").unwrap();
-        install_staged_file_no_clobber(
-            StagedFile::new(successful_staging.clone()),
-            &successful_destination,
-        )
-        .unwrap();
+        let guard = StagedFile::new(successful_staging.clone());
+        link_file_no_clobber(guard.path(), &successful_destination).unwrap();
+        guard.cleanup().unwrap();
         assert!(!successful_staging.exists());
         assert_eq!(fs::read(successful_destination).unwrap(), b"installed");
         let _ = fs::remove_dir_all(root);
@@ -930,7 +1276,7 @@ mod tests {
         fs::write(&staging, b"not a tar archive").unwrap();
 
         assert!(extract_staged_tar_no_clobber(
-            StagedFile::new(staging.clone()),
+            &StagedFile::new(staging.clone()),
             &destination,
             DEFAULT_MAX_ATTACHMENT_BYTES,
         )

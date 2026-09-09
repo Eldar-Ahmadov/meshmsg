@@ -28,21 +28,27 @@ def run_case(command, response, check):
         def daemon():
             try:
                 listener.bind(str(path))
-                listener.listen(1)
+                listener.listen(2)
                 listener.settimeout(0.2)
                 ready.set()
+                expected = command[0]
                 while not stopped.is_set():
                     try:
                         connection, _ = listener.accept()
-                        break
                     except socket.timeout:
                         continue
-                else:
-                    return
-                with connection:
-                    request = connection.makefile("rb").readline()
-                    assert json.loads(request)["command"] == command[0]
-                    connection.sendall(json.dumps(response).encode() + b"\n")
+                    with connection:
+                        request = json.loads(connection.makefile("rb").readline())
+                        if expected in {"send", "share"} and request["command"] == "status":
+                            connection.sendall(json.dumps({
+                                "type": "status",
+                                "ipc_capabilities": ["idempotent_mutations_v1"],
+                                "max_attachment_bytes": 1024 * 1024
+                            }).encode() + b"\n")
+                            continue
+                        assert request["command"] == expected
+                        connection.sendall(json.dumps(response).encode() + b"\n")
+                        break
             except OSError as error:
                 if not stopped.is_set():
                     failure.append(error)
@@ -141,7 +147,7 @@ with tempfile.NamedTemporaryFile() as shared:
     run_case(
         ["share", shared.name],
         {"type": "attachment_shared", "schema_version": 1, "body": "response-body-secret"},
-        contains("unsupported attachment_shared response version (expected 2, observed 1)"),
+        contains("unsupported attachment_shared response version (expected 3, observed 1)"),
     )
 
 # peers/private-send require capability handshakes and chat is interactive; their

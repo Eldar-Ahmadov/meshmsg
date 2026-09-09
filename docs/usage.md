@@ -135,10 +135,25 @@ Client commands use owner-only local IPC and never create another Iroh endpoint.
 A successful send reports `queued`:
 
 ```json
-{"type":"queued","schema_version":2,"from":"<peer-id>","message_id":"<32-hex-digits>","timestamp_ms":1700000000000,"body":"hello","delivery_acknowledged":false}
+{"type":"queued","schema_version":3,"operation_id":"<32-lowercase-hex>","from":"<peer-id>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body":"hello","delivery_acknowledged":false}
 ```
 
-`queued` means the local Gossip implementation accepted the broadcast request. It is not a delivery acknowledgement. Broadcast schema version 2 uses the same message ID in the local `queued` record, remote `message` records, and attachment records. Broadcasts use the topic-bound V2 Gossip protocol and do not interoperate with pre-V2 peers.
+`queued` means the local Gossip implementation accepted the broadcast request. It is not a delivery acknowledgement. The operation ID is also the signed V2 wire message ID, so a retry uses the same replay identity. Remote `message` records remain schema version 2. Broadcasts use the topic-bound V2 Gossip protocol and do not interoperate with pre-V2 peers.
+
+### Retry-safe operation IDs
+
+`send`, `send --to`, and `share` accept `--operation-id` with exactly 32 lowercase hexadecimal characters. The CLI generates a cryptographically random ID when omitted. To recover from a lost response, retry the identical command with the same explicit ID:
+
+```sh
+meshmsg --json send --operation-id 0123456789abcdef0123456789abcdef 'hello'
+meshmsg --json share --operation-id fedcba9876543210fedcba9876543210 ./report.pdf
+```
+
+The daemon joins concurrent duplicates and returns the exact cached terminal success or failure without repeating the broadcast, private transfer, or attachment publication. Reusing an ID with a different operation kind, recipient, body, exact submitted absolute share-path representation, or share-content digest fails with versioned `operation_id_conflict`; errors and successful mutation responses include `operation_id`. A terminal failure remains terminal for that ID—use a new ID only when intentionally starting a new attempt.
+
+The daemon retains at most 1,024 in-flight/terminal IDs. Terminal entries expire after 10 minutes and oldest terminal entries can be evicted under pressure; in-flight entries are never evicted. The cache is intentionally memory-only and is cleared by daemon restart. Status reports `operation_cache_capacity`, `operation_cache_ttl_ms`, and `operation_cache_persistent:false`. Therefore same-ID retry protection applies only while the ID remains in the current daemon's cache. After expiry, eviction, or restart, do not reuse an old ID unless repeating the side effect is acceptable. Private receivers still durably suppress the same wire ID for their separate replay window, but that does not make sender operation outcomes restart-persistent.
+
+This IPC is intentionally incompatible with mutation requests from older clients: `send`, `private_send`, and `share` require `operation_id`, and `share` additionally requires its validated 64-character lowercase `source_digest`. New CLI/web clients first require `idempotent_mutations_v1`; they fail before submission against an older daemon. Local `queued` is schema 3, `private_accepted` is schema 2, and `attachment_shared` is schema 3. Incoming wire records retain their existing schemas.
 
 ### Private sends
 
@@ -156,10 +171,10 @@ Before submitting a private body over local IPC, the CLI checks that the running
 A private message travels over a separate authenticated, encrypted Iroh connection and is signed and bound to the sender, recipient, and topic. It is not placed in the broadcast message stream. On success, human output says the private message was accepted; JSON reports metadata, never the sent body:
 
 ```json
-{"type":"private_accepted","schema_version":1,"to":"<full-peer-key>","message_id":"<32-hex-digits>","timestamp_ms":1700000000000,"body_bytes":13,"acceptance_acknowledged":true,"durable":false,"read":false}
+{"type":"private_accepted","schema_version":2,"operation_id":"<32-lowercase-hex>","to":"<full-peer-key>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body_bytes":13,"acceptance_acknowledged":true,"durable":false,"read":false}
 ```
 
-This acknowledgement means the authenticated recipient daemon validated the request and accepted it into a bounded in-memory queue. It does **not** mean a person or `listen` client read it, that it was written to disk, or that it will survive a daemon/process failure. There is no offline queue, store-and-forward, automatic retry, history, or later retrieval. A failed or timed-out send has an unknown remote outcome; check before manually resending because duplicates are possible.
+This acknowledgement means the authenticated recipient daemon validated the request and accepted it into a bounded in-memory queue. It does **not** mean a person or `listen` client read it, that it was written to disk, or that it will survive a daemon/process failure. There is no offline queue, store-and-forward, history, or later retrieval. A failed or timed-out send can have an unknown remote outcome; retry the identical operation with its same ID while it remains in the current sender daemon's cache. Do not substitute a new ID merely because the response was lost.
 
 `listen` and `chat` subscribers receive accepted messages as `private_message` events containing `private:true`, the canonical `from`, message ID, timestamp, body, and explicit `durable:false`/`read:false` fields. Lines entered in `chat` are still broadcasts; it has no direct-reply mode. Private bodies are suppressed from unattended daemon logs. The mobile web process neither sends private messages nor exposes them in its SSE feed.
 
