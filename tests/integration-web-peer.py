@@ -276,7 +276,7 @@ def main():
                 'type': 'error', 'schema_version': 1,
                 'code': 'operation_id_conflict',
                 'operation_id': conflict_operation_id,
-                'message': 'operation ID was already used with different inputs',
+                'message': 'The operation ID was already used with different inputs.',
                 'outcome': 'not_started', 'retryable': False}
             (retry_code, retry_conflict), _ = upload(
                 conflict_path.name, conflict_payload, conflict_operation_id)

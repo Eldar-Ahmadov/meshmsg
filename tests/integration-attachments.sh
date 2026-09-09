@@ -148,4 +148,111 @@ python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert any(x["name
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "receiver listing did not preserve downloaded directory name and kind"
 
-echo "PASS: canonical shared/received offer timestamps and metadata, ordered durable download commits, restart recovery, no-clobber, deterministic extraction, persistent pins, and best-effort blob listing"
+# Lifecycle controls account shared content once and preserve other references.
+STATUS=$($BIN --state-dir "$ROOT/provider" --json status)
+python3 -c 'import json,sys; s=json.load(sys.stdin); a=s["attachment_storage"]; assert a["tagged_bytes"] > 0 and a["tagged_blobs"] == 2 and a["tags"] == 2 and isinstance(a["pressure"], bool) and s["attachment_retention_secs"] == 0' \
+  <<<"$STATUS" || fail "status omitted attachment storage pressure metrics"
+DUP_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+DUP_SHARE=$($BIN --state-dir "$ROOT/provider" --json share --operation-id "$DUP_ID" "$ROOT/source.txt")
+python3 -c 'import json,sys; assert json.load(sys.stdin)["offer_id"] == sys.argv[1]' "$DUP_ID" \
+  <<<"$DUP_SHARE" || fail "duplicate share failed"
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; same=[x for x in b if x["name"] == "source.txt"]; assert len(same) == 2 and len({x["hash"] for x in same}) == 1' \
+  <<<"$($BIN --state-dir "$ROOT/provider" --json offers)" || fail "deduplicated tags were not independently listed"
+REMOVED=$($BIN --state-dir "$ROOT/provider" --json offers remove "$FILE_ID" --direction outgoing)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v == {"type":"offer_removed","schema_version":1,"dry_run":False,"selected_tags":1,"removed_tags":1,"released_bytes":0,"limited":False,"cutoff_ms":None}' \
+  <<<"$REMOVED" || fail "removing one deduplicated reference released shared bytes"
+DRY=$($BIN --state-dir "$ROOT/provider" --json offers prune --older-than-secs 0 --dry-run --max-delete 1)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["dry_run"] is True and v["selected_tags"] == 1 and v["removed_tags"] == 0 and v["limited"] is True' \
+  <<<"$DRY" || fail "bounded prune dry-run was not deterministic/non-mutating"
+
+# A remote transfer remains protected after it has started while the provider
+# removes its durable offer pin. Concurrent local share/download/lifecycle
+# commands prove the storage gate returns a strict retryable busy outcome.
+dd if=/dev/zero of="$ROOT/large.bin" bs=1M count=64 status=none
+LARGE_SHARE=$($BIN --state-dir "$ROOT/provider" --json share "$ROOT/large.bin")
+LARGE_OFFER=$(json_field '"offer"' <<<"$LARGE_SHARE")
+LARGE_ID=$(json_field '"offer_id"' <<<"$LARGE_SHARE")
+: >"$ROOT/concurrent.listen.log"
+timeout 180 "$BIN" --state-dir "$ROOT/receiver" --json listen >"$ROOT/concurrent.listen.log" 2>"$ROOT/concurrent.listen.err" &
+CONCURRENT_LISTENER=$!
+wait_for 10 "concurrent listener" grep -Fq '"type":"connected"' "$ROOT/concurrent.listen.log"
+"$BIN" --state-dir "$ROOT/receiver" --json download "$LARGE_OFFER" --output "$ROOT/large.received" >"$ROOT/large.download" 2>"$ROOT/large.download.err" &
+LARGE_DOWNLOAD_PID=$!
+wait_for 30 "remote download made verified progress" grep -Fq '"type":"download_progress"' "$ROOT/concurrent.listen.log"
+"$BIN" --state-dir "$ROOT/receiver" --json share "$ROOT/source.txt" >"$ROOT/concurrent.share" 2>"$ROOT/concurrent.share.err" &
+CONCURRENT_SHARE_PID=$!
+if "$BIN" --state-dir "$ROOT/receiver" --json offers prune --older-than-secs 0 --dry-run >"$ROOT/concurrent.prune" 2>"$ROOT/concurrent.prune.err"; then
+  fail "prune raced an active download instead of returning busy"
+fi
+grep -q attachment_storage_busy "$ROOT/concurrent.prune.err" || fail "concurrent prune lacked strict busy code"
+if "$BIN" --state-dir "$ROOT/receiver" --json offers remove "$FILE_ID" >"$ROOT/concurrent.remove" 2>"$ROOT/concurrent.remove.err"; then
+  fail "remove raced an active download instead of returning busy"
+fi
+grep -q attachment_storage_busy "$ROOT/concurrent.remove.err" || fail "concurrent remove lacked strict busy code"
+"$BIN" --state-dir "$ROOT/provider" --json offers remove "$LARGE_ID" >/dev/null
+wait "$LARGE_DOWNLOAD_PID" || fail "remote download did not survive provider pin removal"
+wait "$CONCURRENT_SHARE_PID" || fail "share queued behind concurrent download failed"
+cmp "$ROOT/large.bin" "$ROOT/large.received" || fail "remote download changed during provider removal"
+kill "$CONCURRENT_LISTENER" >/dev/null 2>&1 || true
+wait "$CONCURRENT_LISTENER" >/dev/null 2>&1 || true
+
+# Download admission rejects quota and minimum-free-space pressure before
+# installing output, using the same strict lifecycle errors as shares.
+printf 12345 >"$ROOT/five.bin"
+FIVE_SHARE=$($BIN --state-dir "$ROOT/provider" --json share "$ROOT/five.bin")
+FIVE_OFFER=$(json_field '"offer"' <<<"$FIVE_SHARE")
+"$BIN" --state-dir "$ROOT/quota-receiver" join "$INVITE" >/dev/null
+timeout 300 "$BIN" --state-dir "$ROOT/quota-receiver" --json daemon \
+  --max-attachment-storage-bytes 4 --min-attachment-free-bytes 0 --attachment-retention-secs 0 \
+  >"$ROOT/quota-receiver.daemon.log" 2>"$ROOT/quota-receiver.daemon.err" &
+PIDS[quota-receiver]=$!
+wait_for 80 "quota receiver daemon" status_ok quota-receiver
+if "$BIN" --state-dir "$ROOT/quota-receiver" --json download "$FIVE_OFFER" --output "$ROOT/quota-download" >"$ROOT/quota-download.out" 2>"$ROOT/quota-download.err"; then
+  fail "download exceeded total attachment quota"
+fi
+grep -q attachment_quota_exceeded "$ROOT/quota-download.err" || fail "download quota failure lacked strict code"
+[[ ! -e "$ROOT/quota-download" ]] || fail "quota failure installed a download"
+stop_node quota-receiver
+timeout 300 "$BIN" --state-dir "$ROOT/quota-receiver" --json daemon \
+  --max-attachment-storage-bytes 100 --min-attachment-free-bytes 999999999999999 --attachment-retention-secs 0 \
+  >"$ROOT/quota-receiver.daemon.log" 2>"$ROOT/quota-receiver.daemon.err" &
+PIDS[quota-receiver]=$!
+wait_for 80 "free-space receiver daemon" status_ok quota-receiver
+if "$BIN" --state-dir "$ROOT/quota-receiver" --json download "$FIVE_OFFER" --output "$ROOT/free-download" >"$ROOT/free-download.out" 2>"$ROOT/free-download.err"; then
+  fail "download ignored minimum free-space reserve"
+fi
+grep -q attachment_min_free_space "$ROOT/free-download.err" || fail "download free-space failure lacked strict code"
+[[ ! -e "$ROOT/free-download" ]] || fail "free-space failure installed a download"
+
+# A tiny isolated store proves quota exhaustion, remove recovery, persistence,
+# and a configured free-space reserve failure through the real CLI/IPC daemon.
+"$BIN" --state-dir "$ROOT/quota" init >/dev/null
+timeout 300 "$BIN" --state-dir "$ROOT/quota" --json daemon \
+  --max-attachment-storage-bytes 4 --min-attachment-free-bytes 0 --attachment-retention-secs 0 \
+  >"$ROOT/quota.daemon.log" 2>"$ROOT/quota.daemon.err" &
+PIDS[quota]=$!
+wait_for 80 "quota daemon" status_ok quota
+printf 1234 >"$ROOT/four.bin"
+Q_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+"$BIN" --state-dir "$ROOT/quota" --json share --operation-id "$Q_ID" "$ROOT/four.bin" >/dev/null
+printf x >"$ROOT/one.bin"
+if "$BIN" --state-dir "$ROOT/quota" --json share "$ROOT/one.bin" >"$ROOT/quota.out" 2>"$ROOT/quota.err"; then
+  fail "unique blob exceeded total attachment quota"
+fi
+grep -q attachment_quota_exceeded "$ROOT/quota.err" || fail "quota failure lacked stable error"
+"$BIN" --state-dir "$ROOT/quota" --json offers remove "$Q_ID" | grep -q '"released_bytes":4'
+"$BIN" --state-dir "$ROOT/quota" --json share "$ROOT/one.bin" >/dev/null || fail "quota did not recover after removal"
+stop_node quota
+timeout 300 "$BIN" --state-dir "$ROOT/quota" --json daemon \
+  --max-attachment-storage-bytes 4 --min-attachment-free-bytes 999999999999999 --attachment-retention-secs 0 \
+  >"$ROOT/quota.daemon.log" 2>"$ROOT/quota.daemon.err" &
+PIDS[quota]=$!
+wait_for 80 "free-space daemon" status_ok quota
+python3 -c 'import json,sys; a=json.load(sys.stdin)["attachment_storage"]; assert a["below_min_free"] is True and a["pressure"] is True and a["tagged_bytes"] == 1' \
+  <<<"$($BIN --state-dir "$ROOT/quota" --json status)" || fail "free-space pressure/status was not persistent"
+if "$BIN" --state-dir "$ROOT/quota" --json share "$ROOT/one.bin" >"$ROOT/free.out" 2>"$ROOT/free.err"; then
+  fail "share ignored minimum free-space reserve"
+fi
+grep -q attachment_min_free_space "$ROOT/free.err" || fail "free-space failure lacked stable error"
+
+echo "PASS: attachment transfer/transaction recovery, lifecycle remove/prune/dry-run, dedup accounting, share/download quota and free-space failures, concurrent lifecycle exclusion, active remote transfer safety, and restart persistence"

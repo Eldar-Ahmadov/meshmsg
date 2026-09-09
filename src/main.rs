@@ -14,7 +14,7 @@ mod web;
 use alias::AliasConfig;
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AliasCommand, Cli, Command};
+use cli::{AliasCommand, Cli, Command, OffersCommand};
 use config::State;
 use invite::Invite;
 
@@ -105,7 +105,20 @@ async fn run() -> Result<()> {
         }
         Command::Daemon {
             max_attachment_bytes,
-        } => node::run_daemon(&dir, cli.json, max_attachment_bytes).await?,
+            max_attachment_storage_bytes,
+            min_attachment_free_bytes,
+            attachment_retention_secs,
+        } => {
+            node::run_daemon(
+                &dir,
+                cli.json,
+                max_attachment_bytes,
+                max_attachment_storage_bytes,
+                min_attachment_free_bytes,
+                attachment_retention_secs,
+            )
+            .await?
+        }
         Command::Web { listen, origin } => web::run(&dir, listen, origin).await?,
         Command::Invite => {
             let (state, secret) = State::load_for_doctor(&dir)?;
@@ -144,7 +157,39 @@ async fn run() -> Result<()> {
         Command::Share { operation_id, path } => {
             node::share(&dir, operation_id, &path, cli.json).await?
         }
-        Command::Offers => node::offers(&dir, cli.json).await?,
+        Command::Offers { command } => match command {
+            None => node::offers(&dir, cli.json).await?,
+            Some(OffersCommand::Remove {
+                offer_id,
+                direction,
+                provider,
+            }) => {
+                node::offers_remove(
+                    &dir,
+                    &offer_id,
+                    direction.map(|value| value.as_str()),
+                    provider.as_deref(),
+                    cli.json,
+                )
+                .await?
+            }
+            Some(OffersCommand::Prune {
+                older_than_secs,
+                direction,
+                dry_run,
+                max_delete,
+            }) => {
+                node::offers_prune(
+                    &dir,
+                    older_than_secs,
+                    direction.map(|value| value.as_str()),
+                    dry_run,
+                    max_delete,
+                    cli.json,
+                )
+                .await?
+            }
+        },
         Command::Peers => node::peers(&dir, cli.json).await?,
         Command::Download { input, output } => {
             let offer = input.into_offer()?;

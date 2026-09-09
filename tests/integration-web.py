@@ -116,7 +116,10 @@ class Handler(socketserver.StreamRequestHandler):
                 offer = value['offer']
                 self.server.web_download_attempts[offer] = self.server.web_download_attempts.get(offer, 0) + 1
                 if offer == 'retry-token' and self.server.web_download_attempts[offer] == 1:
-                    emit({'type': 'error', 'code': 'download_busy', 'message': 'scripted busy'})
+                    emit({'type': 'error', 'schema_version': 1,
+                          'code': 'attachment_storage_busy',
+                          'message': 'open /home/alice/private/download.bin: database diagnostic',
+                          'outcome': 'not_started', 'retryable': True})
                     return
                 output = pathlib.Path(value['output'])
                 if offer == 'late-token':
@@ -166,7 +169,7 @@ class Handler(socketserver.StreamRequestHandler):
                 if path.name == 'post-broadcast-failure.txt':
                     outcome = {'type': 'error', 'schema_version': 1,
                                'code': 'share_failed', 'operation_id': operation_id,
-                               'message': 'broadcast result was ambiguous',
+                               'message': 'broadcast /srv/meshmsg/private/stage.bin failed: internal route diagnostic',
                                'outcome': 'unknown', 'retryable': True}
                     self.server.share_operations[operation_id] = (fingerprint, outcome)
                     self.server.broadcast(shared)
@@ -508,8 +511,9 @@ def main():
                 assert code == 502 and ambiguous == {
                     'type': 'error', 'schema_version': 1, 'code': 'share_failed',
                     'operation_id': '20000000000000000000000000000004',
-                    'message': 'broadcast result was ambiguous',
+                    'message': 'Attachment sharing failed.',
                     'outcome': 'unknown', 'retryable': True}
+                assert b'/srv/meshmsg' not in ambiguous_body and b'internal route diagnostic' not in ambiguous_body
                 for response in [feed, other_tab]:
                     observed = next_event(response)
                     assert observed['type'] == 'attachment_shared'
@@ -537,7 +541,7 @@ def main():
                     'type': 'error', 'schema_version': 1,
                     'code': 'operation_id_conflict',
                     'operation_id': forced_conflict_id,
-                    'message': 'operation ID was already used with different inputs',
+                    'message': 'The operation ID was already used with different inputs.',
                     'outcome': 'not_started', 'retryable': False}
 
                 code, _, mismatch_body = request(
@@ -607,6 +611,10 @@ def main():
                         break
                     assert time.monotonic() < deadline
                     time.sleep(.01)
+                assert failed['code'] == 'attachment_storage_busy'
+                assert failed['outcome'] == 'not_started' and failed['retryable'] is True
+                assert failed['message'] == 'Attachment storage is busy; retry later.'
+                assert '/home/alice' not in json.dumps(failed) and 'database diagnostic' not in json.dumps(failed)
                 code, second_retry = api({'command': 'download', 'id': retry_ids[0]})
                 assert code == 202, 'definitely-not-started failure consumed the offer handle'
                 deadline = time.monotonic() + 5

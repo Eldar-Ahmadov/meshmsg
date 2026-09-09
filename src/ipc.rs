@@ -16,6 +16,121 @@ pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v2";
 pub(crate) const WEB_DOWNLOAD_CAPABILITY: &str = "web_download_v1";
 pub(crate) const WEB_SHARE_CAPABILITY: &str = "web_share_v1";
 pub(crate) const IDEMPOTENT_MUTATIONS_CAPABILITY: &str = "idempotent_mutations_v1";
+pub(crate) const ATTACHMENT_LIFECYCLE_CAPABILITY: &str = "attachment_lifecycle_v1";
+pub(crate) const LIFECYCLE_ERROR_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LifecycleErrorV1 {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) schema_version: u8,
+    pub(crate) code: String,
+    pub(crate) message: String,
+    pub(crate) outcome: String,
+    pub(crate) retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) offer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) selected_tags: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) removed_tags: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) quota_bytes_released: Option<u64>,
+}
+
+impl LifecycleErrorV1 {
+    pub(crate) fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        outcome: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        let mut message = message.into();
+        if message.len() > 1024 {
+            let mut boundary = 1024;
+            while !message.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            message.truncate(boundary);
+        }
+        Self {
+            kind: "error".into(),
+            schema_version: LIFECYCLE_ERROR_SCHEMA_VERSION,
+            code: code.into(),
+            message,
+            outcome: outcome.into(),
+            retryable,
+            operation_id: None,
+            offer_id: None,
+            selected_tags: None,
+            removed_tags: None,
+            quota_bytes_released: None,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        const CODES: &[&str] = &[
+            "attachment_storage_busy",
+            "attachment_command_timeout",
+            "attachment_storage_shutdown",
+            "attachment_removal_partial",
+            "attachment_lifecycle_internal",
+            "attachment_quota_exceeded",
+            "attachment_min_free_space",
+            "attachment_tag_capacity",
+            "invalid_offer_selector",
+            "invalid_prune_request",
+            "share_failed",
+            "download_failed",
+            "operation_id_conflict",
+            "operation_capacity",
+            "invalid_operation_id",
+            "invalid_source_digest",
+        ];
+        anyhow::ensure!(self.kind == "error", "lifecycle error type is invalid");
+        anyhow::ensure!(
+            self.schema_version == LIFECYCLE_ERROR_SCHEMA_VERSION,
+            "unsupported lifecycle error schema version"
+        );
+        anyhow::ensure!(
+            CODES.contains(&self.code.as_str()),
+            "unknown lifecycle error code"
+        );
+        anyhow::ensure!(
+            !self.message.is_empty() && self.message.len() <= 1024,
+            "lifecycle error message is invalid"
+        );
+        anyhow::ensure!(
+            matches!(self.outcome.as_str(), "not_started" | "partial" | "unknown"),
+            "lifecycle error outcome is invalid"
+        );
+        if let Some(id) = &self.operation_id {
+            anyhow::ensure!(valid_operation_id(id), "lifecycle operation ID is invalid");
+        }
+        if let Some(id) = &self.offer_id {
+            anyhow::ensure!(valid_operation_id(id), "lifecycle offer ID is invalid");
+        }
+        anyhow::ensure!(
+            self.removed_tags.unwrap_or(0) <= self.selected_tags.unwrap_or(usize::MAX),
+            "lifecycle error removal counts are invalid"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
+        let error: Self = serde_json::from_value(value.clone())
+            .context("daemon returned a malformed lifecycle error")?;
+        error.validate()?;
+        Ok(error)
+    }
+
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        serde_json::to_value(self).expect("lifecycle error serialization cannot fail")
+    }
+}
 
 pub(crate) fn valid_operation_id(value: &str) -> bool {
     value.len() == 32
@@ -62,6 +177,17 @@ pub(crate) enum IpcRequest {
     Status,
     Peers,
     Offers,
+    OffersRemove {
+        offer_id: String,
+        direction: Option<String>,
+        provider: Option<String>,
+    },
+    OffersPrune {
+        older_than_secs: Option<u64>,
+        direction: Option<String>,
+        dry_run: bool,
+        max_delete: usize,
+    },
     Share {
         operation_id: String,
         source_digest: String,
@@ -446,6 +572,49 @@ mod tests {
         assert_eq!(value["command"], "web_download");
         assert_eq!(value["offer"], "signed-offer");
         assert_eq!(value["output"], "server-selected.blob");
+    }
+
+    #[test]
+    fn lifecycle_error_dto_rejects_malformed_unknown_and_incompatible_values() {
+        let mut error =
+            LifecycleErrorV1::new("attachment_storage_busy", "busy", "not_started", true);
+        error.offer_id = Some("0123456789abcdef0123456789abcdef".into());
+        let value = error.clone().into_value();
+        assert_eq!(LifecycleErrorV1::from_value(&value).unwrap(), error);
+        for malformed in [
+            serde_json::json!({"type":"error","schema_version":2,"code":"attachment_storage_busy","message":"busy","outcome":"not_started","retryable":true}),
+            serde_json::json!({"type":"error","schema_version":1,"code":"new_code","message":"busy","outcome":"not_started","retryable":true}),
+            serde_json::json!({"type":"error","schema_version":1,"code":"attachment_storage_busy","message":"busy","outcome":"started","retryable":true}),
+            serde_json::json!({"type":"error","schema_version":1,"code":"attachment_storage_busy","message":"busy","outcome":"not_started","retryable":true,"extra":1}),
+        ] {
+            assert!(LifecycleErrorV1::from_value(&malformed).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_lifecycle_requests_are_strict_and_versioned_by_response_contract() {
+        let mut bytes = Vec::new();
+        write_request(
+            &mut bytes,
+            &IpcRequest::OffersRemove {
+                offer_id: "0123456789abcdef0123456789abcdef".into(),
+                direction: Some("outgoing".into()),
+                provider: None,
+            },
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["command"], "offers_remove");
+        assert!(serde_json::from_slice::<IpcRequest>(
+            br#"{"command":"offers_prune","older_than_secs":0,"direction":null,"dry_run":true,"max_delete":1,"extra":false}"#
+        ).is_err());
+        validate_response(
+            &serde_json::json!({"type":"offers_pruned","schema_version":1}),
+            "offers_pruned",
+            Some(1),
+        )
+        .unwrap();
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
 use anyhow::{bail, Context, Result};
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use std::{
     fs,
     io::{self, Read},
@@ -127,6 +127,60 @@ fn parse_operation_id(value: &str) -> std::result::Result<String, String> {
     }
 }
 
+fn parse_prune_limit(value: &str) -> std::result::Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "prune limit must be an integer".to_owned())?;
+    if (1..=512).contains(&value) {
+        Ok(value)
+    } else {
+        Err("prune limit must be between 1 and 512".into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum OfferDirection {
+    Incoming,
+    Outgoing,
+}
+
+impl OfferDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incoming => "incoming",
+            Self::Outgoing => "outgoing",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum OffersCommand {
+    /// Remove local pins matching one offer ID; shared blob data stays while another tag references it
+    Remove {
+        #[arg(value_parser = parse_operation_id)]
+        offer_id: String,
+        #[arg(long, value_enum)]
+        direction: Option<OfferDirection>,
+        /// Canonical provider public key, useful to disambiguate incoming offers
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Remove oldest pins at or beyond the retention boundary
+    Prune {
+        /// Override daemon retention age; zero selects every matching tag
+        #[arg(long)]
+        older_than_secs: Option<u64>,
+        #[arg(long, value_enum)]
+        direction: Option<OfferDirection>,
+        /// Select and report without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum tags selected in this invocation
+        #[arg(long, default_value_t = 512, value_parser = parse_prune_limit)]
+        max_delete: usize,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum AliasCommand {
     /// Show the captured hostname, override, and effective advertised alias
@@ -180,6 +234,28 @@ pub enum Command {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         max_attachment_bytes: u64,
+        /// Maximum total bytes retained by unique pinned attachment blobs
+        #[arg(
+            long,
+            env = "MESHMSG_MAX_ATTACHMENT_STORAGE_BYTES",
+            default_value_t = crate::node::DEFAULT_MAX_ATTACHMENT_STORAGE_BYTES,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        max_attachment_storage_bytes: u64,
+        /// Free bytes that must remain on the attachment store filesystem
+        #[arg(
+            long,
+            env = "MESHMSG_MIN_ATTACHMENT_FREE_BYTES",
+            default_value_t = crate::node::DEFAULT_MIN_FREE_SPACE_BYTES
+        )]
+        min_attachment_free_bytes: u64,
+        /// Automatically prune pins this old; zero disables automatic pruning
+        #[arg(
+            long,
+            env = "MESHMSG_ATTACHMENT_RETENTION_SECS",
+            default_value_t = crate::node::DEFAULT_ATTACHMENT_RETENTION_SECS
+        )]
+        attachment_retention_secs: u64,
     },
     /// Serve the broadcast web UI over local IPC (no application authentication)
     Web {
@@ -215,8 +291,11 @@ pub enum Command {
     },
     /// Show the current sanitized peer-directory snapshot
     Peers,
-    /// List locally pinned incoming and outgoing attachment blobs
-    Offers,
+    /// List or remove locally pinned incoming and outgoing attachment blobs
+    Offers {
+        #[command(subcommand)]
+        command: Option<OffersCommand>,
+    },
     /// Download an explicitly accepted attachment offer
     Download {
         #[command(flatten)]
@@ -389,6 +468,26 @@ mod tests {
         assert!(parse(&["send", "--message-stdin"]).is_ok());
         assert!(parse(&["share", "file.txt"]).is_ok());
         assert!(parse(&["offers"]).is_ok());
+        assert!(parse(&[
+            "offers",
+            "remove",
+            "0123456789abcdef0123456789abcdef",
+            "--direction",
+            "outgoing"
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "offers",
+            "prune",
+            "--older-than-secs",
+            "0",
+            "--dry-run",
+            "--max-delete",
+            "10"
+        ])
+        .is_ok());
+        assert!(parse(&["offers", "remove", "ABCDEFABCDEFABCDEFABCDEFABCDEFAB"]).is_err());
+        assert!(parse(&["offers", "prune", "--max-delete", "0"]).is_err());
         assert!(parse(&["peers"]).is_ok());
         assert!(parse(&["download", "offer-token", "--output", "file.txt"]).is_ok());
         assert!(parse(&[
@@ -447,21 +546,37 @@ mod tests {
         let cli = parse(&["daemon"]).unwrap();
         let Command::Daemon {
             max_attachment_bytes,
+            max_attachment_storage_bytes,
+            min_attachment_free_bytes,
+            attachment_retention_secs,
         } = cli.command
         else {
             panic!("wrong command")
         };
         assert_eq!(max_attachment_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(max_attachment_storage_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(min_attachment_free_bytes, 1024 * 1024 * 1024);
+        assert_eq!(attachment_retention_secs, 0);
 
         let cli = parse(&["daemon", "--max-attachment-bytes", "12345"]).unwrap();
         let Command::Daemon {
             max_attachment_bytes,
+            ..
         } = cli.command
         else {
             panic!("wrong command")
         };
         assert_eq!(max_attachment_bytes, 12_345);
         assert!(parse(&["daemon", "--max-attachment-bytes", "0"]).is_err());
+        assert!(parse(&["daemon", "--max-attachment-storage-bytes", "0"]).is_err());
+        assert!(parse(&[
+            "daemon",
+            "--min-attachment-free-bytes",
+            "0",
+            "--attachment-retention-secs",
+            "0"
+        ])
+        .is_ok());
     }
 
     #[test]

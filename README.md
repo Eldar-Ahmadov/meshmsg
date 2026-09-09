@@ -88,13 +88,15 @@ Files and deterministic directory snapshots are announced through signed Gossip 
 ```sh
 meshmsg --json share ./report.pdf
 meshmsg offers
+meshmsg offers prune --dry-run
+meshmsg offers remove <offer-id>
 printf '%s' '<signed-offer>' | meshmsg download --offer-stdin --output ./received-report.pdf
 
 meshmsg --json share ./results
 meshmsg download '<signed-directory-offer>' --output ./received-results
 ```
 
-Downloads are explicit, size-limited, content-verified, persistent across provider restarts, and refuse to overwrite existing paths. See [Attachments](docs/attachments.md) for formats, limits, persistence, and security details.
+Downloads are explicit, size-limited, content-verified, persistent across provider restarts, quota/free-space controlled, retention-pruned, removable, and refuse to overwrite existing paths. See [Attachments](docs/attachments.md) for formats, limits, persistence, and security details.
 
 ## Documentation
 

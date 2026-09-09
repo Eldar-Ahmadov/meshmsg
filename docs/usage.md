@@ -11,7 +11,7 @@ The canonical top-level commands are:
 - `web [--listen 127.0.0.1:8787] [--origin https://host.tailnet.ts.net]`
 - `invite`
 - `send [--to <recipient>]`, `listen`, `chat`, `status`, `peers`, `stop`, and `doctor`
-- `share <path>`, `offers`, and `download <offer source> --output <path>`
+- `share <path>`, `offers [remove|prune]`, and `download <offer source> --output <path>`
 - `bench-send`, `bench-receive`, and interactive `bench-tui`
 
 Run `meshmsg <command> --help` for command-specific options.
@@ -36,7 +36,12 @@ The attachment limit defaults to 4 GiB. Configure it for each daemon invocation 
 ```sh
 meshmsg --json daemon --max-attachment-bytes 8589934592
 MESHMSG_MAX_ATTACHMENT_BYTES=8589934592 meshmsg --json daemon
+meshmsg daemon --max-attachment-storage-bytes 17179869184 \
+  --min-attachment-free-bytes 1073741824 \
+  --attachment-retention-secs 2592000
 ```
+
+The matching storage variables are `MESHMSG_MAX_ATTACHMENT_STORAGE_BYTES`, `MESHMSG_MIN_ATTACHMENT_FREE_BYTES`, and `MESHMSG_ATTACHMENT_RETENTION_SECS`. Defaults are 16 GiB total unique retained content, a 1 GiB free-space reserve, and automatic retention disabled. Set a nonzero retention explicitly to opt in; zero prevents surprise deletion during upgrades. See [Attachments](attachments.md) for lifecycle, deduplication, and pressure semantics.
 
 Export the invite from another terminal:
 
@@ -241,6 +246,8 @@ meshmsg --json send 'hello'
 meshmsg --json send --to build-node-2 'private hello'
 meshmsg --json share ./report.pdf
 meshmsg --json offers
+meshmsg --json offers prune --dry-run
+meshmsg --json offers remove <offer-id> --direction outgoing
 meshmsg --json download '<signed-offer>' --output ./report-copy.pdf
 ```
 

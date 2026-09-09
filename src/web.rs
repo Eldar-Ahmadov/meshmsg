@@ -79,7 +79,7 @@ enum DownloadJob {
         created: Instant,
     },
     Failed {
-        message: String,
+        error: ipc::LifecycleErrorV1,
         created: Instant,
     },
 }
@@ -600,6 +600,38 @@ fn public_status(value: &Value) -> Value {
     if let Some(persistent) = value["operation_cache_persistent"].as_bool() {
         result["operation_cache_persistent"] = persistent.into();
     }
+    if let Some(retention) = value["attachment_retention_secs"].as_u64() {
+        result["attachment_retention_secs"] = retention.into();
+    }
+    let storage = &value["attachment_storage"];
+    let numeric = [
+        "tagged_bytes",
+        "tagged_blobs",
+        "tags",
+        "tag_capacity",
+        "quota_bytes",
+        "available_bytes",
+        "min_free_bytes",
+        "sampled_at_ms",
+    ];
+    let booleans = ["pressure", "over_quota", "below_min_free"];
+    if numeric.iter().all(|key| storage[*key].as_u64().is_some())
+        && booleans.iter().all(|key| storage[*key].as_bool().is_some())
+    {
+        result["attachment_storage"] = json!({
+            "tagged_bytes":storage["tagged_bytes"],
+            "tagged_blobs":storage["tagged_blobs"],
+            "tags":storage["tags"],
+            "tag_capacity":storage["tag_capacity"],
+            "quota_bytes":storage["quota_bytes"],
+            "available_bytes":storage["available_bytes"],
+            "min_free_bytes":storage["min_free_bytes"],
+            "sampled_at_ms":storage["sampled_at_ms"],
+            "pressure":storage["pressure"],
+            "over_quota":storage["over_quota"],
+            "below_min_free":storage["below_min_free"]
+        });
+    }
     result
 }
 
@@ -797,25 +829,51 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
                     _ => {
                         let _ = fs::remove_file(&output);
                         DownloadJob::Failed {
-                            message: "Daemon completed without an exported file.".into(),
+                            error: ipc::LifecycleErrorV1::new(
+                                "attachment_lifecycle_internal",
+                                "Daemon completed without an exported file.",
+                                "unknown",
+                                true,
+                            ),
                             created: Instant::now(),
                         }
                     }
                 }
             }
-            Ok(Ok(_)) => {
+            Ok(Ok(value)) => {
                 let _ = fs::remove_file(&output);
+                let error = if value["type"] == "error" {
+                    ipc::LifecycleErrorV1::from_value(&value).unwrap_or_else(|_| {
+                        ipc::LifecycleErrorV1::new(
+                            "attachment_lifecycle_internal",
+                            "Daemon returned a malformed attachment lifecycle error.",
+                            "unknown",
+                            true,
+                        )
+                    })
+                } else {
+                    ipc::LifecycleErrorV1::new(
+                        "attachment_lifecycle_internal",
+                        "Daemon returned an incompatible attachment download response.",
+                        "unknown",
+                        true,
+                    )
+                };
+                log_private_lifecycle_diagnostic("download", &error);
                 DownloadJob::Failed {
-                    // Daemon diagnostics can contain its server-selected output path.
-                    // Keep filesystem details on the trusted local IPC side.
-                    message: "Daemon rejected the attachment download or returned an incompatible response.".into(),
+                    error: public_lifecycle_error(error),
                     created: Instant::now(),
                 }
             }
             Ok(Err(_)) => {
                 let _ = fs::remove_file(&output);
                 DownloadJob::Failed {
-                    message: "Daemon unavailable or disconnected during download.".into(),
+                    error: ipc::LifecycleErrorV1::new(
+                        "attachment_storage_shutdown",
+                        "Daemon unavailable or disconnected during download.",
+                        "unknown",
+                        true,
+                    ),
                     created: Instant::now(),
                 }
             }
@@ -825,7 +883,12 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
                 // until stale-root cleanup is safe.
                 let _ = fs::remove_file(&output);
                 DownloadJob::Failed {
-                    message: "Daemon attachment preparation exceeded its time limit.".into(),
+                    error: ipc::LifecycleErrorV1::new(
+                        "attachment_command_timeout",
+                        "Daemon attachment preparation exceeded its time limit.",
+                        "unknown",
+                        true,
+                    ),
                     created: Instant::now(),
                 }
             }
@@ -846,6 +909,42 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
     )
 }
 
+fn public_lifecycle_error(mut error: ipc::LifecycleErrorV1) -> ipc::LifecycleErrorV1 {
+    error.message = match error.code.as_str() {
+        "attachment_storage_busy" => "Attachment storage is busy; retry later.",
+        "attachment_command_timeout" => {
+            "Attachment processing timed out; retry to reconcile the outcome."
+        }
+        "attachment_storage_shutdown" => "Attachment storage is unavailable.",
+        "attachment_removal_partial" => {
+            "Attachment removal was only partially completed; retry to reconcile."
+        }
+        "attachment_quota_exceeded" => "Attachment storage quota would be exceeded.",
+        "attachment_min_free_space" => {
+            "Attachment storage does not have enough reserved free space."
+        }
+        "attachment_tag_capacity" => "Attachment pin capacity has been reached.",
+        "invalid_offer_selector" => "The attachment selector is invalid.",
+        "invalid_prune_request" => "The attachment prune request is invalid.",
+        "operation_id_conflict" => "The operation ID was already used with different inputs.",
+        "operation_capacity" => "Attachment operation capacity has been reached.",
+        "invalid_operation_id" => "The attachment operation ID is invalid.",
+        "invalid_source_digest" => "The attachment source digest is invalid.",
+        "share_failed" => "Attachment sharing failed.",
+        "download_failed" => "Attachment download failed.",
+        _ => "Attachment processing failed.",
+    }
+    .into();
+    error
+}
+
+fn log_private_lifecycle_diagnostic(context: &str, error: &ipc::LifecycleErrorV1) {
+    eprintln!(
+        "meshmsg web {context} diagnostic [{}; {}]: {:?}",
+        error.code, error.outcome, error.message
+    );
+}
+
 fn download_status(state: &WebState, id: &str) -> Response<Body> {
     state.prune_jobs(Instant::now());
     let jobs = state.jobs.lock().expect("download jobs mutex poisoned");
@@ -857,9 +956,11 @@ fn download_status(state: &WebState, id: &str) -> Response<Body> {
             StatusCode::OK,
             json!({"type":"download_ready", "url":format!("/api/download/{id}")}),
         ),
-        Some(DownloadJob::Failed { message, .. }) => {
-            error(StatusCode::UNPROCESSABLE_ENTITY, "failed", message)
-        }
+        Some(DownloadJob::Failed { error, .. }) => json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::to_value(public_lifecycle_error(error.clone()))
+                .expect("lifecycle error DTO serializes"),
+        ),
         None => error(
             StatusCode::NOT_FOUND,
             "failed",
@@ -1675,7 +1776,14 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     match result {
         Ok(Ok(value)) if value["type"] == "error" => {
             let _ = fs::remove_dir_all(&operation_root);
-            match MutationErrorDto::parse(value, &operation_id) {
+            let public_error = ipc::LifecycleErrorV1::from_value(&value)
+                .ok()
+                .filter(|error| error.operation_id.as_deref() == Some(&operation_id))
+                .map(|error| {
+                    log_private_lifecycle_diagnostic("share", &error);
+                    public_lifecycle_error(error).into_value()
+                });
+            match public_error.and_then(|value| MutationErrorDto::parse(value, &operation_id)) {
                 Some(error) => mutation_error_response(error),
                 None => mutation_error_response(local_mutation_error(
                     &operation_id,
@@ -1934,6 +2042,43 @@ mod tests {
     }
 
     #[test]
+    fn public_attachment_errors_preserve_actions_but_hide_private_diagnostics() {
+        let operation_id = "0123456789abcdef0123456789abcdef";
+        let offer_id = "fedcba9876543210fedcba9876543210";
+        for code in [
+            "download_failed",
+            "share_failed",
+            "attachment_lifecycle_internal",
+            "attachment_min_free_space",
+            "attachment_removal_partial",
+        ] {
+            let mut private = ipc::LifecycleErrorV1::new(
+                code,
+                "open /home/alice/private/file.bin failed: database secret detail",
+                "unknown",
+                true,
+            );
+            private.operation_id = Some(operation_id.into());
+            private.offer_id = Some(offer_id.into());
+            private.selected_tags = Some(2);
+            private.removed_tags = Some(1);
+            private.quota_bytes_released = Some(7);
+            let public = public_lifecycle_error(private);
+            assert_eq!(public.code, code);
+            assert_eq!(public.outcome, "unknown");
+            assert!(public.retryable);
+            assert_eq!(public.operation_id.as_deref(), Some(operation_id));
+            assert_eq!(public.offer_id.as_deref(), Some(offer_id));
+            assert_eq!(public.selected_tags, Some(2));
+            assert_eq!(public.removed_tags, Some(1));
+            assert_eq!(public.quota_bytes_released, Some(7));
+            assert!(!public.message.contains("/home/alice"));
+            assert!(!public.message.contains("database"));
+            assert!(ipc::LifecycleErrorV1::from_value(&public.into_value()).is_ok());
+        }
+    }
+
+    #[test]
     fn mutation_error_dto_is_strict_and_operation_bound() {
         let id = "0123456789abcdef0123456789abcdef";
         let value = json!({
@@ -1947,6 +2092,16 @@ mod tests {
         extra["extra"] = true.into();
         assert!(MutationErrorDto::parse(extra, id).is_none());
         assert!(MutationErrorDto::parse(value, "fedcba9876543210fedcba9876543210").is_none());
+
+        let mut lifecycle =
+            ipc::LifecycleErrorV1::new("attachment_quota_exceeded", "quota", "not_started", false);
+        lifecycle.operation_id = Some(id.into());
+        let lifecycle_value = lifecycle.into_value();
+        assert!(ipc::LifecycleErrorV1::from_value(&lifecycle_value).is_ok());
+        assert!(MutationErrorDto::parse(lifecycle_value.clone(), id).is_some());
+        let mut malformed = lifecycle_value;
+        malformed["extra"] = true.into();
+        assert!(ipc::LifecycleErrorV1::from_value(&malformed).is_err());
     }
 
     #[test]
@@ -2353,6 +2508,22 @@ mod tests {
         );
         assert!(status.get("socket").is_none());
         assert!(status.get("invite").is_none());
+        let status = public_status(&json!({
+            "type":"status", "attachment_retention_secs":60,
+            "attachment_storage":{
+                "tagged_bytes":10, "tagged_blobs":1, "tags":2, "tag_capacity":8192,
+                "quota_bytes":100, "available_bytes":1000, "min_free_bytes":20,
+                "sampled_at_ms":1, "pressure":false, "over_quota":false, "below_min_free":false,
+                "path":"private"
+            }
+        }));
+        assert_eq!(status["attachment_retention_secs"], 60);
+        assert_eq!(status["attachment_storage"]["tagged_bytes"], 10);
+        assert!(status["attachment_storage"].get("path").is_none());
+        let malformed = public_status(&json!({
+            "type":"status", "attachment_storage":{"tagged_bytes":10}
+        }));
+        assert!(malformed.get("attachment_storage").is_none());
 
         let self_key = iroh::SecretKey::generate().public().to_string();
         let remote_key = iroh::SecretKey::generate().public().to_string();

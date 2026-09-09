@@ -39,9 +39,9 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 6. Persistent attachment storage is unbounded
 
-- Relevant documentation: `docs/attachments.md:68`
-- Every successful share/download creates a permanent pin, but there is no remove command, total quota, retention policy, or storage-pressure reporting.
-- Add `offers remove`, `offers prune`, a total-byte quota, minimum-free-space checks, retention controls, and usage metrics.
+- [x] **Status: completed.** `offers remove` and deterministic, bounded `offers prune` (including dry-run) use strict versioned IPC outcomes. One deny-unknown-fields lifecycle-error V1 DTO covers daemon/IPC/HTTP attachment busy, timeout, shutdown, partial, pressure, and internal failures with validated stable codes/outcomes/retryability and relevant IDs/counts. Removal is idempotent, selector-aware, database-synced, retry-safe after partial/unknown failures, and deletes only selected meshmsg tags.
+- A daemon-enforced unique-blob byte quota, authoritative 8,192-pin metadata bound, and filesystem minimum-free reserve protect nonempty and zero-byte/deduplicated stores. Startup reconciliation is bounded to 16,385 reserved-prefix records, runs before the command loop with blocking file/free-space work delegated off-loop, rejects oversized stores, meshmsg `hash_seq` tags, and missing/partial reserved blobs, and ignores foreign-prefix tags. Runtime pin admission rechecks complete authoritative size before its serialized transaction; accounting is transactionally cached, uses full `HashAndFormat` identity, and makes status constant work without stale partial-to-complete usage.
+- Tag/index reservations roll back on ordinary share/download tag, database, index, export, and pre-install failures; rollback uncertainty triggers bounded authoritative reconciliation, while crash boundaries conservatively recover durable tags without phantom reservations. Automatic retention is disabled by default and requires explicit nonzero opt-in. The exclusive storage gate prevents local transfer/lifecycle races; removal acquires bounded nonexpiring in-flight GC pins before named-tag deletion and starts the full one-hour grace only after deletion/database-sync completion; deterministic stall/refresh/rollback and read/GC barrier coverage proves guards cannot expire mid-commit and active provider reads survive a completed post-removal GC cycle. HTTP preserves actionable lifecycle fields while replacing private diagnostics with fixed public messages.
 
 ## API and consistency issues
 
@@ -129,8 +129,8 @@ These are acceptable for a trusted ephemeral tool, but blockers for a general pr
 Passed locally for these completed findings:
 
 - `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo build --locked`;
-- `cargo test --locked --all-targets`: 177 passed, including EnvelopeV2/replay, IPC capacity, attachment transaction/fault/crash coverage, operation-cache behavior, and direct-replay fingerprints, two-phase crash recovery, worker health, WAL recovery/compaction, rate/quota, load, and backpressure coverage;
-- `tests/integration-attachments.sh`: passed with raw/signed file downloads, signed-directory extraction, no-clobber, durability metadata, and inbound-pin restart recovery;
+- `cargo test --locked --all-targets`: 198 passed, including EnvelopeV2/replay, IPC capacity, bounded/oversized attachment reconciliation, missing/partial fail-closed accounting, concurrent completion and exact quota boundaries, cached status responsiveness, transactional pin/index rollback and crash boundaries, deterministic active-read/post-removal-GC safety, HTTP diagnostic sanitization, automatic-retention opt-in, lifecycle DTO compatibility rejection, partial delete/sync/index faults, format/foreign-tag safety, removal/prune boundaries, dry-run, deduplicated quota/reference accounting, lifecycle concurrency, operation-cache behavior, and direct-replay recovery/load coverage;
+- `tests/integration-attachments.sh`: passed with raw/signed file and directory transfers, no-clobber/durability, pin/index restart recovery, remove/prune/dry-run, dedup retention, share and download quota/free-space rejection, quota recovery, concurrent local share/download/remove/prune exclusion, and a started remote download surviving provider-pin removal;
 - `tests/integration-idempotency.sh` and `tests/integration-direct-messages.sh`: passed with response-loss retries, concurrent duplicate joins, stable private wire IDs, recipient WAL persistence across sender restart, duplicate classification, signed changed-body conflicts, authenticated direct delivery, and no replay redelivery;
 - `tests/integration-web.py`, `tests/integration-web-peer.py`, and `node tests/web-ui.cjs`: passed with conflicts, terminal failures, restart semantics, and HTTP/browser propagation.
 
@@ -142,7 +142,7 @@ Native Windows execution was unavailable locally. A Windows cross-check was atte
 2. [x] Bound and time out daemon IPC connections.
 3. [x] Correct download transaction ordering.
 4. Introduce stable typed API and error contracts.
-5. Add attachment lifecycle and quota controls.
+5. [x] Add attachment lifecycle and quota controls.
 6. Replace synchronous daemon logging with bounded nonblocking structured output.
 7. Add fuzzing, slowloris/load tests, crash fault injection, and cross-platform no-clobber tests.
 8. Pin the Rust toolchain and add signed provenance/SBOM. `SHA256SUMS` hosted beside the artifacts protects against corruption, not release-account compromise.
