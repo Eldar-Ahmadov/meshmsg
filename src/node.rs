@@ -1621,13 +1621,19 @@ struct BenchSendStats {
 }
 
 fn benchmark_due_slots(elapsed: Duration, period: Duration, total: u64) -> u64 {
-    ((elapsed.as_nanos() / period.as_nanos()) as u64 + 1).min(total)
+    let Some(slots) = elapsed.as_nanos().checked_div(period.as_nanos()) else {
+        return 0;
+    };
+    u64::try_from(slots)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+        .min(total)
 }
 
 fn advance_benchmark_slot(due_slots: u64, next_slot: &mut u64, schedule_missed: &mut u64) -> u64 {
     let sequence = due_slots.saturating_sub(1).max(*next_slot);
-    *schedule_missed += sequence.saturating_sub(*next_slot);
-    *next_slot = sequence + 1;
+    *schedule_missed = schedule_missed.saturating_add(sequence.saturating_sub(*next_slot));
+    *next_slot = sequence.saturating_add(1);
     sequence
 }
 
@@ -1637,7 +1643,7 @@ fn bench_send_progress(
     stats: &BenchSendStats,
     elapsed: Duration,
 ) -> serde_json::Value {
-    let elapsed_ms = elapsed.as_millis() as u64;
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
     serde_json::json!({
         "type":"bench_send_progress", "schema_version":2,
@@ -1719,7 +1725,11 @@ where
     let started = tokio::time::Instant::now();
     let duration = Duration::from_secs(config.duration_secs);
     let deadline = started + duration;
-    let period = Duration::from_nanos(1_000_000_000 / u64::from(config.rate));
+    let period_ns = 1_000_000_000_u64
+        .checked_div(u64::from(config.rate))
+        .filter(|period| *period > 0)
+        .context("invalid benchmark send period")?;
+    let period = Duration::from_nanos(period_ns);
     let mut ticks = tokio::time::interval_at(started, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stats = BenchSendStats::default();
@@ -1746,12 +1756,18 @@ where
         let due_slots = benchmark_due_slots(started.elapsed(), period, total);
         let sequence =
             advance_benchmark_slot(due_slots, &mut next_slot, &mut stats.schedule_missed);
-        stats.attempted += 1;
+        stats.attempted = stats
+            .attempted
+            .checked_add(1)
+            .context("benchmark attempted-count overflow")?;
         let timestamp_ms = match unix_timestamp_ms() {
             Ok(timestamp_ms) => timestamp_ms,
             Err(error) => {
                 eprintln!("benchmark send diagnostic: {error:#}");
-                stats.failed += 1;
+                stats.failed = stats
+                    .failed
+                    .checked_add(1)
+                    .context("benchmark failure-count overflow")?;
                 stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
                 reason = "send_failed";
                 break 'benchmark;
@@ -1767,7 +1783,10 @@ where
             Ok(body) => body,
             Err(error) => {
                 eprintln!("benchmark send diagnostic: {error:#}");
-                stats.failed += 1;
+                stats.failed = stats
+                    .failed
+                    .checked_add(1)
+                    .context("benchmark failure-count overflow")?;
                 stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
                 reason = "send_failed";
                 break 'benchmark;
@@ -1802,7 +1821,10 @@ where
             }
         };
         if !sent {
-            stats.incomplete += 1;
+            stats.incomplete = stats
+                .incomplete
+                .checked_add(1)
+                .context("benchmark incomplete-count overflow")?;
             break;
         }
         let response = tokio::select! {
@@ -1824,24 +1846,42 @@ where
         };
         match response {
             Some(Ok(Ok(encoded_bytes))) => {
-                stats.queued += 1;
-                stats.body_bytes += config.payload_bytes as u64;
-                stats.envelope_bytes += encoded_bytes as u64;
+                stats.queued = stats
+                    .queued
+                    .checked_add(1)
+                    .context("benchmark queued-count overflow")?;
+                stats.body_bytes = stats
+                    .body_bytes
+                    .checked_add(u64::try_from(config.payload_bytes)?)
+                    .context("benchmark body-byte overflow")?;
+                stats.envelope_bytes = stats
+                    .envelope_bytes
+                    .checked_add(u64::try_from(encoded_bytes)?)
+                    .context("benchmark envelope-byte overflow")?;
             }
             Some(Ok(Err(error))) => {
                 eprintln!("benchmark send diagnostic: {error}");
-                stats.failed += 1;
+                stats.failed = stats
+                    .failed
+                    .checked_add(1)
+                    .context("benchmark failure-count overflow")?;
                 stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
                 reason = "send_failed";
                 break 'benchmark;
             }
             Some(Err(_)) => {
-                stats.incomplete += 1;
+                stats.incomplete = stats
+                    .incomplete
+                    .checked_add(1)
+                    .context("benchmark incomplete-count overflow")?;
                 reason = "daemon_stopped";
                 break 'benchmark;
             }
             None => {
-                stats.incomplete += 1;
+                stats.incomplete = stats
+                    .incomplete
+                    .checked_add(1)
+                    .context("benchmark incomplete-count overflow")?;
                 break 'benchmark;
             }
         }
@@ -1872,7 +1912,10 @@ where
     let elapsed = started.elapsed();
     let observed = elapsed.min(duration);
     let due_slots = benchmark_due_slots(observed, period, total);
-    stats.schedule_missed += due_slots.saturating_sub(next_slot);
+    stats.schedule_missed = stats
+        .schedule_missed
+        .checked_add(due_slots.saturating_sub(next_slot))
+        .context("benchmark missed-schedule count overflow")?;
     let summary = bench_send_summary(&config, total, &stats, reason, elapsed);
     write_local_response(stream, &summary, LOCAL_IPC_RESPONSE_WRITE_TIMEOUT).await
 }
@@ -5902,6 +5945,18 @@ fn validate_send_record_progress(
     Ok(())
 }
 
+fn validate_started_benchmark_error(error: &ErrorEnvelopeV1, request_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        error.request_id.as_deref() == Some(request_id),
+        "daemon post-start benchmark error has missing or mismatched correlation"
+    );
+    anyhow::ensure!(
+        matches!(error.outcome.as_str(), "partial" | "unknown"),
+        "daemon returned a temporally impossible post-start benchmark error"
+    );
+    Ok(())
+}
+
 fn benchmark_contract_failure(
     request_id: &str,
     code: &str,
@@ -6068,6 +6123,14 @@ async fn bench_send_events(
                 },
             );
             emit_bench_terminal(&events, summary).await;
+            if let Err(temporal_error) = validate_started_benchmark_error(&error, &request_id) {
+                return Err(temporal_error.context(benchmark_contract_failure(
+                    &request_id,
+                    "invalid_daemon_response",
+                    "partial",
+                    false,
+                )));
+            }
             return Err(anyhow::Error::new(contracts::ContractFailure(error)));
         }
         match value["type"].as_str() {
@@ -6258,7 +6321,14 @@ impl BenchReceiveStats {
                 "expected count must be between 1 and {MAX_BENCH_MESSAGES}"
             );
         }
-        let seen = expected.map_or_else(Vec::new, |count| vec![0; count.div_ceil(8) as usize]);
+        let seen = match expected {
+            Some(count) => vec![
+                0;
+                usize::try_from(count.div_ceil(8))
+                    .context("benchmark sequence bitmap is too large")?
+            ],
+            None => Vec::new(),
+        };
         Ok(Self {
             run_id,
             expected,
@@ -6292,15 +6362,17 @@ impl BenchReceiveStats {
     }
 
     fn record_latency_sample(&mut self, latency: u64, sequence: u64, capacity: usize) {
-        self.latency_observations += 1;
+        self.latency_observations = self.latency_observations.saturating_add(1);
         if self.latencies.len() < capacity {
             self.latencies.push(latency);
         } else {
             self.latency_sampled = true;
             let candidate = Self::reservoir_index(self.latency_observations, sequence)
-                % self.latency_observations;
-            if candidate < capacity as u64 {
-                self.latencies[candidate as usize] = latency;
+                % self.latency_observations.max(1);
+            if u64::try_from(capacity).is_ok_and(|capacity| candidate < capacity) {
+                if let Ok(index) = usize::try_from(candidate) {
+                    self.latencies[index] = latency;
+                }
             }
         }
     }
@@ -6330,8 +6402,12 @@ impl BenchReceiveStats {
             return;
         }
         if self.expected.is_none() {
+            let Ok(bitmap_len) = usize::try_from(frame.total.div_ceil(8)) else {
+                self.malformed_messages = self.malformed_messages.saturating_add(1);
+                return;
+            };
             self.expected = Some(frame.total);
-            self.seen = vec![0; frame.total.div_ceil(8) as usize];
+            self.seen = vec![0; bitmap_len];
         }
         if self.expected != Some(frame.total) {
             self.malformed_messages = self.malformed_messages.saturating_add(1);
@@ -6342,7 +6418,10 @@ impl BenchReceiveStats {
             self.malformed_messages = self.malformed_messages.saturating_add(1);
             return;
         }
-        let byte = (frame.sequence / 8) as usize;
+        let Ok(byte) = usize::try_from(frame.sequence / 8) else {
+            self.malformed_messages = self.malformed_messages.saturating_add(1);
+            return;
+        };
         let mask = 1_u8 << (frame.sequence % 8);
         if self.seen[byte] & mask != 0 {
             self.duplicates = self.duplicates.saturating_add(1);
@@ -6360,7 +6439,9 @@ impl BenchReceiveStats {
                 .map_or(frame.sequence, |highest| highest.max(frame.sequence)),
         );
         self.unique = self.unique.saturating_add(1);
-        self.body_bytes = self.body_bytes.saturating_add(body.len() as u64);
+        self.body_bytes = self
+            .body_bytes
+            .saturating_add(u64::try_from(body.len()).unwrap_or(u64::MAX));
 
         let Some(latency) = received_timestamp_ms.checked_sub(frame.timestamp_ms) else {
             self.latency_clock_invalid = self.latency_clock_invalid.saturating_add(1);
@@ -6396,11 +6477,14 @@ impl BenchReceiveStats {
     }
 
     fn percentile(sorted: &[u64], percentile: usize) -> Option<u64> {
-        if sorted.is_empty() {
+        if sorted.is_empty() || !(1..=100).contains(&percentile) {
             return None;
         }
-        let rank = (percentile * sorted.len()).div_ceil(100);
-        Some(sorted[rank.saturating_sub(1)])
+        let rank = percentile
+            .checked_mul(sorted.len())?
+            .checked_add(99)?
+            .checked_div(100)?;
+        sorted.get(rank.checked_sub(1)?).copied()
     }
 
     fn missing_sequence_sample(&self) -> Vec<u64> {
@@ -6409,9 +6493,13 @@ impl BenchReceiveStats {
         };
         (0..expected)
             .filter(|sequence| {
-                let byte = (*sequence / 8) as usize;
+                let Ok(byte) = usize::try_from(*sequence / 8) else {
+                    return false;
+                };
                 let mask = 1_u8 << (*sequence % 8);
-                self.seen[byte] & mask == 0
+                self.seen
+                    .get(byte)
+                    .is_some_and(|observed| observed & mask == 0)
             })
             .take(MAX_MISSING_SEQUENCE_SAMPLE)
             .collect()
@@ -6433,7 +6521,7 @@ impl BenchReceiveStats {
             .copied()
             .collect::<Vec<_>>();
         latencies.sort_unstable();
-        let elapsed_ms = elapsed.as_millis() as u64;
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
         let missing = self
             .expected
@@ -6466,7 +6554,7 @@ impl BenchReceiveStats {
 
     fn summary(&mut self, completion_reason: &str, elapsed: Duration) -> serde_json::Value {
         self.latencies.sort_unstable();
-        let elapsed_ms = elapsed.as_millis() as u64;
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
         let missing = self
             .expected
@@ -6560,9 +6648,13 @@ async fn bench_receive_events(
             value = reader.read() => match value {
                 Ok(Some(value)) if value["type"] == "error" => {
                     completion_reason = "daemon_stopped";
-                    terminal_error = Some(anyhow::Error::new(contracts::ContractFailure(
-                        ErrorEnvelopeV1::from_value(&value)?,
-                    )));
+                    let error = ErrorEnvelopeV1::from_value(&value)?;
+                    terminal_error = Some(match validate_started_benchmark_error(&error, &request_id) {
+                        Ok(()) => anyhow::Error::new(contracts::ContractFailure(error)),
+                        Err(error) => error.context(benchmark_contract_failure(
+                            &request_id, "invalid_daemon_response", "partial", false,
+                        )),
+                    });
                     break;
                 }
                 Ok(Some(value)) => stats.record_event(&value),
@@ -7919,12 +8011,20 @@ mod tests {
         assert_eq!(summary["schedule_missed"], 1);
         assert_eq!(summary["accounting_complete"], false);
         assert!(summary["first_error"].is_null());
-        validate_success_payload(&summary).unwrap();
+        assert!(
+            validate_success_payload(&summary).is_err(),
+            "client-only partial snapshots must not validate as daemon summaries"
+        );
     }
 
     #[test]
     fn benchmark_schedule_and_sender_summary_are_deterministic() {
         let period = Duration::from_millis(100);
+        assert_eq!(benchmark_due_slots(Duration::MAX, Duration::ZERO, 10), 0);
+        assert_eq!(
+            benchmark_due_slots(Duration::MAX, Duration::from_nanos(1), 10),
+            10
+        );
         assert_eq!(benchmark_due_slots(Duration::ZERO, period, 10), 1);
         assert_eq!(
             benchmark_due_slots(Duration::from_millis(99), period, 10),
@@ -10321,6 +10421,250 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_start_benchmark_errors_are_normalized_or_preserved_by_outcome() {
+        for (code, outcome, correlation, expected_code, expected_outcome, retryable) in [
+            (
+                "command_timeout",
+                "not_started",
+                "matching",
+                "invalid_daemon_response",
+                "partial",
+                false,
+            ),
+            (
+                "command_timeout",
+                "partial",
+                "matching",
+                "command_timeout",
+                "partial",
+                true,
+            ),
+            (
+                "command_timeout",
+                "unknown",
+                "matching",
+                "command_timeout",
+                "unknown",
+                true,
+            ),
+            (
+                "ipc_capacity",
+                "partial",
+                "missing",
+                "invalid_daemon_response",
+                "partial",
+                false,
+            ),
+            (
+                "initial_frame_timeout",
+                "unknown",
+                "missing",
+                "invalid_daemon_response",
+                "partial",
+                false,
+            ),
+            (
+                "command_timeout",
+                "partial",
+                "missing",
+                "invalid_daemon_response",
+                "partial",
+                false,
+            ),
+            (
+                "ipc_capacity",
+                "unknown",
+                "mismatched",
+                "invalid_daemon_response",
+                "partial",
+                false,
+            ),
+            (
+                "initial_frame_timeout",
+                "partial",
+                "mismatched",
+                "invalid_daemon_response",
+                "partial",
+                false,
+            ),
+            (
+                "command_timeout",
+                "unknown",
+                "mismatched",
+                "invalid_daemon_response",
+                "partial",
+                false,
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "meshmsg-benchmark-error-test-{}",
+                rand::random::<u64>()
+            ));
+            let state_lock = StateLock::acquire(&dir).unwrap();
+            let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let frame = read_frame(&mut stream, MAX_IPC_REQUEST_SIZE).await.unwrap();
+                let request: IpcRequestFrame = serde_json::from_slice(&frame).unwrap();
+                let IpcRequest::BenchSend { config } = request.request else {
+                    panic!("expected benchmark send request")
+                };
+                write_value(
+                    &mut stream,
+                    &contracts::correlate(
+                        serde_json::json!({
+                            "type":"bench_send_started", "schema_version":2,
+                            "run_id":config.run_id, "rate":config.rate,
+                            "duration_secs":config.duration_secs,
+                            "payload_bytes":config.payload_bytes, "planned":1,
+                            "delivery_acknowledged":false
+                        }),
+                        &request.request_id,
+                    ),
+                )
+                .await
+                .unwrap();
+                let mut error = ErrorEnvelopeV1::new(code, "", outcome, true);
+                error.request_id = match correlation {
+                    "matching" => Some(request.request_id),
+                    "missing" => None,
+                    "mismatched" => Some("f".repeat(32)),
+                    _ => unreachable!(),
+                };
+                write_value(&mut stream, &error.into_value()).await.unwrap();
+            });
+
+            let (events, mut output) = mpsc::channel(8);
+            let (cancel, cancellation) = oneshot::channel();
+            let result = bench_send_events(
+                &dir,
+                Some("0123456789abcdef0123456789abcdef".into()),
+                1,
+                1,
+                128,
+                events,
+                cancellation,
+            )
+            .await;
+            drop(cancel);
+            server.await.unwrap();
+            let mut values = Vec::new();
+            while let Some(value) = output.recv().await {
+                values.push(value);
+            }
+            let error = result.unwrap_err();
+            let contract = error
+                .downcast_ref::<contracts::ContractFailure>()
+                .unwrap_or_else(|| panic!("benchmark error remains authoritative: {error:#}"));
+            assert_eq!(contract.0.code, expected_code);
+            assert_eq!(contract.0.outcome, expected_outcome);
+            assert_eq!(contract.0.retryable, retryable);
+            assert_eq!(values.len(), 2);
+            assert_eq!(
+                contract.0.request_id.as_deref(),
+                values[0]["request_id"].as_str()
+            );
+            assert_eq!(values[0]["type"], "bench_send_started");
+            assert_eq!(values[1]["type"], "bench_send_summary");
+            assert_eq!(values[1]["accounting_complete"], false);
+            assert_eq!(values[1]["completion_reason"], "daemon_stopped");
+            assert_eq!(
+                values[0]["request_id"], values[1]["request_id"],
+                "synthesized summary must retain benchmark correlation"
+            );
+
+            drop(guard);
+            drop(state_lock);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receive_benchmark_rejects_post_start_error_correlation_failures() {
+        for (code, outcome, correlation) in [
+            ("ipc_capacity", "partial", "missing"),
+            ("initial_frame_timeout", "unknown", "missing"),
+            ("command_timeout", "partial", "missing"),
+            ("ipc_capacity", "unknown", "mismatched"),
+            ("initial_frame_timeout", "partial", "mismatched"),
+            ("command_timeout", "unknown", "mismatched"),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "meshmsg-receive-error-test-{}",
+                rand::random::<u64>()
+            ));
+            let state_lock = StateLock::acquire(&dir).unwrap();
+            let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let frame = read_frame(&mut stream, MAX_IPC_REQUEST_SIZE).await.unwrap();
+                let request: IpcRequestFrame = serde_json::from_slice(&frame).unwrap();
+                assert!(matches!(request.request, IpcRequest::Subscribe));
+                write_value(
+                    &mut stream,
+                    &contracts::correlate(
+                        serde_json::json!({
+                            "type":"connected", "schema_version":1,
+                            "peer":"2".repeat(64), "endpoint_online":true,
+                            "topic_joined":true, "alias":null, "ipc_capabilities":[]
+                        }),
+                        &request.request_id,
+                    ),
+                )
+                .await
+                .unwrap();
+                let mut error = ErrorEnvelopeV1::new(code, "", outcome, true);
+                error.request_id = match correlation {
+                    "missing" => None,
+                    "mismatched" => Some("f".repeat(32)),
+                    _ => unreachable!(),
+                };
+                write_value(&mut stream, &error.into_value()).await.unwrap();
+            });
+
+            let (events, mut output) = mpsc::channel(8);
+            let (cancel, cancellation) = oneshot::channel();
+            let result = bench_receive_events(
+                &dir,
+                "0123456789abcdef0123456789abcdef".into(),
+                1,
+                Some(1),
+                events,
+                cancellation,
+            )
+            .await;
+            drop(cancel);
+            server.await.unwrap();
+            let mut values = Vec::new();
+            while let Some(value) = output.recv().await {
+                values.push(value);
+            }
+            let error = result.unwrap_err();
+            let contract = error
+                .downcast_ref::<contracts::ContractFailure>()
+                .unwrap_or_else(|| panic!("benchmark error remains authoritative: {error:#}"));
+            assert_eq!(contract.0.code, "invalid_daemon_response");
+            assert_eq!(contract.0.outcome, "partial");
+            assert!(!contract.0.retryable);
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[0]["type"], "bench_receive_started");
+            assert_eq!(values[1]["type"], "bench_receive_summary");
+            assert_eq!(values[1]["completion_reason"], "daemon_stopped");
+            assert_eq!(values[0]["request_id"], values[1]["request_id"]);
+            assert_eq!(
+                contract.0.request_id.as_deref(),
+                values[0]["request_id"].as_str()
+            );
+
+            drop(guard);
+            drop(state_lock);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn benchmark_sender_cancellation_round_trips_through_strict_ipc_client() {
         let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
@@ -10374,6 +10718,7 @@ mod tests {
         assert_eq!(summary["queued"], 0);
         assert_eq!(summary["failed"], 0);
         assert_eq!(summary["incomplete"], 1);
+        assert_eq!(summary["accounting_complete"], true);
         task.await.unwrap().unwrap();
         assert!(!busy.load(Ordering::Acquire));
     }

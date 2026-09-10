@@ -92,12 +92,19 @@ achieved rates must agree with counts, bytes, and elapsed time.
 text `Message submission failed.`; all other completion reasons require
 `first_error:null`. Daemon diagnostics and paths are never accepted there. Receive
 metrics likewise enforce possible unique/highest/duplicate/out-of-order relationships,
-body-byte and elapsed-rate coherence, retained latency samples and feasible percentile
-ranks, local lag event/drop sums, exact bounded missing samples, and completion/validity
-state. A send client accepts `interrupted` only after it initiated cancellation. Once
-a benchmark started, synthesized partial summaries set `accounting_complete:false`,
-retain only the latest validated counters, and preserve the request ID; terminal
-errors use partial/unknown outcomes and strict daemon errors are preserved.
+body-byte and elapsed-rate coherence, retained latency samples and overflow-safe feasible
+percentile ranks, local lag event/drop sums, and completion/validity state. Missing samples
+are either the exact complement of the unique/highest state or a feasible first-100
+prefix of that complement. Numeric range checks precede division, caps precede
+multiplication, and relevant integer arithmetic and machine-width conversions fail
+closed on overflow. A send client accepts `interrupted` only after it initiated
+cancellation. Daemon terminal summaries must set `accounting_complete:true`; once a
+benchmark started, only synthesized partial summaries may set it false, retain only the
+latest validated counters, and preserve the request ID. Every post-start daemon error
+must contain exactly that active request ID, even for codes allowed to omit it before
+admission. Strict matching errors with partial/unknown outcomes are preserved; missing
+or mismatched correlation and the temporally impossible `not_started` outcome become
+correlated `invalid_daemon_response`/`partial`.
 Listen/chat therefore never print an unrecognized daemon event. Error objects are strictly decoded against the closed error contract. Status
 includes capabilities, replay limits, mutation-cache semantics, attachment limits,
 and attachment-storage pressure.

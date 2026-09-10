@@ -172,7 +172,14 @@ def run_benchmark_case(changes, expected_exit, expected_reason,
                         return
                     if "_error" in changes:
                         terminal_error = dict(changes["_error"], schema_version=1,
-                                              request_id=request_id, type="error")
+                                              type="error")
+                        correlation = terminal_error.pop("_correlation", "matching")
+                        if correlation == "matching":
+                            terminal_error["request_id"] = request_id
+                        elif correlation == "mismatched":
+                            terminal_error["request_id"] = "f" * 32
+                        elif correlation != "missing":
+                            raise AssertionError(correlation)
                         connection.sendall(json.dumps(terminal_error).encode() + b"\n")
                         return
                     summary.update(changes)
@@ -201,7 +208,8 @@ def run_benchmark_case(changes, expected_exit, expected_reason,
         benchmark_request_id = values[0]["request_id"]
         assert all(value["request_id"] == benchmark_request_id for value in values), (changes, values)
         if expected_exit == 1:
-            assert values[-1]["type"] == "error"
+            errors = [value for value in values if value["type"] == "error"]
+            assert len(errors) == 1 and values[-1] == errors[0], (changes, values)
             assert values[-1]["code"] == expected_code, (changes, values)
             assert values[-1]["outcome"] == expected_outcome, (changes, values)
         else:
@@ -233,6 +241,9 @@ for incoherent in [
     {"achieved_body_bytes_per_second": -1.0},
     {"achieved_messages_per_second": 2.0},
     {"achieved_body_bytes_per_second": 127.0},
+    {"rate": 0},
+    {"rate": 2**32 - 1},
+    {"elapsed_ms": 2**64 - 1},
     {"schedule_missed": 1},
     {"schedule_missed": 2**64 - 1},
     {"attempted": 2**64 - 1, "queued": 2**64 - 1,
@@ -244,6 +255,7 @@ for incoherent in [
      "achieved_body_bytes_per_second": 64.0},
     {"run_id": "5" * 32},
     {"incomplete": 1},
+    {"accounting_complete": False},
 ]:
     run_benchmark_case(
         incoherent, 1, "daemon_stopped", "invalid_daemon_response", "partial"
@@ -256,9 +268,35 @@ run_benchmark_case(
 run_benchmark_case(
     {"_error": {"code": "command_timeout",
                 "message": "The request timed out; reconcile before retrying.",
-                "outcome": "unknown", "retryable": True}},
-    1, "daemon_stopped", "command_timeout", "unknown",
+                "outcome": "not_started", "retryable": True}},
+    1, "daemon_stopped", "invalid_daemon_response", "partial",
 )
+for valid_outcome in ["partial", "unknown"]:
+    run_benchmark_case(
+        {"_error": {"code": "command_timeout",
+                    "message": "The request timed out; reconcile before retrying.",
+                    "outcome": valid_outcome, "retryable": True}},
+        1, "daemon_stopped", "command_timeout", valid_outcome,
+    )
+for code, message, outcome, correlation in [
+    ("ipc_capacity", "Local capacity is currently unavailable.",
+     "partial", "missing"),
+    ("initial_frame_timeout", "The initial local request timed out.",
+     "unknown", "missing"),
+    ("command_timeout", "The request timed out; reconcile before retrying.",
+     "partial", "missing"),
+    ("ipc_capacity", "Local capacity is currently unavailable.",
+     "unknown", "mismatched"),
+    ("initial_frame_timeout", "The initial local request timed out.",
+     "partial", "mismatched"),
+    ("command_timeout", "The request timed out; reconcile before retrying.",
+     "unknown", "mismatched"),
+]:
+    run_benchmark_case(
+        {"_error": {"code": code, "message": message, "outcome": outcome,
+                    "retryable": True, "_correlation": correlation}},
+        1, "daemon_stopped", "invalid_daemon_response", "partial",
+    )
 run_benchmark_case(
     {"completion_reason": "interrupted", "queued": 0, "failed": 0,
      "incomplete": 1, "queued_body_bytes": 0, "queued_envelope_bytes": 0,

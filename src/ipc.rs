@@ -544,17 +544,20 @@ fn coherent_benchmark_rate(reported: f64, count: u64, elapsed_ms: u64) -> bool {
     (reported - expected).abs() <= tolerance
 }
 
-fn benchmark_eligible_slot_bounds(rate: u32, elapsed_ms: u64, planned: u64) -> (u64, u64) {
-    let period_ns = 1_000_000_000 / u64::from(rate);
-    let lower_ns = u128::from(elapsed_ms) * 1_000_000;
-    let upper_ns = lower_ns + 999_999;
+fn benchmark_eligible_slot_bounds(rate: u32, elapsed_ms: u64, planned: u64) -> Option<(u64, u64)> {
+    let period_ns = 1_000_000_000_u64.checked_div(u64::from(rate))?;
+    if period_ns == 0 {
+        return None;
+    }
+    let lower_ns = u128::from(elapsed_ms).checked_mul(1_000_000)?;
+    let upper_ns = lower_ns.checked_add(999_999)?;
     let eligible = |elapsed_ns: u128| {
-        u64::try_from(elapsed_ns / u128::from(period_ns))
+        u64::try_from(elapsed_ns.checked_div(u128::from(period_ns))?)
             .unwrap_or(u64::MAX)
-            .saturating_add(1)
-            .min(planned)
+            .checked_add(1)
+            .map(|slots| slots.min(planned))
     };
-    (eligible(lower_ns), eligible(upper_ns))
+    Some((eligible(lower_ns)?, eligible(upper_ns)?))
 }
 
 fn validate_send_metrics(
@@ -568,6 +571,12 @@ fn validate_send_metrics(
     let (attempted, queued, failed, incomplete, schedule_missed) = counts;
     let (queued_body_bytes, queued_envelope_bytes) = bytes;
     let (elapsed_ms, achieved_messages_per_second, achieved_body_bytes_per_second) = timing;
+    anyhow::ensure!(
+        (1..=10_000).contains(&rate)
+            && (1..=86_400).contains(&duration_secs)
+            && (106..=4096).contains(&payload_bytes),
+        "invalid benchmark send configuration"
+    );
     let payload_bytes = u64::try_from(payload_bytes).context("invalid benchmark payload size")?;
     let expected_planned = u64::from(rate)
         .checked_mul(duration_secs)
@@ -576,7 +585,8 @@ fn validate_send_metrics(
         .checked_add(failed)
         .and_then(|count| count.checked_add(incomplete));
     let scheduled = attempted.checked_add(schedule_missed);
-    let eligible = benchmark_eligible_slot_bounds(rate, elapsed_ms, planned);
+    let eligible = benchmark_eligible_slot_bounds(rate, elapsed_ms, planned)
+        .context("invalid benchmark scheduler bounds")?;
     let expected_body_bytes = queued.checked_mul(payload_bytes);
     let minimum_envelope_bytes = expected_body_bytes.and_then(|bytes| bytes.checked_add(queued));
     let maximum_envelope_bytes = queued.checked_mul(4096);
@@ -605,6 +615,78 @@ fn validate_send_metrics(
     Ok(())
 }
 
+fn greatest_unlisted_at_or_below(limit: u64, sorted_listed: &[u64]) -> Option<u64> {
+    let mut candidate = Some(limit);
+    for listed in sorted_listed.iter().rev() {
+        let value = candidate?;
+        if *listed == value {
+            candidate = value.checked_sub(1);
+        } else if *listed < value {
+            return candidate;
+        }
+    }
+    candidate
+}
+
+fn coherent_missing_sequence_sample(
+    expected: Option<u64>,
+    unique: u64,
+    missing: Option<u64>,
+    highest: Option<u64>,
+    sample: &[u64],
+) -> bool {
+    const SAMPLE_CAP: u64 = 100;
+    let Some(expected) = expected else {
+        return unique == 0 && missing.is_none() && highest.is_none() && sample.is_empty();
+    };
+    let Some(missing) = missing else {
+        return false;
+    };
+    let Ok(sample_len) = u64::try_from(sample.len()) else {
+        return false;
+    };
+    if sample_len != missing.min(SAMPLE_CAP)
+        || !sample.windows(2).all(|pair| pair[0] < pair[1])
+        || sample.iter().any(|sequence| *sequence >= expected)
+    {
+        return false;
+    }
+
+    if missing <= SAMPLE_CAP {
+        // The whole complement is present. Its greatest unlisted member must
+        // therefore be the reported greatest observed sequence.
+        return expected
+            .checked_sub(1)
+            .and_then(|last| greatest_unlisted_at_or_below(last, sample))
+            == highest;
+    }
+
+    // A capped sample is the ascending prefix of the missing set. Every value
+    // through its last member that is not listed is therefore known observed.
+    let Some(last) = sample.last().copied() else {
+        return false;
+    };
+    let Some(prefix_slots) = last.checked_add(1) else {
+        return false;
+    };
+    let Some(prefix_observed) = prefix_slots.checked_sub(sample_len) else {
+        return false;
+    };
+    if prefix_observed > unique {
+        return false;
+    }
+    let remaining_observed = unique - prefix_observed;
+    match highest {
+        None => prefix_observed == 0 && remaining_observed == 0,
+        Some(highest) if highest <= last => {
+            remaining_observed == 0 && greatest_unlisted_at_or_below(last, sample) == Some(highest)
+        }
+        Some(highest) => highest
+            .checked_sub(last)
+            .is_some_and(|available| (1..=available).contains(&remaining_observed)),
+    }
+}
+
 fn validate_bench_metrics(
     delivery: (Option<u64>, u64, Option<u64>, Option<u64>, u64, u64),
     timing: (u64, f64, f64),
@@ -628,26 +710,37 @@ fn validate_bench_metrics(
     };
     let minimum_body_bytes = unique.checked_mul(106);
     let maximum_body_bytes = unique.checked_mul(4096);
-    let coherent_percentiles = match (latency.p50_ms, latency.p95_ms, latency.p99_ms) {
-        (None, None, None) => latency.samples == 0,
-        (Some(p50), Some(p95), Some(p99)) => {
-            let rank = |percentile: usize| (percentile * latency.samples).div_ceil(100);
-            latency.samples > 0
-                && p50 <= p95
-                && p95 <= p99
-                && p99 <= 86_400_000
-                && (rank(50) != rank(95) || p50 == p95)
-                && (rank(95) != rank(99) || p95 == p99)
-        }
-        _ => false,
+    let latency_samples = u64::try_from(latency.samples).ok();
+    let samples_within_cap = latency.samples <= maximum_latency_samples;
+    let rank = |percentile: usize| {
+        percentile
+            .checked_mul(latency.samples)?
+            .checked_add(99)?
+            .checked_div(100)
     };
+    let coherent_percentiles = samples_within_cap
+        && match (latency.p50_ms, latency.p95_ms, latency.p99_ms) {
+            (None, None, None) => latency.samples == 0,
+            (Some(p50), Some(p95), Some(p99)) => match (rank(50), rank(95), rank(99)) {
+                (Some(rank50), Some(rank95), Some(rank99)) => {
+                    latency.samples > 0
+                        && p50 <= p95
+                        && p95 <= p99
+                        && p99 <= 86_400_000
+                        && (rank50 != rank95 || p50 == p95)
+                        && (rank95 != rank99 || p95 == p99)
+                }
+                _ => false,
+            },
+            _ => false,
+        };
     anyhow::ensure!(
         coherent_benchmark_rate(achieved_messages_per_second, unique, elapsed_ms)
             && coherent_benchmark_rate(achieved_body_bytes_per_second, body_bytes, elapsed_ms),
         "invalid benchmark rates"
     );
     anyhow::ensure!(
-        coherent_expected && expected.map(|count| count - unique) == missing,
+        coherent_expected && expected.and_then(|count| count.checked_sub(unique)) == missing,
         "invalid benchmark missing count"
     );
     anyhow::ensure!(coherent_highest, "invalid benchmark highest sequence");
@@ -657,10 +750,11 @@ fn validate_bench_metrics(
         "invalid benchmark body-byte count"
     );
     anyhow::ensure!(
-        latency.samples <= maximum_latency_samples
-            && latency.samples as u64 <= latency.observations
+        samples_within_cap
+            && latency_samples.is_some_and(|samples| samples <= latency.observations)
             && (latency.observations == 0 || latency.samples > 0)
-            && latency.sampled == (latency.samples as u64 != latency.observations)
+            && latency_samples
+                .is_some_and(|samples| latency.sampled == (samples != latency.observations))
             && latency.observations.checked_add(latency.clock_invalid) == Some(unique)
             && coherent_percentiles,
         "invalid benchmark latency counts"
@@ -963,6 +1057,7 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                     && (1..=10_000).contains(&dto.rate)
                     && (106..=4096).contains(&dto.payload_bytes)
                     && !dto.delivery_acknowledged
+                    && dto.accounting_complete
                     && matches!(
                         dto.completion_reason.as_str(),
                         "deadline" | "interrupted" | "send_failed" | "daemon_stopped"
@@ -981,10 +1076,12 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                         })
                 }
                 "deadline" => {
-                    dto.accounting_complete
-                        && dto.failed == 0
+                    dto.failed == 0
                         && dto.attempted.checked_add(dto.schedule_missed) == Some(dto.planned)
-                        && dto.elapsed_ms >= dto.duration_secs.saturating_mul(1_000)
+                        && dto
+                            .duration_secs
+                            .checked_mul(1_000)
+                            .is_some_and(|deadline_ms| dto.elapsed_ms >= deadline_ms)
                         && dto.first_error.is_none()
                 }
                 "interrupted" | "daemon_stopped" => dto.failed == 0 && dto.first_error.is_none(),
@@ -1062,16 +1159,13 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 (&dto.latency, 1_000_000),
                 &dto.lag,
             )?;
-            let expected_sample_len = dto.missing.map_or(0, |missing| missing.min(100) as usize);
-            let coherent_missing_sample = dto.missing_sequence_sample.len() == expected_sample_len
-                && dto
-                    .missing_sequence_sample
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1])
-                && dto.missing_sequence_sample.iter().all(|sequence| {
-                    dto.expected.is_some_and(|expected| *sequence < expected)
-                        && Some(*sequence) != dto.highest_sequence
-                });
+            let coherent_missing_sample = coherent_missing_sequence_sample(
+                dto.expected,
+                dto.unique,
+                dto.missing,
+                dto.highest_sequence,
+                &dto.missing_sequence_sample,
+            );
             let complete = dto.expected.is_some_and(|count| count == dto.unique);
             anyhow::ensure!(
                 dto.family == family
@@ -2388,6 +2482,155 @@ mod tests {
                 "receive contradiction accepted: {name}"
             );
         }
+    }
+
+    #[test]
+    fn benchmark_numeric_validation_never_panics_at_machine_boundaries() {
+        let request_id = "11111111111111111111111111111111";
+        let run_id = "22222222222222222222222222222222";
+        let send = serde_json::json!({
+            "type":"bench_send_progress", "schema_version":2, "request_id":request_id,
+            "run_id":run_id, "rate":1, "duration_secs":1, "payload_bytes":128,
+            "planned":1, "attempted":1, "queued":1, "failed":0, "incomplete":0,
+            "schedule_missed":0, "queued_body_bytes":128, "queued_envelope_bytes":256,
+            "elapsed_ms":1000, "achieved_messages_per_second":1.0,
+            "achieved_body_bytes_per_second":128.0, "delivery_acknowledged":false
+        });
+        let receive = serde_json::json!({
+            "type":"bench_receive_summary", "schema_version":1, "request_id":request_id,
+            "run_id":run_id, "completion_reason":"deadline", "elapsed_ms":1000,
+            "expected":1, "complete":true, "measurement_valid":true,
+            "unique":1, "missing":0, "missing_sequence_sample":[],
+            "duplicates":0, "out_of_order":0, "highest_sequence":0,
+            "body_bytes":128, "achieved_messages_per_second":1.0,
+            "achieved_body_bytes_per_second":128.0,
+            "latency":{"observations":1,"samples":1,"sampled":false,"clock_invalid":0,
+                "p50_ms":1,"p95_ms":1,"p99_ms":1},
+            "lag":{"local_events":0,"local_dropped":0,"gossip_events":0,"incomplete":false},
+            "peer_up":0,"peer_down":0,"ignored_messages":0,"malformed_messages":0
+        });
+
+        let mut malformed = Vec::new();
+        for rate in [0_u32, u32::MAX] {
+            let mut value = send.clone();
+            value["rate"] = rate.into();
+            malformed.push(value);
+        }
+        for (field, boundary) in [
+            ("elapsed_ms", u64::MAX),
+            ("attempted", u64::MAX),
+            ("queued", u64::MAX),
+            ("queued_body_bytes", u64::MAX),
+            ("queued_envelope_bytes", u64::MAX),
+        ] {
+            let mut value = send.clone();
+            value[field] = boundary.into();
+            malformed.push(value);
+        }
+        let mut huge_samples = receive.clone();
+        huge_samples["latency"]["samples"] = usize::MAX.into();
+        malformed.push(huge_samples);
+        let mut latency_sum_overflow = receive;
+        latency_sum_overflow["unique"] = u64::MAX.into();
+        latency_sum_overflow["latency"]["observations"] = u64::MAX.into();
+        latency_sum_overflow["latency"]["clock_invalid"] = 1.into();
+        malformed.push(latency_sum_overflow);
+
+        for value in malformed {
+            let result = std::panic::catch_unwind(|| validate_success_payload(&value));
+            assert!(result.is_ok(), "numeric boundary panicked: {value}");
+            assert!(
+                result.unwrap().is_err(),
+                "numeric boundary was accepted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_sequence_sample_feasibility_matches_small_exhaustive_model() {
+        for expected in 1_u64..=9 {
+            let universe = 1_u64 << expected;
+            for unique in 0..=expected {
+                for highest in std::iter::once(None).chain((0..expected).map(Some)) {
+                    for missing_mask in 0..universe {
+                        let sample = (0..expected)
+                            .filter(|sequence| missing_mask & (1 << sequence) != 0)
+                            .collect::<Vec<_>>();
+                        let complement = (0..expected)
+                            .filter(|sequence| missing_mask & (1 << sequence) == 0)
+                            .collect::<Vec<_>>();
+                        let feasible = sample.len() as u64 == expected - unique
+                            && complement.last().copied() == highest;
+                        assert_eq!(
+                            coherent_missing_sequence_sample(
+                                Some(expected),
+                                unique,
+                                Some(expected - unique),
+                                highest,
+                                &sample,
+                            ),
+                            feasible,
+                            "expected={expected} unique={unique} highest={highest:?} sample={sample:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Exhaust all observed sets that still force truncation in a 104-item
+        // universe. Their generated first-100 missing prefixes must stay valid.
+        let expected = 104_u64;
+        for observed_mask in 0_u16..(1 << 10) {
+            let observed = (0_u64..10)
+                .filter(|sequence| observed_mask & (1_u16 << sequence) != 0)
+                .collect::<Vec<_>>();
+            if observed.len() >= 4 {
+                continue;
+            }
+            let sample = (0..expected)
+                .filter(|sequence| !observed.contains(sequence))
+                .take(100)
+                .collect::<Vec<_>>();
+            assert!(coherent_missing_sequence_sample(
+                Some(expected),
+                observed.len() as u64,
+                Some(expected - observed.len() as u64),
+                observed.last().copied(),
+                &sample,
+            ));
+        }
+    }
+
+    #[test]
+    fn truncated_missing_sequence_samples_enforce_sound_prefix_constraints() {
+        let valid = (0_u64..100).collect::<Vec<_>>();
+        assert!(coherent_missing_sequence_sample(
+            Some(105),
+            1,
+            Some(104),
+            Some(104),
+            &valid,
+        ));
+        let mut skipped_prefix_gap = valid.clone();
+        skipped_prefix_gap[50..].rotate_left(1);
+        skipped_prefix_gap[99] = 100;
+        skipped_prefix_gap.sort_unstable();
+        assert!(!coherent_missing_sequence_sample(
+            Some(105),
+            1,
+            Some(104),
+            Some(104),
+            &skipped_prefix_gap,
+        ));
+
+        let complete_tail = (100_u64..200).collect::<Vec<_>>();
+        assert!(coherent_missing_sequence_sample(
+            Some(200),
+            100,
+            Some(100),
+            Some(99),
+            &complete_tail,
+        ));
     }
 
     #[test]
