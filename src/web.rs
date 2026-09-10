@@ -2,7 +2,7 @@
 //! Host/Origin checks defend browsers, not hostile local or authorized clients.
 use crate::{
     alias::validate_alias,
-    attachment::{validate_display_name, AttachmentKind},
+    attachment::{validate_display_name, AttachmentKind, AttachmentOffer},
     config::prepare_state_dir,
     contracts::{self, ErrorEnvelopeV1},
     direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
@@ -23,6 +23,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use iroh::PublicKey;
+use iroh_gossip::proto::TopicId;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -35,7 +36,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -655,10 +656,7 @@ fn random_id() -> String {
 }
 
 fn valid_id(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    contracts::valid_operation_id(value)
 }
 
 tokio::task_local! {
@@ -1482,7 +1480,12 @@ async fn web_ipc_request(dir: &Path, request: &IpcRequest) -> Result<Value> {
     ipc::send_request_with_id(dir, request, &http_request_id()).await
 }
 
-fn public_event(state: &WebState, value: Value, download_supported: bool) -> Option<Value> {
+fn public_event(
+    state: &WebState,
+    topic: TopicId,
+    value: Value,
+    download_supported: bool,
+) -> Option<Value> {
     match value["type"].as_str()? {
         "connected" => {
             let decoded: ConnectedEventDto = serde_json::from_value(value.clone()).ok()?;
@@ -1549,6 +1552,13 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
         }
         "attachment_offer" => {
             let decoded: OfferEventDto = serde_json::from_value(value.clone()).ok()?;
+            let semantic_offer = AttachmentOffer {
+                offer_id: decoded.offer_id.clone(),
+                kind: decoded.kind_name,
+                name: decoded.name.clone(),
+                size: decoded.size,
+                ticket: decoded.ticket.clone(),
+            };
             if decoded.kind != "attachment_offer"
                 || decoded.schema_version != 2
                 || !contracts::valid_request_id(&decoded.request_id)
@@ -1556,9 +1566,20 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 || decoded.timestamp_ms == 0
                 || !ipc::valid_operation_id(&decoded.message_id)
                 || decoded.offer_id != decoded.message_id
-                || decoded.name.is_empty()
-                || decoded.ticket.is_empty()
-                || decoded.offer.is_empty()
+                || !ipc::validate_attachment_event_fields(
+                    Some(topic),
+                    Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .ok()?
+                            .as_millis() as u64,
+                    ),
+                    &decoded.from,
+                    &decoded.message_id,
+                    decoded.timestamp_ms,
+                    &semantic_offer,
+                    &decoded.offer,
+                )
             {
                 return None;
             }
@@ -1588,6 +1609,13 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
         }
         "attachment_shared" => {
             let decoded: SharedMutationDto = serde_json::from_value(value.clone()).ok()?;
+            let semantic_offer = AttachmentOffer {
+                offer_id: decoded.offer_id.clone(),
+                kind: decoded.kind_name,
+                name: decoded.name.clone(),
+                size: decoded.size,
+                ticket: decoded.ticket.clone(),
+            };
             if decoded.kind != "attachment_shared"
                 || decoded.schema_version != 3
                 || !contracts::valid_request_id(&decoded.request_id)
@@ -1597,9 +1625,20 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 || decoded.offer_id != decoded.message_id
                 || !ipc::valid_operation_id(&decoded.message_id)
                 || !ipc::valid_content_digest(&decoded.source_digest)
-                || decoded.name.is_empty()
-                || decoded.ticket.is_empty()
-                || decoded.offer.is_empty()
+                || !ipc::validate_attachment_event_fields(
+                    Some(topic),
+                    Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .ok()?
+                            .as_millis() as u64,
+                    ),
+                    &decoded.from,
+                    &decoded.message_id,
+                    decoded.timestamp_ms,
+                    &semantic_offer,
+                    &decoded.offer,
+                )
                 || decoded.delivery_acknowledged
             {
                 return None;
@@ -1688,6 +1727,10 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_offline", "message":"Daemon offline. Reconnecting; feed gaps have no history.", "retryable":true, "outcome":"unknown"}))).await;
             return;
         };
+        let Some(subscription_topic) = reader.expected_topic() else {
+            let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon subscription has no configured topic.", "retryable":true, "outcome":"unknown"}))).await;
+            return;
+        };
         let first = match within_startup_deadline(startup_deadline, reader.read()).await {
             Ok(Ok(Some(first))) => first,
             Ok(Ok(None)) => {
@@ -1710,7 +1753,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
                     .iter()
                     .any(|value| value.as_str() == Some(WEB_DOWNLOAD_CAPABILITY))
             });
-        let Some(connected) = public_event(&state, first, download_supported) else {
+        let Some(connected) = public_event(&state, subscription_topic, first, download_supported) else {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
             return;
         };
@@ -1733,7 +1776,9 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
                 }
             };
             let value = match value {
-                Ok(Some(value)) => public_event(&state, value, download_supported),
+                Ok(Some(value)) => {
+                    public_event(&state, subscription_topic, value, download_supported)
+                },
                 _ => {
                     let _ = timeout(Duration::from_secs(5), tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_disconnected", "message":"Daemon disconnected. Feed gap; no history. Reconnecting.", "retryable":true, "outcome":"unknown"})))).await;
                     return;
@@ -2453,6 +2498,17 @@ mod tests {
 
     fn state() -> WebState {
         let dir = std::env::temp_dir().join(format!("meshmsg-web-unit-{}", random_id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&json!({
+                "advertise_self":true,
+                "topic":TopicId::from_bytes([7; 32]).to_string(),
+                "invite":null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         WebState::new(
             &dir,
             "127.0.0.1:8787".parse().unwrap(),
@@ -2905,13 +2961,21 @@ mod tests {
     fn upload_success_metadata_must_match_the_staged_file() {
         let id = "0123456789abcdef0123456789abcdef";
         let digest = "01".repeat(32);
-        let valid = json!({
-            "type":"attachment_shared", "schema_version":3,
-            "request_id":"11111111111111111111111111111111", "operation_id":id, "message_id":id, "offer_id":id,
-            "source_digest":digest, "from":"peer", "timestamp_ms":1,
-            "kind":"file", "name":"report.txt", "size":7,
-            "ticket":"ticket", "offer":"offer", "delivery_acknowledged":false
-        });
+        let signer = iroh::SecretKey::generate();
+        let mut valid = crate::node::signed_attachment_event_for_test(
+            &signer,
+            id,
+            AttachmentKind::File,
+            "report.txt",
+            7,
+            1,
+        );
+        valid["type"] = "attachment_shared".into();
+        valid["schema_version"] = 3.into();
+        valid["request_id"] = "11111111111111111111111111111111".into();
+        valid["operation_id"] = id.into();
+        valid["source_digest"] = digest.clone().into();
+        valid["delivery_acknowledged"] = false.into();
         assert!(SharedMutationDto::parse(valid.clone(), id, &digest, "report.txt", 7).is_some());
         for (field, replacement) in [
             ("operation_id", json!("fedcba9876543210fedcba9876543210")),
@@ -2965,20 +3029,27 @@ mod tests {
     #[test]
     fn only_safe_live_metadata_is_exposed_and_sse_newlines_are_escaped() {
         let state = state();
-        let public_event = |value| public_event(&state, value, true);
+        let public_event = |value| public_event(&state, TopicId::from_bytes([7; 32]), value, true);
         assert!(public_event(json!({"type":"download_progress", "path":"secret"})).is_none());
-        let incoming = public_event(ipc_event(json!({
-            "type":"attachment_offer", "schema_version":2,
-            "message_id":"01010101010101010101010101010101",
-            "from":"peer", "timestamp_ms":42,
-            "name":"<report>.pdf", "kind":"file", "size":1234,
-            "offer_id":"01010101010101010101010101010101",
-            "offer":"signed-secret", "ticket":"blob-secret"
-        })))
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let incoming_signer = iroh::SecretKey::generate();
+        let incoming_peer = incoming_signer.public().to_string();
+        let incoming = public_event(ipc_event(crate::node::signed_attachment_event_for_test(
+            &incoming_signer,
+            "01010101010101010101010101010101",
+            AttachmentKind::File,
+            "report.pdf",
+            1234,
+            now_ms,
+        )))
         .unwrap();
         assert!(valid_id(incoming["download_id"].as_str().unwrap()));
         let legacy = super::public_event(
             &state,
+            TopicId::from_bytes([7; 32]),
             json!({
                 "type":"attachment_offer", "schema_version":1,
                 "from":"peer", "timestamp_ms":42,
@@ -2996,34 +3067,70 @@ mod tests {
             expected_incoming,
             json!({
                 "type":"attachment_offer", "schema_version":2,
-                "direction":"incoming", "from":"peer",
+                "direction":"incoming", "from":incoming_peer,
                 "message_id":"01010101010101010101010101010101",
-                "timestamp_ms":42, "name":"<report>.pdf", "kind":"file", "size":1234
+                "timestamp_ms":now_ms, "name":"report.pdf", "kind":"file", "size":1234
             })
         );
-        let outgoing = public_event(ipc_event(json!({
-            "type":"attachment_shared", "schema_version":3,
-            "operation_id":"02020202020202020202020202020202",
-            "message_id":"02020202020202020202020202020202",
-            "offer_id":"02020202020202020202020202020202",
-            "source_digest":"02".repeat(32),
-            "from":"local", "timestamp_ms":43,
-            "name":"folder.tar", "kind":"directory_tar_v1", "size":5678,
-            "offer":"signed-secret", "ticket":"blob-secret", "delivery_acknowledged":false
-        })))
-        .unwrap();
+        let outgoing_signer = iroh::SecretKey::generate();
+        let outgoing_peer = outgoing_signer.public().to_string();
+        let mut outgoing_event = crate::node::signed_attachment_event_for_test(
+            &outgoing_signer,
+            "02020202020202020202020202020202",
+            AttachmentKind::DirectoryTarV1,
+            "folder.tar",
+            5678,
+            now_ms,
+        );
+        outgoing_event["type"] = "attachment_shared".into();
+        outgoing_event["schema_version"] = 3.into();
+        outgoing_event["operation_id"] = "02020202020202020202020202020202".into();
+        outgoing_event["source_digest"] = "02".repeat(32).into();
+        outgoing_event["delivery_acknowledged"] = false.into();
+        let outgoing = public_event(ipc_event(outgoing_event)).unwrap();
         assert_eq!(
             outgoing,
             json!({
                 "type":"attachment_shared", "schema_version":3,
-                "direction":"outgoing", "from":"local",
+                "direction":"outgoing", "from":outgoing_peer,
                 "operation_id":"02020202020202020202020202020202",
                 "message_id":"02020202020202020202020202020202",
-                "timestamp_ms":43, "name":"folder.tar", "kind":"directory_tar_v1", "size":5678
+                "timestamp_ms":now_ms, "name":"folder.tar", "kind":"directory_tar_v1", "size":5678
             })
         );
         assert!(!incoming.to_string().contains("secret"));
         assert!(!outgoing.to_string().contains("secret"));
+        let remembered_before = state.offers.lock().unwrap().len();
+        let mut malformed_offer = crate::node::signed_attachment_event_for_test(
+            &incoming_signer,
+            "03030303030303030303030303030303",
+            AttachmentKind::File,
+            "safe.txt",
+            4,
+            now_ms,
+        );
+        malformed_offer["offer_id"] = "0303030303030303030303030303030A".into();
+        assert!(public_event(ipc_event(malformed_offer)).is_none());
+        let cross_topic = crate::node::signed_attachment_event_for_topic_for_test(
+            &incoming_signer,
+            TopicId::from_bytes([8; 32]),
+            "04040404040404040404040404040404",
+            AttachmentKind::File,
+            "safe.txt",
+            4,
+            now_ms,
+        );
+        assert!(public_event(ipc_event(cross_topic)).is_none());
+        let stale = crate::node::signed_attachment_event_for_test(
+            &incoming_signer,
+            "05050505050505050505050505050505",
+            AttachmentKind::File,
+            "safe.txt",
+            4,
+            now_ms - crate::node::ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 - 1,
+        );
+        assert!(public_event(ipc_event(stale)).is_none());
+        assert_eq!(state.offers.lock().unwrap().len(), remembered_before);
         assert!(public_event(json!({
             "type":"private_message", "from":"peer", "body":"dm-secret",
             "private":true, "timestamp_ms":44

@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import http.client
 import json
+import os
 import pathlib
 import signal
 import socket
@@ -42,7 +43,7 @@ def canonical_broadcast_event(value):
         if value.get('type') in {'queued', 'attachment_shared'}:
             value.setdefault('operation_id', value['message_id'])
         if value.get('type') in {'attachment_offer', 'attachment_shared'}:
-            value['offer_id'] = value['message_id']
+            value.setdefault('offer_id', value['message_id'])
         if value.get('type') == 'attachment_shared':
             value.setdefault('source_digest', '0' * 64)
     return value
@@ -51,7 +52,12 @@ def canonical_broadcast_event(value):
 class Daemon(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
-    def __init__(self, path):
+    def __init__(self, path, signer_state):
+        self.signer_state = pathlib.Path(signer_state)
+        self.fixture_root = pathlib.Path(path).parent / 'signed-offer-fixtures'
+        self.fixture_root.mkdir(exist_ok=True)
+        self.offer_labels = {}
+        self.offer_events = {}
         self.requests = []
         self.operations = {}
         self.share_operations = {}
@@ -65,6 +71,48 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
         super().__init__(str(path), Handler)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
+        initial_path = self.fixture_root / 'incoming.txt'
+        initial_path.write_bytes(b'i' * 1536)
+        self.initial_offer = self.signed_event(
+            initial_path, '0123456789abcdef0123456789abcdef', incoming=True,
+            label='private-token')
+
+    def signed_event(self, path, operation_id, *, incoming=False, label=None):
+        path = pathlib.Path(path)
+        directory = path.is_dir()
+        name = f'{path.name}.tar' if directory else path.name
+        size = sum(item.stat().st_size for item in path.rglob('*') if item.is_file()) if directory else path.stat().st_size
+        environment = dict(os.environ, MESHMSG_TEST_FIXTURE_SIGNER='1')
+        completed = subprocess.run(
+            [BIN, '--state-dir', str(self.signer_state), '--json',
+             'test-sign-attachment-fixture', '--operation-id', operation_id,
+             '--name', name, '--size', str(size),
+             '--kind', 'directory_tar_v1' if directory else 'file'],
+            env=environment, text=True, capture_output=True, check=True, timeout=10)
+        value = json.loads(completed.stdout)
+        value.update({
+            'type': 'attachment_shared', 'schema_version': 3,
+            'operation_id': value['message_id'], 'source_digest': '0' * 64,
+            'delivery_acknowledged': False,
+        })
+        if label is not None:
+            self.offer_labels[value['offer']] = label
+        self.offer_events[value['offer']] = dict(value)
+        if incoming:
+            value['type'] = 'attachment_offer'
+            value['schema_version'] = 2
+            for field in ['operation_id', 'source_digest', 'delivery_acknowledged']:
+                value.pop(field, None)
+        return value
+
+    def fixture_offer(self, name, operation_id, *, size=27, kind='file', label=None):
+        path = self.fixture_root / name
+        if kind == 'directory_tar_v1':
+            path.mkdir(exist_ok=True)
+            (path / 'payload.txt').write_bytes(b'x' * size)
+        else:
+            path.write_bytes(b'x' * size)
+        return self.signed_event(path, operation_id, incoming=True, label=label)
 
     def broadcast(self, value):
         with self.lock:
@@ -145,15 +193,16 @@ class Handler(socketserver.StreamRequestHandler):
                 emit(malicious_peers_snapshot())
             elif value['command'] == 'web_download':
                 offer = value['offer']
-                self.server.web_download_attempts[offer] = self.server.web_download_attempts.get(offer, 0) + 1
-                if offer == 'retry-token' and self.server.web_download_attempts[offer] == 1:
+                label = self.server.offer_labels.get(offer, offer)
+                self.server.web_download_attempts[label] = self.server.web_download_attempts.get(label, 0) + 1
+                if label == 'retry-token' and self.server.web_download_attempts[label] == 1:
                     emit({'type': 'error', 'schema_version': 1,
                           'code': 'attachment_storage_busy',
                           'message': 'Local capacity is currently unavailable.',
                           'outcome': 'not_started', 'retryable': True})
                     return
                 output = pathlib.Path(value['output'])
-                if offer == 'late-token':
+                if label == 'late-token':
                     def late_export():
                         time.sleep(.3)
                         output.parent.mkdir(parents=True, exist_ok=True)
@@ -164,22 +213,18 @@ class Handler(socketserver.StreamRequestHandler):
                 assert output.parent.parent.name == 'web-downloads-v2'
                 assert output.name.endswith('.blob') and '..' not in output.name
                 output.write_bytes(b'browser attachment payload\n')
-                if offer == 'missing-schema-token':
+                if label == 'missing-schema-token':
                     emit({'type': 'download_complete', '_omit_schema': True})
-                elif offer == 'wrong-schema-token':
+                elif label == 'wrong-schema-token':
                     emit({'type': 'download_complete', 'schema_version': 2})
-                elif offer == 'malformed-schema-token':
+                elif label == 'malformed-schema-token':
                     emit({'type': 'download_complete', 'schema_version': '1'})
                 else:
-                    names = {
-                        'private-token': '<incoming>.txt',
-                        'retry-token': 'retry.txt',
-                        'late-token': 'late.txt',
-                    }
+                    signed = self.server.offer_events[offer]
                     emit({'type': 'download_complete', 'schema_version': 1,
-                          'offer_id': '0123456789abcdef0123456789abcdef',
-                          'name': names.get(offer, 'schema.txt'), 'kind': 'file',
-                          'size': output.stat().st_size, 'from': REMOTE_KEY,
+                          'offer_id': signed['offer_id'],
+                          'name': signed['name'], 'kind': signed['kind'],
+                          'size': output.stat().st_size, 'from': signed['from'],
                           'output': str(output), 'installed': True, 'pinned': True,
                           'destination_synced': True, 'cleanup_complete': True,
                           'warnings': []})
@@ -200,13 +245,8 @@ class Handler(socketserver.StreamRequestHandler):
                     else:
                         emit(previous[1])
                     return
-                shared = {'type': 'attachment_shared', 'schema_version': 3,
-                          'operation_id': operation_id, 'message_id': operation_id,
-                          'offer_id': operation_id, 'source_digest': source_digest,
-                          'from': SELF_KEY,
-                          'timestamp_ms': 1700000000001, 'name': path.name, 'kind': 'file',
-                          'size': len(payload), 'offer': 'private-offer', 'ticket': 'private-ticket',
-                          'delivery_acknowledged': False}
+                shared = self.server.signed_event(path, operation_id)
+                shared['source_digest'] = source_digest
                 if path.name == 'post-broadcast-failure.txt':
                     outcome = {'type': 'error', 'schema_version': 1,
                                'code': 'share_failed', 'operation_id': operation_id,
@@ -256,11 +296,7 @@ class Handler(socketserver.StreamRequestHandler):
                       'topic_joined': True, 'alias': 'local-node',
                       'ipc_capabilities': capabilities})
                 emit(malicious_peers_snapshot())
-                emit({'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 2,
-                      'name': '<incoming>.txt', 'kind': 'file', 'size': 1536,
-                      'offer_id': '0123456789abcdef0123456789abcdef',
-                      'message_id': '0123456789abcdef0123456789abcdef',
-                      'offer': 'private-token', 'ticket': 'private-ticket'})
+                emit(dict(self.server.initial_offer))
                 emit({'type': 'message', 'from': REMOTE_KEY,
                       'message_id': '1123456789abcdef0123456789abcdef',
                       'body': '<img src=x onerror=alert(1)>\ndata: injected', 'timestamp_ms': 1})
@@ -295,7 +331,15 @@ def main():
             port = reservation.getsockname()[1]
         origin = f'http://127.0.0.1:{port}'
         public = 'https://test.example.ts.net'
-        daemon = Daemon(root / 'daemon.sock')
+        signer_state = root / 'offer-signer'
+        subprocess.run(
+            [BIN, 'init', '--state-dir', str(signer_state), '--json', '--no-default-alias'],
+            check=True, capture_output=True, text=True)
+        signer_config = json.loads((signer_state / 'config.json').read_text())
+        (root / 'config.json').write_text(json.dumps({
+            'advertise_self': True, 'topic': signer_config['topic'], 'invite': None}))
+        daemon = Daemon(root / 'daemon.sock', signer_state)
+        signed_provider = daemon.initial_offer['from']
         with (root / 'web.log').open('w+') as log:
             web = subprocess.Popen([BIN, '--state-dir', str(root), 'web', '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
             streams = []
@@ -547,9 +591,10 @@ def main():
                     assert attachment == {
                         'type': 'attachment_offer', 'schema_version': 2,
                         'message_id': '0123456789abcdef0123456789abcdef',
-                        'direction': 'incoming', 'from': REMOTE_KEY,
-                        'timestamp_ms': 2, 'name': '<incoming>.txt', 'kind': 'file', 'size': 1536}
-                    assert 'private-token' not in json.dumps(attachment)
+                        'direction': 'incoming', 'from': signed_provider,
+                        'timestamp_ms': daemon.initial_offer['timestamp_ms'],
+                        'name': 'incoming.txt', 'kind': 'file', 'size': 1536}
+                    assert daemon.initial_offer['offer'] not in json.dumps(attachment)
                     value = next_event(response)
                     assert value['type'] == 'message' and '\ndata: injected' in value['body']
                     assert next_event(response)['type'] == 'lagged'
@@ -568,6 +613,27 @@ def main():
                             break
                     assert time.monotonic() < deadline, 'fake daemon subscriptions were not active'
                     time.sleep(.01)
+
+                malformed_offer = dict(daemon.initial_offer)
+                malformed_offer['offer_id'] = malformed_offer['offer_id'].upper()
+                daemon.broadcast(malformed_offer)
+                for response in [feed, other_tab]:
+                    diagnostic = next_event(response)
+                    assert diagnostic == {
+                        'type': 'error', 'schema_version': 1,
+                        'code': 'internal_contract_error',
+                        'message': 'An internal contract error occurred.',
+                        'outcome': 'unknown', 'retryable': False,
+                        'suppressed_since_last': 0}
+                    assert 'download_id' not in diagnostic
+                daemon.broadcast({'type': 'message', 'from': REMOTE_KEY,
+                                  'message_id': '4123456789abcdef0123456789abcdef',
+                                  'body': 'feed survived malformed attachment',
+                                  'timestamp_ms': int(time.time() * 1000)})
+                for response in [feed, other_tab]:
+                    continued = next_event(response)
+                    assert continued['type'] == 'message'
+                    assert continued['body'] == 'feed survived malformed attachment'
 
                 upload_name = 'browser résumé.txt'
                 upload_payload = b'attachment sent from browser\n'
@@ -592,8 +658,8 @@ def main():
                         'type': 'attachment_shared', 'schema_version': 3,
                         'operation_id': '20000000000000000000000000000001',
                         'message_id': '20000000000000000000000000000001',
-                        'direction': 'outgoing', 'from': SELF_KEY,
-                        'timestamp_ms': 1700000000001, 'name': upload_name,
+                        'direction': 'outgoing', 'from': signed_provider,
+                        'timestamp_ms': daemon.share_operations[upload_operation_id][1]['timestamp_ms'], 'name': upload_name,
                         'kind': 'file', 'size': len(upload_payload)}
                 upload_request = next(value for value in daemon.requests if value.get('command') == 'share')
                 upload_path = pathlib.Path(upload_request['path'])
@@ -683,7 +749,8 @@ def main():
                 mismatch_request = next(
                     value for value in daemon.requests
                     if pathlib.Path(value.get('path', '')).name == 'mismatched-success.txt')
-                assert not pathlib.Path(mismatch_request['path']).exists()
+                assert pathlib.Path(mismatch_request['path']).exists(), \
+                    'unknown malformed share outcome was not retained for race-safe cleanup'
 
                 code, started = api({'command': 'download', 'id': incoming_download_ids[0]})
                 assert code == 202 and started['type'] == 'download_started'
@@ -709,7 +776,7 @@ def main():
                 assert download_headers['content-length'] == str(len(payload))
                 disposition = download_headers['content-disposition']
                 assert 'attachment;' in disposition and 'filename*=UTF-8' in disposition
-                assert '%3Cincoming%3E.txt' in disposition and '\r' not in disposition and '\n' not in disposition
+                assert 'incoming.txt' in disposition and '\r' not in disposition and '\n' not in disposition
                 retry_code, _, retry_payload = request('GET', download['url'])
                 assert retry_code == 200 and retry_payload == payload, 'ready download was not retryable'
                 range_code, range_headers, range_payload = request(
@@ -719,14 +786,14 @@ def main():
                 assert range_headers['accept-ranges'] == 'bytes'
                 web_download = next(value for value in daemon.requests if value['command'] == 'web_download')
                 assert set(web_download) == {'command', 'offer', 'output'}
-                assert web_download['offer'] == 'private-token'
+                assert daemon.offer_labels[web_download['offer']] == 'private-token'
                 output_path = pathlib.Path(web_download['output'])
                 assert output_path.parent.parent == root / 'web-downloads-v2'
                 assert output_path.exists(), 'retryable ready file was removed after serving'
 
-                retry_offer = {'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 5,
-                               'name': 'retry.txt', 'kind': 'file', 'size': 27,
-                               'offer_id': 'retry-id', 'offer': 'retry-token', 'ticket': 'private-ticket'}
+                retry_offer = daemon.fixture_offer(
+                    'retry.txt', '30000000000000000000000000000001',
+                    label='retry-token')
                 daemon.broadcast(retry_offer)
                 retry_ids = []
                 for response in [feed, other_tab]:
@@ -755,11 +822,11 @@ def main():
                     time.sleep(.01)
                 assert request('GET', retried['url'])[2] == b'browser attachment payload\n'
 
-                for schema_offer in ['missing-schema-token', 'wrong-schema-token', 'malformed-schema-token']:
-                    daemon.broadcast({'type': 'attachment_offer', 'from': REMOTE_KEY,
-                                      'timestamp_ms': 6, 'name': 'schema.txt', 'kind': 'file',
-                                      'size': 27, 'offer_id': 'schema-id', 'offer': schema_offer,
-                                      'ticket': 'private-ticket'})
+                for schema_index, schema_offer in enumerate(
+                        ['missing-schema-token', 'wrong-schema-token', 'malformed-schema-token'], 2):
+                    daemon.broadcast(daemon.fixture_offer(
+                        f'schema-{schema_index}.txt', f'{0x30000000000000000000000000000000 + schema_index:032x}',
+                        label=schema_offer))
                     schema_ids = [next_event(response)['download_id'] for response in [feed, other_tab]]
                     code, schema_started = api({'command': 'download', 'id': schema_ids[0]})
                     assert code == 202
@@ -772,26 +839,27 @@ def main():
                         time.sleep(.01)
                     schema_request = next(value for value in reversed(daemon.requests)
                                           if value.get('command') == 'web_download'
-                                          and value.get('offer') == schema_offer)
+                                          and daemon.offer_labels.get(value.get('offer')) == schema_offer)
                     assert not pathlib.Path(schema_request['output']).exists(), 'invalid IPC success exposed a file'
 
-                shared = {'type': 'attachment_shared', 'from': SELF_KEY, 'timestamp_ms': 3,
-                          'name': 'shared-directory.tar', 'kind': 'directory_tar_v1', 'size': 4096,
-                          'offer_id': 'private-id', 'offer': 'private-token',
-                          'ticket': 'private-ticket', 'delivery_acknowledged': False}
+                shared_path = daemon.fixture_root / 'shared-directory'
+                shared_path.mkdir(exist_ok=True)
+                (shared_path / 'payload.txt').write_bytes(b'x' * 4096)
+                shared = daemon.signed_event(
+                    shared_path, '30000000000000000000000000000005')
                 daemon.broadcast(shared)
                 for response in [feed, other_tab]:
                     assert next_event(response) == {
                         'type': 'attachment_shared', 'schema_version': 3,
-                        'operation_id': '0123456789abcdef0123456789abcdef',
-                        'message_id': '0123456789abcdef0123456789abcdef',
-                        'direction': 'outgoing', 'from': SELF_KEY,
-                        'timestamp_ms': 3, 'name': 'shared-directory.tar',
-                        'kind': 'directory_tar_v1', 'size': 4096}
+                        'operation_id': shared['operation_id'],
+                        'message_id': shared['message_id'],
+                        'direction': 'outgoing', 'from': signed_provider,
+                        'timestamp_ms': shared['timestamp_ms'], 'name': shared['name'],
+                        'kind': 'directory_tar_v1', 'size': shared['size']}
 
-                incoming = {'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 4,
-                            'name': 'incoming-directory.tar', 'kind': 'directory_tar_v1', 'size': 8192,
-                            'offer_id': 'private-id', 'offer': 'private-token', 'ticket': 'private-ticket'}
+                incoming = daemon.fixture_offer(
+                    'incoming-directory', '30000000000000000000000000000006',
+                    size=8192, kind='directory_tar_v1')
                 daemon.broadcast(incoming)
                 for response in [feed, other_tab]:
                     directory = next_event(response)
@@ -799,10 +867,10 @@ def main():
                     assert len(directory_id) == 32
                     assert directory == {
                         'type': 'attachment_offer', 'schema_version': 2,
-                        'message_id': '0123456789abcdef0123456789abcdef',
-                        'direction': 'incoming', 'from': REMOTE_KEY,
-                        'timestamp_ms': 4, 'name': 'incoming-directory.tar',
-                        'kind': 'directory_tar_v1', 'size': 8192}
+                        'message_id': incoming['message_id'],
+                        'direction': 'incoming', 'from': signed_provider,
+                        'timestamp_ms': incoming['timestamp_ms'], 'name': incoming['name'],
+                        'kind': 'directory_tar_v1', 'size': incoming['size']}
 
                 daemon.broadcast({
                     'type': 'error', 'schema_version': 1,
@@ -891,22 +959,76 @@ def main():
                 assert offline_event['type'] == 'error' and offline_event['code'] == 'daemon_offline'
                 assert offline_event['retryable'] is True and offline_event['outcome'] == 'unknown'
                 offline.close()
-                daemon = Daemon(root / 'daemon.sock')
+                daemon = Daemon(root / 'daemon.sock', signer_state)
                 assert api({'command': 'status'})[0] == 200
                 restarted = open_feed()
                 assert next_event(restarted)['type'] == 'connected'
                 restarted.close()
 
+                # Replace the stopped daemon's complete state/topic while the
+                # web process survives. A new subscription must bind the new
+                # topic, reject an old-topic token, and admit both directions.
+                old_topic_offer = daemon.fixture_offer(
+                    'old-topic.txt', '30000000000000000000000000000008')
+                daemon.close()
+                replacement_state = root / 'replacement-signer'
+                subprocess.run(
+                    [BIN, 'init', '--state-dir', str(replacement_state), '--json',
+                     '--no-default-alias'], check=True, capture_output=True, text=True)
+                replacement_config = json.loads(
+                    (replacement_state / 'config.json').read_text())
+                assert replacement_config['topic'] != signer_config['topic']
+                (root / 'config.json').write_text(json.dumps(replacement_config))
+                daemon = Daemon(root / 'daemon.sock', replacement_state)
+                signed_provider = daemon.initial_offer['from']
+                assert web.poll() is None, 'web process did not survive topic replacement'
+                replacement_feed = open_feed()
+                assert next_event(replacement_feed)['type'] == 'connected'
+                assert next_event(replacement_feed)['type'] == 'peers_snapshot'
+                for expected_type in ['attachment_offer', 'message', 'lagged', 'peer_discovered']:
+                    assert next_event(replacement_feed)['type'] == expected_type
+                daemon.broadcast(old_topic_offer)
+                rejected = next_event(replacement_feed)
+                assert rejected['type'] == 'error', rejected
+                assert rejected['code'] == 'internal_contract_error'
+                new_topic_offer = daemon.fixture_offer(
+                    'new-topic.txt', '30000000000000000000000000000009')
+                daemon.broadcast(new_topic_offer)
+                accepted = next_event(replacement_feed)
+                assert accepted['type'] == 'attachment_offer'
+                assert accepted['message_id'] == new_topic_offer['message_id']
+                assert accepted['from'] == signed_provider
+                replacement_upload_id = '3000000000000000000000000000000a'
+                replacement_payload = b'new topic browser share\n'
+                code, _, replacement_response = request(
+                    'POST', '/api/attachment', raw=replacement_payload,
+                    headers={
+                        'Origin': origin, 'Content-Type': 'application/octet-stream',
+                        'X-Meshmsg-File-Name': 'new-topic-share.txt',
+                        'X-Meshmsg-Operation-Id': replacement_upload_id,
+                    })
+                assert code == 200
+                shared_response = response_json(replacement_response)
+                assert shared_response['operation_id'] == replacement_upload_id
+                assert shared_response['message_id'] == replacement_upload_id
+                shared_event = next_event(replacement_feed)
+                assert shared_event['type'] == 'attachment_shared'
+                assert shared_event['operation_id'] == replacement_upload_id
+                assert shared_event['message_id'] == replacement_upload_id
+                assert shared_event['from'] == signed_provider
+                replacement_feed.close()
+
                 late_feed = open_feed()
                 assert next_event(late_feed)['type'] == 'connected'
                 assert next_event(late_feed)['type'] == 'peers_snapshot'
-                daemon.broadcast({'type': 'attachment_offer', 'from': REMOTE_KEY, 'timestamp_ms': 9,
-                                  'name': 'late.txt', 'kind': 'file', 'size': 19,
-                                  'offer_id': 'late-id', 'offer': 'late-token', 'ticket': 'private-ticket'})
+                late_offer = daemon.fixture_offer(
+                    'late.txt', '30000000000000000000000000000007',
+                    size=19, label='late-token')
+                daemon.broadcast(late_offer)
                 while True:
                     late_event = next_event(late_feed)
                     if late_event.get('name') == 'late.txt':
-                        assert late_event.get('from') == REMOTE_KEY
+                        assert late_event.get('from') == signed_provider
                         late_id = late_event['download_id']
                         break
                 code, late_started = api({'command': 'download', 'id': late_id})
@@ -914,7 +1036,8 @@ def main():
                 deadline = time.monotonic() + 5
                 while True:
                     matches = [value for value in daemon.requests
-                               if value.get('command') == 'web_download' and value.get('offer') == 'late-token']
+                               if value.get('command') == 'web_download'
+                               and daemon.offer_labels.get(value.get('offer')) == 'late-token']
                     if matches:
                         break
                     assert time.monotonic() < deadline
@@ -944,7 +1067,7 @@ def main():
                     client.connect(str(root / 'daemon.sock'))
                     client.sendall(b'{"schema_version":1,"request_id":"66666666666666666666666666666666","request":{"command":"status"}}\n')
                     assert json.loads(client.recv(4096))['running'] is True
-                print('PASS: HTTP security/allowlist/assets, bounded browser attachment uploads and negotiated opaque retryable/ranged downloads with safe staging/headers, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, offline/restart, independent web shutdown')
+                print('PASS: isolated offline signed fixtures, HTTP security/allowlist/assets, bounded browser attachment uploads and negotiated opaque retryable/ranged downloads with safe staging/headers, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, live web-process daemon topic replacement with old-topic rejection and correlated new-topic offer/share delivery, offline/restart, independent web shutdown')
             finally:
                 for response, conn in streams:
                     response.close()

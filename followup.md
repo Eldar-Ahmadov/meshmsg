@@ -17,9 +17,9 @@ The producer/consumer validation findings 1 and 2 below are now addressed, and f
 
 ### 2. Attachment offer identity validation still drifts — High
 
-- [x] **Status: completed.** AttachmentOffer EnvelopeV2 semantics are now fully checked after signature verification and before replay admission: the body must be a typed nonempty offer, its display name and kind must deserialize through the safe structural types, the offer ID must be canonical lowercase, the envelope message ID must equal it, and the canonical raw ticket provider must equal the signer. Topic and envelope kind are already signed and checked at the same boundary.
-- The same ID equality is required by strict IPC and web attachment-event consumers, and signed download tokens reuse the complete validator. Local attachment publication also passes it before encoding.
-- Crafted empty-body, uppercase-ID, mismatched-ID, and wrong-provider offers are rejected without replay-ID/token consumption; each case is followed by an accepted message with the same signer and message ID in focused receive-pipeline coverage.
+- [x] **Status: completed.** AttachmentOffer EnvelopeV2 semantics are now fully checked after signature verification and before accepted-traffic or replay/rate admission (every frame still pays a separate bounded pre-verification attempt budget): the body must be a typed nonempty offer, its display name and kind must deserialize through the safe structural types, the offer ID uses the one shared canonical lowercase operation-ID validator, the envelope message ID must equal it, and the canonical raw ticket's provider/hash/format must match the signer and signed metadata. The configured signed topic, envelope kind, and nonzero timestamp are checked at the same boundary; live events enforce the normal freshness window, while saved signed download tokens intentionally remain portable after that window and revalidate every other signed relationship.
+- Strict request-context-aware IPC and HTTP/SSE consumers decode the signed offer again and bind the configured topic plus every duplicated provider/message-ID/timestamp/kind/name/size/ticket field to it before fanout, download registration, or transfer work. Signed CLI/web downloads reuse the wire validator. Local publication validates the resulting envelope before persistent tag generation, and reserved tag parsing uses the shared lowercase validator.
+- Crafted malformed-body, uppercase, mixed-case, mismatched envelope/offer ID, provider/topic/time, unsafe-name, non-raw-format, duplicate/replay, alternate-envelope-ID, and operation-ID-reuse cases prove rejection without accepted-traffic or replay/rate consumption. Dedicated token tests prove stale, future, and replay frames consume only the cheap verification budget and leave valid retries/unrelated traffic admissible. Contract-field mutation, generated-event guard, strict-subscription continuity, and real peer/web attachment coverage prove malformed offers cannot create download handles or terminate live feeds, while released valid V2 offers remain accepted.
 
 ### 3. End-to-end idempotency does not cover every mutating operation — Medium-high
 
@@ -86,9 +86,9 @@ Attachment storage permits up to 8,192 tags, while `offers` returns only the fir
 
 The hardening work substantially increased already large modules:
 
-- `src/node.rs`: 11,964 lines
-- `src/web.rs`: 3,200 lines
-- `src/ipc.rs`: 2,649 lines
+- `src/node.rs`: 12,541 lines
+- `src/web.rs`: 3,307 lines
+- `src/ipc.rs`: 2,939 lines
 
 There are duplicate ID validators, lifecycle DTOs, ad-hoc JSON producers, and response validators spread across these files. The remaining empty-message and offer-ID bugs demonstrate the resulting producer/consumer drift risk.
 
@@ -132,7 +132,7 @@ At the clean `v0.1.18` tagged revision:
 
 Native Windows and musl execution and local `cargo-audit`/`cargo-deny` execution were unavailable during the audit; those remain CI responsibilities.
 
-Findings 1, 2, and the finding 5 integration gates were subsequently verified with `cargo fmt --all -- --check`, 227 full Rust tests, Clippy with warnings denied, and a locked debug build. The CLI-error, fake/real web (including live SSE `internal_contract_error` continuity and suppression accounting), idempotency, five-peer, peer-directory, attachment, direct-message (including positional/file/stdin 3900/3901/4096/4097 private boundaries), published-version IPC, and pinned v0.1.18 mixed-boundary integration (old daemon production to a current daemon/client, and current daemon production to an old daemon/client) all passed; browser asset syntax and UI tests also passed. Crafted signed malformed text and attachment EnvelopeV2 cases are exercised in the focused receive pipeline because there is intentionally no public raw-envelope injection command. Native Windows and musl execution remain CI-only.
+Findings 1, 2, and the finding 5 integration gates were subsequently verified with `cargo fmt --all -- --check`, 231 full Rust tests, Clippy with warnings denied, and a locked debug build. The CLI-error, isolated fake/real web (including live SSE `internal_contract_error` continuity, suppression accounting, and same-process daemon topic replacement with old-topic rejection and new-topic offer/share delivery), idempotency, five-peer, peer-directory, attachment, direct-message (including positional/file/stdin 3900/3901/4096/4097 private boundaries), published-version IPC, and pinned v0.1.18 mixed-boundary integration (old daemon production to a current daemon/client, and current daemon production to an old daemon/client) all passed; browser asset syntax and UI tests also passed. Crafted signed malformed text and attachment EnvelopeV2 cases are exercised in the focused receive pipeline because there is intentionally no public raw-envelope injection command. Native Windows and musl execution remain CI-only.
 
 ## Recommended order
 

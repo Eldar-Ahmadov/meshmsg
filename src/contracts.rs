@@ -14,8 +14,17 @@ pub(crate) fn new_request_id() -> String {
     data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>())
 }
 
+/// Canonical lexical form shared by request, operation, wire-message, and
+/// attachment-offer IDs: exactly 128 bits encoded as lowercase hexadecimal.
+pub(crate) fn valid_operation_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn valid_request_id(value: &str) -> bool {
-    crate::ipc::valid_operation_id(value)
+    valid_operation_id(value)
 }
 
 pub(crate) fn known_error_code(code: &str) -> bool {

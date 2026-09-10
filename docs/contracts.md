@@ -78,11 +78,17 @@ consumers retain the released v0.1.18-compatible 1 through 3928-byte worst-case
 range. That exact maximum occurs with a one-byte postcard timestamp; the complete
 4096-byte envelope bound is still checked before decoding. Local rejection occurs
 before throttle/operation-cache admission, has `code:"invalid_message"` and
-`outcome:"not_started"`, and preserves the operation ID. Invalid signed remote text or
-attachment semantics are rejected before replay admission or fanout. Daemon-created
-message/queued events are contract-checked before publication; sampled guard failures
-become strict, subscriber-correlated `internal_contract_error` records with exact
-`suppressed_since_last` accounting and no synchronous stderr write.
+`outcome:"not_started"`, and preserves the operation ID. Invalid signed remote text or attachment semantics are rejected before accepted-traffic
+or replay/rate admission and fanout, while every frame still pays a separate bounded
+pre-verification attempt budget. Attachment validation binds one canonical lowercase
+operation/offer ID plus the configured signed topic, kind, provider, ticket hash/format,
+name, size, and nonzero timestamp before download registration or transfer work. Live
+IPC/HTTP attachment events must remain inside the wire freshness window. Saved signed
+download tokens deliberately do not expire by timestamp, but revalidate the nonzero time,
+signature, configured topic, identity, and complete metadata before any network work. Daemon-created
+message/queued/attachment events are contract-checked before publication; sampled guard
+failures become strict, subscriber-correlated `internal_contract_error` records with
+exact `suppressed_since_last` accounting and no synchronous stderr write.
 Unknown families, unsupported versions, and unknown/missing/wrong-typed fields fail
 closed. This applies to every command response and subscription event, including
 stop, attachment share/download metadata, lifecycle/progress/loss/peer events, and
@@ -152,9 +158,12 @@ operation IDs in separate headers. Every JSON response has `type`, exact
 
 SSE `data` records are JSON DTOs with the SSE connection's request ID. Connected,
 message, queued, attachment, lag, peer snapshot, and peer transition source DTOs are
-strictly deserialized before reconstruction from a public allowlist. A malformed or
-unsupported daemon event terminates that IPC subscription and yields a sanitized
-SSE disconnect error; it is never skipped in a way that could hide a contract gap. A
+strictly deserialized before reconstruction from a public allowlist. A malformed or unsupported non-attachment daemon event terminates that IPC subscription
+and yields a sanitized SSE disconnect error; it is never skipped in a way that could hide
+a contract gap. A malformed attachment offer/share instead becomes a correlated strict, one-per-second
+sampled `internal_contract_error` with exact `suppressed_since_last` accounting and the
+subscription continues, preventing attacker-controlled wire metadata from terminating
+live feeds or creating a web download handle. A
 connected handshake that cannot be reconstructed as a valid public connected event,
 including `endpoint_online:false`, yields a correlated `invalid_daemon_response`
 error and closes the feed cleanly. IPC connection establishment and reading this

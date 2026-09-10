@@ -234,6 +234,23 @@ async fn run() -> Result<()> {
         Command::Share { operation_id, path } => {
             node::share(&dir, operation_id, &path, cli.json).await?
         }
+        #[cfg(debug_assertions)]
+        Command::TestSignAttachmentFixture {
+            operation_id,
+            name,
+            size,
+            kind,
+        } => {
+            anyhow::ensure!(
+                std::env::var_os("MESHMSG_TEST_FIXTURE_SIGNER").as_deref()
+                    == Some(std::ffi::OsStr::new("1")),
+                "test fixture signer is disabled"
+            );
+            println!(
+                "{}",
+                node::signed_attachment_fixture(&dir, &operation_id, &kind, &name, size)?
+            );
+        }
         Command::Offers { command } => match command {
             None => node::offers(&dir, cli.json).await?,
             Some(OffersCommand::Remove {

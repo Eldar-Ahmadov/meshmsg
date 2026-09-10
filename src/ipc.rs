@@ -1,13 +1,19 @@
 //! Shared bounded newline-delimited local daemon protocol. Platform connection
 //! ownership checks remain in node::connect_daemon for both CLI and web clients.
 use crate::{
+    attachment::{AttachmentKind, AttachmentOffer},
+    config::State,
     contracts::{self, ErrorEnvelopeV1},
     message::{validate_v2_message_body, MAX_V2_MESSAGE_BODY_BYTES},
     node::{connect_daemon, LocalClientStream},
 };
 use anyhow::{Context, Result};
+use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 // JSON may escape each envelope byte as six ASCII bytes.
@@ -23,12 +29,7 @@ pub(crate) const IDEMPOTENT_MUTATIONS_CAPABILITY: &str = "idempotent_mutations_v
 pub(crate) const ATTACHMENT_LIFECYCLE_CAPABILITY: &str = "attachment_lifecycle_v1";
 pub(crate) type LifecycleErrorV1 = ErrorEnvelopeV1;
 
-pub(crate) fn valid_operation_id(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+pub(crate) use contracts::valid_operation_id;
 
 pub(crate) fn valid_content_digest(value: &str) -> bool {
     value.len() == 64
@@ -499,6 +500,27 @@ impl DownloadCompleteV1 {
     }
 }
 
+pub(crate) fn validate_attachment_event_fields(
+    expected_topic: Option<TopicId>,
+    live_now_ms: Option<u64>,
+    from: &str,
+    message_id: &str,
+    timestamp_ms: u64,
+    offer: &AttachmentOffer,
+    offer_token: &str,
+) -> bool {
+    crate::node::validate_attachment_event(
+        expected_topic,
+        live_now_ms,
+        from,
+        message_id,
+        timestamp_ms,
+        offer,
+        offer_token,
+    )
+    .is_ok()
+}
+
 fn valid_peer_id(value: &str) -> bool {
     value.len() == 64
         && value
@@ -774,6 +796,14 @@ fn validate_bench_metrics(
 }
 
 pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> {
+    validate_success_payload_for_context(value, None, None)
+}
+
+pub(crate) fn validate_success_payload_for_context(
+    value: &serde_json::Value,
+    expected_topic: Option<TopicId>,
+    live_now_ms: Option<u64>,
+) -> Result<()> {
     let family = value
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -862,23 +892,52 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
         ("attachment_offer", 2) => {
             let dto: AttachmentOfferV2 =
                 serde_json::from_value(value.clone()).context("malformed attachment offer")?;
+            let kind = match dto.kind.as_str() {
+                "file" => AttachmentKind::File,
+                "directory_tar_v1" => AttachmentKind::DirectoryTarV1,
+                _ => anyhow::bail!("invalid attachment offer"),
+            };
+            let offer = AttachmentOffer {
+                offer_id: dto.offer_id.clone(),
+                kind,
+                name: dto.name.clone(),
+                size: dto.size,
+                ticket: dto.ticket.clone(),
+            };
             anyhow::ensure!(
                 valid_family(&dto.family, family, dto.schema_version, &dto.request_id)
                     && valid_peer_id(&dto.from)
                     && valid_operation_id(&dto.message_id)
                     && dto.offer_id == dto.message_id
                     && dto.timestamp_ms != 0
-                    && matches!(dto.kind.as_str(), "file" | "directory_tar_v1")
                     && valid_public_text(&dto.name, 255)
-                    && !dto.ticket.is_empty()
-                    && !dto.offer.is_empty(),
+                    && validate_attachment_event_fields(
+                        expected_topic,
+                        live_now_ms,
+                        &dto.from,
+                        &dto.message_id,
+                        dto.timestamp_ms,
+                        &offer,
+                        &dto.offer,
+                    ),
                 "invalid attachment offer"
             );
-            let _ = dto.size;
         }
         ("attachment_shared", 3) => {
             let dto: AttachmentSharedV3 =
                 serde_json::from_value(value.clone()).context("malformed attachment share")?;
+            let kind = match dto.kind.as_str() {
+                "file" => AttachmentKind::File,
+                "directory_tar_v1" => AttachmentKind::DirectoryTarV1,
+                _ => anyhow::bail!("invalid attachment share"),
+            };
+            let offer = AttachmentOffer {
+                offer_id: dto.offer_id.clone(),
+                kind,
+                name: dto.name.clone(),
+                size: dto.size,
+                ticket: dto.ticket.clone(),
+            };
             anyhow::ensure!(
                 valid_family(&dto.family, family, dto.schema_version, &dto.request_id)
                     && valid_operation_id(&dto.operation_id)
@@ -887,14 +946,19 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                     && valid_content_digest(&dto.source_digest)
                     && valid_peer_id(&dto.from)
                     && dto.timestamp_ms != 0
-                    && matches!(dto.kind.as_str(), "file" | "directory_tar_v1")
                     && valid_public_text(&dto.name, 255)
-                    && !dto.ticket.is_empty()
-                    && !dto.offer.is_empty()
+                    && validate_attachment_event_fields(
+                        expected_topic,
+                        live_now_ms,
+                        &dto.from,
+                        &dto.message_id,
+                        dto.timestamp_ms,
+                        &offer,
+                        &dto.offer,
+                    )
                     && !dto.delivery_acknowledged,
                 "invalid attachment share"
             );
-            let _ = dto.size;
         }
         ("offers", 1) => {
             let dto: OffersV1 =
@@ -1445,7 +1509,17 @@ struct ResponseMetadata {
     _payload: std::collections::HashMap<String, serde_json::Value>,
 }
 
+#[cfg(test)]
 fn decode_response(frame: &[u8], expected_request_id: &str) -> Result<serde_json::Value> {
+    decode_response_for_context(frame, expected_request_id, None, None)
+}
+
+fn decode_response_for_context(
+    frame: &[u8],
+    expected_request_id: &str,
+    expected_topic: Option<TopicId>,
+    live_now_ms: Option<u64>,
+) -> Result<serde_json::Value> {
     let metadata: ResponseMetadata =
         serde_json::from_slice(frame).context("daemon returned a malformed response envelope")?;
     anyhow::ensure!(
@@ -1476,7 +1550,7 @@ fn decode_response(frame: &[u8], expected_request_id: &str) -> Result<serde_json
         metadata.request_id.as_deref() == Some(expected_request_id),
         "daemon response request ID does not match the request"
     );
-    validate_success_payload(&value)?;
+    validate_success_payload_for_context(&value, expected_topic, live_now_ms)?;
     Ok(value)
 }
 
@@ -1534,7 +1608,18 @@ pub(crate) async fn send_request_with_id(
     let mut stream = connect_daemon(dir).await?;
     write_request_with_id(&mut stream, request, request_id).await?;
     let frame = read_frame(&mut stream, MAX_IPC_EVENT_SIZE).await?;
-    decode_response(&frame, request_id)
+    let value = decode_response_for_context(&frame, request_id, None, None)?;
+    if matches!(
+        value["type"].as_str(),
+        Some("attachment_offer" | "attachment_shared")
+    ) {
+        // One-shot attachment results may be operation-cache replays and
+        // contain a portable signed token. Bind their configured topic and
+        // nonzero signed timestamp, but apply freshness only to live events.
+        let expected_topic = State::load(dir)?.topic_id()?;
+        validate_success_payload_for_context(&value, Some(expected_topic), None)?;
+    }
+    Ok(value)
 }
 
 fn json_kind(value: Option<&serde_json::Value>) -> &'static str {
@@ -1678,6 +1763,9 @@ pub(crate) struct SubscriptionReader<S> {
     reader: BufReader<S>,
     frame: Vec<u8>,
     request_id: Option<String>,
+    expected_topic: Option<TopicId>,
+    last_attachment_rejection: Option<Instant>,
+    suppressed_attachment_rejections: u64,
 }
 
 impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
@@ -1687,14 +1775,28 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
             reader: BufReader::new(stream),
             frame: Vec::new(),
             request_id: None,
+            expected_topic: None,
+            last_attachment_rejection: None,
+            suppressed_attachment_rejections: 0,
         }
     }
 
     pub(crate) fn new_correlated(stream: S, request_id: String) -> Self {
+        Self::new_correlated_for_topic(stream, request_id, None)
+    }
+
+    pub(crate) fn new_correlated_for_topic(
+        stream: S,
+        request_id: String,
+        expected_topic: Option<TopicId>,
+    ) -> Self {
         Self {
             reader: BufReader::new(stream),
             frame: Vec::new(),
             request_id: Some(request_id),
+            expected_topic,
+            last_attachment_rejection: None,
+            suppressed_attachment_rejections: 0,
         }
     }
 
@@ -1702,32 +1804,86 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
         self.reader.get_mut()
     }
 
+    pub(crate) fn expected_topic(&self) -> Option<TopicId> {
+        self.expected_topic
+    }
+
     /// Reads one event while retaining any bytes consumed if this future is
     /// cancelled by a competing `select!` branch.
     pub(crate) async fn read(&mut self) -> Result<Option<serde_json::Value>> {
-        let limit = MAX_IPC_EVENT_SIZE + 2;
-        anyhow::ensure!(self.frame.len() < limit, "daemon event is too large");
-        let remaining = limit - self.frame.len();
-        let read = (&mut self.reader)
-            .take(remaining as u64)
-            .read_until(b'\n', &mut self.frame)
-            .await?;
-        if read == 0 && self.frame.is_empty() {
-            return Ok(None);
-        }
-        anyhow::ensure!(
-            self.frame.len() <= MAX_IPC_EVENT_SIZE + 1,
-            "daemon event is too large"
-        );
-        anyhow::ensure!(self.frame.ends_with(b"\n"), "incomplete daemon event");
-        let value = match &self.request_id {
-            Some(request_id) => {
-                decode_response(&self.frame, request_id).context("invalid daemon event")
+        loop {
+            let limit = MAX_IPC_EVENT_SIZE + 2;
+            anyhow::ensure!(self.frame.len() < limit, "daemon event is too large");
+            let remaining = limit - self.frame.len();
+            let read = (&mut self.reader)
+                .take(remaining as u64)
+                .read_until(b'\n', &mut self.frame)
+                .await?;
+            if read == 0 && self.frame.is_empty() {
+                return Ok(None);
             }
-            None => serde_json::from_slice(&self.frame).context("invalid daemon event"),
-        }?;
-        self.frame.clear();
-        Ok(Some(value))
+            anyhow::ensure!(
+                self.frame.len() <= MAX_IPC_EVENT_SIZE + 1,
+                "daemon event is too large"
+            );
+            anyhow::ensure!(self.frame.ends_with(b"\n"), "incomplete daemon event");
+            let decoded = match &self.request_id {
+                Some(request_id) => decode_response_for_context(
+                    &self.frame,
+                    request_id,
+                    self.expected_topic,
+                    self.expected_topic
+                        .map(|_| {
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .context("system clock is before the Unix epoch")
+                                .map(|elapsed| elapsed.as_millis() as u64)
+                        })
+                        .transpose()?,
+                )
+                .context("invalid daemon event"),
+                None => serde_json::from_slice(&self.frame).context("invalid daemon event"),
+            };
+            match decoded {
+                Ok(value) => {
+                    self.frame.clear();
+                    return Ok(Some(value));
+                }
+                Err(error) => {
+                    let attachment_family =
+                        serde_json::from_slice::<serde_json::Value>(&self.frame)
+                            .ok()
+                            .and_then(|value| value["type"].as_str().map(str::to_owned))
+                            .is_some_and(|family| {
+                                matches!(family.as_str(), "attachment_offer" | "attachment_shared")
+                            });
+                    self.frame.clear();
+                    if !attachment_family {
+                        return Err(error);
+                    }
+                    let now = Instant::now();
+                    if self
+                        .last_attachment_rejection
+                        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+                    {
+                        self.suppressed_attachment_rejections =
+                            self.suppressed_attachment_rejections.saturating_add(1);
+                        continue;
+                    }
+                    let suppressed = std::mem::take(&mut self.suppressed_attachment_rejections);
+                    self.last_attachment_rejection = Some(now);
+                    let mut rejection = ErrorEnvelopeV1::new(
+                        "internal_contract_error",
+                        "invalid attachment event",
+                        "unknown",
+                        false,
+                    );
+                    rejection.request_id = self.request_id.clone();
+                    rejection.suppressed_since_last = Some(suppressed);
+                    return Ok(Some(rejection.into_value()));
+                }
+            }
+        }
     }
 }
 
@@ -1740,10 +1896,19 @@ pub(crate) async fn subscribe_with_id(
     request_id: &str,
 ) -> Result<SubscriptionReader<LocalClientStream>> {
     let mut stream = connect_daemon(dir).await?;
+    // Load after connecting so a stopped daemon's atomic state/socket
+    // replacement cannot pair a new subscription with the previous topic.
+    #[cfg(not(test))]
+    let expected_topic = Some(State::load(dir)?.topic_id()?);
+    #[cfg(test)]
+    let expected_topic = State::load(dir)
+        .ok()
+        .and_then(|state| state.topic_id().ok());
     write_request_with_id(&mut stream, &IpcRequest::Subscribe, request_id).await?;
-    Ok(SubscriptionReader::new_correlated(
+    Ok(SubscriptionReader::new_correlated_for_topic(
         stream,
         request_id.to_owned(),
+        expected_topic,
     ))
 }
 #[cfg(test)]
@@ -1820,6 +1985,49 @@ mod tests {
         assert_eq!(reader.read().await.unwrap().unwrap()["type"], "connected");
         assert_eq!(reader.read().await.unwrap().unwrap()["body"], "a\nb");
         assert!(reader.read().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_attachment_event_reports_error_without_terminating_subscription() {
+        let request_id = "11111111111111111111111111111111";
+        let operation_id = "22222222222222222222222222222222";
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut subscription = SubscriptionReader::new_correlated(reader, request_id.into());
+        let malformed = serde_json::json!({
+            "type":"attachment_offer", "schema_version":2, "request_id":request_id,
+            "from":"4".repeat(64), "message_id":operation_id, "timestamp_ms":1,
+            "offer_id":operation_id.to_ascii_uppercase(), "kind":"file",
+            "name":"safe.txt", "size":4, "ticket":"malformed", "offer":"malformed"
+        });
+        let valid = serde_json::json!({
+            "type":"message", "schema_version":2, "request_id":request_id,
+            "from":"4".repeat(64), "message_id":operation_id,
+            "timestamp_ms":2, "body":"feed continues"
+        });
+        writer
+            .write_all(format!("{malformed}\n{malformed}\n{malformed}\n").as_bytes())
+            .await
+            .unwrap();
+        let rejection = subscription.read().await.unwrap().unwrap();
+        assert_eq!(rejection["type"], "error");
+        assert_eq!(rejection["code"], "internal_contract_error");
+        assert_eq!(rejection["request_id"], request_id);
+        assert_eq!(rejection["suppressed_since_last"], 0);
+        let delayed = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_010)).await;
+            writer
+                .write_all(format!("{malformed}\n{valid}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let sampled = subscription.read().await.unwrap().unwrap();
+        assert_eq!(sampled["code"], "internal_contract_error");
+        assert_eq!(sampled["request_id"], request_id);
+        assert_eq!(sampled["suppressed_since_last"], 2);
+        let continued = subscription.read().await.unwrap().unwrap();
+        assert_eq!(continued["type"], "message");
+        assert_eq!(continued["body"], "feed continues");
+        delayed.await.unwrap();
     }
 
     #[tokio::test]
@@ -2026,6 +2234,70 @@ mod tests {
     }
 
     #[test]
+    fn attachment_event_contract_binds_every_field_to_the_signed_offer() {
+        let signer = iroh::SecretKey::generate();
+        let id = "0123456789abcdef0123456789abcdef";
+        let request_id = "11111111111111111111111111111111";
+        let valid = contracts::correlate(
+            crate::node::signed_attachment_event_for_test(
+                &signer,
+                id,
+                AttachmentKind::File,
+                "safe.txt",
+                4,
+                42,
+            ),
+            request_id,
+        );
+        validate_success_payload(&valid).unwrap();
+        validate_success_payload_for_context(&valid, Some(TopicId::from_bytes([7; 32])), Some(42))
+            .unwrap();
+        assert!(validate_success_payload_for_context(
+            &valid,
+            Some(TopicId::from_bytes([8; 32])),
+            Some(42),
+        )
+        .is_err());
+        assert!(validate_success_payload_for_context(
+            &valid,
+            Some(TopicId::from_bytes([7; 32])),
+            Some(42 + crate::node::ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 + 1),
+        )
+        .is_err());
+        for (field, replacement) in [
+            (
+                "from",
+                serde_json::json!(iroh::SecretKey::generate().public().to_string()),
+            ),
+            (
+                "message_id",
+                serde_json::json!("fedcba9876543210fedcba9876543210"),
+            ),
+            (
+                "offer_id",
+                serde_json::json!("fedcba9876543210fedcba9876543210"),
+            ),
+            (
+                "offer_id",
+                serde_json::json!("0123456789abcdeF0123456789abcdef"),
+            ),
+            ("timestamp_ms", serde_json::json!(43)),
+            ("kind", serde_json::json!("directory_tar_v1")),
+            ("name", serde_json::json!("other.txt")),
+            ("size", serde_json::json!(5)),
+            ("ticket", serde_json::json!("not-the-signed-ticket")),
+            ("offer", serde_json::json!("malformed-signed-body")),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[field] = replacement;
+            assert!(
+                validate_success_payload(&malformed).is_err(),
+                "accepted mismatched attachment field {field}"
+            );
+        }
+    }
+
+    #[test]
     fn response_envelope_rejects_duplicate_or_mismatched_correlation() {
         let id = "11111111111111111111111111111111";
         let valid = br#"{"type":"stopping","schema_version":1,"request_id":"11111111111111111111111111111111","outcome":"accepted"}"#;
@@ -2122,7 +2394,25 @@ mod tests {
         let request_id = "11111111111111111111111111111111";
         let operation_id = "22222222222222222222222222222222";
         let digest = "3".repeat(64);
-        let peer = "4".repeat(64);
+        let attachment_signer = iroh::SecretKey::generate();
+        let peer = attachment_signer.public().to_string();
+        let attachment_offer = contracts::correlate(
+            crate::node::signed_attachment_event_for_test(
+                &attachment_signer,
+                operation_id,
+                AttachmentKind::File,
+                "safe.txt",
+                4,
+                1,
+            ),
+            request_id,
+        );
+        let mut attachment_shared = attachment_offer.clone();
+        attachment_shared["type"] = "attachment_shared".into();
+        attachment_shared["schema_version"] = 3.into();
+        attachment_shared["operation_id"] = operation_id.into();
+        attachment_shared["source_digest"] = digest.clone().into();
+        attachment_shared["delivery_acknowledged"] = false.into();
         let base_send_progress = serde_json::json!({
             "type":"bench_send_progress", "schema_version":2, "request_id":request_id,
             "run_id":operation_id, "rate":10, "duration_secs":1, "payload_bytes":128,
@@ -2144,8 +2434,8 @@ mod tests {
             serde_json::json!({"type":"private_message","schema_version":1,"request_id":request_id,"private":true,"from":peer,"message_id":operation_id,"timestamp_ms":1,"body":"secret","acceptance_acknowledged":true,"durable":false,"read":false}),
             serde_json::json!({"type":"queued","schema_version":3,"request_id":request_id,"operation_id":operation_id,"from":peer,"message_id":operation_id,"timestamp_ms":1,"body":"hello","delivery_acknowledged":false}),
             serde_json::json!({"type":"private_accepted","schema_version":3,"request_id":request_id,"operation_id":operation_id,"to":peer,"message_id":operation_id,"timestamp_ms":1,"body_bytes":6,"acceptance_acknowledged":true,"duplicate_accepted":false,"durable":false,"read":false}),
-            serde_json::json!({"type":"attachment_offer","schema_version":2,"request_id":request_id,"from":peer,"message_id":operation_id,"timestamp_ms":1,"offer_id":operation_id,"kind":"file","name":"safe.txt","size":4,"ticket":"ticket","offer":"offer"}),
-            serde_json::json!({"type":"attachment_shared","schema_version":3,"request_id":request_id,"operation_id":operation_id,"from":peer,"message_id":operation_id,"timestamp_ms":1,"offer_id":operation_id,"source_digest":digest,"kind":"file","name":"safe.txt","size":4,"ticket":"ticket","offer":"offer","delivery_acknowledged":false}),
+            attachment_offer,
+            attachment_shared,
             serde_json::json!({"type":"offers","schema_version":1,"request_id":request_id,"blobs":[{"direction":"outgoing","offer_id":operation_id,"name":"safe.txt","kind":"file","hash":digest,"format":"raw","status":"complete","size":4}],"truncated":false,"has_more":false,"item_errors":0}),
             serde_json::json!({"type":"offer_removed","schema_version":1,"request_id":request_id,"dry_run":false,"selected_tags":1,"removed_tags":1,"released_bytes":4,"limited":false,"cutoff_ms":null}),
             serde_json::json!({"type":"offers_pruned","schema_version":1,"request_id":request_id,"dry_run":true,"selected_tags":1,"removed_tags":0,"released_bytes":4,"limited":false,"cutoff_ms":1}),

@@ -287,6 +287,19 @@ pub enum Command {
         /// File or directory to share
         path: PathBuf,
     },
+    /// Produce a signed synthetic offer without networking or blob storage
+    #[cfg(debug_assertions)]
+    #[command(hide = true)]
+    TestSignAttachmentFixture {
+        #[arg(long, value_parser = parse_operation_id)]
+        operation_id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long, default_value = "file")]
+        kind: String,
+    },
     /// Show the current sanitized peer-directory snapshot
     Peers,
     /// List or remove locally pinned incoming and outgoing attachment blobs

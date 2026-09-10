@@ -77,7 +77,7 @@ const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 const BROADCAST_ALPN_V2: &[u8] = b"/meshmsg/broadcast-gossip/2";
 const ENVELOPE_DOMAIN: &str = "meshmsg-broadcast";
 const ENVELOPE_VERSION: u8 = 2;
-const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
+pub(crate) const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 const REPLAY_BUCKET_WIDTH: Duration = Duration::from_secs(60);
 // A bucket may receive an envelope at its last millisecond whose timestamp is
@@ -259,33 +259,40 @@ impl TokenBucket {
 }
 
 struct TransportSourceState {
-    limiter: TokenBucket,
+    verification_limiter: TokenBucket,
+    admission_limiter: TokenBucket,
     last_seen_ms: u64,
 }
 
 struct TransportSourceLimiter {
     sources: HashMap<PublicKey, TransportSourceState>,
-    global: TokenBucket,
+    verification_global: TokenBucket,
+    admission_global: TokenBucket,
 }
 
 impl Default for TransportSourceLimiter {
     fn default() -> Self {
         Self {
             sources: HashMap::new(),
-            global: TokenBucket::new(GLOBAL_TRANSPORT_RATE_PER_SEC, GLOBAL_TRANSPORT_BURST, 0),
+            verification_global: TokenBucket::new(
+                GLOBAL_TRANSPORT_RATE_PER_SEC,
+                GLOBAL_TRANSPORT_BURST,
+                0,
+            ),
+            admission_global: TokenBucket::new(
+                GLOBAL_TRANSPORT_RATE_PER_SEC,
+                GLOBAL_TRANSPORT_BURST,
+                0,
+            ),
         }
     }
 }
 
 impl TransportSourceLimiter {
-    fn allow(&mut self, source: PublicKey, now_ms: u64) -> bool {
+    fn prepare_source(&mut self, source: PublicKey, now_ms: u64) -> bool {
         let idle_ms = TRANSPORT_SOURCE_IDLE_LIFETIME.as_millis() as u64;
         self.sources
             .retain(|_, state| state.last_seen_ms.saturating_add(idle_ms) > now_ms);
-        self.global.refill(now_ms);
-        if !self.global.available() {
-            return false;
-        }
         if !self.sources.contains_key(&source) {
             if self.sources.len() >= MAX_TRANSPORT_SOURCES {
                 return false;
@@ -293,7 +300,12 @@ impl TransportSourceLimiter {
             self.sources.insert(
                 source,
                 TransportSourceState {
-                    limiter: TokenBucket::new(
+                    verification_limiter: TokenBucket::new(
+                        TRANSPORT_SOURCE_RATE_PER_SEC,
+                        TRANSPORT_SOURCE_BURST,
+                        now_ms,
+                    ),
+                    admission_limiter: TokenBucket::new(
                         TRANSPORT_SOURCE_RATE_PER_SEC,
                         TRANSPORT_SOURCE_BURST,
                         now_ms,
@@ -302,15 +314,48 @@ impl TransportSourceLimiter {
                 },
             );
         }
-        let state = self.sources.get_mut(&source).expect("source was inserted");
-        state.limiter.refill(now_ms);
-        if !state.limiter.available() {
+        true
+    }
+
+    /// Cheap authenticated-hop bound paid by every frame before postcard or
+    /// signature work. It is deliberately separate from accepted-message
+    /// accounting, so malformed/stale/replayed frames cannot consume the
+    /// transport tokens needed by later valid traffic.
+    fn allow_verification(&mut self, source: PublicKey, now_ms: u64) -> bool {
+        if !self.prepare_source(source, now_ms) {
             return false;
         }
-        self.global.consume();
-        state.limiter.consume();
+        self.verification_global.refill(now_ms);
+        if !self.verification_global.available() {
+            return false;
+        }
+        let state = self.sources.get_mut(&source).expect("source was inserted");
+        state.verification_limiter.refill(now_ms);
+        if !state.verification_limiter.available() {
+            return false;
+        }
+        self.verification_global.consume();
+        state.verification_limiter.consume();
         state.last_seen_ms = now_ms;
         true
+    }
+
+    fn admission_available(&mut self, source: PublicKey, now_ms: u64) -> bool {
+        if !self.prepare_source(source, now_ms) {
+            return false;
+        }
+        self.admission_global.refill(now_ms);
+        let state = self.sources.get_mut(&source).expect("source was inserted");
+        state.admission_limiter.refill(now_ms);
+        self.admission_global.available() && state.admission_limiter.available()
+    }
+
+    fn consume_admission(&mut self, source: PublicKey, now_ms: u64) {
+        debug_assert!(self.admission_available(source, now_ms));
+        self.admission_global.consume();
+        let state = self.sources.get_mut(&source).expect("source was reserved");
+        state.admission_limiter.consume();
+        state.last_seen_ms = now_ms;
     }
 }
 
@@ -761,6 +806,15 @@ impl Envelope {
     }
 
     fn decode(data: &[u8], expected_topic: TopicId) -> Result<Self> {
+        let value = Self::decode_signed(data)?;
+        anyhow::ensure!(
+            value.topic == expected_topic,
+            "message belongs to another topic"
+        );
+        Ok(value)
+    }
+
+    fn decode_signed(data: &[u8]) -> Result<Self> {
         anyhow::ensure!(
             data.len() <= MAX_ENVELOPE_SIZE,
             "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
@@ -776,10 +830,6 @@ impl Envelope {
         anyhow::ensure!(
             value.version == ENVELOPE_VERSION,
             "unsupported message version"
-        );
-        anyhow::ensure!(
-            value.topic == expected_topic,
-            "message belongs to another topic"
         );
         let signed = postcard::to_stdvec(&EnvelopeSignaturePayload {
             domain: &value.domain,
@@ -861,6 +911,10 @@ fn validate_attachment_envelope(envelope: &Envelope) -> Result<AttachmentOffer> 
         envelope.kind == EnvelopeKind::AttachmentOffer,
         "message is not an attachment offer"
     );
+    anyhow::ensure!(
+        envelope.timestamp_ms != 0,
+        "attachment envelope timestamp is invalid"
+    );
     let offer = parse_attachment_body(&envelope.body)?
         .context("attachment envelope does not contain a typed offer")?;
     anyhow::ensure!(
@@ -921,6 +975,66 @@ fn parse_signed_offer_token(
     Ok((offer, ticket))
 }
 
+/// Validate an IPC/HTTP attachment event against the complete signed offer,
+/// rather than trusting duplicated presentation fields. The active daemon has
+/// already checked the topic; local consumers can still prove that one topic,
+/// provider, timestamp, kind, ticket/hash/format, name, size, and canonical ID
+/// were signed together.
+pub(crate) fn validate_attachment_event(
+    expected_topic: Option<TopicId>,
+    live_now_ms: Option<u64>,
+    from: &str,
+    message_id: &str,
+    timestamp_ms: u64,
+    offer: &AttachmentOffer,
+    token: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        crate::contracts::valid_operation_id(message_id),
+        "invalid attachment message ID"
+    );
+    anyhow::ensure!(
+        offer.offer_id == message_id,
+        "attachment event IDs do not match"
+    );
+    let encoded = BASE64URL_NOPAD
+        .decode(token.as_bytes())
+        .context("decode signed attachment event")?;
+    let envelope = Envelope::decode_signed(&encoded)?;
+    if let Some(expected_topic) = expected_topic {
+        anyhow::ensure!(
+            envelope.topic == expected_topic,
+            "attachment event belongs to another topic"
+        );
+    }
+    if let Some(now_ms) = live_now_ms {
+        let oldest = now_ms.saturating_sub(ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64);
+        let newest = now_ms.saturating_add(ENVELOPE_FUTURE_SKEW.as_millis() as u64);
+        anyhow::ensure!(
+            (oldest..=newest).contains(&envelope.timestamp_ms),
+            "attachment event timestamp is outside the live acceptance window"
+        );
+    }
+    let signed_offer = validate_attachment_envelope(&envelope)?;
+    anyhow::ensure!(
+        envelope.from.to_string() == from,
+        "attachment event provider does not match"
+    );
+    anyhow::ensure!(
+        direct::id_string(&envelope.message_id) == message_id,
+        "attachment event message ID does not match"
+    );
+    anyhow::ensure!(
+        envelope.timestamp_ms == timestamp_ms && timestamp_ms != 0,
+        "attachment event timestamp does not match"
+    );
+    anyhow::ensure!(
+        &signed_offer == offer,
+        "attachment event metadata does not match its signed offer"
+    );
+    Ok(())
+}
+
 fn offer_event(envelope: Envelope, encoded: &[u8], offer: AttachmentOffer) -> serde_json::Value {
     serde_json::json!({
         "type":"attachment_offer", "schema_version":2,
@@ -931,6 +1045,109 @@ fn offer_event(envelope: Envelope, encoded: &[u8], offer: AttachmentOffer) -> se
         "name":offer.name, "size":offer.size, "ticket":offer.ticket,
         "offer":BASE64URL_NOPAD.encode(encoded)
     })
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn signed_attachment_fixture(
+    dir: &Path,
+    offer_id: &str,
+    kind: &str,
+    name: &str,
+    size: u64,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        contracts::valid_operation_id(offer_id),
+        "invalid fixture offer ID"
+    );
+    attachment::validate_display_name(name)?;
+    let kind = match kind {
+        "file" => AttachmentKind::File,
+        "directory_tar_v1" => AttachmentKind::DirectoryTarV1,
+        _ => anyhow::bail!("invalid fixture attachment kind"),
+    };
+    let (state, secret) = State::load_for_doctor(dir)?;
+    let topic = state.topic_id()?;
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis() as u64;
+    let offer = AttachmentOffer {
+        offer_id: offer_id.to_owned(),
+        kind,
+        name: name.to_owned(),
+        size,
+        ticket: BlobTicket::new(
+            iroh::EndpointAddr::new(secret.public()),
+            iroh_blobs::Hash::new(format!("{offer_id}:{kind:?}:{name}:{size}").as_bytes()),
+            BlobFormat::Raw,
+        )
+        .to_string(),
+    };
+    let encoded = Envelope::encode_with_id_at(
+        &secret,
+        topic,
+        EnvelopeKind::AttachmentOffer,
+        attachment_body(&offer)?,
+        operation_id_bytes(offer_id),
+        timestamp_ms,
+    )?;
+    let envelope = Envelope::decode(&encoded, topic)?;
+    Ok(offer_event(envelope, &encoded, offer))
+}
+
+#[cfg(test)]
+pub(crate) fn signed_attachment_event_for_test(
+    secret: &SecretKey,
+    offer_id: &str,
+    kind: AttachmentKind,
+    name: &str,
+    size: u64,
+    timestamp_ms: u64,
+) -> serde_json::Value {
+    signed_attachment_event_for_topic_for_test(
+        secret,
+        TopicId::from_bytes([7; 32]),
+        offer_id,
+        kind,
+        name,
+        size,
+        timestamp_ms,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn signed_attachment_event_for_topic_for_test(
+    secret: &SecretKey,
+    topic: TopicId,
+    offer_id: &str,
+    kind: AttachmentKind,
+    name: &str,
+    size: u64,
+    timestamp_ms: u64,
+) -> serde_json::Value {
+    let offer = AttachmentOffer {
+        offer_id: offer_id.to_owned(),
+        kind,
+        name: name.to_owned(),
+        size,
+        ticket: BlobTicket::new(
+            iroh::EndpointAddr::new(secret.public()),
+            iroh_blobs::Hash::new(b"test attachment"),
+            BlobFormat::Raw,
+        )
+        .to_string(),
+    };
+    let encoded = Envelope::encode_with_id_at(
+        secret,
+        topic,
+        EnvelopeKind::AttachmentOffer,
+        attachment_body(&offer).expect("test offer body"),
+        operation_id_bytes(offer_id),
+        timestamp_ms,
+    )
+    .expect("test signed attachment envelope");
+    let envelope = Envelope::decode(&encoded, topic).expect("test offer decode");
+    offer_event(envelope, &encoded, offer)
 }
 
 struct RunningNode {
@@ -2604,13 +2821,6 @@ fn parse_attachment_kind(value: &str) -> Option<AttachmentKind> {
     }
 }
 
-fn valid_offer_id(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 fn decode_tag_name(value: &str) -> Option<String> {
     // A valid display name is at most 100 UTF-8 bytes. Reject oversized input
     // before the decoder allocates in proportion to untrusted tag metadata.
@@ -2628,6 +2838,11 @@ fn encode_tag_name(value: &str) -> String {
 }
 
 fn outbound_blob_tag(offer_id: &str, kind: AttachmentKind, name: &str) -> String {
+    assert!(
+        contracts::valid_operation_id(offer_id),
+        "invalid attachment offer ID before tag generation"
+    );
+    attachment::validate_display_name(name).expect("invalid attachment name before tag generation");
     format!(
         "{OUTBOUND_BLOB_TAG_PREFIX}{offer_id}/{}/{}",
         attachment_kind_name(kind),
@@ -2641,6 +2856,11 @@ fn inbound_blob_tag(
     kind: AttachmentKind,
     name: &str,
 ) -> String {
+    assert!(
+        contracts::valid_operation_id(offer_id),
+        "invalid attachment offer ID before tag generation"
+    );
+    attachment::validate_display_name(name).expect("invalid attachment name before tag generation");
     format!(
         "{INBOUND_BLOB_TAG_PREFIX}{provider}/{offer_id}/{}/{}",
         attachment_kind_name(kind),
@@ -2659,14 +2879,17 @@ fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
             if provider.len() > MAX_ENCODED_PUBLIC_KEY_BYTES {
                 return None;
             }
-            let provider = provider.parse::<PublicKey>().ok()?.to_string();
-            ("incoming", Some(provider), remainder)
+            let canonical_provider = provider.parse::<PublicKey>().ok()?.to_string();
+            if canonical_provider != provider {
+                return None;
+            }
+            ("incoming", Some(canonical_provider), remainder)
         };
     let mut parts = remainder.split('/');
     let offer_id = parts.next()?;
     let kind = parse_attachment_kind(parts.next()?)?;
     let name = decode_tag_name(parts.next()?)?;
-    if parts.next().is_some() || !valid_offer_id(offer_id) {
+    if parts.next().is_some() || !contracts::valid_operation_id(offer_id) {
         return None;
     }
     Some(PinnedBlobTag {
@@ -3867,7 +4090,6 @@ async fn share_attachment(
     } else {
         AttachmentKind::File
     };
-    let tag_name = outbound_blob_tag(&offer_id, kind, &name);
     let imported = store
         .blobs()
         .add_path(staged.path())
@@ -3899,9 +4121,16 @@ async fn share_attachment(
             operation_id_bytes(&offer.offer_id),
             timestamp_ms,
         )?;
-        let message_id = Envelope::decode(&encoded, topic)
-            .expect("locally encoded attachment envelope must decode")
-            .message_id;
+        let validated = Envelope::decode(&encoded, topic)
+            .expect("locally encoded attachment envelope must decode");
+        let message_id = validated.message_id;
+        let validated_offer = validate_attachment_envelope(&validated)
+            .expect("locally encoded attachment semantics must validate");
+        anyhow::ensure!(
+            validated_offer == offer,
+            "locally encoded attachment offer changed"
+        );
+        let tag_name = outbound_blob_tag(&offer.offer_id, offer.kind, &offer.name);
         storage
             .commit_pin(
                 &tag_name,
@@ -4697,7 +4926,7 @@ pub async fn run_daemon(
     let mut envelope_replay = EnvelopeReplayCache::default();
     let mut broadcast_sources = TransportSourceLimiter::default();
     let mut broadcast_rejections = RejectionSampler::default();
-    let mut internal_contract_guard = InternalContractGuard::default();
+    let internal_contract_guard = Arc::new(Mutex::new(InternalContractGuard::default()));
     let connection_limit = Arc::new(Semaphore::new(LOCAL_IPC_CONNECTION_CAPACITY));
     let mut local_client_tasks = tokio::task::JoinSet::new();
     let mut transfer_tasks = tokio::task::JoinSet::new();
@@ -4786,7 +5015,8 @@ pub async fn run_daemon(
                         publish_daemon_message_event(
                             &event_tx,
                             response.clone(),
-                            &mut internal_contract_guard,
+                            &mut internal_contract_guard.lock().expect("contract guard poisoned"),
+                            topic,
                             unix_timestamp_ms().unwrap_or(0),
                         );
                     }
@@ -4995,12 +5225,12 @@ pub async fn run_daemon(
                         },
                         None => None,
                     };
-                    if !valid_offer_id(&offer_id) || !valid_direction {
+                    if !contracts::valid_operation_id(&offer_id) || !valid_direction {
                         let mut error = LifecycleErrorV1::new(
                             "invalid_offer_selector", "offer ID or direction is invalid",
                             "not_started", false,
                         );
-                        if valid_offer_id(&offer_id) { error.offer_id = Some(offer_id.clone()); }
+                        if contracts::valid_operation_id(&offer_id) { error.offer_id = Some(offer_id.clone()); }
                         let _ = reply.send(error.into_value());
                         continue;
                     }
@@ -5070,6 +5300,7 @@ pub async fn run_daemon(
                     let state_dir = dir.to_path_buf();
                     let events = event_tx.clone();
                     let operation_cache = operation_cache.clone();
+                    let contract_guard = internal_contract_guard.clone();
                     transfer_tasks.spawn(async move {
                         let _permit = permit;
                         let storage_permit = storage.gate.clone().acquire_owned().await;
@@ -5104,7 +5335,13 @@ pub async fn run_daemon(
                         let response = operation_cache.lock().expect("operation cache poisoned")
                             .complete(&operation_id, response, StdInstant::now());
                         if response["type"] == "attachment_shared" {
-                            let _ = events.send(response);
+                            publish_daemon_message_event(
+                                &events,
+                                response,
+                                &mut contract_guard.lock().expect("contract guard poisoned"),
+                                topic,
+                                unix_timestamp_ms().unwrap_or(0),
+                            );
                         }
                     });
                 }
@@ -5195,7 +5432,8 @@ pub async fn run_daemon(
                         if publish_daemon_message_event(
                             &event_tx,
                             full_value.clone(),
-                            &mut internal_contract_guard,
+                            &mut internal_contract_guard.lock().expect("contract guard poisoned"),
+                            topic,
                             now_ms,
                         ) {
                             event(json, suppress_message_body(full_value));
@@ -5340,23 +5578,11 @@ fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Va
     if envelope.kind == EnvelopeKind::Message {
         return message_event(envelope);
     }
-    match parse_attachment_body(&envelope.body) {
-        Ok(Some(offer)) => match offer.ticket.parse::<BlobTicket>() {
-            Ok(ticket) if ticket.addr().id == envelope.from => {
-                offer_event(envelope, encoded, offer)
-            }
-            Ok(_) => {
-                serde_json::json!({"type":"error", "code":"invalid_attachment_offer", "message":"attachment provider does not match its signature"})
-            }
-            Err(error) => {
-                serde_json::json!({"type":"error", "code":"invalid_attachment_offer", "message":error.to_string()})
-            }
-        },
-        // The prefix predates typed attachments as valid signed message text.
-        // Only a fully valid typed payload opts into attachment semantics.
-        Ok(None) | Err(_) => serde_json::json!({
+    match validate_attachment_envelope(&envelope) {
+        Ok(offer) => offer_event(envelope, encoded, offer),
+        Err(error) => serde_json::json!({
             "type":"error", "code":"invalid_attachment_offer",
-            "message":"attachment envelope does not contain a valid offer"
+            "message":error.to_string()
         }),
     }
 }
@@ -5372,14 +5598,23 @@ fn network_event(
     match value {
         Event::Received(message) => {
             let source = message.delivered_from;
-            if !sources.allow(source, now_ms) {
+            if !sources.allow_verification(source, now_ms) {
                 return rejections
-                    .event(now_ms, "broadcast transport source rate limit exceeded")
+                    .event(now_ms, "broadcast verification rate limit exceeded")
                     .into_iter()
                     .collect();
             }
+            // Signature and complete semantics come before accepted-traffic
+            // accounting. Freshness/replay admission also comes first, so
+            // stale, future, replayed, and malformed frames pay only the
+            // separate cheap verification-attempt budget.
             match Envelope::decode(&message.content, topic).and_then(|envelope| {
+                anyhow::ensure!(
+                    sources.admission_available(source, now_ms),
+                    "broadcast transport source rate limit exceeded"
+                );
                 replay.accept(&envelope, source, now_ms)?;
+                sources.consume_admission(source, now_ms);
                 Ok(envelope)
             }) {
                 Ok(envelope) => {
@@ -5416,11 +5651,12 @@ fn network_event(
     }
 }
 
-fn valid_daemon_message_event(value: &serde_json::Value) -> bool {
+fn valid_daemon_message_event(value: &serde_json::Value, topic: TopicId, now_ms: u64) -> bool {
     match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("message" | "queued") => {
+        Some("message" | "queued" | "attachment_offer" | "attachment_shared") => {
             let correlated = contracts::correlate(value.clone(), &contracts::new_request_id());
-            crate::ipc::validate_success_payload(&correlated).is_ok()
+            crate::ipc::validate_success_payload_for_context(&correlated, Some(topic), Some(now_ms))
+                .is_ok()
         }
         _ => true,
     }
@@ -5430,9 +5666,10 @@ fn publish_daemon_message_event(
     events: &broadcast::Sender<serde_json::Value>,
     value: serde_json::Value,
     guard: &mut InternalContractGuard,
+    topic: TopicId,
     now_ms: u64,
 ) -> bool {
-    if valid_daemon_message_event(&value) {
+    if valid_daemon_message_event(&value, topic, now_ms) {
         let _ = events.send(value);
         return true;
     }
@@ -7422,6 +7659,23 @@ mod tests {
             assert_eq!(parse_pinned_blob_tag(invalid.as_bytes()), None, "{invalid}");
         }
         assert_eq!(parse_pinned_blob_tag(&[0xff]), None);
+        let provider = SecretKey::generate().public().to_string();
+        let canonical = format!(
+            "{INBOUND_BLOB_TAG_PREFIX}{provider}/0123456789abcdef0123456789abcdef/file/bmFtZQ"
+        );
+        let uppercase_provider = canonical.replacen(&provider, &provider.to_ascii_uppercase(), 1);
+        let padded_provider = canonical.replacen(&provider, &format!("{provider}="), 1);
+        assert!(parse_pinned_blob_tag(canonical.as_bytes()).is_some());
+        assert_eq!(parse_pinned_blob_tag(uppercase_provider.as_bytes()), None);
+        assert_eq!(parse_pinned_blob_tag(padded_provider.as_bytes()), None);
+        assert_eq!(
+            [canonical, uppercase_provider, padded_provider]
+                .iter()
+                .filter(|tag| parse_pinned_blob_tag(tag.as_bytes()).is_some())
+                .count(),
+            1,
+            "noncanonical provider encodings consumed duplicate logical slots"
+        );
 
         let oversized_name = format!(
             "meshmsg/out/v1/0123456789abcdef0123456789abcdef/file/{}",
@@ -7468,6 +7722,50 @@ mod tests {
         let (decoded, ticket) = parse_signed_offer_token(&token, test_topic()).unwrap();
         assert_eq!(decoded, offer);
         assert_eq!(ticket.addr().id, secret.public());
+        validate_attachment_event(
+            Some(test_topic()),
+            Some(42),
+            &secret.public().to_string(),
+            &decoded.offer_id,
+            42,
+            &decoded,
+            &token,
+        )
+        .unwrap();
+        assert!(validate_attachment_event(
+            Some(TopicId::from_bytes([8; 32])),
+            Some(42),
+            &secret.public().to_string(),
+            &decoded.offer_id,
+            42,
+            &decoded,
+            &token,
+        )
+        .is_err());
+        assert!(validate_attachment_event(
+            Some(test_topic()),
+            Some(42 + ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 + 1),
+            &secret.public().to_string(),
+            &decoded.offer_id,
+            42,
+            &decoded,
+            &token,
+        )
+        .is_err());
+        // Saved signed tokens are portable capabilities: their nonzero signed
+        // timestamp remains authenticated but does not expire at download time.
+        assert!(parse_signed_offer_token(&token, test_topic()).is_ok());
+        let zero_time = encode_unchecked_signed_envelope(
+            &secret,
+            EnvelopeKind::AttachmentOffer,
+            attachment_body(&offer).unwrap(),
+            operation_id_bytes(&offer.offer_id),
+            0,
+        );
+        assert!(Envelope::decode(&zero_time, test_topic()).is_err());
+        assert!(
+            parse_signed_offer_token(&BASE64URL_NOPAD.encode(&zero_time), test_topic()).is_err()
+        );
 
         let mut tampered = encoded.to_vec();
         let last = tampered.last_mut().unwrap();
@@ -7694,6 +7992,7 @@ mod tests {
             &events,
             malformed_message,
             &mut guard,
+            test_topic(),
             now_ms
         ));
         for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
@@ -7714,6 +8013,7 @@ mod tests {
             &events,
             suppressed_message,
             &mut guard,
+            test_topic(),
             now_ms + 1,
         ));
         assert_eq!(guard.suppressed, 1);
@@ -7728,6 +8028,7 @@ mod tests {
             &events,
             malformed_queued,
             &mut guard,
+            test_topic(),
             now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64,
         ));
         for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
@@ -7742,11 +8043,30 @@ mod tests {
             assert_eq!(error.suppressed_since_last, Some(1));
         }
 
+        let attachment_signer = SecretKey::generate();
+        let mut malformed_offer = signed_attachment_event_for_test(
+            &attachment_signer,
+            "09090909090909090909090909090909",
+            AttachmentKind::File,
+            "safe.txt",
+            4,
+            44,
+        );
+        malformed_offer["size"] = 5.into();
+        assert!(!publish_daemon_message_event(
+            &events,
+            malformed_offer,
+            &mut guard,
+            test_topic(),
+            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64 + 1,
+        ));
+
         assert!(publish_daemon_message_event(
             &events,
             canonical,
             &mut guard,
-            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64 + 1,
+            test_topic(),
+            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64 + 2,
         ));
         for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
             let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
@@ -7754,6 +8074,38 @@ mod tests {
             crate::ipc::validate_success_payload(&value).unwrap();
             assert_eq!(value["request_id"], subscriber_ids[index]);
             assert_eq!(value["body"], "subscriber remains connected");
+        }
+
+        let mut shared = signed_attachment_event_for_test(
+            &attachment_signer,
+            "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+            AttachmentKind::File,
+            "shared.txt",
+            4,
+            now_ms + 3,
+        );
+        shared["type"] = "attachment_shared".into();
+        shared["schema_version"] = 3.into();
+        shared["operation_id"] = shared["message_id"].clone();
+        shared["source_digest"] = "01".repeat(32).into();
+        shared["delivery_acknowledged"] = false.into();
+        assert!(publish_daemon_message_event(
+            &events,
+            shared,
+            &mut guard,
+            test_topic(),
+            now_ms + 3,
+        ));
+        for stream in [&mut first, &mut second] {
+            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            crate::ipc::validate_success_payload_for_context(
+                &value,
+                Some(test_topic()),
+                Some(now_ms + 3),
+            )
+            .unwrap();
+            assert_eq!(value["type"], "attachment_shared");
         }
 
         drop(first);
@@ -7771,14 +8123,29 @@ mod tests {
         let message_id = operation_id_bytes("0123456789abcdef0123456789abcdef");
         let mut uppercase = sample_offer(signer.public());
         uppercase.offer_id = uppercase.offer_id.to_ascii_uppercase();
+        let mut mixed_case = sample_offer(signer.public());
+        mixed_case.offer_id.replace_range(7..8, "A");
         let mut mismatched_id = sample_offer(signer.public());
         mismatched_id.offer_id = "fedcba9876543210fedcba9876543210".into();
         let wrong_provider = sample_offer(other.public());
+        let mut unsafe_name = sample_offer(signer.public());
+        unsafe_name.name = "../report.txt".into();
+        let mut wrong_format = sample_offer(signer.public());
+        wrong_format.ticket = BlobTicket::new(
+            iroh::EndpointAddr::new(signer.public()),
+            iroh_blobs::Hash::new(b"hash sequence"),
+            BlobFormat::HashSeq,
+        )
+        .to_string();
         let malformed_bodies = [
             String::new(),
+            format!("{ATTACHMENT_PREFIX}malformed"),
             attachment_body(&uppercase).unwrap(),
+            attachment_body(&mixed_case).unwrap(),
             attachment_body(&mismatched_id).unwrap(),
             attachment_body(&wrong_provider).unwrap(),
+            attachment_body(&unsafe_name).unwrap(),
+            attachment_body(&wrong_format).unwrap(),
         ];
 
         for body in malformed_bodies {
@@ -7806,6 +8173,11 @@ mod tests {
             );
             assert_eq!(rejected.len(), 1);
             assert_eq!(replay.live_ids, 0);
+            assert_eq!(sources.sources.len(), 1);
+            assert_eq!(
+                sources.admission_global.milli_tokens,
+                GLOBAL_TRANSPORT_BURST * 1_000
+            );
 
             let valid = Envelope::encode_with_id_at(
                 &signer,
@@ -7832,6 +8204,193 @@ mod tests {
             assert_eq!(accepted[0]["type"], "message");
             assert_eq!(replay.live_ids, 1);
         }
+    }
+
+    #[test]
+    fn attachment_offer_identity_cannot_be_replayed_under_an_alternate_envelope_id() {
+        let signer = SecretKey::generate();
+        let source = SecretKey::generate().public();
+        let now_ms = 1_700_000_000_000;
+        let offer = sample_offer(signer.public());
+        let canonical_id = operation_id_bytes(&offer.offer_id);
+        let body = attachment_body(&offer).unwrap();
+        let canonical = Envelope::encode_with_id_at(
+            &signer,
+            test_topic(),
+            EnvelopeKind::AttachmentOffer,
+            body.clone(),
+            canonical_id,
+            now_ms,
+        )
+        .unwrap();
+        let mut replay = EnvelopeReplayCache::default();
+        let mut sources = TransportSourceLimiter::default();
+        let mut rejections = RejectionSampler::default();
+        let received = |content| {
+            Event::Received(iroh_gossip::api::Message {
+                content,
+                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                delivered_from: source,
+            })
+        };
+        let accepted = network_event(
+            received(canonical.clone()),
+            test_topic(),
+            &mut replay,
+            &mut sources,
+            &mut rejections,
+            now_ms,
+        );
+        assert_eq!(accepted[0]["type"], "attachment_offer");
+        assert_eq!(replay.live_ids, 1);
+
+        let duplicate = network_event(
+            received(canonical),
+            test_topic(),
+            &mut replay,
+            &mut sources,
+            &mut rejections,
+            now_ms,
+        );
+        assert_eq!(duplicate.len(), 1);
+        assert_eq!(duplicate[0]["message"], "replayed message");
+        assert_eq!(replay.live_ids, 1);
+
+        let alternate = encode_unchecked_signed_envelope(
+            &signer,
+            EnvelopeKind::AttachmentOffer,
+            body,
+            operation_id_bytes("fedcba9876543210fedcba9876543210"),
+            now_ms,
+        );
+        let source_tokens = sources.admission_global.milli_tokens;
+        let bypass = network_event(
+            received(alternate),
+            test_topic(),
+            &mut replay,
+            &mut sources,
+            &mut rejections,
+            now_ms,
+        );
+        assert!(
+            bypass.is_empty(),
+            "sampled malformed offer should be suppressed"
+        );
+        assert_eq!(replay.live_ids, 1);
+        assert_eq!(sources.admission_global.milli_tokens, source_tokens);
+    }
+
+    #[test]
+    fn stale_future_and_replay_frames_do_not_consume_admission_tokens() {
+        let signer = SecretKey::generate();
+        let source = SecretKey::generate().public();
+        let now_ms = 1_700_000_040_000;
+        let mut replay = EnvelopeReplayCache::default();
+        let mut sources = TransportSourceLimiter::default();
+        let mut rejections = RejectionSampler::default();
+        let received = |content| {
+            Event::Received(iroh_gossip::api::Message {
+                content,
+                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                delivered_from: source,
+            })
+        };
+        let stale = encode_unchecked_signed_envelope(
+            &signer,
+            EnvelopeKind::Message,
+            "stale".into(),
+            [1; 16],
+            now_ms - ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 - 1,
+        );
+        let future = encode_unchecked_signed_envelope(
+            &signer,
+            EnvelopeKind::Message,
+            "future".into(),
+            [2; 16],
+            now_ms + ENVELOPE_FUTURE_SKEW.as_millis() as u64 + 1,
+        );
+        let initial_admission = GLOBAL_TRANSPORT_BURST * 1_000;
+        for rejected in [stale, future] {
+            let _ = network_event(
+                received(rejected),
+                test_topic(),
+                &mut replay,
+                &mut sources,
+                &mut rejections,
+                now_ms,
+            );
+            assert_eq!(sources.admission_global.milli_tokens, initial_admission);
+            assert_eq!(
+                sources.sources[&source].admission_limiter.milli_tokens,
+                TRANSPORT_SOURCE_BURST * 1_000
+            );
+        }
+
+        let valid = Envelope::encode_with_id_at(
+            &signer,
+            test_topic(),
+            EnvelopeKind::Message,
+            "valid".into(),
+            [3; 16],
+            now_ms,
+        )
+        .unwrap();
+        assert_eq!(
+            network_event(
+                received(valid.clone()),
+                test_topic(),
+                &mut replay,
+                &mut sources,
+                &mut rejections,
+                now_ms,
+            )[0]["type"],
+            "message"
+        );
+        let after_valid = sources.admission_global.milli_tokens;
+        let source_after_valid = sources.sources[&source].admission_limiter.milli_tokens;
+        let _ = network_event(
+            received(valid),
+            test_topic(),
+            &mut replay,
+            &mut sources,
+            &mut rejections,
+            now_ms,
+        );
+        assert_eq!(sources.admission_global.milli_tokens, after_valid);
+        assert_eq!(
+            sources.sources[&source].admission_limiter.milli_tokens,
+            source_after_valid
+        );
+
+        let unrelated = Envelope::encode_with_id_at(
+            &signer,
+            test_topic(),
+            EnvelopeKind::Message,
+            "unrelated".into(),
+            [4; 16],
+            now_ms,
+        )
+        .unwrap();
+        assert_eq!(
+            network_event(
+                received(unrelated),
+                test_topic(),
+                &mut replay,
+                &mut sources,
+                &mut rejections,
+                now_ms,
+            )[0]["body"],
+            "unrelated"
+        );
+        assert_eq!(sources.admission_global.milli_tokens, after_valid - 1_000);
+        assert_eq!(
+            sources.sources[&source].admission_limiter.milli_tokens,
+            source_after_valid - 1_000
+        );
+        assert_eq!(
+            sources.verification_global.milli_tokens,
+            GLOBAL_TRANSPORT_BURST * 1_000 - 5_000
+        );
     }
 
     #[test]
@@ -7973,13 +8532,14 @@ mod tests {
     }
 
     #[test]
-    fn transport_limiter_precedes_decode_and_rejection_events_are_sampled() {
+    fn semantic_validation_precedes_rate_admission_and_rejections_are_sampled() {
         let source = SecretKey::generate().public();
         let now_ms = 1_700_000_040_000;
         let mut sources = TransportSourceLimiter::default();
         for _ in 0..TRANSPORT_SOURCE_BURST {
-            assert!(sources.allow(source, now_ms));
+            assert!(sources.allow_verification(source, now_ms));
         }
+        let global_tokens_before_malformed = sources.admission_global.milli_tokens;
         let mut replay = EnvelopeReplayCache::default();
         let mut sampler = RejectionSampler::default();
         let values = network_event(
@@ -7998,9 +8558,14 @@ mod tests {
         assert_eq!(values[0]["rate_limited"], true);
         assert_eq!(
             values[0]["message"],
-            "broadcast transport source rate limit exceeded"
+            "broadcast verification rate limit exceeded"
         );
         assert_eq!(replay.live_ids, 0);
+        assert_eq!(sources.sources.len(), 1);
+        assert_eq!(
+            sources.admission_global.milli_tokens,
+            global_tokens_before_malformed
+        );
 
         for _ in 0..100 {
             assert!(sampler.event(now_ms + 1, "rejected").is_none());
@@ -8021,17 +8586,17 @@ mod tests {
         let other = SecretKey::generate().public();
         let mut limiter = TransportSourceLimiter::default();
         for _ in 0..TRANSPORT_SOURCE_BURST {
-            assert!(limiter.allow(abusive, now_ms));
+            assert!(limiter.allow_verification(abusive, now_ms));
         }
-        assert!(!limiter.allow(abusive, now_ms));
-        assert!(limiter.allow(other, now_ms));
+        assert!(!limiter.allow_verification(abusive, now_ms));
+        assert!(limiter.allow_verification(other, now_ms));
 
         let mut source_limited = TransportSourceLimiter::default();
         for _ in 0..MAX_TRANSPORT_SOURCES {
-            assert!(source_limited.allow(SecretKey::generate().public(), now_ms));
+            assert!(source_limited.allow_verification(SecretKey::generate().public(), now_ms));
         }
-        assert!(!source_limited.allow(SecretKey::generate().public(), now_ms));
-        assert!(source_limited.allow(
+        assert!(!source_limited.allow_verification(SecretKey::generate().public(), now_ms));
+        assert!(source_limited.allow_verification(
             SecretKey::generate().public(),
             now_ms + TRANSPORT_SOURCE_IDLE_LIFETIME.as_millis() as u64
         ));
@@ -8250,7 +8815,11 @@ mod tests {
             assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
             let envelope = Envelope::decode(&encoded, test_topic()).unwrap();
             assert_eq!(envelope.body.len(), length);
-            assert!(valid_daemon_message_event(&message_event(envelope)));
+            assert!(valid_daemon_message_event(
+                &message_event(envelope),
+                test_topic(),
+                1,
+            ));
         }
     }
 
@@ -9122,7 +9691,7 @@ mod tests {
                 BlobFormat::Raw,
             );
             let offer_id = raw_ticket_offer_id(&ticket);
-            assert!(valid_offer_id(&offer_id));
+            assert!(contracts::valid_operation_id(&offer_id));
             assert_eq!(offer_id, raw_ticket_offer_id(&ticket));
             let tag = raw_ticket_blob_tag(&ticket);
             let options = FsStoreOptions::new(&root.join("store"));
