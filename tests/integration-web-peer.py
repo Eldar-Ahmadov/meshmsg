@@ -189,6 +189,16 @@ def main():
             for feed, _ in feeds:
                 assert event(feed)['type'] == 'connected'
                 assert_peer_snapshot(event(feed))
+
+            # A rejected empty CLI broadcast has no event side effect and does
+            # not terminate either live SSE subscription; the valid marker below
+            # must still arrive on both existing feeds and the remote listener.
+            empty = subprocess.run(
+                [BIN, '--state-dir', str(root / 'one'), '--json', 'send', ''],
+                text=True, capture_output=True, timeout=15, check=False)
+            assert empty.returncode == 1 and empty.stderr == ''
+            assert json.loads(empty.stdout)['outcome'] == 'not_started'
+
             marker = f'web-peer-receipt-{time.time_ns()}'
             send_operation_id = operation_id()
             code, queued = post({'command': 'send', 'operation_id': send_operation_id, 'body': marker})

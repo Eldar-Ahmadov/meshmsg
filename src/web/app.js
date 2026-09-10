@@ -386,6 +386,14 @@ function connect() {
         reconnect(nextSource);
         break;
       case 'error':
+        if (value.code === 'internal_contract_error') {
+          const suppressed = Number.isSafeInteger(value.suppressed_since_last)
+            && value.suppressed_since_last > 0
+            ? ` · ${value.suppressed_since_last} similar event${value.suppressed_since_last === 1 ? '' : 's'} suppressed`
+            : '';
+          addEntry(`Warning · malformed internal event rejected${suppressed}`, value.message, undefined, 'warning');
+          break;
+        }
         if (value.code !== 'daemon_offline' && value.code !== 'daemon_disconnected') break;
         byId('status').textContent = 'Daemon offline or restarting.';
         reconnect(nextSource);
@@ -396,7 +404,7 @@ function connect() {
 }
 
 draft.addEventListener('input', () => {
-  byId('size').textContent = `${encoder.encode(draft.value).length} / 4096 UTF-8 bytes (envelope may reduce limit)`;
+  byId('size').textContent = `${encoder.encode(draft.value).length} / 3900 UTF-8 bytes`;
 });
 document.addEventListener('keydown', (event) => {
   if (event.ctrlKey && event.key === 'Enter') {
@@ -417,8 +425,8 @@ byId('composer').addEventListener('submit', async (event) => {
     return;
   }
   const body = draft.value;
-  if (!body.trim() || encoder.encode(body).length > 4096) {
-    byId('outcome').textContent = 'Not sent: write a nonblank message or attach a file. Text may be at most 4096 UTF-8 bytes.';
+  if (!body || encoder.encode(body).length > 3900) {
+    byId('outcome').textContent = 'Not sent: write a nonempty message or attach a file. Text may be at most 3900 UTF-8 bytes.';
     return;
   }
   sending = true;

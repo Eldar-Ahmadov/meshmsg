@@ -7,6 +7,7 @@ use crate::{
     contracts::{self, ErrorEnvelopeV1},
     direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
     ipc::{self, IpcRequest, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY},
+    message::{validate_broadcast_body, validate_v2_message_body},
     peers::PEER_LEASE_MS,
 };
 use anyhow::{Context, Result};
@@ -632,15 +633,11 @@ fn parse_request(bytes: &[u8]) -> Result<WebRequest> {
     }
     let request = frame.request;
     match &request {
-        WebRequest::Send { operation_id, body } => {
+        WebRequest::Send { operation_id, .. } => {
             anyhow::ensure!(
                 ipc::valid_operation_id(operation_id),
                 "invalid operation ID"
             );
-            anyhow::ensure!(
-                !body.trim().is_empty() && body.len() <= 4096,
-                "body must be nonblank and at most 4096 UTF-8 bytes"
-            )
         }
         WebRequest::Download { id } | WebRequest::DownloadStatus { id } => {
             anyhow::ensure!(valid_id(id), "invalid download ID")
@@ -1292,6 +1289,17 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         Ok(request) => request,
         Err(_) => return error(StatusCode::BAD_REQUEST, "not_sent", "Only send, status, peers, and opaque attachment download IDs are supported; no extra fields."),
     };
+    if let WebRequest::Send { operation_id, body } = &request {
+        if validate_broadcast_body(body).is_err() {
+            return mutation_error_response(local_mutation_error(
+                operation_id,
+                "invalid_message",
+                "The message is invalid.",
+                false,
+                "not_started",
+            ));
+        }
+    }
     let Ok(_permit) = state.requests.try_acquire() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1459,6 +1467,10 @@ fn sse_frame(value: &Value) -> Bytes {
                 .unwrap_or(true),
         );
         error.request_id = Some(request_id);
+        error.suppressed_since_last = value
+            .get("suppressed_since_last")
+            .and_then(Value::as_u64)
+            .filter(|_| error.code == "internal_contract_error");
         error.into_value()
     } else {
         contracts::correlate(value.clone(), &request_id)
@@ -1497,7 +1509,7 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 || !contracts::valid_request_id(&decoded.request_id)
                 || decoded.from.is_empty()
                 || decoded.timestamp_ms == 0
-                || decoded.body.len() > 4096
+                || validate_v2_message_body(&decoded.body).is_err()
             {
                 return None;
             }
@@ -1519,7 +1531,7 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 || !contracts::valid_request_id(&decoded.request_id)
                 || decoded.from.is_empty()
                 || decoded.timestamp_ms == 0
-                || decoded.body.len() > 4096
+                || validate_v2_message_body(&decoded.body).is_err()
                 || decoded.delivery_acknowledged
             {
                 return None;
@@ -1543,7 +1555,7 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 || decoded.from.is_empty()
                 || decoded.timestamp_ms == 0
                 || !ipc::valid_operation_id(&decoded.message_id)
-                || !ipc::valid_operation_id(&decoded.offer_id)
+                || decoded.offer_id != decoded.message_id
                 || decoded.name.is_empty()
                 || decoded.ticket.is_empty()
                 || decoded.offer.is_empty()
@@ -1605,6 +1617,20 @@ fn public_event(state: &WebState, value: Value, download_supported: bool) -> Opt
                 "timestamp_ms":value["timestamp_ms"], "name":value["name"],
                 "kind":value["kind"], "size":value["size"]
             }))
+        }
+        "error" => {
+            let error = ErrorEnvelopeV1::from_value(&value).ok()?;
+            (error.code == "internal_contract_error").then(|| {
+                let mut public = json!({
+                    "type":"error", "schema_version":1,
+                    "code":error.code, "message":error.message,
+                    "retryable":error.retryable, "outcome":error.outcome
+                });
+                if let Some(suppressed) = error.suppressed_since_last {
+                    public["suppressed_since_last"] = suppressed.into();
+                }
+                public
+            })
         }
         "peers_snapshot" => public_peers_snapshot(&value),
         event_type @ ("peer_discovered" | "peer_updated" | "peer_expired") => {
@@ -2690,9 +2716,7 @@ mod tests {
         }
         for value in [
             json!({"command":"status", "body":"ignored"}),
-            json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":" "}),
             json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"a", "path":"/etc/passwd"}),
-            json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"二".repeat(1366)}),
         ] {
             assert!(parse_request(&web_request(value)).is_err());
         }
@@ -2707,10 +2731,19 @@ mod tests {
             json!({"command":"download","id":"../../secret"})
         ))
         .is_err());
-        assert!(parse_request(
-            &web_request(json!({"command":"send", "operation_id":"0123456789abcdef0123456789abcdef", "body":"二".repeat(1365)}))
-        )
-        .is_ok());
+        for body in [
+            "".to_owned(),
+            " ".to_owned(),
+            "二".repeat(1300),
+            "二".repeat(1301),
+        ] {
+            assert!(parse_request(&web_request(json!({
+                "command":"send",
+                "operation_id":"0123456789abcdef0123456789abcdef",
+                "body":body
+            })))
+            .is_ok());
+        }
     }
 
     #[test]

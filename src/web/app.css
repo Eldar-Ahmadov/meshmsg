@@ -41,6 +41,8 @@ h2 { margin-bottom: .35rem; color: #f8edc4; font-size: 1rem; letter-spacing: .05
 #feed { display: grid; gap: .65rem; list-style: none; padding: 0; margin: 0; }
 #feed li { padding: .8rem .9rem; overflow-wrap: anywhere; border-left: 2px solid var(--purple); background: var(--panel); }
 #feed li.queued { background: var(--panel-strong); }
+#feed li.warning { border-left-color: var(--warning); background: var(--panel-strong); }
+#feed li.warning small { color: var(--warning); }
 #feed li.attachment { padding: .85rem 1rem; border-left-color: #8060aa; background: var(--panel-strong); }
 #feed li.attachment.incoming { border-left-color: var(--green); }
 #feed small { display: block; color: var(--purple); font-size: .74rem; font-weight: 700; letter-spacing: .02em; }

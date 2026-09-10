@@ -208,7 +208,7 @@ if "$BIN" --state-dir "$ROOT/c1" --json send "$OVERSIZED" >"$ROOT/oversized.out"
 fi
 ! grep -q '"type":"queued"' "$ROOT/oversized.out" || fail "oversized message was reported queued"
 grep -q '"type":"error"' "$ROOT/oversized.out" || fail "oversized rejection was not machine-readable"
-grep -q '"code":"command_failed"' "$ROOT/oversized.out" || fail "oversized rejection had the wrong stable code"
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "invalid_message" and v["outcome"] == "not_started" and len(v["operation_id"]) == 32' "$ROOT/oversized.out" || fail "oversized rejection had the wrong stable code/outcome/operation ID"
 test ! -s "$ROOT/oversized.err" || fail "JSON failure wrote to stderr"
 
 # Stale socket recovery and peer daemon restart.

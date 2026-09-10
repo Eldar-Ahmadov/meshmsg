@@ -284,6 +284,20 @@ function submit(body) {
   source.emit({ type: 'peer_down', peer: '<low-level-neighbor>' });
   assert.equal(el('feed').children.length, feedLength, 'low-level neighbor events were displayed');
 
+  const sourcesBeforeGuardWarning = EventSource.instances.length;
+  const timersBeforeGuardWarning = activeTimers().length;
+  source.emit({
+    type: 'error', code: 'internal_contract_error',
+    message: '<script>malformed generated event</script>', suppressed_since_last: 2
+  });
+  assert.equal(EventSource.instances.length, sourcesBeforeGuardWarning, 'guard warning reconnected SSE');
+  assert.equal(activeTimers().length, timersBeforeGuardWarning, 'guard warning scheduled reconnection');
+  assert.equal(el('feed').children[0].className, 'warning');
+  assert.match(el('feed').children[0].children[0].textContent, /2 similar events suppressed/);
+  assert.equal(el('feed').children[0].children[1].textContent, '<script>malformed generated event</script>');
+  source.emit({ type: 'message', from: 'after-warning', body: 'feed continues', timestamp_ms: 1700000000050 });
+  assert.equal(el('feed').children[0].children[1].textContent, 'feed continues');
+
   source.emit({
     type: 'attachment_offer', direction: 'incoming', from: '<peer>',
     timestamp_ms: 1700000000100, name: '<img src=x onerror=alert(1)>',
@@ -492,5 +506,5 @@ function submit(body) {
     'Refreshing status…', 'Status refreshed. Read-only; peer count is not delivery proof.'
   ]);
 
-  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, atomic lag recovery without stale snapshot/callback rollback, silent unchanged periodic polling, mobile compose, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon events without optimistic duplicates, browser attachment upload success/rejection and incoming/outgoing cards with safe text, queued/rejected/ambiguous wording, sender/timestamps, draft/file preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, gap/reconnect, no automatic retry, and retained operation IDs');
+  console.log('PASS: accessible live feed and status route, deterministic peer snapshot/current count, text-only discovery/update/expiry lifecycle, atomic lag recovery without stale snapshot/callback rollback, silent unchanged periodic polling, mobile compose, AA primary button contrast, bounded composer, safe read-only status rendering/refresh, canonical daemon events without optimistic duplicates, browser attachment upload success/rejection and incoming/outgoing cards with safe text, queued/rejected/ambiguous wording, sender/timestamps, draft/file preservation, in-flight edits/double-tap, UTF-8 bound, text-only bounded feed, non-reconnecting internal-contract warnings, gap/reconnect, no automatic retry, and retained operation IDs');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -60,6 +60,37 @@ timeout 240 "$BIN" --state-dir "$ROOT/receiver" --json listen >"$ROOT/receiver.l
 LISTENER=$!
 wait_for 10 "receiver listener" grep -q '"type":"connected"' "$ROOT/receiver.listen"
 
+# Empty text is rejected before daemon admission from the CLI, and the daemon
+# independently rejects a crafted IPC request without reserving its operation ID.
+EMPTY_ID=00000000000000000000000000000001
+if "$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$EMPTY_ID" '' >"$ROOT/empty-cli.out" 2>"$ROOT/empty-cli.err"; then
+  fail "empty positional CLI send succeeded"
+fi
+[[ ! -s "$ROOT/empty-cli.err" ]] || fail "empty JSON CLI send wrote stderr"
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "invalid_message" and v["outcome"] == "not_started" and v["operation_id"] == sys.argv[2]' "$ROOT/empty-cli.out" "$EMPTY_ID" \
+  || fail "empty CLI send did not preserve canonical error and operation ID"
+: >"$ROOT/empty-message"
+if "$BIN" --state-dir "$ROOT/sender" --json send --message-file "$ROOT/empty-message" >"$ROOT/empty-file.out" 2>"$ROOT/empty-file.err"; then
+  fail "empty file CLI send succeeded"
+fi
+if printf '' | "$BIN" --state-dir "$ROOT/sender" --json send --message-stdin >"$ROOT/empty-stdin.out" 2>"$ROOT/empty-stdin.err"; then
+  fail "empty stdin CLI send succeeded"
+fi
+for form in file stdin; do
+  [[ ! -s "$ROOT/empty-$form.err" ]] || fail "empty $form JSON CLI send wrote stderr"
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "invalid_message" and v["outcome"] == "not_started" and len(v["operation_id"]) == 32' "$ROOT/empty-$form.out" \
+    || fail "empty $form CLI send did not report canonical not_started with generated ID"
+done
+EMPTY_IPC=$(ipc sender "{\"command\":\"send\",\"operation_id\":\"$EMPTY_ID\",\"body\":\"\"}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "invalid_message" and v["outcome"] == "not_started" and v["operation_id"] == sys.argv[1]' "$EMPTY_ID" <<<"$EMPTY_IPC" \
+  || fail "daemon did not reject empty IPC send before admission"
+sleep 1
+! grep -Fq '"body":""' "$ROOT/receiver.listen" || fail "empty rejection reached the wire/feed"
+REUSED=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$EMPTY_ID" operation-id-reused-after-empty)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "queued" and v["operation_id"] == sys.argv[1]' "$EMPTY_ID" <<<"$REUSED" \
+  || fail "operation ID was consumed by empty rejection"
+wait_for 30 "reused operation ID broadcast" grep -Fq '"body":"operation-id-reused-after-empty"' "$ROOT/receiver.listen"
+
 # Submit then discard the response. Retrying with the caller's ID must return the
 # cached outcome and must not broadcast a second envelope.
 SEND_ID=11111111111111111111111111111111
@@ -177,4 +208,4 @@ grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: CLI/IPC broadcast response-loss retry, concurrent private/share joins, wire IDs, conflicts, terminal failures, bounded-cache status, sender restarts, recipient WAL replay persistence, duplicate classification, and signed fingerprint conflicts"
+echo "PASS: empty CLI/IPC rejection without side effects and operation-ID consumption; broadcast response-loss retry, concurrent private/share joins, wire IDs, conflicts, terminal failures, bounded-cache status, sender restarts, recipient WAL replay persistence, duplicate classification, and signed fingerprint conflicts"

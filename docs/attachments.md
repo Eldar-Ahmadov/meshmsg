@@ -18,7 +18,7 @@ meshmsg --json share ./results
 meshmsg download '<signed-directory-offer>' --output ./received-results
 ```
 
-Copy the `offer` value from the `share` or `listen` JSON output. `--offer-file` and `--offer-stdin` avoid exposing this reusable plaintext capability in argv and shell history. A raw Iroh `BlobTicket` is also accepted for interoperability, but is treated only as a file and has no meshmsg-signed name, kind, or declared size.
+Copy the `offer` value from the `share` or `listen` JSON output. Signed offers require one canonical lowercase ID shared by the EnvelopeV2 message ID and embedded offer ID, a canonical raw ticket whose provider is the signer, a safe typed name/kind, and the expected topic; malformed offers are rejected before replay admission or subscriber fanout. `--offer-file` and `--offer-stdin` avoid exposing this reusable plaintext capability in argv and shell history. A raw Iroh `BlobTicket` is also accepted for interoperability, but is treated only as a file and has no meshmsg-signed name, kind, or declared size.
 
 List attachment blobs currently pinned in the local store:
 

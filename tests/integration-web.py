@@ -468,12 +468,32 @@ def main():
                 assert duplicate_response.startswith(b'HTTP/1.1 400')
                 for command in ['stop', 'subscribe', 'share', 'offers', 'download', 'bench_send', 'init', 'join', 'topic']:
                     assert api({'command': command})[0] == 400
-                for value in [{'command': 'status', 'path': '/etc/passwd'}, {'command': 'send', 'operation_id': '00000000000000000000000000000001', 'body': ''}, {'command': 'send', 'operation_id': '00000000000000000000000000000002', 'body': '二' * 1366}, {'command': 'send', 'operation_id': '00000000000000000000000000000003', 'body': 'x', 'extra': True}]:
+                for value in [{'command': 'status', 'path': '/etc/passwd'}, {'command': 'send', 'operation_id': '00000000000000000000000000000003', 'body': 'x', 'extra': True}]:
                     assert api(value)[0] == 400
+                for operation_id, body in [
+                    ('00000000000000000000000000000001', ''),
+                    ('00000000000000000000000000000002', '二' * 1301),
+                ]:
+                    code, rejected = api({
+                        'command': 'send', 'operation_id': operation_id, 'body': body})
+                    assert code == 422
+                    assert rejected == {
+                        'type': 'error', 'schema_version': 1,
+                        'code': 'invalid_message', 'operation_id': operation_id,
+                        'message': 'The message is invalid.',
+                        'outcome': 'not_started', 'retryable': False}
                 raw_headers = dict(base_headers, **{'X-Meshmsg-Request-Id': strict_id})
                 assert request(raw='{bad json', headers=raw_headers)[0] == 400
                 assert request(raw='x' * 30000, headers=raw_headers)[0] == 413
                 assert len(daemon.requests) == before, 'rejected HTTP request reached IPC'
+                reused_http_id = '00000000000000000000000000000001'
+                assert api({
+                    'command': 'send', 'operation_id': reused_http_id,
+                    'body': 'valid-after-http-empty-rejection'}) == (
+                        200, {'type': 'queued', 'schema_version': 3,
+                              'operation_id': reused_http_id,
+                              'message_id': reused_http_id,
+                              'delivery_acknowledged': False})
 
                 daemon.idempotency_capability = False
                 sends_before = sum(r.get('command') == 'send' for r in daemon.requests)
@@ -489,6 +509,7 @@ def main():
                     'outcome': 'not_started', 'retryable': False}
                 assert sum(r.get('command') == 'send' for r in daemon.requests) == sends_before
                 daemon.idempotency_capability = True
+                time.sleep(1.05)
 
                 assert api({'command': 'send', 'operation_id': '10000000000000000000000000000001', 'body': 'hello\n<script>test</script>'}) == (200, {'type': 'queued', 'schema_version': 3, 'operation_id': '10000000000000000000000000000001', 'message_id': '10000000000000000000000000000001', 'delivery_acknowledged': False})
                 assert api({'command': 'send', 'operation_id': '10000000000000000000000000000002', 'body': 'too-fast'})[0] == 429
@@ -783,6 +804,21 @@ def main():
                         'timestamp_ms': 4, 'name': 'incoming-directory.tar',
                         'kind': 'directory_tar_v1', 'size': 8192}
 
+                daemon.broadcast({
+                    'type': 'error', 'schema_version': 1,
+                    'code': 'internal_contract_error',
+                    'message': 'An internal contract error occurred.',
+                    'retryable': False, 'outcome': 'unknown',
+                    'suppressed_since_last': 2})
+                for response in [feed, other_tab]:
+                    observed = next_event(response)
+                    assert observed == {
+                        'type': 'error', 'schema_version': 1,
+                        'code': 'internal_contract_error',
+                        'message': 'An internal contract error occurred.',
+                        'retryable': False, 'outcome': 'unknown',
+                        'suppressed_since_last': 2}
+
                 time.sleep(1.05)
                 synced = 'sent-from-another-web-tab'
                 assert api({'command': 'send', 'operation_id': '10000000000000000000000000000005', 'body': synced})[0] == 200
@@ -804,12 +840,17 @@ def main():
                     assert value['type'] == 'queued' and value['body'] == 'sent-from-cli'
 
                 chat_body = 'sent-from-chat-input'
+                sends_before_chat = len([
+                    request for request in daemon.requests if request.get('command') == 'send'])
                 chat = subprocess.run(
-                    [BIN, '--state-dir', str(root), '--json', 'chat'], input=chat_body + '\n',
+                    [BIN, '--state-dir', str(root), '--json', 'chat'],
+                    input='\n\n' + chat_body + '\n\n',
                     text=True, capture_output=True, timeout=15, check=False)
                 assert chat.returncode == 0, chat.stderr
-                assert any(request.get('command') == 'send' and request.get('body') == chat_body
-                           and len(request.get('operation_id', '')) == 32 for request in daemon.requests)
+                chat_sends = [
+                    request for request in daemon.requests if request.get('command') == 'send'][sends_before_chat:]
+                assert len(chat_sends) == 1 and chat_sends[0].get('body') == chat_body
+                assert len(chat_sends[0].get('operation_id', '')) == 32
                 for response in [feed, other_tab]:
                     value = next_event(response)
                     assert value['type'] == 'queued' and value['schema_version'] == 3

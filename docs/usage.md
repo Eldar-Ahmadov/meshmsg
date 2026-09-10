@@ -143,7 +143,7 @@ A successful send reports `queued`:
 {"type":"queued","schema_version":3,"operation_id":"<32-lowercase-hex>","from":"<peer-id>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body":"hello","delivery_acknowledged":false}
 ```
 
-`queued` means the local Gossip implementation accepted the broadcast request. It is not a delivery acknowledgement. The operation ID is also the signed V2 wire message ID, so a retry uses the same replay identity. Remote `message` records remain schema version 2. Broadcasts use the topic-bound V2 Gossip protocol and do not interoperate with pre-V2 peers.
+`queued` means the local Gossip implementation accepted the broadcast request. It is not a delivery acknowledgement. The operation ID is also the signed V2 wire message ID, so a retry uses the same replay identity. Remote `message` records remain schema version 2. New broadcast bodies must contain at least one byte and are limited to 3900 UTF-8 bytes. Empty or oversized requests are rejected with `invalid_message` and `outcome:"not_started"` before operation-cache admission, preserving their explicit or generated operation ID for correction and reuse. Receive/event consumers continue accepting released valid EnvelopeV2 bodies through the exact 3928-byte worst-case capacity of a 4096-byte frame. Signed remote envelopes with invalid text or attachment semantics are dropped before replay admission. Broadcasts use the topic-bound V2 Gossip protocol and do not interoperate with pre-V2 peers.
 
 ### Retry-safe operation IDs
 
@@ -185,7 +185,7 @@ The direct v2 signed rejection results are mapped to stable daemon errors. `priv
 
 `listen` and `chat` subscribers receive accepted messages as `private_message` events containing `private:true`, the canonical `from`, message ID, timestamp, body, and explicit `durable:false`/`read:false` fields. Replay persistence stores only sender, ID, fingerprint, expiration, and pending/confirmed state. Persistence runs on a dedicated blocking worker with a bounded 64-request queue. Live IDs are never pressure-evicted: new admission returns signed `Busy` when the queue, global 8,192-ID quota, per-sender 512-ID quota, per-sender 8/second (burst 16) rate, global 128/second (burst 256) rate, volatile delivery queue, or WAL bound is unavailable. Status exposes these bounds plus `direct_replay_available` and stable `direct_replay_error`; terminal failure makes subsequent direct requests return signed unavailable results.
 
-Lines entered in `chat` are still broadcasts; it has no direct-reply mode. Private bodies are suppressed from unattended daemon logs and replay persistence. The mobile web process neither sends private messages nor exposes them in its SSE feed.
+Nonempty lines entered in `chat` are still broadcasts; blank lines are ignored without allocating an operation ID or contacting the daemon. It has no direct-reply mode. Private bodies are suppressed from unattended daemon logs and replay persistence. The mobile web process neither sends private messages nor exposes them in its SSE feed.
 
 ## Input sources
 
@@ -208,7 +208,7 @@ meshmsg download --offer-file signed-offer.txt --output ./report.pdf
 printf '%s' '<signed-offer>' | meshmsg download --offer-stdin --output ./report.pdf
 ```
 
-File and stdin flags conflict with each other and with the positional value. Stdin is read through EOF; `-` is a literal filename, not stdin. Invite and attachment-offer input remove one final LF and an optional preceding CR. Message input is preserved exactly. Inputs must be UTF-8. Invite and attachment-offer input are limited to 1 MiB and message bodies to 4096 bytes.
+File and stdin flags conflict with each other and with the positional value. Stdin is read through EOF; `-` is a literal filename, not stdin. Invite and attachment-offer input remove one final LF and an optional preceding CR. Message input is preserved exactly. Inputs must be UTF-8. Invite and attachment-offer input are limited to 1 MiB. Broadcast message bodies must be nonempty and are limited to 3900 UTF-8 bytes for positional, file, stdin, chat, IPC, and web input alike. Private `send --to` bodies use their separate nonempty 4096-byte contract for positional, file, and stdin input.
 
 These forms prevent argv and history disclosure only. Broadcast messages remain plaintext to every topic participant. Private-message transport is encrypted between the two daemons, but the body is still available to the sender and recipient processes, their owner-only IPC subscribers, and the operators of those machines.
 

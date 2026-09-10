@@ -32,7 +32,6 @@ const PRESENCE_VERSION: u8 = 1;
 const DIRECT_VERSION: u8 = 2;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 const MAX_DIRECT_FRAME: usize = 6 * 1024;
-const MAX_BODY_BYTES: usize = 4096;
 const MAX_PRESENCE_FRAME: usize = 2048;
 const MAX_ENDPOINT_ADDRS: usize = 8;
 pub(crate) const MAX_DYNAMIC_PRESENCE_IDENTITIES: usize = 1024;
@@ -533,11 +532,7 @@ impl DirectFrame {
         body: String,
         id: [u8; 16],
     ) -> Result<Self> {
-        anyhow::ensure!(!body.is_empty(), "private message cannot be empty");
-        anyhow::ensure!(
-            body.len() <= MAX_BODY_BYTES,
-            "private message exceeds {MAX_BODY_BYTES} UTF-8 bytes"
-        );
+        crate::message::validate_private_body(&body)?;
         let payload = DirectPayload {
             version: DIRECT_VERSION,
             sender: secret.public(),
@@ -578,14 +573,7 @@ impl DirectFrame {
             frame.payload.version == DIRECT_VERSION,
             "unsupported private message version"
         );
-        anyhow::ensure!(
-            !frame.payload.body.is_empty(),
-            "private message cannot be empty"
-        );
-        anyhow::ensure!(
-            frame.payload.body.len() <= MAX_BODY_BYTES,
-            "private message body is too large"
-        );
+        crate::message::validate_private_body(&frame.payload.body)?;
         let signed = postcard::to_stdvec(&(MESSAGE_DOMAIN, &frame.payload))?;
         frame
             .payload

@@ -7,8 +7,6 @@ use std::{
     path::PathBuf,
 };
 
-// The message body cannot fit its signed envelope if it alone exceeds the wire limit.
-const MAX_MESSAGE_INPUT_BYTES: usize = 4096;
 // Plaintext capabilities are normally only a few KiB.
 const MAX_CAPABILITY_INPUT_BYTES: usize = 1024 * 1024;
 
@@ -354,17 +352,17 @@ impl InviteInput {
 }
 
 impl MessageInput {
-    pub fn into_message(self) -> Result<String> {
+    pub fn into_message(self, maximum: usize) -> Result<String> {
         match (self.message, self.message_file, self.message_stdin) {
             (Some(message), None, false) => {
                 anyhow::ensure!(
-                    message.len() <= MAX_MESSAGE_INPUT_BYTES,
-                    "message body exceeds the input limit"
+                    message.len() <= maximum,
+                    "message body exceeds {maximum} bytes"
                 );
                 Ok(message)
             }
-            (None, Some(path), false) => read_file(&path, "message body", MAX_MESSAGE_INPUT_BYTES),
-            (None, None, true) => read_stdin("message body", MAX_MESSAGE_INPUT_BYTES),
+            (None, Some(path), false) => read_file(&path, "message body", maximum),
+            (None, None, true) => read_stdin("message body", maximum),
             _ => bail!("exactly one message input source is required"),
         }
     }
@@ -789,34 +787,72 @@ mod tests {
     }
 
     #[test]
-    fn message_file_preserves_text_exactly_and_rejects_invalid_utf8() {
+    fn positional_message_uses_canonical_empty_and_utf8_byte_bounds() {
+        let input = |message: String| MessageInput {
+            message: Some(message),
+            message_file: None,
+            message_stdin: false,
+        };
+        let empty = input(String::new())
+            .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+            .unwrap();
+        assert!(crate::message::validate_broadcast_body(&empty).is_err());
+        assert!(
+            input("界".repeat(crate::message::MAX_BROADCAST_BODY_BYTES / 3))
+                .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+                .is_ok()
+        );
+        assert!(
+            input("界".repeat(crate::message::MAX_BROADCAST_BODY_BYTES / 3 + 1))
+                .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn message_file_preserves_text_exactly_and_rejects_oversized_and_invalid_utf8() {
         let dir = std::env::temp_dir().join(format!("meshmsg-cli-test-{}", rand::random::<u64>()));
         fs::create_dir(&dir).unwrap();
-        for (name, bytes) in [
-            ("multiline", " one\r\n二\n\0".as_bytes()),
-            ("empty", b"".as_slice()),
-        ] {
-            let path = dir.join(name);
-            fs::write(&path, bytes).unwrap();
-            let message = MessageInput {
-                message: None,
-                message_file: Some(path),
-                message_stdin: false,
-            }
-            .into_message()
-            .unwrap();
-            assert_eq!(message.as_bytes(), bytes);
+        let path = dir.join("multiline");
+        let bytes = " one\r\n二\n\0".as_bytes();
+        fs::write(&path, bytes).unwrap();
+        let message = MessageInput {
+            message: None,
+            message_file: Some(path),
+            message_stdin: false,
         }
+        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+        .unwrap();
+        assert_eq!(message.as_bytes(), bytes);
+
+        let empty_path = dir.join("empty");
+        fs::write(&empty_path, []).unwrap();
+        let empty = MessageInput {
+            message: None,
+            message_file: Some(empty_path),
+            message_stdin: false,
+        }
+        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+        .unwrap();
+        assert!(crate::message::validate_broadcast_body(&empty).is_err());
+
         let oversized_path = dir.join("oversized");
-        fs::write(&oversized_path, vec![b'x'; MAX_MESSAGE_INPUT_BYTES + 1]).unwrap();
+        fs::write(
+            &oversized_path,
+            vec![b'x'; crate::message::MAX_BROADCAST_BODY_BYTES + 1],
+        )
+        .unwrap();
         let error = MessageInput {
             message: None,
             message_file: Some(oversized_path),
             message_stdin: false,
         }
-        .into_message()
+        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
         .unwrap_err();
-        assert!(error.to_string().contains("4096-byte input limit"));
+        assert!(error.to_string().contains(&format!(
+            "{}-byte input limit",
+            crate::message::MAX_BROADCAST_BODY_BYTES
+        )));
 
         let path = dir.join("invalid");
         fs::write(&path, [0xff]).unwrap();
@@ -825,7 +861,7 @@ mod tests {
             message_file: Some(path),
             message_stdin: false,
         }
-        .into_message()
+        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
         .unwrap_err();
         assert!(error.to_string().contains("UTF-8"));
         fs::remove_dir_all(dir).unwrap();

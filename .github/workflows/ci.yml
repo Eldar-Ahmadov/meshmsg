@@ -79,3 +79,7 @@ jobs:
         run: timeout 600 bash tests/integration-direct-messages.sh target/debug/meshmsg
       - name: Run IPC version compatibility scenario
         run: timeout 600 bash tests/integration-ipc-version-compat.sh target/debug/meshmsg
+      - name: Run v0.1.18 message-boundary compatibility scenario
+        run: timeout 600 bash tests/integration-v018-message-boundary.sh target/debug/meshmsg
+      - name: Run idempotency scenario
+        run: timeout 600 bash tests/integration-idempotency.sh target/debug/meshmsg

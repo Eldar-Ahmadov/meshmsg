@@ -204,6 +204,8 @@ pub(crate) struct ErrorEnvelopeV1 {
     pub(crate) removed_tags: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) quota_bytes_released: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suppressed_since_last: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -244,6 +246,7 @@ impl ErrorEnvelopeV1 {
             selected_tags: None,
             removed_tags: None,
             quota_bytes_released: None,
+            suppressed_since_last: None,
         }
     }
 
@@ -296,6 +299,10 @@ impl ErrorEnvelopeV1 {
                 (None, None, None) | (Some(_), Some(_), Some(_))
             ) && self.removed_tags.unwrap_or(0) <= self.selected_tags.unwrap_or(0),
             "error removal counts are invalid"
+        );
+        anyhow::ensure!(
+            self.suppressed_since_last.is_none() || self.code == "internal_contract_error",
+            "error suppression accounting is not applicable"
         );
         Ok(())
     }

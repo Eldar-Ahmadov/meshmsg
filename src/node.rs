@@ -320,6 +320,35 @@ struct RejectionSampler {
     suppressed: u64,
 }
 
+#[derive(Default)]
+struct InternalContractGuard {
+    last_emitted_ms: Option<u64>,
+    suppressed: u64,
+}
+
+impl InternalContractGuard {
+    fn rejection(&mut self, now_ms: u64, _family: &str) -> Option<serde_json::Value> {
+        let interval_ms = REJECTION_SAMPLE_INTERVAL.as_millis() as u64;
+        if self
+            .last_emitted_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) < interval_ms)
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        let suppressed = std::mem::take(&mut self.suppressed);
+        self.last_emitted_ms = Some(now_ms);
+        let mut error = ErrorEnvelopeV1::new(
+            "internal_contract_error",
+            "generated event failed its strict contract",
+            "unknown",
+            false,
+        );
+        error.suppressed_since_last = Some(suppressed);
+        Some(error.into_value())
+    }
+}
+
 impl RejectionSampler {
     fn event(&mut self, now_ms: u64, message: &str) -> Option<serde_json::Value> {
         let interval_ms = REJECTION_SAMPLE_INTERVAL.as_millis() as u64;
@@ -635,8 +664,9 @@ fn validate_bench_config(config: &BenchConfig) -> Result<u64> {
         "benchmark plans {total} messages; maximum is {MAX_BENCH_MESSAGES}"
     );
     anyhow::ensure!(
-        config.payload_bytes <= MAX_ENVELOPE_SIZE,
-        "payload size cannot exceed {MAX_ENVELOPE_SIZE} bytes"
+        config.payload_bytes <= crate::message::MAX_BROADCAST_BODY_BYTES,
+        "payload size cannot exceed {} bytes",
+        crate::message::MAX_BROADCAST_BODY_BYTES
     );
     let body = build_bench_body(
         &config.run_id,
@@ -695,6 +725,9 @@ impl Envelope {
         message_id: [u8; 16],
         timestamp_ms: u64,
     ) -> Result<Bytes> {
+        if kind == EnvelopeKind::Message {
+            crate::message::validate_broadcast_body(&body)?;
+        }
         let payload = EnvelopeSignaturePayload {
             domain: ENVELOPE_DOMAIN,
             version: ENVELOPE_VERSION,
@@ -717,6 +750,7 @@ impl Envelope {
             body,
             signature: ByteArray::new(secret.sign(&signed).to_bytes()),
         };
+        value.validate_semantics()?;
         let encoded = postcard::to_stdvec(&value)?;
         anyhow::ensure!(
             encoded.len() <= MAX_ENVELOPE_SIZE,
@@ -761,7 +795,15 @@ impl Envelope {
             .from
             .verify(&signed, &iroh::Signature::from_bytes(&value.signature))
             .context("verify message")?;
+        value.validate_semantics()?;
         Ok(value)
+    }
+
+    fn validate_semantics(&self) -> Result<()> {
+        match self.kind {
+            EnvelopeKind::Message => crate::message::validate_v2_message_body(&self.body),
+            EnvelopeKind::AttachmentOffer => validate_attachment_envelope(self).map(|_| ()),
+        }
     }
 }
 
@@ -795,12 +837,7 @@ fn parse_attachment_body(body: &str) -> Result<Option<AttachmentOffer>> {
     );
     attachment::validate_display_name(&wire.offer.name)?;
     anyhow::ensure!(
-        wire.offer.offer_id.len() == 32
-            && wire
-                .offer
-                .offer_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit()),
+        crate::ipc::valid_operation_id(&wire.offer.offer_id),
         "invalid attachment offer ID"
     );
     let ticket: BlobTicket = wire
@@ -812,7 +849,30 @@ fn parse_attachment_body(body: &str) -> Result<Option<AttachmentOffer>> {
         ticket.format() == BlobFormat::Raw,
         "unsupported attachment blob format"
     );
+    anyhow::ensure!(
+        ticket.to_string() == wire.offer.ticket,
+        "attachment ticket is not canonical"
+    );
     Ok(Some(wire.offer))
+}
+
+fn validate_attachment_envelope(envelope: &Envelope) -> Result<AttachmentOffer> {
+    anyhow::ensure!(
+        envelope.kind == EnvelopeKind::AttachmentOffer,
+        "message is not an attachment offer"
+    );
+    let offer = parse_attachment_body(&envelope.body)?
+        .context("attachment envelope does not contain a typed offer")?;
+    anyhow::ensure!(
+        direct::id_string(&envelope.message_id) == offer.offer_id,
+        "attachment envelope message ID does not match offer ID"
+    );
+    let ticket: BlobTicket = offer.ticket.parse().context("parse attachment ticket")?;
+    anyhow::ensure!(
+        ticket.addr().id == envelope.from,
+        "attachment provider does not match its signature"
+    );
+    Ok(offer)
 }
 
 fn decode_legacy_envelope_v1(data: &[u8]) -> Result<LegacyEnvelopeV1> {
@@ -856,13 +916,8 @@ fn parse_signed_offer_token(
         envelope.kind == EnvelopeKind::AttachmentOffer,
         "token is not an attachment offer"
     );
-    let offer =
-        parse_attachment_body(&envelope.body)?.context("token is not an attachment offer")?;
+    let offer = validate_attachment_envelope(&envelope)?;
     let ticket: BlobTicket = offer.ticket.parse().context("parse attachment ticket")?;
-    anyhow::ensure!(
-        ticket.addr().id == envelope.from,
-        "attachment provider does not match its signature"
-    );
     Ok((offer, ticket))
 }
 
@@ -1998,6 +2053,10 @@ fn normalize_ipc_response(value: &serde_json::Value, request_id: &str) -> serde_
         error.quota_bytes_released = value
             .get("quota_bytes_released")
             .and_then(serde_json::Value::as_u64);
+        error.suppressed_since_last = value
+            .get("suppressed_since_last")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|_| code == "internal_contract_error");
         return error.into_value();
     }
     contracts::correlate(value.clone(), request_id)
@@ -2225,6 +2284,26 @@ where
             .await?;
             return Ok(());
         }
+    }
+    let invalid_message = match &request {
+        IpcRequest::Send { operation_id, body } => crate::message::validate_broadcast_body(body)
+            .err()
+            .map(|error| (operation_id, error)),
+        IpcRequest::PrivateSend {
+            operation_id, body, ..
+        } => crate::message::validate_private_body(body)
+            .err()
+            .map(|error| (operation_id, error)),
+        _ => None,
+    };
+    if let Some((operation_id, error)) = invalid_message {
+        write_local_response(
+            &mut stream,
+            &OperationCache::error(operation_id, "invalid_message", &error.to_string()),
+            timeouts.response_write,
+        )
+        .await?;
+        return Ok(());
     }
     match request {
         IpcRequest::Subscribe => {
@@ -4618,6 +4697,7 @@ pub async fn run_daemon(
     let mut envelope_replay = EnvelopeReplayCache::default();
     let mut broadcast_sources = TransportSourceLimiter::default();
     let mut broadcast_rejections = RejectionSampler::default();
+    let mut internal_contract_guard = InternalContractGuard::default();
     let connection_limit = Arc::new(Semaphore::new(LOCAL_IPC_CONNECTION_CAPACITY));
     let mut local_client_tasks = tokio::task::JoinSet::new();
     let mut transfer_tasks = tokio::task::JoinSet::new();
@@ -4673,6 +4753,12 @@ pub async fn run_daemon(
             }
             command = command_rx.recv() => match command {
                 Some(DaemonCommand::Send { operation_id, body, reply }) => {
+                    if let Err(error) = crate::message::validate_broadcast_body(&body) {
+                        let _ = reply.send(OperationCache::error(
+                            &operation_id, "invalid_message", &error.to_string(),
+                        ));
+                        continue;
+                    }
                     let fingerprint = operation_fingerprint("send", &[body.as_bytes()]);
                     if !operation_cache.lock().expect("operation cache poisoned").admit(
                         operation_id.clone(), fingerprint, reply, StdInstant::now()
@@ -4697,7 +4783,12 @@ pub async fn run_daemon(
                     let response = operation_cache.lock().expect("operation cache poisoned")
                         .complete(&operation_id, response, StdInstant::now());
                     if response["type"] == "queued" {
-                        let _ = event_tx.send(response.clone());
+                        publish_daemon_message_event(
+                            &event_tx,
+                            response.clone(),
+                            &mut internal_contract_guard,
+                            unix_timestamp_ms().unwrap_or(0),
+                        );
                     }
                 }
                 Some(DaemonCommand::PrivateSend { operation_id, to, body, reply }) => {
@@ -5091,17 +5182,24 @@ pub async fn run_daemon(
                             let _ = node.presence_sender.broadcast(record).await;
                         }
                     }
+                    let now_ms = unix_timestamp_ms()?;
                     let values = network_event(
                         value,
                         topic,
                         &mut envelope_replay,
                         &mut broadcast_sources,
                         &mut broadcast_rejections,
-                        unix_timestamp_ms()?,
+                        now_ms,
                     );
                     for full_value in values {
-                        let _ = event_tx.send(full_value.clone());
-                        event(json, suppress_message_body(full_value));
+                        if publish_daemon_message_event(
+                            &event_tx,
+                            full_value.clone(),
+                            &mut internal_contract_guard,
+                            now_ms,
+                        ) {
+                            event(json, suppress_message_body(full_value));
+                        }
                     }
                 }
                 None => break,
@@ -5316,6 +5414,36 @@ fn network_event(
             "message":"receiver fell behind; one or more events were dropped"
         })],
     }
+}
+
+fn valid_daemon_message_event(value: &serde_json::Value) -> bool {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("message" | "queued") => {
+            let correlated = contracts::correlate(value.clone(), &contracts::new_request_id());
+            crate::ipc::validate_success_payload(&correlated).is_ok()
+        }
+        _ => true,
+    }
+}
+
+fn publish_daemon_message_event(
+    events: &broadcast::Sender<serde_json::Value>,
+    value: serde_json::Value,
+    guard: &mut InternalContractGuard,
+    now_ms: u64,
+) -> bool {
+    if valid_daemon_message_event(&value) {
+        let _ = events.send(value);
+        return true;
+    }
+    let family = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if let Some(error) = guard.rejection(now_ms, family) {
+        let _ = events.send(error);
+    }
+    false
 }
 
 fn queued_event(
@@ -6767,6 +6895,13 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
         tokio::select! {
             line = rx.recv() => match line {
                 Some(body) => {
+                    // `lines()` removes the terminator, so an empty value is a
+                    // blank input line. Ignore it without allocating an operation
+                    // ID or contacting the daemon.
+                    if body.is_empty() {
+                        continue;
+                    }
+                    crate::message::validate_broadcast_body(&body)?;
                     send_request_checked(
                         dir,
                         &IpcRequest::Send {
@@ -6889,6 +7024,10 @@ fn offer_listing_warnings(value: &serde_json::Value) -> Vec<String> {
         ));
     }
     warnings
+}
+
+fn daemon_started_human_output(value: &serde_json::Value) -> String {
+    format!("daemon running as {}", value["peer"].as_str().unwrap_or(""))
 }
 
 fn event(json: bool, mut value: serde_json::Value) {
@@ -7060,11 +7199,7 @@ fn event(json: bool, mut value: serde_json::Value) {
             }
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
-            "daemon_started" => println!(
-                "daemon running as {}\nlocal endpoint: {}",
-                value["peer"].as_str().unwrap_or(""),
-                value["local_endpoint"].as_str().unwrap_or("")
-            ),
+            "daemon_started" => println!("{}", daemon_started_human_output(&value)),
             "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
             "stopping" => println!("daemon stopping"),
             "lagged" => println!(
@@ -7109,6 +7244,40 @@ mod tests {
             body,
             signature: ByteArray::new([0; SIGNATURE_LENGTH]),
         }
+    }
+
+    fn encode_unchecked_signed_envelope(
+        secret: &SecretKey,
+        kind: EnvelopeKind,
+        body: String,
+        message_id: [u8; 16],
+        timestamp_ms: u64,
+    ) -> Bytes {
+        let topic = test_topic();
+        let signed = postcard::to_stdvec(&EnvelopeSignaturePayload {
+            domain: ENVELOPE_DOMAIN,
+            version: ENVELOPE_VERSION,
+            topic,
+            from: secret.public(),
+            message_id,
+            timestamp_ms,
+            kind,
+            body: &body,
+        })
+        .unwrap();
+        postcard::to_stdvec(&Envelope {
+            domain: ENVELOPE_DOMAIN.to_owned(),
+            version: ENVELOPE_VERSION,
+            topic,
+            from: secret.public(),
+            message_id,
+            timestamp_ms,
+            kind,
+            body,
+            signature: ByteArray::new(secret.sign(&signed).to_bytes()),
+        })
+        .unwrap()
+        .into()
     }
 
     fn assert_object_keys(value: &serde_json::Value, expected: &[&str]) {
@@ -7285,11 +7454,12 @@ mod tests {
     fn signed_attachment_offer_round_trips_and_rejects_tampering() {
         let secret = SecretKey::generate();
         let offer = sample_offer(secret.public());
-        let encoded = Envelope::encode_at(
+        let encoded = Envelope::encode_with_id_at(
             &secret,
             test_topic(),
             EnvelopeKind::AttachmentOffer,
             attachment_body(&offer).unwrap(),
+            operation_id_bytes(&offer.offer_id),
             42,
         )
         .unwrap();
@@ -7395,6 +7565,273 @@ mod tests {
         assert!(EnvelopeReplayCache::default()
             .accept(&future, future.from, now_ms)
             .is_err());
+    }
+
+    #[test]
+    fn crafted_signed_empty_message_is_rejected_before_replay_and_next_message_survives() {
+        let secret = SecretKey::generate();
+        let topic = test_topic();
+        let now_ms = 1_700_000_000_000;
+        let message_id = [9; 16];
+        let signed_envelope = |body: String| {
+            let signed = postcard::to_stdvec(&EnvelopeSignaturePayload {
+                domain: ENVELOPE_DOMAIN,
+                version: ENVELOPE_VERSION,
+                topic,
+                from: secret.public(),
+                message_id,
+                timestamp_ms: now_ms,
+                kind: EnvelopeKind::Message,
+                body: &body,
+            })
+            .unwrap();
+            postcard::to_stdvec(&Envelope {
+                domain: ENVELOPE_DOMAIN.to_owned(),
+                version: ENVELOPE_VERSION,
+                topic,
+                from: secret.public(),
+                message_id,
+                timestamp_ms: now_ms,
+                kind: EnvelopeKind::Message,
+                body,
+                signature: ByteArray::new(secret.sign(&signed).to_bytes()),
+            })
+            .unwrap()
+        };
+        let source = SecretKey::generate().public();
+        let mut replay = EnvelopeReplayCache::default();
+        let mut sources = TransportSourceLimiter::default();
+        let mut rejections = RejectionSampler::default();
+
+        let rejected = network_event(
+            Event::Received(iroh_gossip::api::Message {
+                content: signed_envelope(String::new()).into(),
+                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                delivered_from: source,
+            }),
+            topic,
+            &mut replay,
+            &mut sources,
+            &mut rejections,
+            now_ms,
+        );
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["code"], "invalid_message");
+        assert_eq!(
+            replay.live_ids, 0,
+            "invalid semantics consumed replay state"
+        );
+
+        let accepted = network_event(
+            Event::Received(iroh_gossip::api::Message {
+                content: signed_envelope("still connected".to_owned()).into(),
+                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                delivered_from: source,
+            }),
+            topic,
+            &mut replay,
+            &mut sources,
+            &mut rejections,
+            now_ms,
+        );
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0]["type"], "message");
+        assert_eq!(accepted[0]["body"], "still connected");
+        assert_eq!(replay.live_ids, 1);
+    }
+
+    #[tokio::test]
+    async fn generated_event_guard_keeps_live_strict_subscribers_and_reports_bounded_errors() {
+        let secret = SecretKey::generate();
+        let canonical = message_event(unsigned_test_envelope(
+            secret.public(),
+            "subscriber remains connected".to_owned(),
+            42,
+        ));
+        let (events, _) = broadcast::channel(8);
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (mut first, first_server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
+        let (mut second, second_server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
+        let first_task = tokio::spawn(handle_local_client(
+            first_server,
+            commands.clone(),
+            events.subscribe(),
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let second_task = tokio::spawn(handle_local_client(
+            second_server,
+            commands,
+            events.subscribe(),
+            serde_json::json!({"type":"connected"}),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        write_request(&mut first, &IpcRequest::Subscribe)
+            .await
+            .unwrap();
+        write_request(&mut second, &IpcRequest::Subscribe)
+            .await
+            .unwrap();
+        let first_connected: serde_json::Value =
+            serde_json::from_slice(&read_frame(&mut first, MAX_IPC_EVENT_SIZE).await.unwrap())
+                .unwrap();
+        let second_connected: serde_json::Value =
+            serde_json::from_slice(&read_frame(&mut second, MAX_IPC_EVENT_SIZE).await.unwrap())
+                .unwrap();
+        let subscriber_ids = [
+            first_connected["request_id"].as_str().unwrap().to_owned(),
+            second_connected["request_id"].as_str().unwrap().to_owned(),
+        ];
+        assert_ne!(subscriber_ids[0], subscriber_ids[1]);
+
+        let mut guard = InternalContractGuard::default();
+        let now_ms = 1_700_000_000_000;
+        let mut malformed_message = canonical.clone();
+        malformed_message["body"] = "".into();
+        assert!(!publish_daemon_message_event(
+            &events,
+            malformed_message,
+            &mut guard,
+            now_ms
+        ));
+        for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
+            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
+            let error = serde_json::from_slice(&frame).unwrap();
+            let error = ErrorEnvelopeV1::from_value(&error).unwrap();
+            assert_eq!(error.code, "internal_contract_error");
+            assert_eq!(
+                error.request_id.as_deref(),
+                Some(subscriber_ids[index].as_str())
+            );
+            assert_eq!(error.suppressed_since_last, Some(0));
+        }
+
+        let mut suppressed_message = canonical.clone();
+        suppressed_message["body"] = "".into();
+        assert!(!publish_daemon_message_event(
+            &events,
+            suppressed_message,
+            &mut guard,
+            now_ms + 1,
+        ));
+        assert_eq!(guard.suppressed, 1);
+
+        let malformed_queued = queued_event(
+            &secret.public().to_string(),
+            [8; 16],
+            "x".repeat(crate::message::MAX_V2_MESSAGE_BODY_BYTES + 1),
+            43,
+        );
+        assert!(!publish_daemon_message_event(
+            &events,
+            malformed_queued,
+            &mut guard,
+            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64,
+        ));
+        for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
+            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
+            let error = serde_json::from_slice(&frame).unwrap();
+            let error = ErrorEnvelopeV1::from_value(&error).unwrap();
+            assert_eq!(error.code, "internal_contract_error");
+            assert_eq!(
+                error.request_id.as_deref(),
+                Some(subscriber_ids[index].as_str())
+            );
+            assert_eq!(error.suppressed_since_last, Some(1));
+        }
+
+        assert!(publish_daemon_message_event(
+            &events,
+            canonical,
+            &mut guard,
+            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64 + 1,
+        ));
+        for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
+            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            crate::ipc::validate_success_payload(&value).unwrap();
+            assert_eq!(value["request_id"], subscriber_ids[index]);
+            assert_eq!(value["body"], "subscriber remains connected");
+        }
+
+        drop(first);
+        drop(second);
+        drop(events);
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn malformed_signed_attachment_semantics_do_not_consume_replay_admission() {
+        let signer = SecretKey::generate();
+        let other = SecretKey::generate();
+        let now_ms = 1_700_000_000_000;
+        let message_id = operation_id_bytes("0123456789abcdef0123456789abcdef");
+        let mut uppercase = sample_offer(signer.public());
+        uppercase.offer_id = uppercase.offer_id.to_ascii_uppercase();
+        let mut mismatched_id = sample_offer(signer.public());
+        mismatched_id.offer_id = "fedcba9876543210fedcba9876543210".into();
+        let wrong_provider = sample_offer(other.public());
+        let malformed_bodies = [
+            String::new(),
+            attachment_body(&uppercase).unwrap(),
+            attachment_body(&mismatched_id).unwrap(),
+            attachment_body(&wrong_provider).unwrap(),
+        ];
+
+        for body in malformed_bodies {
+            let source = SecretKey::generate().public();
+            let mut replay = EnvelopeReplayCache::default();
+            let mut sources = TransportSourceLimiter::default();
+            let mut rejections = RejectionSampler::default();
+            let rejected = network_event(
+                Event::Received(iroh_gossip::api::Message {
+                    content: encode_unchecked_signed_envelope(
+                        &signer,
+                        EnvelopeKind::AttachmentOffer,
+                        body,
+                        message_id,
+                        now_ms,
+                    ),
+                    scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                    delivered_from: source,
+                }),
+                test_topic(),
+                &mut replay,
+                &mut sources,
+                &mut rejections,
+                now_ms,
+            );
+            assert_eq!(rejected.len(), 1);
+            assert_eq!(replay.live_ids, 0);
+
+            let valid = Envelope::encode_with_id_at(
+                &signer,
+                test_topic(),
+                EnvelopeKind::Message,
+                "valid reuse after malformed attachment".into(),
+                message_id,
+                now_ms,
+            )
+            .unwrap();
+            let accepted = network_event(
+                Event::Received(iroh_gossip::api::Message {
+                    content: valid,
+                    scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                    delivered_from: source,
+                }),
+                test_topic(),
+                &mut replay,
+                &mut sources,
+                &mut rejections,
+                now_ms,
+            );
+            assert_eq!(accepted.len(), 1);
+            assert_eq!(accepted[0]["type"], "message");
+            assert_eq!(replay.live_ids, 1);
+        }
     }
 
     #[test]
@@ -7711,15 +8148,15 @@ mod tests {
         let signer = SecretKey::generate();
         let other = SecretKey::generate();
         let mismatched = sample_offer(other.public());
-        let encoded = Envelope::encode_at(
+        assert!(Envelope::encode_with_id_at(
             &signer,
             test_topic(),
             EnvelopeKind::AttachmentOffer,
             attachment_body(&mismatched).unwrap(),
+            operation_id_bytes(&mismatched.offer_id),
             42,
         )
-        .unwrap();
-        assert!(parse_signed_offer_token(&BASE64URL_NOPAD.encode(&encoded), test_topic()).is_err());
+        .is_err());
 
         let version = postcard::to_stdvec(&AttachmentWire {
             version: ATTACHMENT_OFFER_VERSION + 1,
@@ -7773,36 +8210,131 @@ mod tests {
         );
         let secret = SecretKey::generate();
         let timestamp_ms = 1_700_000_000_000;
-        let largest_body = (0..=MAX_ENVELOPE_SIZE)
-            .rev()
-            .find(|length| {
-                Envelope::encode_at(
-                    &secret,
-                    test_topic(),
-                    EnvelopeKind::Message,
-                    "a".repeat(*length),
-                    timestamp_ms,
-                )
-                .is_ok()
-            })
-            .expect("an empty message must fit");
-        let encoded = Envelope::encode_at(
-            &secret,
-            test_topic(),
-            EnvelopeKind::Message,
-            "a".repeat(largest_body),
-            timestamp_ms,
-        )
-        .unwrap();
-        assert_eq!(encoded.len(), MAX_ENVELOPE_SIZE);
+        let body = "a".repeat(crate::message::MAX_BROADCAST_BODY_BYTES);
+        for timestamp in [timestamp_ms, u64::MAX] {
+            let encoded = Envelope::encode_at(
+                &secret,
+                test_topic(),
+                EnvelopeKind::Message,
+                body.clone(),
+                timestamp,
+            )
+            .unwrap();
+            assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
+        }
         assert!(Envelope::encode_at(
             &secret,
             test_topic(),
             EnvelopeKind::Message,
-            "a".repeat(largest_body + 1),
+            "a".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1),
             timestamp_ms,
         )
         .is_err());
+    }
+
+    #[test]
+    fn released_v2_body_range_remains_decodable_and_publishable() {
+        let secret = SecretKey::generate();
+        for length in [
+            crate::message::MAX_BROADCAST_BODY_BYTES + 1,
+            3923,
+            crate::message::MAX_V2_MESSAGE_BODY_BYTES,
+        ] {
+            let encoded = encode_unchecked_signed_envelope(
+                &secret,
+                EnvelopeKind::Message,
+                "a".repeat(length),
+                [5; 16],
+                1,
+            );
+            assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
+            let envelope = Envelope::decode(&encoded, test_topic()).unwrap();
+            assert_eq!(envelope.body.len(), length);
+            assert!(valid_daemon_message_event(&message_event(envelope)));
+        }
+    }
+
+    #[test]
+    fn released_v2_capacity_uses_exact_postcard_metadata_boundaries() {
+        let secret = SecretKey::generate();
+        // Postcard varints add one metadata byte at each 7-bit timestamp
+        // boundary. These capacities are measured on the complete released V2
+        // structure, including its string-length prefix and fixed signature.
+        for (timestamp_ms, capacity) in [
+            (0, 3928),
+            (127, 3928),
+            (1_u64 << 7, 3927),
+            ((1_u64 << 14) - 1, 3927),
+            (1_u64 << 14, 3926),
+            (1_u64 << 21, 3925),
+            (1_u64 << 28, 3924),
+            (1_u64 << 35, 3923),
+            (1_u64 << 42, 3922),
+            (1_u64 << 49, 3921),
+            (1_u64 << 56, 3920),
+            (1_u64 << 63, 3919),
+            (u64::MAX, 3919),
+        ] {
+            let at_limit = encode_unchecked_signed_envelope(
+                &secret,
+                EnvelopeKind::Message,
+                "a".repeat(capacity),
+                [6; 16],
+                timestamp_ms,
+            );
+            let over_limit = encode_unchecked_signed_envelope(
+                &secret,
+                EnvelopeKind::Message,
+                "a".repeat(capacity + 1),
+                [6; 16],
+                timestamp_ms,
+            );
+            assert_eq!(
+                at_limit.len(),
+                MAX_ENVELOPE_SIZE,
+                "timestamp {timestamp_ms}"
+            );
+            assert!(
+                Envelope::decode(&at_limit, test_topic()).is_ok(),
+                "exact frame rejected at timestamp {timestamp_ms}"
+            );
+            assert_eq!(
+                over_limit.len(),
+                MAX_ENVELOPE_SIZE + 1,
+                "timestamp {timestamp_ms}"
+            );
+            assert!(
+                Envelope::decode(&over_limit, test_topic()).is_err(),
+                "oversized frame accepted at timestamp {timestamp_ms}"
+            );
+        }
+
+        let body_127 = encode_unchecked_signed_envelope(
+            &secret,
+            EnvelopeKind::Message,
+            "a".repeat(127),
+            [7; 16],
+            0,
+        );
+        let body_128 = encode_unchecked_signed_envelope(
+            &secret,
+            EnvelopeKind::Message,
+            "a".repeat(128),
+            [7; 16],
+            0,
+        );
+        assert_eq!(body_128.len() - body_127.len(), 2);
+        assert_eq!(crate::message::MAX_V2_MESSAGE_BODY_BYTES, 3928);
+    }
+
+    #[test]
+    fn daemon_started_human_output_omits_removed_local_endpoint() {
+        let output = daemon_started_human_output(&serde_json::json!({
+            "type":"daemon_started", "peer":"test-peer"
+        }));
+        assert_eq!(output, "daemon running as test-peer");
+        assert!(!output.contains("local endpoint:"));
+        assert_eq!(output.lines().count(), 1);
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod direct;
 mod direct_replay;
 mod invite;
 mod ipc;
+mod message;
 mod node;
 mod peers;
 mod web;
@@ -208,8 +209,27 @@ async fn run() -> Result<()> {
             to,
             input,
         } => {
-            let message = input.into_message()?;
-            node::send_once(&dir, operation_id, to.as_deref(), &message, cli.json).await?
+            // Allocate or preserve the retry identity before local body
+            // validation, but do not contact the daemon or admit its cache.
+            let operation_id = operation_id.unwrap_or_else(ipc::new_operation_id);
+            let private = to.is_some();
+            let maximum = if private {
+                message::MAX_PRIVATE_BODY_BYTES
+            } else {
+                message::MAX_BROADCAST_BODY_BYTES
+            };
+            let message = input
+                .into_message(maximum)
+                .and_then(|body| {
+                    if private {
+                        message::validate_private_body(&body)?;
+                    } else {
+                        message::validate_broadcast_body(&body)?;
+                    }
+                    Ok(body)
+                })
+                .map_err(|error| message::invalid_local_message(&operation_id, error))?;
+            node::send_once(&dir, Some(operation_id), to.as_deref(), &message, cli.json).await?
         }
         Command::Share { operation_id, path } => {
             node::share(&dir, operation_id, &path, cli.json).await?

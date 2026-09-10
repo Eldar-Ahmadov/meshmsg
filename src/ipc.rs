@@ -2,6 +2,7 @@
 //! ownership checks remain in node::connect_daemon for both CLI and web clients.
 use crate::{
     contracts::{self, ErrorEnvelopeV1},
+    message::{validate_v2_message_body, MAX_V2_MESSAGE_BODY_BYTES},
     node::{connect_daemon, LocalClientStream},
 };
 use anyhow::{Context, Result};
@@ -574,7 +575,7 @@ fn validate_send_metrics(
     anyhow::ensure!(
         (1..=10_000).contains(&rate)
             && (1..=86_400).contains(&duration_secs)
-            && (106..=4096).contains(&payload_bytes),
+            && (106..=MAX_V2_MESSAGE_BODY_BYTES).contains(&payload_bytes),
         "invalid benchmark send configuration"
     );
     let payload_bytes = u64::try_from(payload_bytes).context("invalid benchmark payload size")?;
@@ -709,7 +710,7 @@ fn validate_bench_metrics(
         }
     };
     let minimum_body_bytes = unique.checked_mul(106);
-    let maximum_body_bytes = unique.checked_mul(4096);
+    let maximum_body_bytes = unique.checked_mul(MAX_V2_MESSAGE_BODY_BYTES as u64);
     let latency_samples = u64::try_from(latency.samples).ok();
     let samples_within_cap = latency.samples <= maximum_latency_samples;
     let rank = |percentile: usize| {
@@ -819,8 +820,7 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                     && valid_peer_id(&dto.from)
                     && valid_operation_id(&dto.message_id)
                     && dto.timestamp_ms != 0
-                    && !dto.body.is_empty()
-                    && dto.body.len() <= 4096,
+                    && validate_v2_message_body(&dto.body).is_ok(),
                 "invalid message event"
             );
         }
@@ -866,7 +866,7 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 valid_family(&dto.family, family, dto.schema_version, &dto.request_id)
                     && valid_peer_id(&dto.from)
                     && valid_operation_id(&dto.message_id)
-                    && valid_operation_id(&dto.offer_id)
+                    && dto.offer_id == dto.message_id
                     && dto.timestamp_ms != 0
                     && matches!(dto.kind.as_str(), "file" | "directory_tar_v1")
                     && valid_public_text(&dto.name, 255)
@@ -982,7 +982,7 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 dto.family == family
                     && dto.schema_version == 2
                     && (1..=10_000).contains(&dto.rate)
-                    && (106..=4096).contains(&dto.payload_bytes)
+                    && (106..=MAX_V2_MESSAGE_BODY_BYTES).contains(&dto.payload_bytes)
                     && u64::from(dto.rate).checked_mul(dto.duration_secs) == Some(dto.planned)
                     && !dto.delivery_acknowledged,
                 "invalid benchmark start"
@@ -1018,7 +1018,7 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 dto.family == family
                     && dto.schema_version == 2
                     && (1..=10_000).contains(&dto.rate)
-                    && (106..=4096).contains(&dto.payload_bytes)
+                    && (106..=MAX_V2_MESSAGE_BODY_BYTES).contains(&dto.payload_bytes)
                     && dto.failed == 0
                     && dto.incomplete == 0
                     && !dto.delivery_acknowledged,
@@ -1055,7 +1055,7 @@ pub(crate) fn validate_success_payload(value: &serde_json::Value) -> Result<()> 
                 dto.family == family
                     && dto.schema_version == 2
                     && (1..=10_000).contains(&dto.rate)
-                    && (106..=4096).contains(&dto.payload_bytes)
+                    && (106..=MAX_V2_MESSAGE_BODY_BYTES).contains(&dto.payload_bytes)
                     && !dto.delivery_acknowledged
                     && dto.accounting_complete
                     && matches!(
@@ -1213,8 +1213,7 @@ impl QueuedV3 {
         anyhow::ensure!(
             valid_peer_id(&self.from)
                 && self.timestamp_ms != 0
-                && !self.body.is_empty()
-                && self.body.len() <= 4096
+                && validate_v2_message_body(&self.body).is_ok()
                 && !self.delivery_acknowledged,
             "invalid queued response values"
         );

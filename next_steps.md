@@ -56,17 +56,16 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 8. Validation rules have drifted across layers
 
-- Signed offers accept uppercase hexadecimal IDs at `src/node.rs:335-340`, while persistent listing accepts lowercase only at `src/node.rs:1324-1328`. Such a downloaded pin becomes invisible to `offers`.
-- Positional message/token/offer inputs bypass the limits applied to file/stdin forms: `src/cli.rs:238-275`.
-- Offer files accept 1 MiB, but IPC requests are capped at 25,600 bytes: `src/ipc.rs:10`, making most of that advertised range unusable.
-- Web and CLI accept 4,096-byte broadcast bodies even though the complete signed envelope—not the body—is capped at 4,096 bytes.
-- Centralize canonical validators and expose authoritative limits in daemon capabilities/status.
+- [x] Operation-specific message validation is centralized in `src/message.rs` without breaking released contracts: new broadcast producers require 1–3900 UTF-8 bytes, private/direct sends retain 1–4096 bytes, and broadcast wire/event consumers retain the full v0.1.18-compatible 1–3928-byte worst-case range under the complete 4096-byte envelope bound. Empty local requests are rejected before operation-cache/wire/message-event effects with their operation ID preserved; blank chat lines are ignored; invalid signed remote text is rejected before replay admission or fanout.
+- [x] Signed attachment offers now require a typed safe body, lowercase operation-format offer ID equal to the envelope message ID, canonical raw ticket, and signer/provider match before replay admission. Strict IPC/web events enforce the same identity binding.
+- Offer files accept 1 MiB, but IPC requests are capped at approximately 25 KiB, making most of that advertised range unusable.
+- Exposing all authoritative limits in daemon capabilities/status remains open.
 
 ### 9. There are redundant compatibility fields without a deprecation policy
 
-- `socket` and `local_endpoint` always contain the same value: `src/node.rs:1955`, `src/node.rs:2113`.
-- `truncated` and `has_more` are always set together: `src/node.rs:2151-2152`.
-- Document these as compatibility aliases with a removal version, or retain one canonical field.
+- The original `socket`/`local_endpoint` redundancy claim was already stale at v0.1.18: that release omitted both from public JSON status and `daemon_started` records. This follow-up changed no JSON contract; it only removed the human renderer's leftover empty `local endpoint:` startup line.
+- `truncated` and `has_more` remain redundant: offer-list producers set both from the same completeness flag and strict consumers require equality.
+- Retain one canonical offer-list completeness field in the next version, or document the alias and its removal version.
 
 ## Operations and maintainability
 
@@ -96,7 +95,7 @@ It is reasonably robust for a **small, trusted, live-only mesh**, but the follow
 
 ### 14. Large modules increase audit and regression risk
 
-- `src/node.rs` is about 5,000 lines and `src/web.rs` about 1,900 lines.
+- Current line counts are `src/node.rs`: 11,964, `src/web.rs`: 3,200, and `src/ipc.rs`: 2,649.
 - Split wire formats, daemon loop, IPC transport, attachment service, benchmark service, CLI presentation, and platform-specific IPC into separate modules.
 - This will also make typed API contracts easier to enforce.
 
