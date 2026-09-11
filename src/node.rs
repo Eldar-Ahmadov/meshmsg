@@ -608,6 +608,12 @@ fn unix_timestamp_ms() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
 }
 
+fn unix_timestamp_ms_saturating(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 fn valid_run_id(run_id: &str) -> bool {
     run_id.len() == 32
         && run_id
@@ -1270,15 +1276,23 @@ async fn start(
 const OPERATION_CACHE_CAPACITY: usize = 1_024;
 const OPERATION_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PruneResolution {
+    older_than_secs: u64,
+    cutoff_ms: u64,
+}
+
 struct CompletedOperation {
     fingerprint: [u8; 32],
     response: serde_json::Value,
     expires_at: StdInstant,
+    prune_resolution: Option<PruneResolution>,
 }
 
 struct InFlightOperation {
     fingerprint: [u8; 32],
     waiters: Vec<oneshot::Sender<serde_json::Value>>,
+    prune_resolution: Option<PruneResolution>,
 }
 
 struct OperationCache {
@@ -1327,6 +1341,28 @@ impl OperationCache {
         self.prune(now);
         if let Some(entry) = self.completed.get(&operation_id) {
             let response = if entry.fingerprint == fingerprint {
+                if let Some(resolution) = entry.prune_resolution {
+                    if entry
+                        .response
+                        .get("cutoff_ms")
+                        .is_some_and(|value| !value.is_null())
+                    {
+                        debug_assert_eq!(
+                            entry
+                                .response
+                                .get("older_than_secs")
+                                .and_then(serde_json::Value::as_u64),
+                            Some(resolution.older_than_secs)
+                        );
+                        debug_assert_eq!(
+                            entry
+                                .response
+                                .get("cutoff_ms")
+                                .and_then(serde_json::Value::as_u64),
+                            Some(resolution.cutoff_ms)
+                        );
+                    }
+                }
                 entry.response.clone()
             } else {
                 Self::error(
@@ -1366,9 +1402,30 @@ impl OperationCache {
             InFlightOperation {
                 fingerprint,
                 waiters: vec![reply],
+                prune_resolution: None,
             },
         );
         true
+    }
+
+    /// Resolve a prune boundary only for the newly admitted owner and retain it
+    /// with the cache entry so execution and terminal replay share one authority.
+    fn resolve_prune(
+        &mut self,
+        operation_id: &str,
+        older_than_secs: u64,
+        now_ms: u64,
+    ) -> PruneResolution {
+        let entry = self
+            .in_flight
+            .get_mut(operation_id)
+            .expect("newly admitted prune is in flight");
+        let resolution = *entry.prune_resolution.get_or_insert(PruneResolution {
+            older_than_secs,
+            cutoff_ms: crate::ipc::prune_cutoff_upper_bound(now_ms, older_than_secs),
+        });
+        debug_assert_eq!(resolution.older_than_secs, older_than_secs);
+        resolution
     }
 
     fn complete(
@@ -1392,6 +1449,7 @@ impl OperationCache {
                 fingerprint: in_flight.fingerprint,
                 response,
                 expires_at: now + self.ttl,
+                prune_resolution: in_flight.prune_resolution,
             },
         );
         self.order.push_back(operation_id.to_owned());
@@ -1429,16 +1487,6 @@ fn optional_text_fingerprint(value: Option<&str>) -> Vec<u8> {
         Some(value) => [b"some\0".as_slice(), value.as_bytes()].concat(),
         None => b"none".to_vec(),
     }
-}
-
-#[cfg(test)]
-fn optional_u64_fingerprint(value: Option<u64>) -> [u8; 9] {
-    let mut encoded = [0_u8; 9];
-    if let Some(value) = value {
-        encoded[0] = 1;
-        encoded[1..].copy_from_slice(&value.to_le_bytes());
-    }
-    encoded
 }
 
 enum DaemonCommand {
@@ -1481,7 +1529,6 @@ enum DaemonCommand {
     OffersPrune {
         operation_id: String,
         older_than_secs: u64,
-        cutoff_ms: u64,
         direction: Option<String>,
         dry_run: bool,
         max_delete: usize,
@@ -2727,7 +2774,6 @@ where
         IpcRequest::OffersPrune {
             operation_id,
             older_than_secs,
-            cutoff_ms,
             direction,
             dry_run,
             max_delete,
@@ -2739,7 +2785,6 @@ where
                     DaemonCommand::OffersPrune {
                         operation_id: operation_id.clone(),
                         older_than_secs,
-                        cutoff_ms,
                         direction,
                         dry_run,
                         max_delete,
@@ -3747,7 +3792,7 @@ impl AttachmentStorage {
             (None, older_than_secs) => LifecycleRequestContext::Prune {
                 operation_id,
                 older_than_secs: older_than_secs.unwrap_or(0),
-                cutoff_ms: cutoff.context("prune cutoff missing")?,
+                cutoff_ms: Some(cutoff.context("prune cutoff missing")?),
                 direction,
                 dry_run,
                 maximum,
@@ -5522,15 +5567,14 @@ pub async fn run_daemon(
                             &operation_id, response, StdInstant::now());
                     });
                 }
-                Some(DaemonCommand::OffersPrune { operation_id, older_than_secs, cutoff_ms, direction, dry_run, max_delete, reply }) => {
+                Some(DaemonCommand::OffersPrune { operation_id, older_than_secs, direction, dry_run, max_delete, reply }) => {
                     let age_fingerprint = older_than_secs.to_le_bytes();
-                    let cutoff_fingerprint = cutoff_ms.to_le_bytes();
                     let direction_fingerprint = optional_text_fingerprint(direction.as_deref());
                     let dry_run_fingerprint = [u8::from(dry_run)];
                     let maximum_fingerprint = max_delete.to_le_bytes();
                     let fingerprint = operation_fingerprint(
                         "offers_prune",
-                        &[&age_fingerprint, &cutoff_fingerprint, &direction_fingerprint, &dry_run_fingerprint, &maximum_fingerprint],
+                        &[&age_fingerprint, &direction_fingerprint, &dry_run_fingerprint, &maximum_fingerprint],
                     );
                     if !operation_cache.lock().expect("operation cache poisoned").admit(
                         operation_id.clone(), fingerprint, reply, StdInstant::now()
@@ -5549,8 +5593,16 @@ pub async fn run_daemon(
                             &operation_id, error.into_value(), StdInstant::now());
                         continue;
                     }
-                    let age = older_than_secs;
-                    let cutoff = cutoff_ms;
+                    let resolution = operation_cache
+                        .lock()
+                        .expect("operation cache poisoned")
+                        .resolve_prune(
+                            &operation_id,
+                            older_than_secs,
+                            unix_timestamp_ms_saturating(SystemTime::now()),
+                        );
+                    let age = resolution.older_than_secs;
+                    let cutoff = resolution.cutoff_ms;
                     let storage = attachment_storage.clone();
                     let operation_cache = operation_cache.clone();
                     offer_list_tasks.spawn(async move {
@@ -6408,13 +6460,10 @@ pub async fn offers_prune(
     );
     let effective_age = older_than_secs
         .unwrap_or_else(|| status["attachment_retention_secs"].as_u64().unwrap_or(0));
-    let submission_now_ms = unix_timestamp_ms()?;
-    let cutoff_ms = crate::ipc::prune_cutoff_upper_bound(submission_now_ms, effective_age);
-    crate::ipc::validate_resolved_prune_cutoff(submission_now_ms, effective_age, cutoff_ms)?;
     let lifecycle_context = LifecycleRequestContext::Prune {
         operation_id: &operation_id,
         older_than_secs: effective_age,
-        cutoff_ms,
+        cutoff_ms: None,
         direction,
         dry_run,
         maximum: max_delete,
@@ -6424,7 +6473,6 @@ pub async fn offers_prune(
         &IpcRequest::OffersPrune {
             operation_id: operation_id.clone(),
             older_than_secs: effective_age,
-            cutoff_ms,
             direction: direction.map(str::to_owned),
             dry_run,
             max_delete,
@@ -7905,7 +7953,7 @@ mod tests {
             operation_fingerprint(
                 "offers_prune",
                 &[
-                    &optional_u64_fingerprint(None),
+                    &0_u64.to_le_bytes(),
                     &optional_text_fingerprint(None),
                     &[0],
                     &1_usize.to_le_bytes(),
@@ -7914,23 +7962,13 @@ mod tests {
             operation_fingerprint(
                 "offers_prune",
                 &[
-                    &optional_u64_fingerprint(Some(0)),
+                    &1_u64.to_le_bytes(),
                     &optional_text_fingerprint(None),
                     &[0],
                     &1_usize.to_le_bytes(),
                 ],
-            )
-        );
-        assert_ne!(
-            operation_fingerprint(
-                "offers_prune",
-                &[&0_u64.to_le_bytes(), &10_u64.to_le_bytes()]
             ),
-            operation_fingerprint(
-                "offers_prune",
-                &[&0_u64.to_le_bytes(), &11_u64.to_le_bytes()]
-            ),
-            "changed explicit prune cutoff must conflict"
+            "changed prune age must conflict"
         );
         assert_ne!(
             operation_fingerprint("download", &[b"token", b"/tmp/one"]),
@@ -8049,7 +8087,7 @@ mod tests {
                 LifecycleRequestContext::Prune {
                     operation_id: operation,
                     older_than_secs: 60,
-                    cutoff_ms: 10_000,
+                    cutoff_ms: Some(10_000),
                     direction: Some("outgoing"),
                     dry_run: false,
                     maximum: 7,
@@ -8102,16 +8140,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prune_cutoff_is_stable_near_ttl_and_changed_cutoff_conflicts() {
+    fn daemon_resolved_prune_cutoff_is_authoritative_near_ttl() {
+        assert_eq!(
+            unix_timestamp_ms_saturating(UNIX_EPOCH - Duration::from_millis(1)),
+            0,
+            "a backwards wall clock saturates instead of creating a future cutoff"
+        );
         let operation = "44444444444444444444444444444444";
         let now = StdInstant::now();
         let ttl = Duration::from_secs(600);
-        let fingerprint = |cutoff: u64| {
+        let fingerprint = |age: u64| {
             operation_fingerprint(
                 "offers_prune",
                 &[
-                    &60_u64.to_le_bytes(),
-                    &cutoff.to_le_bytes(),
+                    &age.to_le_bytes(),
                     &optional_text_fingerprint(Some("outgoing")),
                     &[0],
                     &1_usize.to_le_bytes(),
@@ -8120,14 +8162,24 @@ mod tests {
         };
         let mut cache = OperationCache::new(4, ttl);
         let (first_reply, _first_receiver) = oneshot::channel();
-        assert!(cache.admit(operation.into(), fingerprint(40_000), first_reply, now));
-        let terminal = serde_json::json!({"type":"offers_pruned","cutoff_ms":40_000});
+        assert!(cache.admit(operation.into(), fingerprint(60), first_reply, now));
+        let resolution = cache.resolve_prune(operation, 60, 100_000);
+        assert_eq!(resolution.cutoff_ms, 40_000);
+        let terminal = serde_json::json!({
+            "type":"offers_pruned", "older_than_secs":60, "cutoff_ms":40_000
+        });
         cache.complete(operation, terminal.clone(), now);
+        assert_eq!(
+            cache.completed.get(operation).unwrap().prune_resolution,
+            Some(resolution)
+        );
 
+        // A retry can arrive with a much later or backwards wall clock. Its
+        // stable caller-intent fingerprint does not derive another cutoff.
         let (replay_reply, replay_receiver) = oneshot::channel();
         assert!(!cache.admit(
             operation.into(),
-            fingerprint(40_000),
+            fingerprint(60),
             replay_reply,
             now + ttl - Duration::from_millis(1),
         ));
@@ -8139,7 +8191,7 @@ mod tests {
         let (conflict_reply, conflict_receiver) = oneshot::channel();
         assert!(!cache.admit(
             operation.into(),
-            fingerprint(40_001),
+            fingerprint(61),
             conflict_reply,
             now + Duration::from_secs(1),
         ));
@@ -13008,7 +13060,6 @@ mod tests {
             IpcRequest::OffersPrune {
                 operation_id: operation.clone(),
                 older_than_secs: 1,
-                cutoff_ms: 1,
                 direction: None,
                 dry_run: false,
                 max_delete: 1,

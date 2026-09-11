@@ -1,0 +1,12 @@
+60	node	tests/web-ui.cjs
+60	python3	tests/integration-cli-errors.py	{BIN}
+180	python3	tests/integration-web.py	{BIN}
+600	python3	tests/integration-web-peer.py	{BIN}
+600	python3	tests/integration-peer-directory.py	{BIN}
+1100	bash	tests/integration-5-peer.sh	{BIN}
+600	bash	tests/integration-attachments.sh	{BIN}
+600	bash	tests/integration-direct-messages.sh	{BIN}
+600	bash	tests/integration-ipc-version-compat.sh	{BIN}
+600	bash	tests/integration-v018-message-boundary.sh	{BIN}
+600	bash	tests/integration-idempotency.sh	{BIN}
+60	bash	tests/integration-installer.sh	{BIN}

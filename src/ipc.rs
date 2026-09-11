@@ -139,7 +139,8 @@ pub(crate) fn validate_lifecycle_error_for_request(
             match (age, context) {
                 (None, _) => error.cutoff_ms.is_none(),
                 (Some(_), LifecycleRequestContext::Prune { cutoff_ms, .. }) =>
-                    error.cutoff_ms == Some(*cutoff_ms),
+                    cutoff_ms.is_none_or(|expected| error.cutoff_ms == Some(expected))
+                        && error.cutoff_ms.is_some(),
                 _ => false,
             },
             "partial lifecycle cutoff is invalid"
@@ -179,18 +180,6 @@ pub(crate) fn valid_content_digest(value: &str) -> bool {
 
 pub(crate) fn prune_cutoff_upper_bound(now_ms: u64, older_than_secs: u64) -> u64 {
     now_ms.saturating_sub(older_than_secs.saturating_mul(1000))
-}
-
-pub(crate) fn validate_resolved_prune_cutoff(
-    submission_now_ms: u64,
-    older_than_secs: u64,
-    cutoff_ms: u64,
-) -> Result<()> {
-    anyhow::ensure!(
-        cutoff_ms == prune_cutoff_upper_bound(submission_now_ms, older_than_secs),
-        "resolved prune cutoff does not match submission age"
-    );
-    Ok(())
 }
 
 pub(crate) fn new_operation_id() -> String {
@@ -412,7 +401,9 @@ pub(crate) enum LifecycleRequestContext<'a> {
     Prune {
         operation_id: &'a str,
         older_than_secs: u64,
-        cutoff_ms: u64,
+        /// `None` for a caller validating a daemon-resolved cutoff; `Some` for
+        /// the daemon producer and generic strict response validation.
+        cutoff_ms: Option<u64>,
         direction: Option<&'a str>,
         dry_run: bool,
         maximum: usize,
@@ -576,9 +567,9 @@ impl LifecycleSuccessV3 {
         anyhow::ensure!(
             match context {
                 LifecycleRequestContext::Remove { .. } => self.cutoff_ms.is_none(),
-                LifecycleRequestContext::Prune { cutoff_ms, .. } => {
-                    self.cutoff_ms == Some(*cutoff_ms)
-                }
+                LifecycleRequestContext::Prune { cutoff_ms, .. } =>
+                    cutoff_ms.is_none_or(|expected| self.cutoff_ms == Some(expected))
+                        && self.cutoff_ms.is_some(),
             },
             "invalid lifecycle cutoff"
         );
@@ -1402,7 +1393,7 @@ pub(crate) fn validate_success_payload_for_context(
                 LifecycleRequestContext::Prune {
                     operation_id: &dto.operation_id,
                     older_than_secs: dto.older_than_secs.context("prune age missing")?,
-                    cutoff_ms: dto.cutoff_ms.context("prune cutoff missing")?,
+                    cutoff_ms: Some(dto.cutoff_ms.context("prune cutoff missing")?),
                     direction: dto.direction.as_deref(),
                     dry_run: dto.dry_run,
                     maximum: dto.maximum,
@@ -1947,10 +1938,8 @@ pub(crate) enum IpcRequest {
     },
     OffersPrune {
         operation_id: String,
-        /// Explicit effective age resolved by the client from status before admission.
+        /// Explicit effective age. The daemon resolves and owns the cutoff.
         older_than_secs: u64,
-        /// Concrete overflow-safe cutoff resolved once by the client.
-        cutoff_ms: u64,
         direction: Option<String>,
         dry_run: bool,
         max_delete: usize,
@@ -2738,14 +2727,10 @@ mod tests {
         ] {
             let cutoff = prune_cutoff_upper_bound(now_ms, age);
             assert_eq!(cutoff, now_ms.saturating_sub(age.saturating_mul(1000)));
-            validate_resolved_prune_cutoff(now_ms, age, cutoff).unwrap();
-            if cutoff != u64::MAX {
-                assert!(validate_resolved_prune_cutoff(now_ms, age, cutoff + 1).is_err());
-            }
             let context = LifecycleRequestContext::Prune {
                 operation_id: operation,
                 older_than_secs: age,
-                cutoff_ms: cutoff,
+                cutoff_ms: Some(cutoff),
                 direction: None,
                 dry_run: false,
                 maximum: 2,
@@ -2781,7 +2766,7 @@ mod tests {
         let replay = LifecycleRequestContext::Prune {
             operation_id: operation,
             older_than_secs: 60,
-            cutoff_ms: 40_000,
+            cutoff_ms: Some(40_000),
             direction: None,
             dry_run: false,
             maximum: 1,
@@ -2855,7 +2840,7 @@ mod tests {
         let prune = LifecycleRequestContext::Prune {
             operation_id: operation,
             older_than_secs: 60,
-            cutoff_ms: cutoff,
+            cutoff_ms: Some(cutoff),
             direction: Some("outgoing"),
             dry_run: true,
             maximum: 2,
@@ -3046,7 +3031,7 @@ mod tests {
         let prune_context = LifecycleRequestContext::Prune {
             operation_id: operation,
             older_than_secs: 60,
-            cutoff_ms: 40_000,
+            cutoff_ms: Some(40_000),
             direction: Some("outgoing"),
             dry_run: false,
             maximum: 3,
@@ -3087,7 +3072,7 @@ mod tests {
                     } => {
                         partial.direction = direction.map(str::to_owned);
                         partial.older_than_secs = Some(*older_than_secs);
-                        partial.cutoff_ms = Some(*cutoff_ms);
+                        partial.cutoff_ms = *cutoff_ms;
                     }
                 }
                 assert!(validate_lifecycle_error_for_request(
@@ -3143,19 +3128,25 @@ mod tests {
         let prune = IpcRequest::OffersPrune {
             operation_id: "fedcba9876543210fedcba9876543210".into(),
             older_than_secs: 0,
-            cutoff_ms: 123_456,
             direction: None,
             dry_run: true,
             max_delete: 1,
         };
         let encoded = serde_json::to_value(&prune).unwrap();
-        assert_eq!(encoded["cutoff_ms"], 123_456);
+        assert!(encoded.get("cutoff_ms").is_none());
         assert!(serde_json::from_slice::<IpcRequest>(
             br#"{"command":"offers_prune","operation_id":"fedcba9876543210fedcba9876543210","older_than_secs":0,"direction":null,"dry_run":true,"max_delete":1}"#
-        ).is_err());
-        assert!(serde_json::from_slice::<IpcRequest>(
-            br#"{"command":"offers_prune","operation_id":"fedcba9876543210fedcba9876543210","older_than_secs":0,"cutoff_ms":1,"direction":null,"dry_run":true,"max_delete":1,"extra":false}"#
-        ).is_err());
+        ).is_ok());
+        // Schema-v1 has exactly one prune request representation: caller age
+        // and selectors only. A raw client cannot omit age or supply any
+        // matching, future, saturated, or selector-specific cutoff.
+        for malformed in [
+            br#"{"command":"offers_prune","operation_id":"fedcba9876543210fedcba9876543210","cutoff_ms":1,"direction":null,"dry_run":true,"max_delete":1}"#.as_slice(),
+            br#"{"command":"offers_prune","operation_id":"fedcba9876543210fedcba9876543210","older_than_secs":0,"cutoff_ms":18446744073709551615,"direction":null,"dry_run":true,"max_delete":1}"#.as_slice(),
+            br#"{"command":"offers_prune","operation_id":"fedcba9876543210fedcba9876543210","older_than_secs":18446744073709551615,"cutoff_ms":0,"direction":"incoming","dry_run":true,"max_delete":1}"#.as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<IpcRequest>(malformed).is_err());
+        }
         assert!(validate_success_payload(&serde_json::json!({
             "type":"offers_pruned", "schema_version":1,
             "request_id":"11111111111111111111111111111111"
@@ -3329,7 +3320,6 @@ mod tests {
             IpcRequest::OffersPrune {
                 operation_id: operation.into(),
                 older_than_secs: 1,
-                cutoff_ms: 1,
                 direction: None,
                 dry_run: false,
                 max_delete: 1,

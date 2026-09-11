@@ -250,21 +250,33 @@ presence lookahead, including records after the 512th public item. A list/stream
 failure returns canonical `offers_failed` rather than panicking. Version 1 has no
 cursor, so truncation is a bounded prefix rather than pagination.
 
-Lifecycle v3 successes and partial errors repeat the exact operation ID,
-remove/prune selectors, effective age, dry-run mode, and maximum from the request.
-Remove has no cutoff; prune carries the concrete cutoff resolved before command
-submission and transmitted as the required strict `cutoff_ms` request field. The
-client computes it once as `request_now_ms.saturating_sub(
-older_than_secs.saturating_mul(1000))`; age multiplication and subtraction cannot
-overflow. The daemon performs no independent cutoff clock calculation: the exact
-value controls selection, operation fingerprint/cache identity, success, and partial
-errors. Cached replay therefore remains stable through long execution, near-TTL
-delay, millisecond boundaries, and later wall-clock rollback; a changed cutoff under
-the same operation ID conflicts. Selection is bounded by `maximum`; `limited:true`
-requires a full selection; successful non-dry-run removal has equal selected and
-removed counts; dry-run removes zero; and an empty selection releases zero bytes.
-The same request-aware DTO validator is used by production, IPC dispatch, and CLI
-consumption. `attachment_lifecycle_v3` is negotiated before submission, so a daemon that only supports lifecycle-v2 or earlier fails closed before mutation.
+Lifecycle-v3 successes and partial errors repeat the exact operation ID,
+remove/prune selectors, effective age, dry-run mode, maximum, and applicable cutoff.
+Remove has no cutoff. The sole schema-1 prune request representation contains
+`operation_id`, required `older_than_secs`, nullable `direction`, `dry_run`, and
+`max_delete`; it never contains `cutoff_ms`. Strict deny-unknown-fields decoding
+therefore rejects cutoff-only, age-plus-cutoff, future-cutoff, saturated-cutoff, and
+selector/cutoff combinations instead of letting raw clients choose a boundary.
+
+The operation fingerprint binds only stable caller intent: kind, effective age,
+direction, dry-run, and maximum. For the first admitted owner, the daemon resolves
+`cutoff_ms = daemon_now_ms.saturating_sub(
+older_than_secs.saturating_mul(1000))`; multiplication and subtraction cannot
+overflow, age zero uses admission time, and sufficiently large ages resolve to zero.
+That resolution is retained as authoritative in the in-flight and completed cache
+entry, drives selection, and is repeated in success or partial-error output.
+Concurrent duplicates join it and terminal retries replay it without consulting the
+clock. This preserves delayed execution, backward-clock behavior, and retries up to
+the cache TTL while ensuring an identical CLI retry does not need a value from the
+lost response. Changed age/selectors/mode/limit conflict; cutoff is not caller input.
+Selection is bounded by `maximum`; `limited:true` requires a full selection;
+successful non-dry-run removal has equal selected and removed counts; dry-run removes
+zero; and an empty selection releases zero bytes. The same request-aware DTO
+validator is used by production, generic IPC dispatch, and CLI consumption;
+caller-side validation accepts one required daemon-authoritative cutoff while
+producer/generic validation binds its exact value. `attachment_lifecycle_v3` is
+negotiated before submission, so a daemon that only supports lifecycle-v2 or earlier
+fails closed before mutation.
 
 Attachment operation errors are additionally request-kind-aware. Share, remove,
 prune, download, and web-download each admit only their documented code set with

@@ -179,7 +179,7 @@ def lifecycle_error(code, outcome, retryable, include_offer=False, partial=False
                 value.update(
                     direction=request["request"]["direction"],
                     older_than_secs=request["request"]["older_than_secs"],
-                    cutoff_ms=request["request"]["cutoff_ms"],
+                    cutoff_ms=1,
                     maximum=request["request"]["max_delete"],
                 )
         return value

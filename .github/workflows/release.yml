@@ -2,75 +2,91 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*.*.*"]
 
 permissions:
   contents: read
 
-# A tag has exactly one release publisher. Failed attempts leave only a draft;
-# retries replace that draft rather than mixing assets from separate builds.
+# One immutable tag has one non-cancelling publisher. A rerun replaces only an
+# existing draft and never overwrites an already-published release.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  validate:
+  validate-tag:
+    name: Initial release admission
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require tip admission or prove this run was admitted previously
+        id: release-eligibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: bash tests/check-release-admission.sh "$RELEASE_TAG" "$RELEASE_SHA" "$RUN_ID" "$RUN_ATTEMPT"
+
+  verification:
+    needs: validate-tag
+    uses: ./.github/workflows/verification.yml
+    permissions:
+      contents: read
+
+  audit-protections:
+    needs: verification
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Validate tag matches Cargo package version
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          test -n "${version}"
-          test "${GITHUB_REF_NAME}" = "v${version}"
+      - name: Fail closed unless live GitHub protections match canonical policy
+        id: live-protection-audit
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}
+        run: scripts/github-release-protections.sh --ci-check
 
   linux:
-    needs: validate
+    needs: audit-protections
     # GNU binaries built on this older baseline run on that glibc and newer.
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Install targets and musl linker
+      - name: Install pinned toolchain targets and musl linker
         shell: bash
         run: |
           set -euo pipefail
+          rustup toolchain install 1.91.0 --profile minimal
           rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - name: Run locked Linux tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --all-targets
-          cargo build --locked
-          timeout 30 node --check src/web/app.js
-          timeout 30 node --check src/web/settings.js
-          timeout 60 node tests/web-ui.cjs
-          timeout 60 python3 tests/integration-cli-errors.py target/debug/meshmsg
-          timeout 180 python3 tests/integration-web.py target/debug/meshmsg
-          timeout 600 python3 tests/integration-web-peer.py target/debug/meshmsg
-          timeout 600 python3 tests/integration-peer-directory.py target/debug/meshmsg
-          timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
-          timeout 600 bash tests/integration-attachments.sh target/debug/meshmsg
-          timeout 600 bash tests/integration-direct-messages.sh target/debug/meshmsg
-          timeout 600 bash tests/integration-ipc-version-compat.sh target/debug/meshmsg
-          timeout 600 bash tests/integration-v018-message-boundary.sh target/debug/meshmsg
-          timeout 600 bash tests/integration-idempotency.sh target/debug/meshmsg
-      - name: Build locked release binaries
+      - name: Build final locked release binaries
+        id: release-build-linux
         shell: bash
         run: |
           set -euo pipefail
           cargo build --release --locked --target x86_64-unknown-linux-gnu
           cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: Package Linux archives
+        id: release-package-linux
         shell: bash
         run: |
           set -euo pipefail
@@ -84,32 +100,43 @@ jobs:
             tar -C dist -czf "dist/${name}.tar.gz" "${name}"
             rm -rf "dist/${name}"
           done
-      - name: Upload Linux archives
+      - name: Inspect and smoke-test final packaged GNU and musl binaries
+        id: release-smoke-linux
+        run: >-
+          python3 tests/verify-release-assets.py --platform linux
+          --tag "$GITHUB_REF_NAME" --dist dist --binary-root target --execute
+      - name: Upload exact Linux archives
+        id: release-upload-linux
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-linux
-          path: dist/*.tar.gz
+          path: |
+            dist/meshmsg-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/meshmsg-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz
           if-no-files-found: error
           retention-days: 1
 
   windows:
-    needs: validate
+    needs: audit-protections
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 35
     env:
       # Keep the release archive self-contained on clean Windows hosts.
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Test Windows IPC and state handling
+      - name: Install pinned Rust toolchain
         shell: pwsh
-        run: cargo test --locked --target x86_64-pc-windows-msvc
-      - name: Build locked Windows release binary
+        run: rustup toolchain install 1.91.0 --profile minimal
+      - name: Build final locked static-CRT Windows release binary
+        id: release-build-windows
         shell: pwsh
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
       - name: Package Windows archive
+        id: release-package-windows
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -121,58 +148,112 @@ jobs:
           Copy-Item docs "dist/$name/docs" -Recurse
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           Remove-Item -Recurse -Force "dist/$name"
-      - name: Upload Windows archive
+      - name: Resolve dumpbin from the canonical x64 MSVC environment
+        id: release-resolve-dumpbin
+        shell: pwsh
+        run: ./tests/resolve-dumpbin.ps1
+      - name: Inspect and smoke-test final packaged Windows binary and static CRT
+        id: release-smoke-windows
+        shell: pwsh
+        env:
+          DUMPBIN: ${{ steps.release-resolve-dumpbin.outputs.path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          python tests/verify-release-assets.py --platform windows --tag "$env:GITHUB_REF_NAME" --dist dist --binary-root target --execute
+          $dependencies = & $env:DUMPBIN /dependents "target/x86_64-pc-windows-msvc/release/meshmsg.exe" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed: $dependencies" }
+          if ($dependencies -match '(?im)\b(?:VCRUNTIME|MSVCP)[^\s]*\.dll\b') { throw "release binary dynamically depends on the MSVC runtime: $dependencies" }
+      - name: Upload exact Windows archive
+        id: release-upload-windows
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-windows
-          path: dist/*.zip
+          path: dist/meshmsg-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
           retention-days: 1
 
   release:
     needs: [linux, windows]
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - name: Download packaged archives
+      - name: Download exact Linux artifact
+        id: download-linux
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: dist
-          merge-multiple: true
+          name: release-linux
+          path: incoming/linux
+      - name: Download exact Windows artifact
+        id: download-windows
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-windows
+          path: incoming/windows
+      - name: Reject extra assets and inspect exact archive contents
+        id: release-assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          python3 tests/verify-release-assets.py --platform all --tag "$RELEASE_TAG"
+          --incoming incoming --dist dist
       - name: Generate unified checksums
+        id: release-checksums
         shell: bash
         run: |
           set -euo pipefail
           cd dist
-          mapfile -t archives < <(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\n' | sort)
-          test "${#archives[@]}" -eq 3
-          sha256sum "${archives[@]}" > SHA256SUMS
-      - name: Publish complete GitHub release atomically
+          archives=(
+            "meshmsg-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+            "meshmsg-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl.tar.gz"
+            "meshmsg-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip"
+          )
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
+          sha256sum "${archives[@]}" >SHA256SUMS
+      - name: Reaudit live protections immediately before publication
+        id: final-live-protection-audit
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}
+        run: scripts/github-release-protections.sh --ci-check
+      - name: Publish exact-SHA release fail closed
+        id: release-publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_PROTECTION_AUDIT_TOKEN: ${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          if gh release view "${tag}" --json isDraft >/dev/null 2>&1; then
-            if test "$(gh release view "${tag}" --json isDraft --jq .isDraft)" != true; then
-              echo "refusing to overwrite already-published release ${tag}" >&2
+          tag="$RELEASE_TAG"
+          if gh release view "$tag" --json isDraft >/dev/null 2>&1; then
+            if test "$(gh release view "$tag" --json isDraft --jq .isDraft)" != true; then
+              echo "refusing to overwrite already-published release $tag" >&2
               exit 1
             fi
-            gh release delete "${tag}" --yes
+            gh release delete "$tag" --yes
           fi
-          notes_file=".github/release-notes/${tag}.md"
-          if test -f "${notes_file}"; then
-            notes_args=(--notes-file "${notes_file}")
-          else
-            notes_args=(--generate-notes)
-          fi
-          gh release create "${tag}" --draft --verify-tag "${notes_args[@]}" --title "meshmsg ${tag}"
-          gh release upload "${tag}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS
-          gh release edit "${tag}" --draft=false
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          git show "$RELEASE_SHA:.github/release-notes/${tag}.md" >"$notes_file"
+          # Re-fetch and resolve the remote tag in the command immediately before
+          # creating a draft explicitly targeted at the event commit.
+          bash tests/check-release-eligibility.sh recheck "$tag" "$RELEASE_SHA"
+          gh release create "$tag" --draft --verify-tag --target "$RELEASE_SHA" \
+            --notes-file "$notes_file" --title "meshmsg $tag"
+          gh release upload "$tag" \
+            "dist/meshmsg-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/meshmsg-${tag}-x86_64-unknown-linux-musl.tar.gz" \
+            "dist/meshmsg-${tag}-x86_64-pc-windows-msvc.zip" \
+            dist/SHA256SUMS
+          # Reaudit policy, then re-resolve the tag, immediately before making
+          # the draft public. The read-only audit token is never used to publish.
+          GH_TOKEN="$RELEASE_PROTECTION_AUDIT_TOKEN" scripts/github-release-protections.sh --ci-check
+          bash tests/check-release-eligibility.sh recheck "$tag" "$RELEASE_SHA"
+          gh release edit "$tag" --target "$RELEASE_SHA" --draft=false

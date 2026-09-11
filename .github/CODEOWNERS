@@ -1,0 +1,21 @@
+# Release authority and verification policy. Enforcement is intentionally not
+# enabled until an eligible second reviewer is configured; see docs/development.md.
+/.github/ @Eldar-Ahmadov
+/install.sh @Eldar-Ahmadov
+/rust-toolchain.toml @Eldar-Ahmadov
+/scripts/confirm-required-check.sh @Eldar-Ahmadov
+/scripts/github-release-protections.sh @Eldar-Ahmadov
+/tests/check-release-admission.sh @Eldar-Ahmadov
+/tests/check-release-eligibility.sh @Eldar-Ahmadov
+/tests/github-protection-contract-tests.py @Eldar-Ahmadov
+/tests/integration-installer.sh @Eldar-Ahmadov
+/tests/linux-integration-inventory.tsv @Eldar-Ahmadov
+/tests/release-assets-tests.py @Eldar-Ahmadov
+/tests/release-contract-tests.py @Eldar-Ahmadov
+/tests/resolve-dumpbin.ps1 @Eldar-Ahmadov
+/tests/run-linux-integrations.sh @Eldar-Ahmadov
+/tests/validate-codeowners.py @Eldar-Ahmadov
+/tests/validate-github-protections.py @Eldar-Ahmadov
+/tests/validate-release-metadata.py @Eldar-Ahmadov
+/tests/verify-release-assets.py @Eldar-Ahmadov
+/tests/workflow-contract.rb @Eldar-Ahmadov

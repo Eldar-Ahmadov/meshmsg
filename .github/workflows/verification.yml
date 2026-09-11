@@ -1,0 +1,150 @@
+name: Authoritative verification
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install actionlint pinned to an immutable upstream commit
+        id: install-actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+      - name: Validate GitHub Actions semantics with actionlint
+        id: actionlint
+        run: "$(go env GOPATH)/bin/actionlint"
+      - name: Validate parsed workflow and release contracts with mutation tests
+        id: workflow-contract
+        run: |
+          ruby tests/workflow-contract.rb
+          python3 tests/release-contract-tests.py
+          python3 tests/release-assets-tests.py
+          python3 tests/github-protection-contract-tests.py
+
+  rust-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        id: rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run Clippy with warnings denied
+        id: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run locked all-target tests
+        id: rust-tests
+        run: cargo test --locked --all-targets
+      - name: Build locked debug binary
+        id: rust-build
+        run: cargo build --locked
+
+  windows-rust:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt --component clippy
+      - name: Test native Windows named-pipe IPC and all Rust targets
+        id: windows-tests
+        shell: pwsh
+        run: cargo test --locked --all-targets
+      - name: Clippy native Windows targets
+        id: windows-clippy
+        shell: pwsh
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build native Windows binary
+        id: windows-build
+        shell: pwsh
+        run: cargo build --locked
+      - name: Resolve dumpbin from the canonical x64 MSVC environment
+        id: windows-resolve-dumpbin
+        shell: pwsh
+        run: ./tests/resolve-dumpbin.ps1
+      - name: Exercise the resolved dumpbin on the regular Windows build
+        id: windows-exercise-dumpbin
+        shell: pwsh
+        env:
+          DUMPBIN: ${{ steps.windows-resolve-dumpbin.outputs.path }}
+        run: |
+          & $env:DUMPBIN /headers target/debug/meshmsg.exe
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed with exit code $LASTEXITCODE" }
+
+  dependency-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal
+      - name: Install pinned policy tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - name: Audit dependencies
+        id: cargo-audit
+        run: cargo audit
+      - name: Enforce dependency policy
+        id: cargo-deny
+        run: cargo deny check advisories bans licenses sources
+
+  linux-integration:
+    runs-on: ubuntu-24.04
+    # Inventory command budgets total at most 115 minutes; setup/build and cleanup
+    # have a further 15-minute allowance. The driver enforces that inventory cap.
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.91.0 --profile minimal
+      - name: Build integration binary
+        id: integration-build
+        run: cargo build --locked
+      - name: Run authoritative Linux static and integration inventory
+        id: linux-integrations
+        run: bash tests/run-linux-integrations.sh target/debug/meshmsg
+
+  required:
+    name: Reusable verification aggregate
+    if: ${{ always() }}
+    needs: [workflow-contract, rust-linux, windows-rust, dependency-policy, linux-integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every verification job for this SHA
+        env:
+          WORKFLOW_CONTRACT: ${{ needs['workflow-contract'].result }}
+          RUST_LINUX: ${{ needs['rust-linux'].result }}
+          WINDOWS_RUST: ${{ needs['windows-rust'].result }}
+          DEPENDENCY_POLICY: ${{ needs['dependency-policy'].result }}
+          LINUX_INTEGRATION: ${{ needs['linux-integration'].result }}
+        run: |
+          test "$WORKFLOW_CONTRACT" = success
+          test "$RUST_LINUX" = success
+          test "$WINDOWS_RUST" = success
+          test "$DEPENDENCY_POLICY" = success
+          test "$LINUX_INTEGRATION" = success
