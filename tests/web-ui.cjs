@@ -207,7 +207,6 @@ const canonicalDownloadErrors = [
   ['attachment_tag_capacity', 'The attachment pin capacity is exhausted.', 'not_started', false],
   ['download_operation_capacity', 'Attachment download capacity is unavailable.', 'not_started', true],
   ['download_staging_unavailable', 'Attachment download staging is unavailable.', 'not_started', true],
-  ['attachment_lifecycle_internal', 'The attachment lifecycle operation failed.', 'unknown', true],
   ['not_found', 'The requested resource was not found.', 'not_started', false]
 ];
 for (const [code, message, outcome, retryable] of canonicalDownloadErrors) {
@@ -218,7 +217,7 @@ for (const [code, message, outcome, retryable] of canonicalDownloadErrors) {
   assert.equal(context.strictOperationError(error, contractOperation), true, code);
   for (const mutation of [
     { message: `${message}!` },
-    { outcome: outcome === 'unknown' ? 'not_started' : 'unknown' },
+    { outcome: code === 'download_failed' ? 'partial' : (outcome === 'unknown' ? 'not_started' : 'unknown') },
     { retryable: !retryable }, { operation_id: '3'.repeat(32) },
     { offer_id: contractOperation }, { extra: true }
   ]) {
@@ -226,6 +225,11 @@ for (const [code, message, outcome, retryable] of canonicalDownloadErrors) {
       `${code} accepted adversarial metadata`);
   }
 }
+assert.equal(context.strictOperationError({
+  type: 'error', schema_version: 1, request_id: contractRequest,
+  operation_id: contractOperation, code: 'download_failed',
+  message: 'Attachment download failed.', outcome: 'unknown', retryable: true
+}, contractOperation), true, 'unknown download failure was rejected');
 assert.equal(context.strictOperationError({
   type: 'error', schema_version: 1, request_id: contractRequest,
   operation_id: contractOperation, code: 'send_failed',

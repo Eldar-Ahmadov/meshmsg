@@ -46,6 +46,18 @@ timeout 300 "$BIN" --state-dir "$ROOT/current" daemon >"$ROOT/current.daemon" 2>
 wait_for 80 "current daemon" status_current
 wait_for 80 "mixed neighbors" bash -c '[[ $("$1" --state-dir "$2" --json status | python3 -c '\''import json,sys; print(json.load(sys.stdin)["neighbors"])'\'') -ge 1 ]]' _ "$BIN" "$ROOT/current"
 
+"$OLD" --state-dir "$ROOT/current" --json status | python3 -c '
+import json,sys
+value=json.load(sys.stdin)
+assert value["type"] == "status" and value["schema_version"] == 1
+assert "diagnostic_records_accepted" not in value
+' || fail "v0.1.18 client rejected current daemon exact status v1"
+"$BIN" --state-dir "$ROOT/old" --json status | python3 -c '
+import json,sys
+value=json.load(sys.stdin)
+assert value["type"] == "status" and value["schema_version"] == 1
+' || fail "current client rejected v0.1.18 daemon status v1"
+
 timeout 240 "$BIN" --state-dir "$ROOT/current" --json listen >"$ROOT/current-client-current-daemon.listen" 2>"$ROOT/current-client-current-daemon.err" & PIDS+=("$!")
 timeout 240 "$OLD" --state-dir "$ROOT/current" --json listen >"$ROOT/old-client-current-daemon.listen" 2>"$ROOT/old-client-current-daemon.err" & PIDS+=("$!")
 timeout 240 "$OLD" --state-dir "$ROOT/old" --json listen >"$ROOT/old-client-old-daemon.listen" 2>"$ROOT/old-client-old-daemon.err" & PIDS+=("$!")

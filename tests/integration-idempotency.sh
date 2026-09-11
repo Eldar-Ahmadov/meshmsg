@@ -176,17 +176,33 @@ SECOND_ID=33333333333333333333333333333334
 THIRD_ID=33333333333333333333333333333335
 SECOND=$($BIN --state-dir "$ROOT/sender" --json share --operation-id "$SECOND_ID" "$ROOT/source-2.txt")
 THIRD=$($BIN --state-dir "$ROOT/sender" --json share --operation-id "$THIRD_ID" "$ROOT/source-3.txt")
+# Strict IPC carries one client-resolved cutoff. Nonzero and saturating ages are
+# echoed exactly even when command execution is delayed; the daemon never re-reads
+# its wall clock to derive a replacement boundary.
+NONZERO_ID=55555555555555555555555555555553
+NONZERO_CUTOFF=$(python3 -c 'import time; print(max(0, time.time_ns() // 1000000 - 1000))')
+sleep 1
+NONZERO=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$NONZERO_ID\",\"older_than_secs\":1,\"cutoff_ms\":$NONZERO_CUTOFF,\"direction\":\"incoming\",\"dry_run\":true,\"max_delete\":1}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["older_than_secs"] == 1 and v["cutoff_ms"] == int(sys.argv[1])' "$NONZERO_CUTOFF" <<<"$NONZERO" \
+  || fail "delayed nonzero-age prune did not preserve explicit cutoff"
+SATURATED_ID=55555555555555555555555555555554
+SATURATED=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$SATURATED_ID\",\"older_than_secs\":18446744073709551615,\"cutoff_ms\":0,\"direction\":\"incoming\",\"dry_run\":true,\"max_delete\":1}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["older_than_secs"] == 18446744073709551615 and v["cutoff_ms"] == 0' <<<"$SATURATED" \
+  || fail "saturating u64 prune cutoff was not preserved"
+
 PRUNE_ID=55555555555555555555555555555555
-PRUNE_REQUEST="{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":1}"
+PRUNE_CUTOFF=$(python3 -c 'import time; print(time.time_ns() // 1000000)')
+PRUNE_REQUEST="{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"cutoff_ms\":$PRUNE_CUTOFF,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":1}"
 ipc sender "$PRUNE_REQUEST" >/dev/null
-PRUNE_RETRY=$($BIN --state-dir "$ROOT/sender" --json offers prune --operation-id "$PRUNE_ID" --older-than-secs 0 --direction outgoing --max-delete 1)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["schema_version"] == 2 and v["operation_id"] == sys.argv[1] and v["selected_tags"] == v["removed_tags"] == 1' "$PRUNE_ID" <<<"$PRUNE_RETRY" \
+sleep 1
+PRUNE_RETRY=$(ipc sender "$PRUNE_REQUEST")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["schema_version"] == 3 and v["operation_id"] == sys.argv[1] and v["selected_tags"] == v["removed_tags"] == 1' "$PRUNE_ID" <<<"$PRUNE_RETRY" \
   || fail "lost-response prune did not replay its authoritative original result"
 COUNT=$($BIN --state-dir "$ROOT/sender" --json offers | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["blobs"]))')
 [[ "$COUNT" == 2 ]] || fail "prune retry deleted the next eligible batch"
-PRUNE_CONFLICT=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":2}")
+PRUNE_CONFLICT=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"cutoff_ms\":$((PRUNE_CUTOFF + 1)),\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":1}")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict" and v["operation_id"] == sys.argv[1]' "$PRUNE_ID" <<<"$PRUNE_CONFLICT" \
-  || fail "changed prune limit did not conflict"
+  || fail "changed prune cutoff did not conflict"
 
 # Remove replays the authoritative original count even though the end state is
 # already absent, and selector changes conflict.
@@ -269,4 +285,4 @@ grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: empty rejection; send/private/share joins and replay; prune selection stability and per-operation limit; authoritative remove replay; download response-loss replay/no-extra-install and changed-input conflicts; terminal failures; bounded-cache expiry/eviction/restart semantics; recipient WAL replay persistence"
+echo "PASS: empty rejection; send/private/share joins and replay; explicit prune cutoff age/saturation/delay/replay/conflict and selection stability; authoritative remove replay; download response-loss replay/no-extra-install and changed-input conflicts; terminal failures; bounded-cache expiry/eviction/restart semantics; recipient WAL replay persistence"

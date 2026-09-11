@@ -14,10 +14,11 @@ use crate::{
         read_frame, send_request_checked, subscribe, subscribe_with_id, valid_content_digest,
         valid_operation_id, validate_success_payload, write_request_with_id, write_value,
         AttachmentOperationKind, BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
-        SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY,
+        LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1, SubscriptionReader,
+        ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_CAPABILITY,
         IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY,
-        MAX_IPC_REQUEST_SIZE, PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY,
-        WEB_SHARE_CAPABILITY,
+        MAX_IPC_REQUEST_SIZE, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
+        PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY,
     },
     peers::{
         self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
@@ -163,9 +164,6 @@ const MAX_ATTACHMENT_TAGS: usize = 8_192;
 const MAX_ATTACHMENT_INDEX_BYTES: usize = 8 * 1024 * 1024;
 const ATTACHMENT_INDEX_NAME: &str = "attachment-retention-v1.json";
 const DOWNLOAD_PROGRESS_STEP: u64 = 8 * 1024 * 1024;
-const MAX_OFFER_LIST_ENTRIES: usize = 512;
-/// Also bound malformed tags and per-item store errors encountered while looking ahead.
-const MAX_OFFER_LIST_SCANNED: usize = 4096;
 const MAX_ENCODED_TAG_NAME_BYTES: usize = 134;
 const MAX_ENCODED_PUBLIC_KEY_BYTES: usize = 64;
 const BLOB_TAG_PREFIX: &[u8] = b"meshmsg/";
@@ -1307,12 +1305,15 @@ impl OperationCache {
         self.order.retain(|id| self.completed.contains_key(id));
     }
 
-    fn error(operation_id: &str, code: &str, message: &str) -> serde_json::Value {
-        serde_json::json!({
-            "type":"error", "schema_version":1, "code":code,
-            "message":message, "operation_id":operation_id,
-            "retryable":code == "operation_capacity", "outcome":"not_started"
-        })
+    fn error(operation_id: &str, code: &str, diagnostic: &str) -> serde_json::Value {
+        let mut error = ErrorEnvelopeV1::new(
+            code,
+            diagnostic,
+            "not_started",
+            code == "operation_capacity",
+        );
+        error.operation_id = Some(operation_id.to_owned());
+        error.into_value()
     }
 
     /// Returns true only for the first caller that must execute the operation.
@@ -1430,6 +1431,7 @@ fn optional_text_fingerprint(value: Option<&str>) -> Vec<u8> {
     }
 }
 
+#[cfg(test)]
 fn optional_u64_fingerprint(value: Option<u64>) -> [u8; 9] {
     let mut encoded = [0_u8; 9];
     if let Some(value) = value {
@@ -1460,6 +1462,9 @@ enum DaemonCommand {
     Status {
         reply: oneshot::Sender<serde_json::Value>,
     },
+    Diagnostics {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
     Peers {
         reply: oneshot::Sender<serde_json::Value>,
     },
@@ -1475,7 +1480,8 @@ enum DaemonCommand {
     },
     OffersPrune {
         operation_id: String,
-        older_than_secs: Option<u64>,
+        older_than_secs: u64,
+        cutoff_ms: u64,
         direction: Option<String>,
         dry_run: bool,
         max_delete: usize,
@@ -2291,6 +2297,23 @@ fn normalize_ipc_response(value: &serde_json::Value, request_id: &str) -> serde_
         error.quota_bytes_released = value
             .get("quota_bytes_released")
             .and_then(serde_json::Value::as_u64);
+        error.direction = value
+            .get("direction")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        error.provider = value
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        error.older_than_secs = value
+            .get("older_than_secs")
+            .and_then(serde_json::Value::as_u64);
+        error.maximum = value
+            .get("maximum")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok());
+        error.dry_run = value.get("dry_run").and_then(serde_json::Value::as_bool);
+        error.cutoff_ms = value.get("cutoff_ms").and_then(serde_json::Value::as_u64);
         error.suppressed_since_last = value
             .get("suppressed_since_last")
             .and_then(serde_json::Value::as_u64)
@@ -2648,6 +2671,15 @@ where
             .await;
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
+        IpcRequest::Diagnostics => {
+            let (reply, response) = oneshot::channel();
+            let value = command_response(
+                send_command(&commands, DaemonCommand::Diagnostics { reply }, response),
+                timeouts.ordinary_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+        }
         IpcRequest::Peers => {
             let (reply, response) = oneshot::channel();
             let value = command_response(
@@ -2695,6 +2727,7 @@ where
         IpcRequest::OffersPrune {
             operation_id,
             older_than_secs,
+            cutoff_ms,
             direction,
             dry_run,
             max_delete,
@@ -2706,6 +2739,7 @@ where
                     DaemonCommand::OffersPrune {
                         operation_id: operation_id.clone(),
                         older_than_secs,
+                        cutoff_ms,
                         direction,
                         dry_run,
                         max_delete,
@@ -2821,20 +2855,6 @@ where
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-struct PinnedBlobInfo {
-    direction: &'static str,
-    offer_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
-    name: String,
-    kind: &'static str,
-    hash: String,
-    format: &'static str,
-    status: &'static str,
-    size: Option<u64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PinnedBlobTag {
     direction: &'static str,
@@ -2939,67 +2959,79 @@ fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
     })
 }
 
-async fn list_pinned_blobs(store: &Store) -> Result<(Vec<PinnedBlobInfo>, bool, usize)> {
+async fn list_pinned_blobs(store: &Store) -> Result<(Vec<OfferItemV1>, bool, usize)> {
     let mut tags = store
         .tags()
         .list_prefix(BLOB_TAG_PREFIX)
         .await
         .context("list attachment blob tags")?;
-    // iroh-blobs' fs tag table is a BTree range and list_prefix preserves that
-    // order. Consume only a bounded prefix, including one valid lookahead.
-    let mut selected = Vec::new();
-    let mut scanned = 0;
-    let mut item_errors = 0;
+    // Validate at most 4096 records plus one presence-only lookahead. Continuing
+    // after filling the public page accounts malformed/unavailable omitted items
+    // without allocating an unbounded response.
+    let mut blobs = Vec::new();
+    let mut scanned = 0_usize;
+    let mut item_errors = 0_usize;
     let mut has_more = false;
     while scanned < MAX_OFFER_LIST_SCANNED {
         let Some(item) = tags.next().await else { break };
         scanned += 1;
         let tag = match item {
             Ok(tag) => tag,
-            Err(_) => {
+            Err(error) => {
+                contracts::log_private_diagnostic(
+                    "offers_item",
+                    "offers_failed",
+                    &error.to_string(),
+                );
                 item_errors += 1;
-                has_more = true;
                 continue;
             }
         };
-        if parse_pinned_blob_tag(tag.name.as_ref()).is_none() {
+        let Some(parsed) = parse_pinned_blob_tag(tag.name.as_ref()) else {
+            item_errors += 1;
             continue;
-        }
-        if selected.len() == MAX_OFFER_LIST_ENTRIES {
+        };
+        let size = match (tag.format, store.blobs().status(tag.hash).await) {
+            (BlobFormat::Raw, Ok(iroh_blobs::api::proto::BlobStatus::Complete { size })) => size,
+            (format, Ok(status)) => {
+                contracts::log_private_diagnostic(
+                    "offers_item",
+                    "offers_failed",
+                    &format!("non-public pin format/status: {format:?}/{status:?}"),
+                );
+                item_errors += 1;
+                continue;
+            }
+            (_, Err(error)) => {
+                contracts::log_private_diagnostic(
+                    "offers_item",
+                    "offers_failed",
+                    &error.to_string(),
+                );
+                item_errors += 1;
+                continue;
+            }
+        };
+        if blobs.len() == MAX_OFFER_LIST_ENTRIES {
             has_more = true;
-            break;
+        } else {
+            blobs.push(OfferItemV1 {
+                direction: parsed.direction.into(),
+                offer_id: parsed.offer_id,
+                provider: parsed.provider,
+                name: parsed.name,
+                kind: attachment_kind_name(parsed.kind).into(),
+                hash: tag.hash.to_string(),
+                format: "raw".into(),
+                status: "complete".into(),
+                size: Some(size),
+            });
         }
-        selected.push(tag);
     }
     if scanned == MAX_OFFER_LIST_SCANNED {
-        has_more = true;
+        has_more |= tags.next().await.is_some();
     }
-
-    let mut blobs = Vec::with_capacity(selected.len());
-    for tag in selected {
-        let parsed = parse_pinned_blob_tag(tag.name.as_ref()).expect("selected tag was validated");
-        let (status, size) = match store.blobs().status(tag.hash).await {
-            Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => ("complete", Some(size)),
-            Ok(iroh_blobs::api::proto::BlobStatus::Partial { size }) => ("partial", size),
-            Ok(iroh_blobs::api::proto::BlobStatus::NotFound) => ("missing", None),
-            Err(_) => ("unknown", None),
-        };
-        let format = match tag.format {
-            BlobFormat::Raw => "raw",
-            BlobFormat::HashSeq => "hash_seq",
-        };
-        blobs.push(PinnedBlobInfo {
-            direction: parsed.direction,
-            offer_id: parsed.offer_id,
-            provider: parsed.provider,
-            name: parsed.name,
-            kind: attachment_kind_name(parsed.kind),
-            hash: tag.hash.to_string(),
-            format,
-            status,
-            size,
-        });
-    }
+    has_more |= item_errors != 0;
     Ok((blobs, has_more, item_errors))
 }
 
@@ -3149,6 +3181,7 @@ struct AttachmentStorageStatus {
 }
 
 struct RemovalSpec<'a> {
+    operation_id: &'a str,
     offer_id: Option<&'a str>,
     direction: Option<&'a str>,
     provider: Option<&'a str>,
@@ -3520,7 +3553,9 @@ impl AttachmentStorage {
         if self.retention_secs == 0 {
             return Ok(None);
         }
+        let operation_id = crate::ipc::new_operation_id();
         self.remove(
+            &operation_id,
             None,
             None,
             None,
@@ -3597,8 +3632,10 @@ impl AttachmentStorage {
         Ok(guard)
     }
 
+    #[allow(clippy::too_many_arguments)] // Internal selector wrapper used outside strict IPC.
     async fn remove(
         &self,
+        operation_id: &str,
         offer_id: Option<&str>,
         direction: Option<&str>,
         provider: Option<&str>,
@@ -3606,8 +3643,42 @@ impl AttachmentStorage {
         maximum: usize,
         dry_run: bool,
     ) -> Result<serde_json::Value> {
-        self.remove_with_fault(
+        let cutoff_ms = match older_than_secs {
+            Some(age) => Some(crate::ipc::prune_cutoff_upper_bound(
+                unix_timestamp_ms()?,
+                age,
+            )),
+            None if offer_id.is_none() => Some(unix_timestamp_ms()?),
+            None => None,
+        };
+        self.remove_at_cutoff(
+            operation_id,
+            offer_id,
+            direction,
+            provider,
+            older_than_secs,
+            cutoff_ms,
+            maximum,
+            dry_run,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the complete lifecycle selector contract.
+    async fn remove_at_cutoff(
+        &self,
+        operation_id: &str,
+        offer_id: Option<&str>,
+        direction: Option<&str>,
+        provider: Option<&str>,
+        older_than_secs: Option<u64>,
+        cutoff_ms: Option<u64>,
+        maximum: usize,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        self.remove_with_fault_at_cutoff(
             RemovalSpec {
+                operation_id,
                 offer_id,
                 direction,
                 provider,
@@ -3615,17 +3686,38 @@ impl AttachmentStorage {
                 maximum,
                 dry_run,
             },
+            cutoff_ms,
             &|_| Ok(()),
         )
         .await
     }
 
+    #[cfg(test)]
     async fn remove_with_fault(
         &self,
         spec: RemovalSpec<'_>,
         fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
     ) -> Result<serde_json::Value> {
+        let cutoff_ms = match spec.older_than_secs {
+            Some(age) => Some(crate::ipc::prune_cutoff_upper_bound(
+                unix_timestamp_ms()?,
+                age,
+            )),
+            None if spec.offer_id.is_none() => Some(unix_timestamp_ms()?),
+            None => None,
+        };
+        self.remove_with_fault_at_cutoff(spec, cutoff_ms, fault)
+            .await
+    }
+
+    async fn remove_with_fault_at_cutoff(
+        &self,
+        spec: RemovalSpec<'_>,
+        cutoff_ms: Option<u64>,
+        fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
+    ) -> Result<serde_json::Value> {
         let RemovalSpec {
+            operation_id,
             offer_id,
             direction,
             provider,
@@ -3639,8 +3731,29 @@ impl AttachmentStorage {
             )
         })?;
         let now = unix_timestamp_ms()?;
-        let cutoff =
-            older_than_secs.map(|seconds| now.saturating_sub(seconds.saturating_mul(1000)));
+        anyhow::ensure!(
+            offer_id.is_some() == cutoff_ms.is_none(),
+            "invalid internal lifecycle cutoff context"
+        );
+        let cutoff = cutoff_ms;
+        let lifecycle_context = match (offer_id, older_than_secs) {
+            (Some(offer_id), None) => LifecycleRequestContext::Remove {
+                operation_id,
+                offer_id,
+                direction,
+                provider,
+                maximum,
+            },
+            (None, older_than_secs) => LifecycleRequestContext::Prune {
+                operation_id,
+                older_than_secs: older_than_secs.unwrap_or(0),
+                cutoff_ms: cutoff.context("prune cutoff missing")?,
+                direction,
+                dry_run,
+                maximum,
+            },
+            _ => anyhow::bail!("invalid internal lifecycle request context"),
+        };
         let (before, mut selected, tags) = {
             let state = self
                 .state
@@ -3691,12 +3804,15 @@ impl AttachmentStorage {
             .filter(|tag| !selected_set.contains(&tag.name));
         let projected_usage = unique_storage_usage(projected).0;
         if dry_run {
-            return Ok(serde_json::json!({
-                "type":"offers_pruned", "schema_version":2, "dry_run":true,
-                "selected_tags":selected_names.len(), "removed_tags":0,
-                "released_bytes":before.saturating_sub(projected_usage),
-                "limited":limited, "cutoff_ms":cutoff
-            }));
+            return Ok(LifecycleSuccessV3::new(
+                &lifecycle_context,
+                selected_names.len(),
+                0,
+                before.saturating_sub(projected_usage),
+                limited,
+                cutoff,
+            )?
+            .into_value());
         }
         let protection = self
             .protect_removed_blobs_from_gc(
@@ -3754,12 +3870,13 @@ impl AttachmentStorage {
             error.selected_tags = Some(selected_names.len());
             error.removed_tags = Some(removed.len());
             error.quota_bytes_released = Some(before.saturating_sub(after));
+            bind_partial_lifecycle_error(&mut error, &lifecycle_context, cutoff);
             if let Some(reconcile_error) = reconcile_error {
-                error.message = format!(
-                    "{}; reconciliation failed: {reconcile_error}",
-                    error.message
+                contracts::log_private_diagnostic(
+                    "attachment_removal_reconciliation",
+                    &error.code,
+                    &reconcile_error.to_string(),
                 );
-                error.message.truncate(1024);
             }
             return Ok(error.into_value());
         }
@@ -3797,16 +3914,55 @@ impl AttachmentStorage {
             error.selected_tags = Some(selected_names.len());
             error.removed_tags = Some(removed.len());
             error.quota_bytes_released = Some(before.saturating_sub(self.status().tagged_bytes));
+            bind_partial_lifecycle_error(&mut error, &lifecycle_context, cutoff);
             return Ok(error.into_value());
         }
         self.recalculate_cached_status().await?;
-        Ok(serde_json::json!({
-            "type":if offer_id.is_some() { "offer_removed" } else { "offers_pruned" },
-            "schema_version":2, "dry_run":false,
-            "selected_tags":selected_names.len(), "removed_tags":removed.len(),
-            "released_bytes":before.saturating_sub(self.status().tagged_bytes),
-            "limited":limited, "cutoff_ms":cutoff
-        }))
+        Ok(LifecycleSuccessV3::new(
+            &lifecycle_context,
+            selected_names.len(),
+            removed.len(),
+            before.saturating_sub(self.status().tagged_bytes),
+            limited,
+            cutoff,
+        )?
+        .into_value())
+    }
+}
+
+fn bind_partial_lifecycle_error(
+    error: &mut LifecycleErrorV1,
+    context: &LifecycleRequestContext<'_>,
+    cutoff_ms: Option<u64>,
+) {
+    match context {
+        LifecycleRequestContext::Remove {
+            direction,
+            provider,
+            maximum,
+            ..
+        } => {
+            error.direction = direction.map(str::to_owned);
+            error.provider = provider.map(str::to_owned);
+            error.older_than_secs = None;
+            error.maximum = Some(*maximum);
+            error.dry_run = Some(false);
+            error.cutoff_ms = None;
+        }
+        LifecycleRequestContext::Prune {
+            older_than_secs,
+            direction,
+            dry_run,
+            maximum,
+            ..
+        } => {
+            error.direction = direction.map(str::to_owned);
+            error.provider = None;
+            error.older_than_secs = Some(*older_than_secs);
+            error.maximum = Some(*maximum);
+            error.dry_run = Some(*dry_run);
+            error.cutoff_ms = cutoff_ms;
+        }
     }
 }
 
@@ -5060,7 +5216,7 @@ pub async fn run_daemon(
                             "type":"connected", "peer":peer, "endpoint_online":true,
                             "topic_joined":node.receiver.is_joined(),
                             "alias":alias_config.effective(),
-                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY]
+                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_CAPABILITY]
                         });
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
@@ -5248,7 +5404,7 @@ pub async fn run_daemon(
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY],
+                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_CAPABILITY],
                         "operation_cache_capacity":OPERATION_CACHE_CAPACITY,
                         "operation_cache_ttl_ms":OPERATION_CACHE_TTL.as_millis() as u64,
                         "operation_cache_persistent":false,
@@ -5264,6 +5420,14 @@ pub async fn run_daemon(
                         "max_attachment_bytes":max_attachment_bytes,
                         "attachment_storage":attachment_status,
                         "attachment_retention_secs":attachment_retention_secs
+                    }));
+                }
+                Some(DaemonCommand::Diagnostics { reply }) => {
+                    let (accepted, dropped, retained) = contracts::diagnostic_metrics();
+                    let _ = reply.send(serde_json::json!({
+                        "type":"diagnostic_status", "schema_version":1,
+                        "records_accepted":accepted, "records_dropped":dropped,
+                        "records_retained":retained
                     }));
                 }
                 Some(DaemonCommand::Peers { reply }) => {
@@ -5286,13 +5450,14 @@ pub async fn run_daemon(
                     offer_list_tasks.spawn(async move {
                         let _permit = permit;
                         let response = match list_pinned_blobs(&store).await {
-                            Ok((blobs, has_more, item_errors)) => {
-                                serde_json::json!({
-                                    "type":"offers", "schema_version":1, "blobs":blobs,
-                                    "truncated":has_more, "has_more":has_more,
-                                    "item_errors":item_errors
-                                })
-                            }
+                            Ok((blobs, has_more, item_errors)) => match OffersV1::new(
+                                blobs, has_more, item_errors,
+                            ) {
+                                Ok(offers) => offers.into_value(),
+                                Err(error) => ErrorEnvelopeV1::new(
+                                    "offers_failed", error.to_string(), "unknown", true,
+                                ).into_value(),
+                            },
                             Err(error) => serde_json::json!({
                                 "type":"error", "code":"offers_failed", "message":error.to_string()
                             }),
@@ -5344,9 +5509,9 @@ pub async fn run_daemon(
                     let storage = attachment_storage.clone();
                     let operation_cache = operation_cache.clone();
                     offer_list_tasks.spawn(async move {
-                        let response = match storage.remove(
-                            Some(&offer_id), direction.as_deref(), provider.as_deref(), None,
-                            MAX_PRUNE_TAGS, false,
+                        let response = match storage.remove_at_cutoff(
+                            &operation_id, Some(&offer_id), direction.as_deref(), provider.as_deref(), None,
+                            None, MAX_PRUNE_TAGS, false,
                         ).await {
                             Ok(value) => value,
                             // Only selector and partial-removal errors are offer-specific.
@@ -5357,14 +5522,15 @@ pub async fn run_daemon(
                             &operation_id, response, StdInstant::now());
                     });
                 }
-                Some(DaemonCommand::OffersPrune { operation_id, older_than_secs, direction, dry_run, max_delete, reply }) => {
-                    let age_fingerprint = optional_u64_fingerprint(older_than_secs);
+                Some(DaemonCommand::OffersPrune { operation_id, older_than_secs, cutoff_ms, direction, dry_run, max_delete, reply }) => {
+                    let age_fingerprint = older_than_secs.to_le_bytes();
+                    let cutoff_fingerprint = cutoff_ms.to_le_bytes();
                     let direction_fingerprint = optional_text_fingerprint(direction.as_deref());
                     let dry_run_fingerprint = [u8::from(dry_run)];
                     let maximum_fingerprint = max_delete.to_le_bytes();
                     let fingerprint = operation_fingerprint(
                         "offers_prune",
-                        &[&age_fingerprint, &direction_fingerprint, &dry_run_fingerprint, &maximum_fingerprint],
+                        &[&age_fingerprint, &cutoff_fingerprint, &direction_fingerprint, &dry_run_fingerprint, &maximum_fingerprint],
                     );
                     if !operation_cache.lock().expect("operation cache poisoned").admit(
                         operation_id.clone(), fingerprint, reply, StdInstant::now()
@@ -5383,12 +5549,13 @@ pub async fn run_daemon(
                             &operation_id, error.into_value(), StdInstant::now());
                         continue;
                     }
-                    let age = older_than_secs.unwrap_or(attachment_retention_secs);
+                    let age = older_than_secs;
+                    let cutoff = cutoff_ms;
                     let storage = attachment_storage.clone();
                     let operation_cache = operation_cache.clone();
                     offer_list_tasks.spawn(async move {
-                        let response = match storage.remove(
-                            None, direction.as_deref(), None, Some(age), max_delete, dry_run,
+                        let response = match storage.remove_at_cutoff(
+                            &operation_id, None, direction.as_deref(), None, Some(age), Some(cutoff), max_delete, dry_run,
                         ).await {
                             Ok(value) => value,
                             Err(error) => storage_operation_error("offers_prune_failed", &error, false, Some(&operation_id), None),
@@ -6161,7 +6328,7 @@ async fn send_lifecycle_request(
     expected_schema_version: u64,
     operation_kind: AttachmentOperationKind,
     expected_operation_id: &str,
-    expected_offer_id: Option<&str>,
+    lifecycle_context: Option<&LifecycleRequestContext<'_>>,
 ) -> Result<serde_json::Value> {
     let value = crate::ipc::send_request(dir, request).await?;
     if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
@@ -6169,7 +6336,11 @@ async fn send_lifecycle_request(
             &value,
             operation_kind,
             expected_operation_id,
-            expected_offer_id,
+            lifecycle_context.and_then(|context| match context {
+                LifecycleRequestContext::Remove { offer_id, .. } => Some(*offer_id),
+                LifecycleRequestContext::Prune { .. } => None,
+            }),
+            lifecycle_context,
         )?;
         return Err(anyhow::Error::new(contracts::ContractFailure(error)));
     }
@@ -6192,6 +6363,13 @@ pub async fn offers_remove(
             && advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
         "daemon does not advertise retry-safe attachment lifecycle IPC; upgrade and restart the daemon (operation was not submitted)"
     );
+    let lifecycle_context = LifecycleRequestContext::Remove {
+        operation_id: &operation_id,
+        offer_id,
+        direction,
+        provider,
+        maximum: MAX_PRUNE_TAGS,
+    };
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::OffersRemove {
@@ -6201,19 +6379,13 @@ pub async fn offers_remove(
             provider: provider.map(str::to_owned),
         },
         "offer_removed",
-        2,
+        3,
         AttachmentOperationKind::Remove,
         &operation_id,
-        Some(offer_id),
+        Some(&lifecycle_context),
     )
     .await?;
-    validate_lifecycle_response(
-        &value,
-        "offer_removed",
-        &operation_id,
-        false,
-        MAX_PRUNE_TAGS,
-    )?;
+    LifecycleSuccessV3::from_value_for_request(&value, &lifecycle_context)?;
     event(json, value);
     Ok(())
 }
@@ -6234,75 +6406,38 @@ pub async fn offers_prune(
             && advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
         "daemon does not advertise retry-safe attachment lifecycle IPC; upgrade and restart the daemon (operation was not submitted)"
     );
+    let effective_age = older_than_secs
+        .unwrap_or_else(|| status["attachment_retention_secs"].as_u64().unwrap_or(0));
+    let submission_now_ms = unix_timestamp_ms()?;
+    let cutoff_ms = crate::ipc::prune_cutoff_upper_bound(submission_now_ms, effective_age);
+    crate::ipc::validate_resolved_prune_cutoff(submission_now_ms, effective_age, cutoff_ms)?;
+    let lifecycle_context = LifecycleRequestContext::Prune {
+        operation_id: &operation_id,
+        older_than_secs: effective_age,
+        cutoff_ms,
+        direction,
+        dry_run,
+        maximum: max_delete,
+    };
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::OffersPrune {
             operation_id: operation_id.clone(),
-            older_than_secs,
+            older_than_secs: effective_age,
+            cutoff_ms,
             direction: direction.map(str::to_owned),
             dry_run,
             max_delete,
         },
         "offers_pruned",
-        2,
+        3,
         AttachmentOperationKind::Prune,
         &operation_id,
-        None,
+        Some(&lifecycle_context),
     )
     .await?;
-    validate_lifecycle_response(&value, "offers_pruned", &operation_id, dry_run, max_delete)?;
+    LifecycleSuccessV3::from_value_for_request(&value, &lifecycle_context)?;
     event(json, value);
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LifecycleResponse {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    operation_id: String,
-    dry_run: bool,
-    selected_tags: usize,
-    removed_tags: usize,
-    released_bytes: u64,
-    limited: bool,
-    cutoff_ms: Option<u64>,
-}
-
-fn validate_lifecycle_response(
-    value: &serde_json::Value,
-    expected: &str,
-    operation_id: &str,
-    expected_dry_run: bool,
-    maximum_selected: usize,
-) -> Result<()> {
-    let response: LifecycleResponse = serde_json::from_value(value.clone())
-        .context("daemon returned an invalid attachment lifecycle response")?;
-    anyhow::ensure!(
-        response.kind == expected
-            && response.schema_version == 2
-            && response.operation_id == operation_id
-            && response.dry_run == expected_dry_run,
-        "daemon returned an invalid attachment lifecycle response"
-    );
-    anyhow::ensure!(
-        contracts::valid_request_id(&response.request_id),
-        "daemon lifecycle response request ID is invalid"
-    );
-    anyhow::ensure!(
-        response.removed_tags <= response.selected_tags
-            && response.selected_tags <= maximum_selected
-            && (!response.dry_run || response.removed_tags == 0),
-        "daemon returned impossible attachment lifecycle counts"
-    );
-    let _ = (
-        response.dry_run,
-        response.released_bytes,
-        response.limited,
-        response.cutoff_ms,
-    );
     Ok(())
 }
 
@@ -6573,7 +6708,11 @@ async fn bench_send_events(
             &request_id,
         )
         .await?;
-        let mut reader = SubscriptionReader::new_correlated(stream, request_id.clone());
+        let mut reader = SubscriptionReader::new_correlated_for_operation(
+            stream,
+            request_id.clone(),
+            contracts::ErrorOperationKind::Benchmark,
+        );
         let started = reader
             .read()
             .await?
@@ -7653,6 +7792,7 @@ fn event(json: bool, mut value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_OPERATION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
     use iroh_blobs::protocol::ChunkRangesExt;
     #[cfg(unix)]
@@ -7782,6 +7922,17 @@ mod tests {
             )
         );
         assert_ne!(
+            operation_fingerprint(
+                "offers_prune",
+                &[&0_u64.to_le_bytes(), &10_u64.to_le_bytes()]
+            ),
+            operation_fingerprint(
+                "offers_prune",
+                &[&0_u64.to_le_bytes(), &11_u64.to_le_bytes()]
+            ),
+            "changed explicit prune cutoff must conflict"
+        );
+        assert_ne!(
             operation_fingerprint("download", &[b"token", b"/tmp/one"]),
             operation_fingerprint("download", &[b"token", b"/tmp/two"]),
         );
@@ -7873,6 +8024,135 @@ mod tests {
         let mut restarted = OperationCache::new(2, Duration::from_secs(10));
         let (retry, _retry_response) = oneshot::channel();
         assert!(restarted.admit(id1.into(), fp1, retry, now));
+    }
+
+    #[test]
+    fn lifecycle_partial_errors_survive_cache_normalization_and_strict_consumption() {
+        let now = StdInstant::now();
+        let operation = "11111111111111111111111111111111";
+        let offer = "22222222222222222222222222222222";
+        let provider = SecretKey::generate().public().to_string();
+        for (kind, context, cutoff) in [
+            (
+                AttachmentOperationKind::Remove,
+                LifecycleRequestContext::Remove {
+                    operation_id: operation,
+                    offer_id: offer,
+                    direction: Some("incoming"),
+                    provider: Some(&provider),
+                    maximum: 7,
+                },
+                None,
+            ),
+            (
+                AttachmentOperationKind::Prune,
+                LifecycleRequestContext::Prune {
+                    operation_id: operation,
+                    older_than_secs: 60,
+                    cutoff_ms: 10_000,
+                    direction: Some("outgoing"),
+                    dry_run: false,
+                    maximum: 7,
+                },
+                Some(10_000),
+            ),
+        ] {
+            let mut producer = LifecycleErrorV1::new(
+                "attachment_removal_partial",
+                "private store failure",
+                "partial",
+                true,
+            );
+            producer.selected_tags = Some(3);
+            producer.removed_tags = Some(1);
+            producer.quota_bytes_released = Some(4);
+            producer.offer_id = (kind == AttachmentOperationKind::Remove).then(|| offer.into());
+            bind_partial_lifecycle_error(&mut producer, &context, cutoff);
+
+            let mut cache = OperationCache::new(2, Duration::from_secs(60));
+            let (reply, _receiver) = oneshot::channel();
+            assert!(cache.admit(operation.into(), [7; 32], reply, now));
+            let cached = cache.complete(operation, producer.into_value(), now);
+            let normalized = normalize_ipc_response(&cached, "33333333333333333333333333333333");
+            let consumed = crate::ipc::validate_lifecycle_error_for_request(
+                &normalized,
+                kind,
+                operation,
+                (kind == AttachmentOperationKind::Remove).then_some(offer),
+                Some(&context),
+            )
+            .unwrap();
+            assert_eq!(consumed.direction.as_deref(), context_direction(&context));
+            assert_eq!(consumed.maximum, Some(7));
+            assert_eq!(consumed.dry_run, Some(false));
+            assert_eq!(consumed.cutoff_ms, cutoff);
+            match &context {
+                LifecycleRequestContext::Remove { provider, .. } => {
+                    assert_eq!(consumed.provider.as_deref(), *provider);
+                    assert_eq!(consumed.older_than_secs, None);
+                }
+                LifecycleRequestContext::Prune {
+                    older_than_secs, ..
+                } => {
+                    assert_eq!(consumed.provider, None);
+                    assert_eq!(consumed.older_than_secs, Some(*older_than_secs));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_prune_cutoff_is_stable_near_ttl_and_changed_cutoff_conflicts() {
+        let operation = "44444444444444444444444444444444";
+        let now = StdInstant::now();
+        let ttl = Duration::from_secs(600);
+        let fingerprint = |cutoff: u64| {
+            operation_fingerprint(
+                "offers_prune",
+                &[
+                    &60_u64.to_le_bytes(),
+                    &cutoff.to_le_bytes(),
+                    &optional_text_fingerprint(Some("outgoing")),
+                    &[0],
+                    &1_usize.to_le_bytes(),
+                ],
+            )
+        };
+        let mut cache = OperationCache::new(4, ttl);
+        let (first_reply, _first_receiver) = oneshot::channel();
+        assert!(cache.admit(operation.into(), fingerprint(40_000), first_reply, now));
+        let terminal = serde_json::json!({"type":"offers_pruned","cutoff_ms":40_000});
+        cache.complete(operation, terminal.clone(), now);
+
+        let (replay_reply, replay_receiver) = oneshot::channel();
+        assert!(!cache.admit(
+            operation.into(),
+            fingerprint(40_000),
+            replay_reply,
+            now + ttl - Duration::from_millis(1),
+        ));
+        let replayed = replay_receiver.blocking_recv().unwrap();
+        assert_eq!(replayed["type"], terminal["type"]);
+        assert_eq!(replayed["cutoff_ms"], terminal["cutoff_ms"]);
+        assert_eq!(replayed["operation_id"], operation);
+
+        let (conflict_reply, conflict_receiver) = oneshot::channel();
+        assert!(!cache.admit(
+            operation.into(),
+            fingerprint(40_001),
+            conflict_reply,
+            now + Duration::from_secs(1),
+        ));
+        let conflict = conflict_receiver.blocking_recv().unwrap();
+        assert_eq!(conflict["code"], "operation_id_conflict");
+        assert_eq!(conflict["operation_id"], operation);
+    }
+
+    fn context_direction<'a>(context: &'a LifecycleRequestContext<'a>) -> Option<&'a str> {
+        match context {
+            LifecycleRequestContext::Remove { direction, .. }
+            | LifecycleRequestContext::Prune { direction, .. } => *direction,
+        }
     }
 
     #[test]
@@ -9840,6 +10120,25 @@ mod tests {
         validate_private_acceptance(&accepted, "0123456789abcdef0123456789abcdef", "秘密".len())
             .unwrap();
 
+        for (code, message, outcome, retryable) in [
+            ("private_replay_unavailable", "recipient replay persistence is unavailable", "not_started", true),
+            ("private_delivery_unknown", "recipient durably recorded this message ID but cannot prove whether its volatile delivery was queued", "unknown", false),
+            ("private_send_failed", "private transport failed", "unknown", true),
+        ] {
+            let raw = serde_json::json!({
+                "type":"error", "schema_version":1, "code":code,
+                "message":message, "outcome":outcome, "retryable":retryable
+            });
+            let mut normalized = normalize_ipc_response(&raw, "11111111111111111111111111111111");
+            normalized["operation_id"] = "0123456789abcdef0123456789abcdef".into();
+            let error = ErrorEnvelopeV1::from_value(&normalized).unwrap();
+            error.validate_for_operation(
+                contracts::ErrorOperationKind::PrivateSend,
+                Some("0123456789abcdef0123456789abcdef"),
+            ).unwrap();
+            assert_eq!((error.outcome.as_str(), error.retryable), (outcome, retryable));
+        }
+
         for invalid in [
             {
                 let mut value = accepted.clone();
@@ -10003,11 +10302,22 @@ mod tests {
                 .await
                 .unwrap()
                 .into();
-            let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
-            assert_eq!(pins.len(), 1);
-            assert_eq!(pins[0].direction, "incoming");
-            assert_eq!(pins[0].offer_id, offer_id);
-            assert_eq!(pins[0].hash, ticket.hash().to_string());
+            let (pins, _, item_errors) = list_pinned_blobs(&store).await.unwrap();
+            assert!(
+                pins.is_empty(),
+                "missing blob content must not be advertised"
+            );
+            assert_eq!(item_errors, 1);
+            assert_eq!(
+                store
+                    .tags()
+                    .get(tag.as_bytes())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .hash_and_format(),
+                ticket.hash_and_format()
+            );
             let output = root.join("output");
             let staging = root.join(".meshmsg-part-1111111111111111.download");
             assert_eq!(output.exists(), phase == "after_destination_install");
@@ -10035,8 +10345,17 @@ mod tests {
                 .unwrap();
                 assert!(outcome.destination_synced);
                 assert!(outcome.cleanup_complete);
-                let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
-                assert_eq!(pins.len(), 1, "raw retry created a duplicate permanent pin");
+                assert_eq!(
+                    store
+                        .tags()
+                        .get(tag.as_bytes())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .hash_and_format(),
+                    ticket.hash_and_format(),
+                    "raw retry changed the permanent pin"
+                );
                 assert_eq!(std::fs::read(&output).unwrap(), b"crash payload");
                 assert!(!staging.exists());
             }
@@ -10108,10 +10427,9 @@ mod tests {
                 !staging.exists(),
                 "{boundary} leaked its failed staging file"
             );
-            let (failed_pins, _, _) = list_pinned_blobs(&store).await.unwrap();
             assert_eq!(
-                failed_pins.len(),
-                usize::from(boundary != "blob_tag_persist"),
+                store.tags().get(tag.as_bytes()).await.unwrap().is_some(),
+                boundary != "blob_tag_persist",
                 "unexpected pin state at {boundary}"
             );
 
@@ -10141,11 +10459,19 @@ mod tests {
             assert!(outcome.warnings.is_empty());
             assert_eq!(std::fs::read(&output).unwrap(), b"blob");
             store.sync_db().await.unwrap();
-            let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
-            assert_eq!(pins.len(), 1);
-            assert_eq!(pins[0].direction, "incoming");
-            assert_eq!(pins[0].provider.as_deref(), Some(provider_text.as_str()));
-            assert_eq!(pins[0].hash, hash_and_format.hash.to_string());
+            let parsed = parse_pinned_blob_tag(tag.as_bytes()).unwrap();
+            assert_eq!(parsed.direction, "incoming");
+            assert_eq!(parsed.provider.as_deref(), Some(provider_text.as_str()));
+            assert_eq!(
+                store
+                    .tags()
+                    .get(tag.as_bytes())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .hash_and_format(),
+                hash_and_format
+            );
             drop(store);
             let _ = std::fs::remove_dir_all(root);
         }
@@ -10211,11 +10537,19 @@ mod tests {
             assert_eq!(outcome.cleanup_complete, boundary != "staging_cleanup");
             assert_eq!(outcome.warnings.len(), 1);
             assert!(!staging.exists(), "drop recovery did not remove staging");
-            let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
-            assert_eq!(pins.len(), 1);
-            assert_eq!(pins[0].direction, "incoming");
-            assert_eq!(pins[0].provider.as_deref(), Some(provider_text.as_str()));
-            assert_eq!(pins[0].hash, hash_and_format.hash.to_string());
+            let parsed = parse_pinned_blob_tag(tag.as_bytes()).unwrap();
+            assert_eq!(parsed.direction, "incoming");
+            assert_eq!(parsed.provider.as_deref(), Some(provider_text.as_str()));
+            assert_eq!(
+                store
+                    .tags()
+                    .get(tag.as_bytes())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .hash_and_format(),
+                hash_and_format
+            );
             drop(store);
             let _ = std::fs::remove_dir_all(root);
         }
@@ -10277,11 +10611,19 @@ mod tests {
             std::fs::read(output.join("nested/file.txt")).unwrap(),
             b"directory payload"
         );
-        let (pins, _, _) = list_pinned_blobs(&store).await.unwrap();
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0].direction, "incoming");
-        assert_eq!(pins[0].offer_id, offer_id);
-        assert_eq!(pins[0].hash, hash_and_format.hash.to_string());
+        let parsed = parse_pinned_blob_tag(tag.as_bytes()).unwrap();
+        assert_eq!(parsed.direction, "incoming");
+        assert_eq!(parsed.offer_id, offer_id);
+        assert_eq!(
+            store
+                .tags()
+                .get(tag.as_bytes())
+                .await
+                .unwrap()
+                .unwrap()
+                .hash_and_format(),
+            hash_and_format
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -10295,7 +10637,10 @@ mod tests {
             .await
             .unwrap()
             .into();
-        let hash = iroh_blobs::Hash::new(b"listing test");
+        let source = dir.join("listing-source");
+        std::fs::write(&source, b"listing test").unwrap();
+        let imported = store.blobs().add_path(&source).temp_tag().await.unwrap();
+        let hash = imported.hash();
         for index in (0..=MAX_OFFER_LIST_ENTRIES).rev() {
             let tag = outbound_blob_tag(
                 &format!("{index:032x}"),
@@ -10321,7 +10666,7 @@ mod tests {
         let (blobs, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
         assert_eq!(blobs.len(), MAX_OFFER_LIST_ENTRIES);
         assert!(has_more);
-        assert_eq!(item_errors, 0);
+        assert_eq!(item_errors, 1);
         assert_eq!(blobs[0].offer_id, format!("{:032x}", 0));
         assert_eq!(
             blobs.last().unwrap().offer_id,
@@ -10378,6 +10723,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_store_offer_scan_bounds_4095_4096_4097_and_caps_item_errors() {
+        for count in [4095_usize, 4096, 4097] {
+            let dir = std::env::temp_dir().join(format!(
+                "meshmsg-offer-scan-{count}-{}",
+                rand::random::<u64>()
+            ));
+            let options = FsStoreOptions::new(&dir);
+            let store: Store = FsStore::load_with_opts(dir.join("blobs.db"), options)
+                .await
+                .unwrap()
+                .into();
+            for index in 0..count {
+                let malformed = format!("meshmsg/out/v1/A{index:031x}/file/eA");
+                store
+                    .tags()
+                    .set(
+                        malformed.as_bytes(),
+                        iroh_blobs::HashAndFormat::raw(iroh_blobs::Hash::new(b"missing")),
+                    )
+                    .await
+                    .unwrap();
+            }
+            store.sync_db().await.unwrap();
+            let (listed, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+            assert!(listed.is_empty());
+            assert!(has_more);
+            assert_eq!(item_errors, count.min(MAX_OFFER_LIST_SCANNED));
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
     async fn incomplete_and_missing_pins_fail_closed_then_restart_accounts_completion() {
         let (root, state, store) = lifecycle_test_store("incomplete-reconcile").await;
         let data = vec![9_u8; 64 * 1024];
@@ -10403,6 +10781,10 @@ mod tests {
             .await
             .unwrap();
         store.sync_db().await.unwrap();
+        let (listed, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+        assert!(listed.is_empty());
+        assert!(has_more);
+        assert_eq!(item_errors, 1, "partial blob must be an item error");
         let error = AttachmentStorage::open(
             store.clone(),
             root.join("blobs"),
@@ -10620,6 +11002,7 @@ mod tests {
             task_storage
                 .remove_with_fault(
                     RemovalSpec {
+                        operation_id: TEST_OPERATION_ID,
                         offer_id: Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
                         direction: None,
                         provider: None,
@@ -10719,6 +11102,7 @@ mod tests {
         let result = storage
             .remove_with_fault(
                 RemovalSpec {
+                    operation_id: TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -10754,6 +11138,7 @@ mod tests {
         let result = storage
             .remove_with_fault(
                 RemovalSpec {
+                    operation_id: TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -10846,6 +11231,7 @@ mod tests {
         assert_eq!(prefix, data[..prefix.len()]);
         storage
             .remove(
+                TEST_OPERATION_ID,
                 Some("fffffffffffffffffffffffffffffff1"),
                 None,
                 None,
@@ -10927,6 +11313,7 @@ mod tests {
 
         let removed = storage
             .remove(
+                TEST_OPERATION_ID,
                 Some("00000000000000000000000000000001"),
                 None,
                 None,
@@ -10940,6 +11327,7 @@ mod tests {
         assert_eq!(removed["released_bytes"], 0);
         let removed = storage
             .remove(
+                TEST_OPERATION_ID,
                 Some("00000000000000000000000000000002"),
                 None,
                 None,
@@ -10996,7 +11384,7 @@ mod tests {
             persist_attachment_index(&state, &lifecycle.index).unwrap();
         }
         let dry = storage
-            .remove(None, None, None, Some(10), 1, true)
+            .remove(TEST_OPERATION_ID, None, None, None, Some(10), 1, true)
             .await
             .unwrap();
         assert_eq!(dry["selected_tags"], 1);
@@ -11004,14 +11392,14 @@ mod tests {
         assert_eq!(dry["limited"], true);
         assert_eq!(storage.status().tags, 3);
         let pruned = storage
-            .remove(None, None, None, Some(10), 2, false)
+            .remove(TEST_OPERATION_ID, None, None, None, Some(10), 2, false)
             .await
             .unwrap();
         assert_eq!(pruned["removed_tags"], 2, "the exact cutoff is inclusive");
         assert_eq!(storage.status().tags, 1);
         let held = storage.gate.clone().acquire_owned().await.unwrap();
         let busy = storage
-            .remove(None, None, None, Some(0), 1, false)
+            .remove(TEST_OPERATION_ID, None, None, None, Some(0), 1, false)
             .await
             .unwrap_err();
         assert!(busy.to_string().starts_with("attachment_storage_busy:"));
@@ -11104,6 +11492,7 @@ mod tests {
             .contains("hash_seq"));
         storage
             .remove(
+                TEST_OPERATION_ID,
                 Some("11111111111111111111111111111111"),
                 None,
                 None,
@@ -11128,6 +11517,10 @@ mod tests {
             .await
             .unwrap();
         store.sync_db().await.unwrap();
+        let (listed, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+        assert!(listed.is_empty());
+        assert!(has_more);
+        assert_eq!(item_errors, 1);
         drop(storage);
         let error = AttachmentStorage::open(store.clone(), root.join("blobs"), &state, 100, 0, 0)
             .await
@@ -11275,6 +11668,7 @@ mod tests {
             }
             storage
                 .remove(
+                    TEST_OPERATION_ID,
                     Some("dddddddddddddddddddddddddddddddd"),
                     None,
                     None,
@@ -11323,6 +11717,7 @@ mod tests {
         assert!(storage.state.lock().unwrap().reservations.is_empty());
         storage
             .remove(
+                TEST_OPERATION_ID,
                 Some("44444444444444444444444444444444"),
                 None,
                 None,
@@ -11357,6 +11752,7 @@ mod tests {
             let value = storage
                 .remove_with_fault(
                     RemovalSpec {
+                        operation_id: TEST_OPERATION_ID,
                         offer_id: Some("66666666666666666666666666666666"),
                         direction: None,
                         provider: None,
@@ -11412,6 +11808,7 @@ mod tests {
         let value = storage
             .remove_with_fault(
                 RemovalSpec {
+                    operation_id: TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -11508,14 +11905,15 @@ mod tests {
             async move { Ok(receiver.await?) },
             Duration::from_millis(1),
             None,
-            Some(offer_id.clone()),
+            None,
         )
         .await;
         let timeout = LifecycleErrorV1::from_value(&timeout_value).unwrap();
         assert_eq!(timeout.code, "attachment_command_timeout");
         assert_eq!(timeout.outcome, "unknown");
         assert!(timeout.retryable);
-        assert_eq!(timeout.offer_id.as_deref(), Some(offer_id.as_str()));
+        assert_eq!(timeout.offer_id, None);
+        let _ = offer_id;
         drop(sender);
 
         let shutdown_value = lifecycle_command_response(
@@ -11559,6 +11957,7 @@ mod tests {
         let partial = enabled
             .remove_with_fault(
                 RemovalSpec {
+                    operation_id: TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -11931,14 +12330,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let mut error = ErrorEnvelopeV1::new(code, "", outcome, true);
-                error.request_id = match correlation {
+                let request_id = match correlation {
                     "matching" => Some(request.request_id),
                     "missing" => None,
                     "mismatched" => Some("f".repeat(32)),
                     _ => unreachable!(),
                 };
-                write_value(&mut stream, &error.into_value()).await.unwrap();
+                let error = serde_json::json!({
+                    "type":"error", "schema_version":1, "code":code,
+                    "message":contracts::error_code_spec(code).unwrap().message,
+                    "outcome":outcome, "retryable":true, "request_id":request_id,
+                });
+                write_value(&mut stream, &error).await.unwrap();
             });
 
             let (events, mut output) = mpsc::channel(8);
@@ -12021,13 +12424,17 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let mut error = ErrorEnvelopeV1::new(code, "", outcome, true);
-                error.request_id = match correlation {
+                let request_id = match correlation {
                     "missing" => None,
                     "mismatched" => Some("f".repeat(32)),
                     _ => unreachable!(),
                 };
-                write_value(&mut stream, &error.into_value()).await.unwrap();
+                let error = serde_json::json!({
+                    "type":"error", "schema_version":1, "code":code,
+                    "message":contracts::error_code_spec(code).unwrap().message,
+                    "outcome":outcome, "retryable":true, "request_id":request_id,
+                });
+                write_value(&mut stream, &error).await.unwrap();
             });
 
             let (events, mut output) = mpsc::channel(8);
@@ -12575,6 +12982,66 @@ mod tests {
         assert!(rejection.retryable);
         assert!(rejection.request_id.is_none());
         assert_eq!(tasks.len(), LOCAL_IPC_CONNECTION_CAPACITY);
+
+        let operation = "11111111111111111111111111111111".to_owned();
+        let mutations = vec![
+            IpcRequest::Send {
+                operation_id: operation.clone(),
+                body: "x".into(),
+            },
+            IpcRequest::PrivateSend {
+                operation_id: operation.clone(),
+                to: "2".repeat(64),
+                body: "x".into(),
+            },
+            IpcRequest::Share {
+                operation_id: operation.clone(),
+                source_digest: "3".repeat(64),
+                path: PathBuf::from("x"),
+            },
+            IpcRequest::OffersRemove {
+                operation_id: operation.clone(),
+                offer_id: "4".repeat(32),
+                direction: None,
+                provider: None,
+            },
+            IpcRequest::OffersPrune {
+                operation_id: operation.clone(),
+                older_than_secs: 1,
+                cutoff_ms: 1,
+                direction: None,
+                dry_run: false,
+                max_delete: 1,
+            },
+            IpcRequest::Download {
+                operation_id: operation.clone(),
+                offer: "x".into(),
+                output: PathBuf::from("x"),
+            },
+            IpcRequest::WebDownload {
+                operation_id: operation,
+                offer: "x".into(),
+                output: PathBuf::from("x"),
+            },
+        ];
+        for mutation in mutations {
+            let (mut client, admitted) = accept_and_admit_test_client(
+                &mut listener,
+                &dir,
+                &limit,
+                &mut tasks,
+                &commands,
+                &events,
+                &preparations,
+                timeouts,
+            )
+            .await;
+            assert!(!admitted);
+            let frame = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            let transport = ErrorEnvelopeV1::from_value(&value).unwrap();
+            crate::ipc::validate_error_for_request(&transport, &mutation).unwrap();
+        }
 
         tokio::time::timeout(Duration::from_secs(7), async {
             while !tasks.is_empty() {

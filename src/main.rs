@@ -37,6 +37,9 @@ fn authoritative_contract_failure(error: &anyhow::Error) -> Option<contracts::Er
 #[tokio::main]
 async fn main() {
     let json = json_mode_requested(std::env::args_os());
+    // Preserve the documented machine-output guarantee: private diagnostics use
+    // the bounded local sink only in human mode, never the JSON stderr stream.
+    contracts::set_private_diagnostic_output(!json);
     if let Err(error) = run().await {
         if json {
             // JSON failures use stdout, the same documented stream as JSON
@@ -54,12 +57,8 @@ async fn main() {
                 } else {
                     ("command_failed", false, "not_started")
                 };
-                let mut envelope = contracts::ErrorEnvelopeV1::new(
-                    code,
-                    "Command failed. Run without --json for a local diagnostic.",
-                    outcome,
-                    retryable,
-                );
+                let mut envelope =
+                    contracts::ErrorEnvelopeV1::new(code, &diagnostic, outcome, retryable);
                 envelope.request_id = Some(contracts::new_request_id());
                 envelope
             });

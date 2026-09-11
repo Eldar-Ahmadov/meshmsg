@@ -92,7 +92,7 @@ def download_status():
         "self_advertised": False, "neighbors": 1, "endpoint_online": True,
         "topic_joined": True, "alias": None, "alias_enabled": False,
         "captured_hostname": None, "custom_alias": None, "advertised_aliases": 0,
-        "ipc_capabilities": ["idempotent_attachment_operations_v1", "attachment_lifecycle_v1"],
+        "ipc_capabilities": ["idempotent_attachment_operations_v1", "attachment_lifecycle_v3"],
         "operation_cache_capacity": 1024, "operation_cache_ttl_ms": 600000,
         "operation_cache_persistent": False, "direct_replay_available": True,
         "direct_replay_error": None, "direct_replay_capacity": 8192,
@@ -173,7 +173,15 @@ def lifecycle_error(code, outcome, retryable, include_offer=False, partial=False
         if include_offer:
             value["offer_id"] = request["request"]["offer_id"]
         if partial:
-            value.update(selected_tags=2, removed_tags=1, quota_bytes_released=4)
+            value.update(selected_tags=2, removed_tags=1, quota_bytes_released=4,
+                         maximum=512, dry_run=False)
+            if request["request"]["command"] == "offers_prune":
+                value.update(
+                    direction=request["request"]["direction"],
+                    older_than_secs=request["request"]["older_than_secs"],
+                    cutoff_ms=request["request"]["cutoff_ms"],
+                    maximum=request["request"]["max_delete"],
+                )
         return value
     return response
 
@@ -198,6 +206,18 @@ run_case(
     expected_fields={"operation_id": "c" * 32, "offer_id": "d" * 32,
                      "selected_tags": 2, "removed_tags": 1,
                      "quota_bytes_released": 4},
+)
+run_case(
+    ["offers", "prune", "--operation-id", "e" * 32,
+     "--older-than-secs", "1", "--direction", "outgoing", "--max-delete", "2"],
+    lifecycle_error("attachment_removal_partial", "partial", True, partial=True),
+    expected_code="attachment_removal_partial", expected_outcome="partial",
+    expected_retryable=True,
+    expected_fields={"operation_id": "e" * 32, "direction": "outgoing",
+                     "older_than_secs": 1, "maximum": 2, "dry_run": False,
+                     "selected_tags": 2, "removed_tags": 1,
+                     "quota_bytes_released": 4},
+    absent_fields=("offer_id", "provider"),
 )
 
 # The stable listing-capacity error crosses a strict correlated fake IPC reply
