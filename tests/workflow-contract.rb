@@ -101,7 +101,7 @@ def validate(ci, verification, release, inventory)
   contract = jobs["workflow-contract"]
   assert_run(contract, "install-actionlint",
              "go install github.com/rhysd/actionlint/cmd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca")
-  assert_run(contract, "actionlint", '$(go env GOPATH)/bin/actionlint')
+  assert_run(contract, "actionlint", '"$(go env GOPATH)/bin/actionlint"')
   assert_run(contract, "workflow-contract", "ruby tests/workflow-contract.rb\npython3 tests/release-contract-tests.py\npython3 tests/release-assets-tests.py\npython3 tests/github-protection-contract-tests.py")
   assert_order(contract, %w[install-actionlint actionlint workflow-contract])
 
