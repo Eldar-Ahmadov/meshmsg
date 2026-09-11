@@ -3145,7 +3145,7 @@ mod tests {
         let state = state();
         let second = WebState::new(&state.dir, "127.0.0.1:8788".parse().unwrap(), None).unwrap();
         assert_ne!(state.download_root, second.download_root);
-        let now = Instant::now();
+        let base = Instant::now();
         let id = state
             .remember_offer(StoredOffer {
                 offer_id: "11111111111111111111111111111111".into(),
@@ -3154,13 +3154,13 @@ mod tests {
                 kind: AttachmentKind::File,
                 name: "résumé\r\n.txt".into(),
                 size: 4,
-                created: now,
+                created: base,
             })
             .unwrap();
         assert!(valid_id(&id));
-        let stored = state.get_offer(&id, now).unwrap();
+        let stored = state.get_offer(&id, base).unwrap();
         assert_eq!(stored.offer, "signed-secret");
-        assert_eq!(state.get_offer(&id, now).unwrap().offer, "signed-secret");
+        assert_eq!(state.get_offer(&id, base).unwrap().offer, "signed-secret");
         let disposition = content_disposition(&stored.name);
         let header = disposition.to_str().unwrap();
         assert!(!header.contains('\r') && !header.contains('\n'));
@@ -3173,28 +3173,36 @@ mod tests {
                 kind: AttachmentKind::File,
                 name: "old.txt".into(),
                 size: 4,
-                created: now - DOWNLOAD_TTL - Duration::from_secs(1),
+                created: base,
             })
             .unwrap();
-        assert!(state.get_offer(&expired, now).is_none());
-        state.jobs.lock().unwrap().insert(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        assert!(state.get_offer(&expired, base + DOWNLOAD_TTL).is_some());
+        assert!(state
+            .get_offer(&expired, base + DOWNLOAD_TTL + Duration::from_millis(1))
+            .is_none());
+
+        let pending = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let failed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let ready = "cccccccccccccccccccccccccccccccc";
+        let ready_path = state.download_root.join("ready-boundary.blob");
+        fs::write(&ready_path, b"safe").unwrap();
+        let mut jobs = state.jobs.lock().unwrap();
+        jobs.insert(
+            pending.into(),
             DownloadEntry {
                 offer_handle: id,
                 input: stored.clone(),
-                owner: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                owner: "dddddddddddddddddddddddddddddddd".into(),
                 attempts: 1,
-                job: DownloadJob::Pending {
-                    created: now - DOWNLOAD_PENDING_TTL - Duration::from_secs(1),
-                },
+                job: DownloadJob::Pending { created: base },
             },
         );
-        state.jobs.lock().unwrap().insert(
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        jobs.insert(
+            failed.into(),
             DownloadEntry {
-                offer_handle: "cccccccccccccccccccccccccccccccc".into(),
-                input: stored,
-                owner: "dddddddddddddddddddddddddddddddd".into(),
+                offer_handle: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                input: stored.clone(),
+                owner: "ffffffffffffffffffffffffffffffff".into(),
                 attempts: MAX_DOWNLOAD_RECONCILIATIONS,
                 job: DownloadJob::Failed {
                     error: operation_bound_download_error(
@@ -3202,13 +3210,54 @@ mod tests {
                         "expired",
                         "unknown",
                         true,
-                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        failed,
                     ),
-                    created: now - DOWNLOAD_TTL - Duration::from_secs(1),
+                    created: base,
                 },
             },
         );
-        state.prune_jobs(now);
+        jobs.insert(
+            ready.into(),
+            DownloadEntry {
+                offer_handle: "99999999999999999999999999999999".into(),
+                input: stored,
+                owner: "88888888888888888888888888888888".into(),
+                attempts: 1,
+                job: DownloadJob::Ready {
+                    path: ready_path.clone(),
+                    name: "safe.txt".into(),
+                    size: 4,
+                    created: base,
+                },
+            },
+        );
+        drop(jobs);
+
+        state.prune_jobs(base + DOWNLOAD_TTL);
+        assert_eq!(state.jobs.lock().unwrap().len(), 3);
+        state.prune_jobs(base + DOWNLOAD_TTL + Duration::from_millis(1));
+        {
+            let jobs = state.jobs.lock().unwrap();
+            assert!(!jobs.contains_key(failed));
+            assert!(matches!(jobs[pending].job, DownloadJob::Pending { .. }));
+            assert!(matches!(jobs[ready].job, DownloadJob::Ready { .. }));
+        }
+        assert!(ready_path.exists());
+
+        state.prune_jobs(base + DOWNLOAD_READY_TTL);
+        assert!(state.jobs.lock().unwrap().contains_key(ready));
+        assert!(ready_path.exists());
+        state.prune_jobs(base + DOWNLOAD_READY_TTL + Duration::from_millis(1));
+        {
+            let jobs = state.jobs.lock().unwrap();
+            assert!(!jobs.contains_key(ready));
+            assert!(matches!(jobs[pending].job, DownloadJob::Pending { .. }));
+        }
+        assert!(!ready_path.exists());
+
+        state.prune_jobs(base + DOWNLOAD_PENDING_TTL);
+        assert!(state.jobs.lock().unwrap().contains_key(pending));
+        state.prune_jobs(base + DOWNLOAD_PENDING_TTL + Duration::from_millis(1));
         assert!(state.jobs.lock().unwrap().is_empty());
     }
 
