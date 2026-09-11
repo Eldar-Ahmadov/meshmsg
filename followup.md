@@ -4,7 +4,7 @@
 
 The hardening work recorded in `next_steps.md` is substantial and generally well designed, but `v0.1.18` should not yet be described as fully production-ready. The topic-bound broadcast protocol, bounded IPC admission, durable download ordering, direct-message replay persistence, attachment quotas/lifecycle controls, and broad typed-contract coverage are appropriate implementations with strong tests.
 
-The producer/consumer validation findings 1, 2, and 4 below are now addressed, and finding 5's release gating is complete. Finding 7 in `next_steps.md` still overstates its broader closure, and several acknowledged operational gaps remain open.
+The producer/consumer validation findings 1, 2, and 4 below are now addressed, and finding 5's release-gating implementation is complete with external bootstrap still pending. Finding 6's persistent-state hardening is a work in progress with two documented races still unresolved. Finding 7 in `next_steps.md` still overstates its broader closure, and several acknowledged operational gaps remain open.
 
 ## Findings
 
@@ -45,18 +45,11 @@ The producer/consumer validation findings 1, 2, and 4 below are now addressed, a
 - Canonical CODEOWNERS and a complete normalized policy require one stale-dismissed code-owner approval after the last push and bind `Required verification` to GitHub Actions app `15368`; mutation fixtures cover every policy field and CODEOWNERS failure, including a push-capable collaborator not named on protected patterns. Existing immutable/authority tag rules and older main essentials were configured, but complete enforcement was not applied because no independent applicable code owner exists. `--apply` parses every canonical pattern and live collaborator permission before mutation and refuses lockout. Finding #5 remains open until the independent owner, singular audit secret, complete live policy, and unmerged probe evidence are all configured/read back.
 - Final GNU/musl/Windows package smoke tests, exact artifacts/checksums, generated-archive installer coverage, and safe draft reruns are retained. Windows now resolves `dumpbin` through `vswhere` and `vcvars64.bat`, exercises the exact lookup in regular Windows verification, and reuses it for static-CRT inspection.
 
-### 6. Persistent-state reads are not allocation-bounded and state lacks a migration plan — Medium
+### 6. Persistent-state reads and migration hardening remain in progress — Medium
 
-Several persistent files are fully allocated before validation:
-
-- `config.json`: `src/config.rs:139-141`
-- Secret text: `src/config.rs:285-297`
-- `alias.json`: `src/alias.rs:52-64`
-- Attachment index: `src/node.rs:3480-3488`; its size is checked only after `std::fs::read` has allocated the complete file.
-
-A corrupt or unexpectedly large local state file can therefore cause excessive startup allocation. `config.json` also has no top-level schema version, making future compatible migrations difficult.
-
-Use a common bounded-reader helper, add a top-level state schema version and explicit migrations, and document backup/restore and failed-migration behavior.
+- [ ] **Status: work in progress.** The implementation below is substantial, but two documented races remain unresolved; this finding is not complete. One common no-follow/reparse-rejecting regular-file layer performs same-handle metadata preflight and a limit-plus-one streaming check, including when a file grows after inspection. Optional files treat only a genuine missing directory entry as absent and dangling links fail closed. Non-forced initialization now commits with an atomic same-filesystem no-replace link rather than a check followed by replacement: any concurrently appearing file, directory, symlink, or Windows reparse point causes `state already exists` and is never overwritten; force retains replacement semantics. Typed internal errors distinguish missing, too-large, I/O, parse, corruption, and unsupported-version failures without putting paths or contents in their public text. It covers `config.json` (64 KiB), selected secret text (256 bytes), `alias.json` (4 KiB), attachment retention indexes (8 MiB), direct-replay v1/v2 snapshots (4 MiB), v2 WALs (8 MiB and existing 512-byte record bounds), and migration backups. Lock/socket/lease bodies are not parsed; attachment data and Iroh storage are streamed or delegated rather than whole-file state reads.
+- `config.json` now has strict top-level schema version 1. Under the exclusive state lock, the only supported legacy unversioned shape is parsed and semantically validated, including invite/bootstrap advertising authority and selected-generation/public-key identity binding, before any migration write. The exact legacy bytes are atomically installed as owner-only `config.json.v0.bak`, followed by an atomic synced v1 commit. Existing mismatched backups and unknown/future versions fail closed. The two durable states make interruption resumable and migration idempotent without guessing or silently selecting another key. Existing direct replay v1-to-v2 migration retains its v1 source as a conservative backup; missing alias/index state keeps its documented safe reconstruction behavior.
+- `docs/operations.md` inventories every persistent file and bound and defines migration, restart, failed-write, backup, and manual rollback behavior. WAL reads/repair and capacity-check/appends each use their same redirected-path-safe opened handle; append reserves the confirmation transition and detects path replacement after sync. Only a final unterminated fragment through the exact 512-byte record limit is repaired, while a 513-byte tail is rejected byte-for-byte. Unsigned 64-bit version probes classify values above 255 before narrow decoding. Bounded sequence/map visitors stop compact entry/key amplification before retained collection growth, while an allocation-free JSON lexical pass counts decoded UTF-8 lengths—including escape, backslash, and surrogate-pair amplification—before serde can allocate escape scratch; field visitors retain tighter bounds. Focused tests cover exact/limit-plus-one and slow one-byte readers, metadata preflight, dangling/replaced paths, deterministic no-replace commit races, typed error classes, truncation/corruption/future versions, escaped-string/key boundaries, compact 8,192/8,193 boundaries, identity-dependent mismatch before writes, backup-first injected failure and resume, isolated 16-way repeated migration, idempotent restart, owner-only permissions, and attachment-index boundaries. Existing replay checksum/torn-tail, migration, crash-process, compaction ordering, restart, and compatibility tests continue covering direct state.
 
 ### 7. Synchronous daemon output remains an availability risk — Medium
 
@@ -127,6 +120,8 @@ Findings 1, 2, and the finding 5 integration gates were subsequently verified wi
 
 Finding 5's workflow refactor and eight review follow-ups were verified with actionlint 1.7.12 (published archive checksum verified), parsed workflow contracts and adversarial mutations, release-note/check-out/worktree fixtures, strict archive/executable fixtures, generated-archive installer success/failure tests, shell/Python/JavaScript syntax checks, and a live read-back of the applied GitHub tag rulesets/main protection. With pinned Rust 1.91.0, formatting, all 245 Rust tests, warnings-denied Clippy, and a locked debug build passed. Actual native Windows/static-CRT, musl packaging, external-network integrations, and dependency policy execution remain Actions responsibilities.
 
+The current finding 6 work in progress was verified with formatting, 272 full Rust tests, warnings-denied Clippy, locked debug/release builds, shell/Python/JavaScript syntax checks, and the complete Linux integration inventory; those checks do not close the two documented remaining races. New focused evidence covers one-byte chunking, exact/limit-plus-one reads, preflight and post-inspection growth bounds, typed non-path error categories, atomic no-replace config races against files/directories/links plus retained force replacement, same-handle WAL capacity and post-open regular/symlink replacement detection, compact escaped backslash/Unicode/surrogate exact and oversized boundaries, config/alias/index truncation and future versions, selected-secret bounds, identity-safe v0 migration, backup-first failure/resume, repeated restart, and owner-only backup/index permissions. Existing direct-replay migration, checksum corruption, torn-tail, compaction, process-exit, and restart cases passed unchanged. Native Windows execution remains CI-only.
+
 ## Recommended order
 
 1. Reject empty broadcasts before any side effect and prevent invalid internal events from reaching subscribers.
@@ -134,6 +129,6 @@ Finding 5's workflow refactor and eight review follow-ups were verified with act
 3. Add producer-to-consumer contract round-trip tests and request-aware semantic validation.
 4. [x] Extend and document the operation-ID boundary through lifecycle and CLI/browser download operations.
 5. [x] Reuse one authoritative CI/release verification workflow and require successful exact-SHA verification of approved main-history release tags.
-6. Introduce bounded state reads and a versioned migration policy.
+6. [ ] Introduce bounded state reads and a versioned migration policy; two documented races remain unresolved.
 7. Move daemon output off the event loop and add explicit readiness/degraded health.
 8. Add attachment pagination, split large modules, and add fuzz/load/provenance coverage.

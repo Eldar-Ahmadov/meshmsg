@@ -169,6 +169,14 @@ const MAX_ENCODED_PUBLIC_KEY_BYTES: usize = 64;
 const BLOB_TAG_PREFIX: &[u8] = b"meshmsg/";
 const OUTBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/out/v1/";
 const INBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/in/v1/";
+const MAX_ATTACHMENT_INDEX_TAG_BYTES: usize = INBOUND_BLOB_TAG_PREFIX.len()
+    + MAX_ENCODED_PUBLIC_KEY_BYTES
+    + 1
+    + 32
+    + 1
+    + "directory_tar_v1".len()
+    + 1
+    + MAX_ENCODED_TAG_NAME_BYTES;
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -3084,7 +3092,54 @@ async fn list_pinned_blobs(store: &Store) -> Result<(Vec<OfferItemV1>, bool, usi
 #[serde(deny_unknown_fields)]
 struct AttachmentRetentionIndex {
     schema_version: u8,
+    #[serde(deserialize_with = "deserialize_attachment_index_entries")]
     created_at_ms: BTreeMap<String, u64>,
+}
+
+#[derive(Deserialize)]
+struct AttachmentIndexVersionProbe {
+    schema_version: u64,
+}
+
+fn deserialize_attachment_index_entries<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct EntriesVisitor;
+    impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+        type Value = BTreeMap<String, u64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_ATTACHMENT_TAGS} bounded attachment index entries"
+            )
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = BTreeMap::new();
+            while let Some(key) = access
+                .next_key::<crate::persistent::BoundedString<MAX_ATTACHMENT_INDEX_TAG_BYTES>>()?
+            {
+                if entries.len() == MAX_ATTACHMENT_TAGS {
+                    return Err(serde::de::Error::invalid_length(entries.len() + 1, &self));
+                }
+                let value = access.next_value::<u64>()?;
+                if entries.insert(key.into_string(), value).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate attachment retention index key",
+                    ));
+                }
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_map(EntriesVisitor)
 }
 
 impl Default for AttachmentRetentionIndex {
@@ -4020,24 +4075,38 @@ fn clone_attachment_index(index: &AttachmentRetentionIndex) -> AttachmentRetenti
 
 fn load_attachment_index(state_dir: &Path) -> Result<AttachmentRetentionIndex> {
     let path = state_dir.join(ATTACHMENT_INDEX_NAME);
-    if !path.exists() {
+    let Some(bytes) = crate::persistent::read_optional_file_bounded(
+        &path,
+        "attachment retention index",
+        MAX_ATTACHMENT_INDEX_BYTES,
+    )?
+    else {
         return Ok(AttachmentRetentionIndex::default());
+    };
+    let probe: AttachmentIndexVersionProbe = crate::persistent::parse_json_bounded_strings(
+        &bytes,
+        "attachment retention index",
+        MAX_ATTACHMENT_INDEX_TAG_BYTES,
+    )?;
+    if probe.schema_version != 1 {
+        return Err(crate::persistent::PersistentError::unsupported_version(
+            "attachment retention index",
+            probe.schema_version,
+        )
+        .into());
     }
-    let bytes = std::fs::read(path).context("read attachment retention index")?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_ATTACHMENT_INDEX_BYTES,
-        "attachment retention index is too large"
-    );
-    let index: AttachmentRetentionIndex =
-        serde_json::from_slice(&bytes).context("parse attachment retention index")?;
-    anyhow::ensure!(
-        index.schema_version == 1,
-        "unsupported attachment retention index version"
-    );
-    anyhow::ensure!(
-        index.created_at_ms.len() <= MAX_ATTACHMENT_TAGS,
-        "attachment retention index exceeds pin capacity"
-    );
+    let index: AttachmentRetentionIndex = crate::persistent::parse_json_bounded_strings(
+        &bytes,
+        "attachment retention index",
+        MAX_ATTACHMENT_INDEX_TAG_BYTES,
+    )?;
+    if index.schema_version != 1 {
+        return Err(crate::persistent::PersistentError::unsupported_version(
+            "attachment retention index",
+            u64::from(index.schema_version),
+        )
+        .into());
+    }
     Ok(index)
 }
 
@@ -8299,7 +8368,7 @@ mod tests {
 
         let oversized_name = format!(
             "meshmsg/out/v1/0123456789abcdef0123456789abcdef/file/{}",
-            "A".repeat(MAX_ENCODED_TAG_NAME_BYTES + 1)
+            "A".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1)
         );
         assert_eq!(parse_pinned_blob_tag(oversized_name.as_bytes()), None);
         let oversized_provider = format!(
@@ -11400,6 +11469,116 @@ mod tests {
             .unwrap();
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_index_read_is_bounded_versioned_and_permission_safe() {
+        let state = std::env::temp_dir().join(format!(
+            "meshmsg-attachment-index-test-{}",
+            rand::random::<u64>()
+        ));
+        crate::config::prepare_state_dir(&state).unwrap();
+        let path = state.join(ATTACHMENT_INDEX_NAME);
+        assert!(load_attachment_index(&state)
+            .unwrap()
+            .created_at_ms
+            .is_empty());
+
+        persist_attachment_index(&state, &AttachmentRetentionIndex::default()).unwrap();
+        let mut exact = std::fs::read(&path).unwrap();
+        exact.resize(MAX_ATTACHMENT_INDEX_BYTES, b' ');
+        std::fs::write(&path, &exact).unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap()
+            .created_at_ms
+            .is_empty());
+
+        std::fs::write(&path, vec![b' '; MAX_ATTACHMENT_INDEX_BYTES + 1]).unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds its size limit"));
+        std::fs::write(&path, b"{\"schema_version\":1").unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("could not parse attachment retention index"));
+        std::fs::write(&path, br#"{"schema_version":256,"created_at_ms":{}}"#).unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported attachment retention index schema version 256"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"schema_version\":1,\"created_at_ms\":{{\"{}\":1}}}}",
+                "x".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1)
+            ),
+        )
+        .unwrap();
+        assert!(load_attachment_index(&state).is_err());
+
+        for (exact, oversized) in [
+            (
+                r"\u0078".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES),
+                r"\u0078".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1),
+            ),
+            (
+                r"\\".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES),
+                r"\\".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1),
+            ),
+        ] {
+            std::fs::write(
+                &path,
+                format!("{{\"schema_version\":1,\"created_at_ms\":{{\"{exact}\":1}}}}"),
+            )
+            .unwrap();
+            let loaded = load_attachment_index(&state).unwrap();
+            assert_eq!(
+                loaded.created_at_ms.keys().next().unwrap().len(),
+                MAX_ATTACHMENT_INDEX_TAG_BYTES
+            );
+            std::fs::write(
+                &path,
+                format!("{{\"schema_version\":1,\"created_at_ms\":{{\"{oversized}\":1}}}}"),
+            )
+            .unwrap();
+            assert!(load_attachment_index(&state).is_err());
+        }
+
+        let mut compact = BTreeMap::new();
+        for index in 0..MAX_ATTACHMENT_TAGS {
+            compact.insert(format!("k{index:04x}"), index as u64);
+        }
+        let boundary = serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,
+            "created_at_ms":compact,
+        }))
+        .unwrap();
+        assert!(boundary.len() < MAX_ATTACHMENT_INDEX_BYTES);
+        std::fs::write(&path, &boundary).unwrap();
+        assert_eq!(
+            load_attachment_index(&state).unwrap().created_at_ms.len(),
+            MAX_ATTACHMENT_TAGS
+        );
+        let insertion = boundary.len() - 2;
+        let mut amplified = boundary;
+        amplified.splice(insertion..insertion, b",\"overflow\":1".iter().copied());
+        std::fs::write(&path, amplified).unwrap();
+        assert!(load_attachment_index(&state).is_err());
+
+        persist_attachment_index(&state, &AttachmentRetentionIndex::default()).unwrap();
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(state.join("missing"), &path).unwrap();
+            assert!(load_attachment_index(&state).is_err());
+        }
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     #[tokio::test]

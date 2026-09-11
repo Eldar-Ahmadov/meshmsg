@@ -165,7 +165,8 @@ python3 - "$ROOT/s1/config.json" "$ROOT/s2/config.json" "$ROOT/s3/config.json" "
 import json, pathlib, sys
 for index, name in enumerate(sys.argv[1:]):
     state = json.loads(pathlib.Path(name).read_text())
-    assert set(state) == {"advertise_self", "topic", "invite", "identity"}
+    assert set(state) == {"schema_version", "advertise_self", "topic", "invite", "identity"}
+    assert state["schema_version"] == 1
     assert state["advertise_self"] is (index < 3)
 PY
 for node in s1 s2 s3 c1 c2; do

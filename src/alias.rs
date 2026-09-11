@@ -1,12 +1,18 @@
-use crate::config::{atomic_write, State, StateLock};
+use crate::{
+    config::{atomic_write, State, StateLock},
+    persistent,
+};
 use anyhow::{Context, Result};
 use iroh::PublicKey;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path, str::FromStr};
+#[cfg(test)]
+use std::fs;
+use std::{path::Path, str::FromStr};
 
 const ALIAS_CONFIG_NAME: &str = "alias.json";
 const ALIAS_CONFIG_VERSION: u8 = 1;
 pub(crate) const MAX_ALIAS_BYTES: usize = 63;
+pub(crate) const MAX_ALIAS_CONFIG_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +27,11 @@ pub(crate) struct AliasConfig {
     /// A user override. `None` means use the captured hostname when enabled.
     alias: Option<String>,
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct AliasVersionProbe {
+    version: u64,
 }
 
 impl AliasConfig {
@@ -49,24 +60,39 @@ impl AliasConfig {
     }
 
     /// Missing alias.json is a compatible, opted-out legacy configuration.
+    #[cfg(test)]
     pub(crate) fn load(dir: &Path) -> Result<Self> {
+        Self::load_with_presence(dir).map(|(value, _present)| value)
+    }
+
+    fn load_with_presence(dir: &Path) -> Result<(Self, bool)> {
         let path = dir.join(ALIAS_CONFIG_NAME);
-        if !path.exists() {
-            return Ok(Self {
-                version: ALIAS_CONFIG_VERSION,
-                identity: None,
-                hostname: None,
-                alias: None,
-                enabled: false,
-            });
+        let Some(bytes) = persistent::read_optional_file_bounded(
+            &path,
+            ALIAS_CONFIG_NAME,
+            MAX_ALIAS_CONFIG_BYTES,
+        )?
+        else {
+            return Ok((
+                Self {
+                    version: ALIAS_CONFIG_VERSION,
+                    identity: None,
+                    hostname: None,
+                    alias: None,
+                    enabled: false,
+                },
+                false,
+            ));
+        };
+        let probe: AliasVersionProbe = persistent::parse_json(&bytes, ALIAS_CONFIG_NAME)?;
+        if probe.version != u64::from(ALIAS_CONFIG_VERSION) {
+            return Err(crate::persistent::PersistentError::unsupported_version(
+                "alias configuration",
+                probe.version,
+            )
+            .into());
         }
-        let value: Self = serde_json::from_slice(&fs::read(&path).context("read alias.json")?)
-            .context("parse alias.json")?;
-        anyhow::ensure!(
-            value.version == ALIAS_CONFIG_VERSION,
-            "unsupported alias configuration version {}",
-            value.version
-        );
+        let value: Self = persistent::parse_json(&bytes, ALIAS_CONFIG_NAME)?;
         if let Some(identity) = &value.identity {
             let parsed = PublicKey::from_str(identity).context("invalid identity in alias.json")?;
             anyhow::ensure!(
@@ -80,13 +106,12 @@ impl AliasConfig {
         if let Some(alias) = &value.alias {
             validate_alias(alias)?;
         }
-        Ok(value)
+        Ok((value, true))
     }
 
     pub(crate) fn load_for_identity(dir: &Path, identity: PublicKey) -> Result<Self> {
-        let exists = dir.join(ALIAS_CONFIG_NAME).exists();
-        let value = Self::load(dir)?;
-        if exists {
+        let (value, present) = Self::load_with_presence(dir)?;
+        if present {
             let expected = identity.to_string();
             anyhow::ensure!(
                 value.identity.as_deref() == Some(expected.as_str()),
@@ -287,6 +312,47 @@ mod tests {
         let new_peer = PublicKey::from_str(&new_peer).unwrap();
         let error = AliasConfig::load_for_identity(&dir, new_peer).unwrap_err();
         assert!(error.to_string().contains("does not match"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bounded_alias_state_rejects_truncation_oversize_and_future_versions() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ALIAS_CONFIG_NAME);
+
+        fs::write(&path, b"{\"version\":1").unwrap();
+        assert!(AliasConfig::load(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("could not parse alias.json"));
+
+        fs::write(&path, vec![b' '; MAX_ALIAS_CONFIG_BYTES + 1]).unwrap();
+        assert!(AliasConfig::load(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds its size limit"));
+
+        fs::write(
+            &path,
+            br#"{"version":256,"identity":null,"hostname":null,"alias":null,"enabled":false}"#,
+        )
+        .unwrap();
+        assert!(AliasConfig::load(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported alias configuration schema version 256"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_alias_link_is_not_treated_as_legacy_absence() {
+        use std::os::unix::fs::symlink;
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        symlink(dir.join("missing"), dir.join(ALIAS_CONFIG_NAME)).unwrap();
+        assert!(AliasConfig::load(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

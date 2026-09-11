@@ -48,8 +48,9 @@ bash tests/run-linux-integrations.sh target/debug/meshmsg
 
 It includes CLI errors, fake/real web, peer directory, five-peer, attachments,
 direct messages, published IPC compatibility, idempotency, checksum-pinned
-v0.1.18 boundaries, and a generated-archive/mock-download installer test. The
-per-command budgets total under 95 minutes. The workflow allows 130 minutes,
+v0.1.18 boundaries, persistent-state migration/restart, and a generated-archive/
+mock-download installer test. The per-command budgets total under 97 minutes.
+The workflow allows 130 minutes,
 including setup/build/cleanup, while the driver rejects an inventory above its
 115-minute command budget.
 

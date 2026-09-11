@@ -11,6 +11,7 @@ mod ipc;
 mod message;
 mod node;
 mod peers;
+mod persistent;
 mod web;
 
 use alias::AliasConfig;

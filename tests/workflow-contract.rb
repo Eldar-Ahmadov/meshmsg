@@ -144,6 +144,7 @@ def validate(ci, verification, release, inventory)
     [600, "bash", "tests/integration-ipc-version-compat.sh", "{BIN}"],
     [600, "bash", "tests/integration-v018-message-boundary.sh", "{BIN}"],
     [600, "bash", "tests/integration-idempotency.sh", "{BIN}"],
+    [120, "bash", "tests/integration-state-migration.sh", "{BIN}"],
     [60, "bash", "tests/integration-installer.sh", "{BIN}"]
   ]
   assert(inventory == expected_inventory, "parsed Linux integration inventory changed unexpectedly")
