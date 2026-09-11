@@ -18,7 +18,8 @@ REQUEST_ID = "1" * 32
 
 
 def run_case(command, response, expected_code="command_failed",
-             expected_outcome="not_started", expected_retryable=False):
+             expected_outcome="not_started", expected_retryable=False,
+             expected_fields=None, absent_fields=()):
     with tempfile.TemporaryDirectory(prefix="meshmsg-cli-errors-") as temporary:
         state = pathlib.Path(temporary)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -28,17 +29,22 @@ def run_case(command, response, expected_code="command_failed",
 
         def daemon():
             try:
-                connection, _ = listener.accept()
-                with connection:
-                    request = json.loads(connection.makefile("rb").readline())
-                    assert request["schema_version"] == 1
-                    assert len(request["request_id"]) == 32
-                    assert "command" in request["request"]
-                    reply = dict(response(request) if callable(response) else response)
-                    if reply.pop("_correlate", True):
-                        reply.setdefault("schema_version", 1)
-                        reply["request_id"] = request["request_id"]
-                    connection.sendall(json.dumps(reply).encode() + b"\n")
+                negotiated = command[0] == "download" or (
+                    command[0] == "offers" and len(command) > 1
+                    and command[1] in ("remove", "prune"))
+                request_count = 2 if negotiated else 1
+                for _ in range(request_count):
+                    connection, _ = listener.accept()
+                    with connection:
+                        request = json.loads(connection.makefile("rb").readline())
+                        assert request["schema_version"] == 1
+                        assert len(request["request_id"]) == 32
+                        assert "command" in request["request"]
+                        reply = dict(response(request) if callable(response) else response)
+                        if reply.pop("_correlate", True):
+                            reply.setdefault("schema_version", 1)
+                            reply["request_id"] = request["request_id"]
+                        connection.sendall(json.dumps(reply).encode() + b"\n")
             except BaseException as error:
                 failure.append(error)
 
@@ -62,6 +68,10 @@ def run_case(command, response, expected_code="command_failed",
         assert error["outcome"] == expected_outcome
         assert error["retryable"] is expected_retryable
         assert len(error["request_id"]) == 32
+        for key, expected in (expected_fields or {}).items():
+            assert error.get(key) == expected, (key, error)
+        for key in absent_fields:
+            assert key not in error, (key, error)
         assert "response-body-secret" not in child.stdout
 
 
@@ -75,14 +85,40 @@ run_case(["status"], {"type": "status", "request_id": "2" * 32, "_correlate": Fa
 
 # Correlated, fully valid completions must echo the exact submitted OS-string
 # representation, not merely a Path-equivalent spelling.
+def download_status():
+    return {
+        "type": "status", "running": True, "peer": "3" * 64, "topic": "4" * 64,
+        "advertises_self": False, "has_invite": True, "bootstrap_peer_count": 1,
+        "self_advertised": False, "neighbors": 1, "endpoint_online": True,
+        "topic_joined": True, "alias": None, "alias_enabled": False,
+        "captured_hostname": None, "custom_alias": None, "advertised_aliases": 0,
+        "ipc_capabilities": ["idempotent_attachment_operations_v1", "attachment_lifecycle_v1"],
+        "operation_cache_capacity": 1024, "operation_cache_ttl_ms": 600000,
+        "operation_cache_persistent": False, "direct_replay_available": True,
+        "direct_replay_error": None, "direct_replay_capacity": 8192,
+        "direct_replay_per_sender_capacity": 512, "direct_replay_queue_capacity": 64,
+        "direct_replay_global_rate_per_second": 128, "direct_replay_global_rate_burst": 256,
+        "direct_replay_sender_rate_per_second": 8, "direct_replay_sender_rate_burst": 16,
+        "max_attachment_bytes": 1024,
+        "attachment_storage": {"tagged_bytes": 0, "tagged_blobs": 0, "tags": 0,
+            "tag_capacity": 8192, "quota_bytes": 1024, "available_bytes": 1024,
+            "min_free_bytes": 0, "pressure": False, "over_quota": False,
+            "below_min_free": False, "sampled_at_ms": 1},
+        "attachment_retention_secs": 0,
+    }
+
+
 def mismatched_download(transform):
     def response(request):
+        if request["request"]["command"] == "status":
+            return download_status()
         requested = request["request"]["output"]
         assert pathlib.Path(requested).is_absolute()
         different = transform(requested)
         assert different != requested
         return {
-            "type": "download_complete",
+            "type": "download_complete", "schema_version": 2,
+            "operation_id": request["request"]["operation_id"],
             "offer_id": "2" * 32,
             "kind": "file",
             "name": "safe.txt",
@@ -119,6 +155,50 @@ for transform in [
         ["download", "fake-offer", "--output", "requested.bin"],
         mismatched_download(transform),
     )
+
+def lifecycle_error(code, outcome, retryable, include_offer=False, partial=False):
+    def response(request):
+        if request["request"]["command"] == "status":
+            return download_status()
+        operation_id = request["request"]["operation_id"]
+        value = {
+            "type": "error", "schema_version": 1, "code": code,
+            "message": {
+                "operation_id_conflict": "The operation ID is bound to different input.",
+                "operation_capacity": "Local capacity is currently unavailable.",
+                "attachment_removal_partial": "Attachment removal completed only partially.",
+            }[code],
+            "operation_id": operation_id, "outcome": outcome, "retryable": retryable,
+        }
+        if include_offer:
+            value["offer_id"] = request["request"]["offer_id"]
+        if partial:
+            value.update(selected_tags=2, removed_tags=1, quota_bytes_released=4)
+        return value
+    return response
+
+
+# Generic operation conflicts/capacity are valid without offer_id, while an
+# offer-specific partial removal remains exactly operation/offer/count bound.
+for code in ["operation_id_conflict", "operation_capacity"]:
+    run_case(
+        ["offers", "remove", "--operation-id", "a" * 32, "b" * 32],
+        lifecycle_error(code, "not_started", code == "operation_capacity"),
+        expected_code=code,
+        expected_retryable=code == "operation_capacity",
+        expected_fields={"operation_id": "a" * 32},
+        absent_fields=("offer_id",),
+    )
+run_case(
+    ["offers", "remove", "--operation-id", "c" * 32, "d" * 32],
+    lifecycle_error("attachment_removal_partial", "partial", True,
+                    include_offer=True, partial=True),
+    expected_code="attachment_removal_partial", expected_outcome="partial",
+    expected_retryable=True,
+    expected_fields={"operation_id": "c" * 32, "offer_id": "d" * 32,
+                     "selected_tags": 2, "removed_tags": 1,
+                     "quota_bytes_released": 4},
+)
 
 # The stable listing-capacity error crosses a strict correlated fake IPC reply
 # and remains actionable in CLI JSON mode.

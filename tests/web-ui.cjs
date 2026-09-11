@@ -84,6 +84,8 @@ deterministicMath.random = () => 0;
 const sent = [];
 const downloadRequests = [];
 let downloadedHref = null;
+let lastDownloadOperation = null;
+let downloadStatusReply = async () => ({ type: 'download_ready', url: downloadedHref });
 let uploaded = null;
 let uploadReply = async (operationId) => ({ ok: true, json: async () => ({
   type: 'attachment_shared', schema_version: 3, operation_id: operationId
@@ -127,18 +129,109 @@ const context = vm.createContext({
     }
     if (request.command === 'download') {
       downloadRequests.push(request);
-      return { ok: true, json: async () => ({ type: 'download_started', id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', poll_timeout_ms: 4260000 }) };
+      lastDownloadOperation = request.operation_id;
+      return { ok: true, json: async () => ({
+        type: 'download_started', schema_version: 1, request_id: 'a'.repeat(32),
+        operation_id: request.operation_id, id: request.operation_id,
+        poll_timeout_ms: 4260000
+      }) };
     }
     if (request.command === 'download_status') {
       downloadRequests.push(request);
       downloadedHref = `/api/download/${request.id}`;
-      return { ok: true, json: async () => ({ type: 'download_ready', url: downloadedHref }) };
+      const supplied = await downloadStatusReply(request);
+      const value = supplied.type === 'error' ? supplied : {
+        schema_version: 1, request_id: 'b'.repeat(32),
+        operation_id: request.id, id: request.id, ...supplied
+      };
+      return { ok: value.type !== 'error', json: async () => value };
     }
     sent.push(request);
     return sendReply(request);
   }
 });
 vm.runInContext(js, context);
+
+// Browser download contracts are exact before they can rotate an operation ID
+// or expose a Save link.
+const contractOperation = '1'.repeat(32);
+const contractRequest = '2'.repeat(32);
+const recordBase = {
+  schema_version: 1, request_id: contractRequest,
+  operation_id: contractOperation, id: contractOperation
+};
+assert.equal(context.strictDownloadRecord({
+  type: 'download_started', ...recordBase, poll_timeout_ms: 4260000
+}, 'download_started', contractOperation), true);
+assert.equal(context.strictDownloadRecord({
+  type: 'download_pending', ...recordBase
+}, 'download_pending', contractOperation), true);
+assert.equal(context.strictDownloadRecord({
+  type: 'download_ready', ...recordBase,
+  url: `/api/download/${contractOperation}`
+}, 'download_ready', contractOperation), true);
+for (const [family, extra] of [
+  ['download_started', { poll_timeout_ms: 4260000 }],
+  ['download_pending', {}]
+]) {
+  for (const mutation of [
+    { id: '3'.repeat(32) }, { operation_id: '3'.repeat(32) }, { extra: true }
+  ]) {
+    assert.equal(context.strictDownloadRecord({
+      type: family, ...recordBase, ...extra, ...mutation
+    }, family, contractOperation), false, `${family} accepted mismatched identity`);
+  }
+}
+for (const mutation of [
+  { id: '3'.repeat(32) }, { operation_id: '3'.repeat(32) },
+  { url: `/api/download/${contractOperation}?x=1` },
+  { url: `/api/download/${contractOperation}#x` },
+  { url: `/api/download/%31${contractOperation.slice(1)}` },
+  { extra: true }
+]) {
+  assert.equal(context.strictDownloadRecord({
+    type: 'download_ready', ...recordBase,
+    url: `/api/download/${contractOperation}`, ...mutation
+  }, 'download_ready', contractOperation), false);
+}
+
+const canonicalDownloadErrors = [
+  ['operation_id_conflict', 'The operation ID is bound to different input.', 'not_started', false],
+  ['operation_capacity', 'Local capacity is currently unavailable.', 'not_started', true],
+  ['attachment_storage_busy', 'Local capacity is currently unavailable.', 'not_started', true],
+  ['attachment_command_timeout', 'The request timed out; reconcile before retrying.', 'unknown', true],
+  ['attachment_storage_shutdown', 'The daemon is shutting down or unavailable.', 'unknown', true],
+  ['download_failed', 'Attachment download failed.', 'not_started', true],
+  ['attachment_quota_exceeded', 'The attachment storage quota is exceeded.', 'not_started', false],
+  ['attachment_min_free_space', 'The attachment free-space reserve is unavailable.', 'not_started', true],
+  ['attachment_tag_capacity', 'The attachment pin capacity is exhausted.', 'not_started', false],
+  ['download_operation_capacity', 'Attachment download capacity is unavailable.', 'not_started', true],
+  ['download_staging_unavailable', 'Attachment download staging is unavailable.', 'not_started', true],
+  ['attachment_lifecycle_internal', 'The attachment lifecycle operation failed.', 'unknown', true],
+  ['not_found', 'The requested resource was not found.', 'not_started', false]
+];
+for (const [code, message, outcome, retryable] of canonicalDownloadErrors) {
+  const error = {
+    type: 'error', schema_version: 1, request_id: contractRequest,
+    operation_id: contractOperation, code, message, outcome, retryable
+  };
+  assert.equal(context.strictOperationError(error, contractOperation), true, code);
+  for (const mutation of [
+    { message: `${message}!` },
+    { outcome: outcome === 'unknown' ? 'not_started' : 'unknown' },
+    { retryable: !retryable }, { operation_id: '3'.repeat(32) },
+    { offer_id: contractOperation }, { extra: true }
+  ]) {
+    assert.equal(context.strictOperationError({ ...error, ...mutation }, contractOperation), false,
+      `${code} accepted adversarial metadata`);
+  }
+}
+assert.equal(context.strictOperationError({
+  type: 'error', schema_version: 1, request_id: contractRequest,
+  operation_id: contractOperation, code: 'send_failed',
+  message: 'Message submission failed.', outcome: 'not_started', retryable: true
+}, contractOperation), false, 'cross-kind error was accepted');
+
 const el = (id) => document.getElementById(id);
 const settle = () => new Promise(setImmediate);
 function runTimer(id, { stale = false } = {}) {
@@ -319,16 +412,89 @@ function submit(body) {
   await settle();
   await settle();
   Date.now = realDateNow;
+  const firstDownloadOperation = downloadRequests[0].operation_id;
   assert.deepEqual(downloadRequests.map(({ command, id }) => ({ command, id })), [
     { command: 'download', id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
-    { command: 'download_status', id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
+    { command: 'download_status', id: firstDownloadOperation }
   ]);
-  assert.equal(downloadedHref, '/api/download/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  assert.equal(downloadedHref, `/api/download/${firstDownloadOperation}`);
   assert.match(card.children[2].textContent, /Download ready.*Choose Save file/);
   assert.equal(card.children[3].textContent, 'Save file');
   assert.equal(card.children[3].href, downloadedHref);
   assert.equal(card.children[3].clicked, undefined, 'ready download was opened without another user click');
 
+  // A strict polled not_started rejection rotates the ID for the next explicit
+  // click; an unknown result retains it for bounded bridge reconciliation.
+  downloadStatusReply = async () => ({
+    type: 'error', schema_version: 1, request_id: 'f'.repeat(32),
+    operation_id: lastDownloadOperation, code: 'attachment_storage_busy',
+    message: 'Local capacity is currently unavailable.', retryable: true,
+    outcome: 'not_started'
+  });
+  source.emit({
+    type: 'attachment_offer', direction: 'incoming', from: '<peer>',
+    timestamp_ms: 1700000000150, name: 'retry.txt', kind: 'file', size: 1,
+    download_id: 'cccccccccccccccccccccccccccccccc'
+  });
+  card = el('feed').children[0];
+  const beforeRejected = downloadRequests.length;
+  card.children[3].click();
+  await settle(); await settle();
+  const rejectedFirstId = downloadRequests[beforeRejected].operation_id;
+  card.children[3].click();
+  await settle(); await settle();
+  const rejectedSecondId = downloadRequests
+    .slice(beforeRejected).filter((value) => value.command === 'download')[1].operation_id;
+  assert.notEqual(rejectedFirstId, rejectedSecondId, 'polled not_started did not rotate ID');
+
+  downloadStatusReply = async () => ({
+    type: 'error', schema_version: 1, request_id: 'e'.repeat(32),
+    operation_id: lastDownloadOperation, code: 'attachment_command_timeout',
+    message: 'The request timed out; reconcile before retrying.', retryable: true,
+    outcome: 'unknown'
+  });
+  source.emit({
+    type: 'attachment_offer', direction: 'incoming', from: '<peer>',
+    timestamp_ms: 1700000000175, name: 'unknown.txt', kind: 'file', size: 1,
+    download_id: 'dddddddddddddddddddddddddddddddd'
+  });
+  card = el('feed').children[0];
+  const beforeUnknown = downloadRequests.length;
+  card.children[3].click();
+  await settle(); await settle();
+  card.children[3].click();
+  await settle(); await settle();
+  const unknownStarts = downloadRequests.slice(beforeUnknown)
+    .filter((value) => value.command === 'download');
+  assert.equal(unknownStarts.length, 2);
+  assert.equal(unknownStarts[0].operation_id, unknownStarts[1].operation_id,
+    'unknown outcome did not retain ID for reconciliation');
+
+  // An adversarial not_started-looking record is not definitive unless its
+  // complete operation error envelope is strict.
+  downloadStatusReply = async () => ({
+    type: 'error', schema_version: 1, request_id: 'd'.repeat(32),
+    operation_id: lastDownloadOperation, code: 'attachment_storage_busy',
+    message: 'Local capacity is currently unavailable.', retryable: true,
+    outcome: 'not_started', injected: true
+  });
+  source.emit({
+    type: 'attachment_offer', direction: 'incoming', from: '<peer>',
+    timestamp_ms: 1700000000180, name: 'malformed.txt', kind: 'file', size: 1,
+    download_id: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+  });
+  card = el('feed').children[0];
+  const beforeMalformed = downloadRequests.length;
+  card.children[3].click();
+  await settle(); await settle();
+  card.children[3].click();
+  await settle(); await settle();
+  const malformedStarts = downloadRequests.slice(beforeMalformed)
+    .filter((value) => value.command === 'download');
+  assert.equal(malformedStarts[0].operation_id, malformedStarts[1].operation_id,
+    'malformed not_started response incorrectly rotated ID');
+
+  downloadStatusReply = async () => ({ type: 'download_ready', url: downloadedHref });
   source.emit({
     type: 'attachment_shared', direction: 'outgoing', from: 'local-peer',
     timestamp_ms: 1700000000200, name: 'results.tar', kind: 'directory_tar_v1', size: 4096

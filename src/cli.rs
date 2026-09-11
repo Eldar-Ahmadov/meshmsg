@@ -155,6 +155,9 @@ impl OfferDirection {
 pub enum OffersCommand {
     /// Remove local pins matching one offer ID; shared blob data stays while another tag references it
     Remove {
+        /// Retry-safe 128-bit operation ID (generated when omitted)
+        #[arg(long, value_parser = parse_operation_id)]
+        operation_id: Option<String>,
         #[arg(value_parser = parse_operation_id)]
         offer_id: String,
         #[arg(long, value_enum)]
@@ -165,6 +168,9 @@ pub enum OffersCommand {
     },
     /// Remove oldest pins at or beyond the retention boundary
     Prune {
+        /// Retry-safe 128-bit operation ID (generated when omitted)
+        #[arg(long, value_parser = parse_operation_id)]
+        operation_id: Option<String>,
         /// Override daemon retention age; zero selects every matching tag
         #[arg(long)]
         older_than_secs: Option<u64>,
@@ -309,6 +315,9 @@ pub enum Command {
     },
     /// Download an explicitly accepted attachment offer
     Download {
+        /// Retry-safe 128-bit operation ID (generated when omitted)
+        #[arg(long, value_parser = parse_operation_id)]
+        operation_id: Option<String>,
         #[command(flatten)]
         input: OfferInput,
         /// Destination path; existing paths are never overwritten

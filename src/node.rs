@@ -13,9 +13,11 @@ use crate::{
     ipc::{
         read_frame, send_request_checked, subscribe, subscribe_with_id, valid_content_digest,
         valid_operation_id, validate_success_payload, write_request_with_id, write_value,
-        BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1, SubscriptionReader,
-        ATTACHMENT_LIFECYCLE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, MAX_IPC_REQUEST_SIZE,
-        PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY,
+        AttachmentOperationKind, BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
+        SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY,
+        IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY,
+        MAX_IPC_REQUEST_SIZE, PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY,
+        WEB_SHARE_CAPABILITY,
     },
     peers::{
         self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
@@ -1309,7 +1311,7 @@ impl OperationCache {
         serde_json::json!({
             "type":"error", "schema_version":1, "code":code,
             "message":message, "operation_id":operation_id,
-            "retryable":false, "outcome":"not_started"
+            "retryable":code == "operation_capacity", "outcome":"not_started"
         })
     }
 
@@ -1421,6 +1423,22 @@ fn operation_fingerprint(kind: &str, fields: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn optional_text_fingerprint(value: Option<&str>) -> Vec<u8> {
+    match value {
+        Some(value) => [b"some\0".as_slice(), value.as_bytes()].concat(),
+        None => b"none".to_vec(),
+    }
+}
+
+fn optional_u64_fingerprint(value: Option<u64>) -> [u8; 9] {
+    let mut encoded = [0_u8; 9];
+    if let Some(value) = value {
+        encoded[0] = 1;
+        encoded[1..].copy_from_slice(&value.to_le_bytes());
+    }
+    encoded
+}
+
 enum DaemonCommand {
     Send {
         operation_id: String,
@@ -1449,12 +1467,14 @@ enum DaemonCommand {
         reply: oneshot::Sender<serde_json::Value>,
     },
     OffersRemove {
+        operation_id: String,
         offer_id: String,
         direction: Option<String>,
         provider: Option<String>,
         reply: oneshot::Sender<serde_json::Value>,
     },
     OffersPrune {
+        operation_id: String,
         older_than_secs: Option<u64>,
         direction: Option<String>,
         dry_run: bool,
@@ -1468,6 +1488,7 @@ enum DaemonCommand {
         reply: oneshot::Sender<serde_json::Value>,
     },
     Download {
+        operation_id: String,
         offer: String,
         output: PathBuf,
         raw_export: bool,
@@ -2465,7 +2486,11 @@ where
     let operation_id = match &request {
         IpcRequest::Send { operation_id, .. }
         | IpcRequest::PrivateSend { operation_id, .. }
-        | IpcRequest::Share { operation_id, .. } => Some(operation_id),
+        | IpcRequest::OffersRemove { operation_id, .. }
+        | IpcRequest::OffersPrune { operation_id, .. }
+        | IpcRequest::Share { operation_id, .. }
+        | IpcRequest::Download { operation_id, .. }
+        | IpcRequest::WebDownload { operation_id, .. } => Some(operation_id),
         _ => None,
     };
     if operation_id.is_some_and(|id| !valid_operation_id(id)) {
@@ -2642,16 +2667,17 @@ where
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::OffersRemove {
+            operation_id,
             offer_id,
             direction,
             provider,
         } => {
             let (reply, response) = oneshot::channel();
-            let response_offer_id = offer_id.clone();
             let value = lifecycle_command_response(
                 send_command(
                     &commands,
                     DaemonCommand::OffersRemove {
+                        operation_id: operation_id.clone(),
                         offer_id,
                         direction,
                         provider,
@@ -2660,13 +2686,14 @@ where
                     response,
                 ),
                 timeouts.list_command,
+                Some(operation_id),
                 None,
-                Some(response_offer_id),
             )
             .await;
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
         IpcRequest::OffersPrune {
+            operation_id,
             older_than_secs,
             direction,
             dry_run,
@@ -2677,6 +2704,7 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::OffersPrune {
+                        operation_id: operation_id.clone(),
                         older_than_secs,
                         direction,
                         dry_run,
@@ -2686,7 +2714,7 @@ where
                     response,
                 ),
                 timeouts.list_command,
-                None,
+                Some(operation_id),
                 None,
             )
             .await;
@@ -2717,12 +2745,17 @@ where
             .await;
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
-        IpcRequest::Download { offer, output } => {
+        IpcRequest::Download {
+            operation_id,
+            offer,
+            output,
+        } => {
             let (reply, response) = oneshot::channel();
             let value = lifecycle_command_response(
                 send_command(
                     &commands,
                     DaemonCommand::Download {
+                        operation_id: operation_id.clone(),
                         offer,
                         output,
                         raw_export: false,
@@ -2731,18 +2764,23 @@ where
                     response,
                 ),
                 timeouts.transfer_command,
-                None,
+                Some(operation_id),
                 None,
             )
             .await;
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
-        IpcRequest::WebDownload { offer, output } => {
+        IpcRequest::WebDownload {
+            operation_id,
+            offer,
+            output,
+        } => {
             let (reply, response) = oneshot::channel();
             let value = lifecycle_command_response(
                 send_command(
                     &commands,
                     DaemonCommand::Download {
+                        operation_id: operation_id.clone(),
                         offer,
                         output,
                         raw_export: true,
@@ -2751,7 +2789,7 @@ where
                     response,
                 ),
                 timeouts.transfer_command,
-                None,
+                Some(operation_id),
                 None,
             )
             .await;
@@ -3654,7 +3692,7 @@ impl AttachmentStorage {
         let projected_usage = unique_storage_usage(projected).0;
         if dry_run {
             return Ok(serde_json::json!({
-                "type":"offers_pruned", "schema_version":1, "dry_run":true,
+                "type":"offers_pruned", "schema_version":2, "dry_run":true,
                 "selected_tags":selected_names.len(), "removed_tags":0,
                 "released_bytes":before.saturating_sub(projected_usage),
                 "limited":limited, "cutoff_ms":cutoff
@@ -3764,7 +3802,7 @@ impl AttachmentStorage {
         self.recalculate_cached_status().await?;
         Ok(serde_json::json!({
             "type":if offer_id.is_some() { "offer_removed" } else { "offers_pruned" },
-            "schema_version":1, "dry_run":false,
+            "schema_version":2, "dry_run":false,
             "selected_tags":selected_names.len(), "removed_tags":removed.len(),
             "released_bytes":before.saturating_sub(self.status().tagged_bytes),
             "limited":limited, "cutoff_ms":cutoff
@@ -4193,6 +4231,55 @@ fn raw_ticket_blob_tag(ticket: &BlobTicket) -> String {
     )
 }
 
+pub(crate) fn download_request_context(
+    operation_id: &str,
+    token: &str,
+    output: &Path,
+    topic: TopicId,
+) -> Result<crate::ipc::DownloadRequestContext> {
+    let (offer_id, provider, kind, name, declared_size) =
+        match parse_signed_offer_token(token, topic) {
+            Ok((offer, ticket)) => (
+                offer.offer_id,
+                ticket.addr().id.to_string(),
+                match offer.kind {
+                    AttachmentKind::File => "file".to_owned(),
+                    AttachmentKind::DirectoryTarV1 => "directory_tar_v1".to_owned(),
+                },
+                offer.name,
+                Some(offer.size),
+            ),
+            Err(signed_error) => {
+                let ticket: BlobTicket = token.parse().map_err(|_| signed_error)?;
+                anyhow::ensure!(
+                    ticket.format() == BlobFormat::Raw,
+                    "only raw blob tickets are supported"
+                );
+                (
+                    raw_ticket_offer_id(&ticket),
+                    ticket.addr().id.to_string(),
+                    "file".to_owned(),
+                    output
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("attachment")
+                        .to_owned(),
+                    None,
+                )
+            }
+        };
+    Ok(crate::ipc::DownloadRequestContext {
+        operation_id: operation_id.to_owned(),
+        token_digest: crate::ipc::download_token_digest(token),
+        offer_id,
+        provider,
+        kind,
+        name,
+        declared_size,
+        output: output.to_path_buf(),
+    })
+}
+
 fn validate_declared_attachment_size(declared_size: Option<u64>, actual_size: u64) -> Result<()> {
     if let Some(declared_size) = declared_size {
         anyhow::ensure!(
@@ -4375,6 +4462,7 @@ async fn commit_download(
 async fn download_attachment(
     resources: DownloadResources,
     events: broadcast::Sender<serde_json::Value>,
+    operation_id: &str,
     offer_token: String,
     output: PathBuf,
     max_attachment_bytes: u64,
@@ -4389,6 +4477,7 @@ async fn download_attachment(
         lookup,
     } = resources;
     storage.preflight_free_space(0).await?;
+    let token_digest = crate::ipc::download_token_digest(&offer_token);
     anyhow::ensure!(
         !output.exists(),
         "output already exists: {}",
@@ -4493,7 +4582,8 @@ async fn download_attachment(
                                 || received_bytes == verified_size) =>
                     {
                         let _ = events.send(serde_json::json!({
-                            "type":"download_progress", "schema_version":1,
+                            "type":"download_progress", "schema_version":2,
+                            "operation_id":operation_id,
                             "received_bytes":received_bytes.min(verified_size),
                             "total_bytes":verified_size, "output":output
                         }));
@@ -4517,7 +4607,8 @@ async fn download_attachment(
     };
     if size == 0 {
         let _ = events.send(serde_json::json!({
-            "type":"download_progress", "schema_version":1,
+            "type":"download_progress", "schema_version":2,
+            "operation_id":operation_id,
             "received_bytes":0, "total_bytes":0, "output":output
         }));
     }
@@ -4584,7 +4675,8 @@ async fn download_attachment(
         }
     };
     Ok(serde_json::json!({
-        "type":"download_complete", "schema_version":1,
+        "type":"download_complete", "schema_version":2,
+        "operation_id":operation_id, "token_digest":token_digest,
         "offer_id":offer.offer_id, "kind":offer.kind,
         "name":offer.name, "size":size, "from":ticket.addr().id.to_string(),
         "output":output, "installed":true, "pinned":true,
@@ -4968,7 +5060,7 @@ pub async fn run_daemon(
                             "type":"connected", "peer":peer, "endpoint_online":true,
                             "topic_joined":node.receiver.is_joined(),
                             "alias":alias_config.effective(),
-                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY]
+                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY]
                         });
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
@@ -5156,7 +5248,7 @@ pub async fn run_daemon(
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY],
+                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY],
                         "operation_cache_capacity":OPERATION_CACHE_CAPACITY,
                         "operation_cache_ttl_ms":OPERATION_CACHE_TTL.as_millis() as u64,
                         "operation_cache_persistent":false,
@@ -5208,7 +5300,18 @@ pub async fn run_daemon(
                         let _ = reply.send(response);
                     });
                 }
-                Some(DaemonCommand::OffersRemove { offer_id, direction, provider, reply }) => {
+                Some(DaemonCommand::OffersRemove { operation_id, offer_id, direction, provider, reply }) => {
+                    let direction_fingerprint = optional_text_fingerprint(direction.as_deref());
+                    let provider_fingerprint = optional_text_fingerprint(provider.as_deref());
+                    let fingerprint = operation_fingerprint(
+                        "offers_remove",
+                        &[offer_id.as_bytes(), &direction_fingerprint, &provider_fingerprint],
+                    );
+                    if !operation_cache.lock().expect("operation cache poisoned").admit(
+                        operation_id.clone(), fingerprint, reply, StdInstant::now()
+                    ) {
+                        continue;
+                    }
                     let valid_direction = direction.as_deref().is_none_or(|value| matches!(value, "incoming" | "outgoing"));
                     let provider = match provider {
                         Some(value) => match value.parse::<PublicKey>() {
@@ -5218,8 +5321,10 @@ pub async fn run_daemon(
                                     "invalid_offer_selector", "provider must be a canonical public key",
                                     "not_started", false,
                                 );
+                                error.operation_id = Some(operation_id.clone());
                                 error.offer_id = Some(offer_id.clone());
-                                let _ = reply.send(error.into_value());
+                                operation_cache.lock().expect("operation cache poisoned").complete(
+                                    &operation_id, error.into_value(), StdInstant::now());
                                 continue;
                             }
                         },
@@ -5230,42 +5335,66 @@ pub async fn run_daemon(
                             "invalid_offer_selector", "offer ID or direction is invalid",
                             "not_started", false,
                         );
+                        error.operation_id = Some(operation_id.clone());
                         if contracts::valid_operation_id(&offer_id) { error.offer_id = Some(offer_id.clone()); }
-                        let _ = reply.send(error.into_value());
+                        operation_cache.lock().expect("operation cache poisoned").complete(
+                            &operation_id, error.into_value(), StdInstant::now());
                         continue;
                     }
                     let storage = attachment_storage.clone();
+                    let operation_cache = operation_cache.clone();
                     offer_list_tasks.spawn(async move {
                         let response = match storage.remove(
                             Some(&offer_id), direction.as_deref(), provider.as_deref(), None,
                             MAX_PRUNE_TAGS, false,
                         ).await {
                             Ok(value) => value,
-                            Err(error) => storage_operation_error("offers_remove_failed", &error, false, None, Some(&offer_id)),
+                            // Only selector and partial-removal errors are offer-specific.
+                            // Generic capacity/storage failures remain operation-bound.
+                            Err(error) => storage_operation_error("offers_remove_failed", &error, false, Some(&operation_id), None),
                         };
-                        let _ = reply.send(response);
+                        operation_cache.lock().expect("operation cache poisoned").complete(
+                            &operation_id, response, StdInstant::now());
                     });
                 }
-                Some(DaemonCommand::OffersPrune { older_than_secs, direction, dry_run, max_delete, reply }) => {
+                Some(DaemonCommand::OffersPrune { operation_id, older_than_secs, direction, dry_run, max_delete, reply }) => {
+                    let age_fingerprint = optional_u64_fingerprint(older_than_secs);
+                    let direction_fingerprint = optional_text_fingerprint(direction.as_deref());
+                    let dry_run_fingerprint = [u8::from(dry_run)];
+                    let maximum_fingerprint = max_delete.to_le_bytes();
+                    let fingerprint = operation_fingerprint(
+                        "offers_prune",
+                        &[&age_fingerprint, &direction_fingerprint, &dry_run_fingerprint, &maximum_fingerprint],
+                    );
+                    if !operation_cache.lock().expect("operation cache poisoned").admit(
+                        operation_id.clone(), fingerprint, reply, StdInstant::now()
+                    ) {
+                        continue;
+                    }
                     if !direction.as_deref().is_none_or(|value| matches!(value, "incoming" | "outgoing"))
                         || !(1..=MAX_PRUNE_TAGS).contains(&max_delete)
                     {
-                        let _ = reply.send(LifecycleErrorV1::new(
+                        let mut error = LifecycleErrorV1::new(
                             "invalid_prune_request", "prune direction or maximum is invalid",
                             "not_started", false,
-                        ).into_value());
+                        );
+                        error.operation_id = Some(operation_id.clone());
+                        operation_cache.lock().expect("operation cache poisoned").complete(
+                            &operation_id, error.into_value(), StdInstant::now());
                         continue;
                     }
                     let age = older_than_secs.unwrap_or(attachment_retention_secs);
                     let storage = attachment_storage.clone();
+                    let operation_cache = operation_cache.clone();
                     offer_list_tasks.spawn(async move {
                         let response = match storage.remove(
                             None, direction.as_deref(), None, Some(age), max_delete, dry_run,
                         ).await {
                             Ok(value) => value,
-                            Err(error) => storage_operation_error("offers_prune_failed", &error, false, None, None),
+                            Err(error) => storage_operation_error("offers_prune_failed", &error, false, Some(&operation_id), None),
                         };
-                        let _ = reply.send(response);
+                        operation_cache.lock().expect("operation cache poisoned").complete(
+                            &operation_id, response, StdInstant::now());
                     });
                 }
                 Some(DaemonCommand::Share { operation_id, source_digest, path, reply }) => {
@@ -5326,7 +5455,7 @@ pub async fn run_daemon(
                             Err(_) => {
                                 let mut error = LifecycleErrorV1::new(
                                     "attachment_storage_shutdown", "attachment storage is shutting down",
-                                    "not_started", true,
+                                    "unknown", true,
                                 );
                                 error.operation_id = Some(operation_id.clone());
                                 error.into_value()
@@ -5345,16 +5474,28 @@ pub async fn run_daemon(
                         }
                     });
                 }
-                Some(DaemonCommand::Download { offer, output, raw_export, reply }) => {
+                Some(DaemonCommand::Download { operation_id, offer, output, raw_export, reply }) => {
+                    let fingerprint = operation_fingerprint(
+                        if raw_export { "web_download" } else { "download" },
+                        &[offer.as_bytes(), output.as_os_str().as_encoded_bytes()],
+                    );
+                    if !operation_cache.lock().expect("operation cache poisoned").admit(
+                        operation_id.clone(), fingerprint, reply, StdInstant::now()
+                    ) {
+                        continue;
+                    }
                     let permit = match try_admit_transfer(
                         &transfer_limit, "download_busy", "attachment transfer capacity reached"
                     ) {
                         Ok(permit) => permit,
                         Err(_) => {
-                            let _ = reply.send(LifecycleErrorV1::new(
+                            let mut error = LifecycleErrorV1::new(
                                 "attachment_storage_busy", "attachment transfer capacity reached",
                                 "not_started", true,
-                            ).into_value());
+                            );
+                            error.operation_id = Some(operation_id.clone());
+                            operation_cache.lock().expect("operation cache poisoned").complete(
+                                &operation_id, error.into_value(), StdInstant::now());
                             continue;
                         }
                     };
@@ -5364,12 +5505,13 @@ pub async fn run_daemon(
                     let endpoint = node.endpoint.clone();
                     let lookup = node.lookup.clone();
                     let events = event_tx.clone();
+                    let operation_cache = operation_cache.clone();
                     transfer_tasks.spawn(async move {
                         let _permit = permit;
                         let storage_permit = storage.gate.clone().acquire_owned().await;
                         let response = match storage_permit {
                             Ok(_storage_permit) => {
-                        let started = serde_json::json!({"type":"download_started", "schema_version":1, "output":output});
+                        let started = serde_json::json!({"type":"download_started", "schema_version":2, "operation_id":operation_id, "output":output});
                         let _ = events.send(started);
                         match download_attachment(
                             DownloadResources {
@@ -5381,24 +5523,30 @@ pub async fn run_daemon(
                                 lookup,
                             },
                             events.clone(),
+                            &operation_id,
                             offer,
                             output,
                             max_attachment_bytes,
                             raw_export,
                         ).await {
                             Ok(value) => value,
-                            Err(error) => storage_operation_error("download_failed", &error, false, None, None),
+                            Err(error) => storage_operation_error("download_failed", &error, false, Some(&operation_id), None),
                         }
                             }
-                            Err(_) => LifecycleErrorV1::new(
-                                "attachment_storage_shutdown", "attachment storage is shutting down",
-                                "not_started", true,
-                            ).into_value(),
+                            Err(_) => {
+                                let mut error = LifecycleErrorV1::new(
+                                    "attachment_storage_shutdown", "attachment storage is shutting down",
+                                    "unknown", true,
+                                );
+                                error.operation_id = Some(operation_id.clone());
+                                error.into_value()
+                            },
                         };
+                        let response = operation_cache.lock().expect("operation cache poisoned")
+                            .complete(&operation_id, response, StdInstant::now());
                         if response["type"] == "download_complete" {
-                            let _ = events.send(response.clone());
+                            let _ = events.send(response);
                         }
-                        let _ = reply.send(response);
                     });
                 }
                 Some(DaemonCommand::Stop) => break,
@@ -5962,7 +6110,8 @@ pub async fn share(
         },
         "attachment_shared",
         3,
-        Some(&operation_id),
+        AttachmentOperationKind::Share,
+        &operation_id,
         None,
     )
     .await
@@ -6010,20 +6159,18 @@ async fn send_lifecycle_request(
     request: &IpcRequest,
     expected_type: &str,
     expected_schema_version: u64,
-    expected_operation_id: Option<&str>,
+    operation_kind: AttachmentOperationKind,
+    expected_operation_id: &str,
     expected_offer_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let value = crate::ipc::send_request(dir, request).await?;
     if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
-        let error = LifecycleErrorV1::from_value(&value)?;
-        anyhow::ensure!(
-            expected_operation_id.is_none_or(|id| error.operation_id.as_deref() == Some(id)),
-            "daemon lifecycle error operation ID does not match the request"
-        );
-        anyhow::ensure!(
-            expected_offer_id.is_none_or(|id| error.offer_id.as_deref() == Some(id)),
-            "daemon lifecycle error offer ID does not match the request"
-        );
+        let error = crate::ipc::validate_lifecycle_error_for_request(
+            &value,
+            operation_kind,
+            expected_operation_id,
+            expected_offer_id,
+        )?;
         return Err(anyhow::Error::new(contracts::ContractFailure(error)));
     }
     crate::ipc::validate_response(&value, expected_type, Some(expected_schema_version))?;
@@ -6032,62 +6179,78 @@ async fn send_lifecycle_request(
 
 pub async fn offers_remove(
     dir: &Path,
+    operation_id: Option<String>,
     offer_id: &str,
     direction: Option<&str>,
     provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
+    let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
     anyhow::ensure!(
-        advertises_capability(&status, ATTACHMENT_LIFECYCLE_CAPABILITY),
-        "daemon does not advertise attachment lifecycle IPC; upgrade and restart the daemon"
+        advertises_capability(&status, ATTACHMENT_LIFECYCLE_CAPABILITY)
+            && advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
+        "daemon does not advertise retry-safe attachment lifecycle IPC; upgrade and restart the daemon (operation was not submitted)"
     );
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::OffersRemove {
+            operation_id: operation_id.clone(),
             offer_id: offer_id.to_owned(),
             direction: direction.map(str::to_owned),
             provider: provider.map(str::to_owned),
         },
         "offer_removed",
-        1,
-        None,
+        2,
+        AttachmentOperationKind::Remove,
+        &operation_id,
         Some(offer_id),
     )
     .await?;
-    validate_lifecycle_response(&value, "offer_removed")?;
+    validate_lifecycle_response(
+        &value,
+        "offer_removed",
+        &operation_id,
+        false,
+        MAX_PRUNE_TAGS,
+    )?;
     event(json, value);
     Ok(())
 }
 
 pub async fn offers_prune(
     dir: &Path,
+    operation_id: Option<String>,
     older_than_secs: Option<u64>,
     direction: Option<&str>,
     dry_run: bool,
     max_delete: usize,
     json: bool,
 ) -> Result<()> {
+    let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
     anyhow::ensure!(
-        advertises_capability(&status, ATTACHMENT_LIFECYCLE_CAPABILITY),
-        "daemon does not advertise attachment lifecycle IPC; upgrade and restart the daemon"
+        advertises_capability(&status, ATTACHMENT_LIFECYCLE_CAPABILITY)
+            && advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
+        "daemon does not advertise retry-safe attachment lifecycle IPC; upgrade and restart the daemon (operation was not submitted)"
     );
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::OffersPrune {
+            operation_id: operation_id.clone(),
             older_than_secs,
             direction: direction.map(str::to_owned),
             dry_run,
             max_delete,
         },
         "offers_pruned",
-        1,
-        None,
+        2,
+        AttachmentOperationKind::Prune,
+        &operation_id,
         None,
     )
     .await?;
-    validate_lifecycle_response(&value, "offers_pruned")?;
+    validate_lifecycle_response(&value, "offers_pruned", &operation_id, dry_run, max_delete)?;
     event(json, value);
     Ok(())
 }
@@ -6099,6 +6262,7 @@ struct LifecycleResponse {
     kind: String,
     schema_version: u8,
     request_id: String,
+    operation_id: String,
     dry_run: bool,
     selected_tags: usize,
     removed_tags: usize,
@@ -6107,11 +6271,20 @@ struct LifecycleResponse {
     cutoff_ms: Option<u64>,
 }
 
-fn validate_lifecycle_response(value: &serde_json::Value, expected: &str) -> Result<()> {
+fn validate_lifecycle_response(
+    value: &serde_json::Value,
+    expected: &str,
+    operation_id: &str,
+    expected_dry_run: bool,
+    maximum_selected: usize,
+) -> Result<()> {
     let response: LifecycleResponse = serde_json::from_value(value.clone())
         .context("daemon returned an invalid attachment lifecycle response")?;
     anyhow::ensure!(
-        response.kind == expected && response.schema_version == 1,
+        response.kind == expected
+            && response.schema_version == 2
+            && response.operation_id == operation_id
+            && response.dry_run == expected_dry_run,
         "daemon returned an invalid attachment lifecycle response"
     );
     anyhow::ensure!(
@@ -6119,7 +6292,9 @@ fn validate_lifecycle_response(value: &serde_json::Value, expected: &str) -> Res
         "daemon lifecycle response request ID is invalid"
     );
     anyhow::ensure!(
-        response.removed_tags <= response.selected_tags,
+        response.removed_tags <= response.selected_tags
+            && response.selected_tags <= maximum_selected
+            && (!response.dry_run || response.removed_tags == 0),
         "daemon returned impossible attachment lifecycle counts"
     );
     let _ = (
@@ -6131,27 +6306,54 @@ fn validate_lifecycle_response(value: &serde_json::Value, expected: &str) -> Res
     Ok(())
 }
 
-pub async fn download(dir: &Path, offer: &str, output: &Path, json: bool) -> Result<()> {
+pub async fn download(
+    dir: &Path,
+    operation_id: Option<String>,
+    offer: &str,
+    output: &Path,
+    json: bool,
+) -> Result<()> {
+    let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
+    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    anyhow::ensure!(
+        advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
+        "daemon does not advertise retry-safe downloads; upgrade and restart the daemon (operation was not submitted)"
+    );
     // Retain the exact absolute representation submitted to the daemon. Do not
     // canonicalize through symlinks or require the not-yet-created destination.
     let requested_output = caller_path(output)?;
+    let topic_bytes: [u8; 32] = data_encoding::HEXLOWER
+        .decode(
+            status["topic"]
+                .as_str()
+                .context("daemon status omitted its topic")?
+                .as_bytes(),
+        )
+        .context("daemon status topic is invalid")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("daemon status topic has the wrong length"))?;
+    let expected = download_request_context(
+        &operation_id,
+        offer,
+        &requested_output,
+        TopicId::from_bytes(topic_bytes),
+    )
+    .context("validate submitted attachment offer")?;
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::Download {
+            operation_id: operation_id.clone(),
             offer: offer.to_owned(),
             output: requested_output.clone(),
         },
         "download_complete",
-        1,
-        None,
+        2,
+        AttachmentOperationKind::Download,
+        &operation_id,
         None,
     )
     .await?;
-    let completed = crate::ipc::DownloadCompleteV1::from_value(&value)?;
-    anyhow::ensure!(
-        completed.output().as_os_str() == requested_output.as_os_str(),
-        "daemon download response output does not exactly match the submitted path representation"
-    );
+    crate::ipc::DownloadCompleteV2::validate_for_request(&value, &expected)?;
     event(json, value);
     Ok(())
 }
@@ -7538,6 +7740,60 @@ mod tests {
         let fp1 = operation_fingerprint("send", &[b"one"]);
         let different = operation_fingerprint("send", &[b"different"]);
 
+        // IDs are global across kinds and every lifecycle/download selector is
+        // represented without Option ambiguity or path/token normalization.
+        assert_ne!(fp1, operation_fingerprint("download", &[b"one"]));
+        assert_ne!(
+            operation_fingerprint(
+                "offers_remove",
+                &[
+                    b"offer",
+                    &optional_text_fingerprint(None),
+                    &optional_text_fingerprint(None)
+                ],
+            ),
+            operation_fingerprint(
+                "offers_remove",
+                &[
+                    b"offer",
+                    &optional_text_fingerprint(Some("incoming")),
+                    &optional_text_fingerprint(None),
+                ],
+            )
+        );
+        assert_ne!(
+            operation_fingerprint(
+                "offers_prune",
+                &[
+                    &optional_u64_fingerprint(None),
+                    &optional_text_fingerprint(None),
+                    &[0],
+                    &1_usize.to_le_bytes(),
+                ],
+            ),
+            operation_fingerprint(
+                "offers_prune",
+                &[
+                    &optional_u64_fingerprint(Some(0)),
+                    &optional_text_fingerprint(None),
+                    &[0],
+                    &1_usize.to_le_bytes(),
+                ],
+            )
+        );
+        assert_ne!(
+            operation_fingerprint("download", &[b"token", b"/tmp/one"]),
+            operation_fingerprint("download", &[b"token", b"/tmp/two"]),
+        );
+        assert_ne!(
+            operation_fingerprint("download", &[b"token", b"/tmp/one"]),
+            operation_fingerprint("download", &[b"changed-token", b"/tmp/one"]),
+        );
+        assert_ne!(
+            operation_fingerprint("download", &[b"token", b"/tmp/one"]),
+            operation_fingerprint("web_download", &[b"token", b"/tmp/one"]),
+        );
+
         let (reply1, response1) = oneshot::channel();
         assert!(cache.admit(id1.into(), fp1, reply1, now));
         let (duplicate, duplicate_response) = oneshot::channel();
@@ -7559,6 +7815,38 @@ mod tests {
         let (cached, cached_response) = oneshot::channel();
         assert!(!cache.admit(id1.into(), fp1, cached, now));
         assert_eq!(cached_response.await.unwrap(), stored);
+
+        let partial = serde_json::json!({
+            "type":"download_complete", "schema_version":2,
+            "destination_synced":false, "cleanup_complete":false,
+            "warnings":["sync warning"]
+        });
+        let partial_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let partial_fp = operation_fingerprint("download", &[b"token", b"output"]);
+        let mut partial_cache = OperationCache::new(2, Duration::from_secs(10));
+        let (partial_reply, partial_response) = oneshot::channel();
+        assert!(partial_cache.admit(partial_id.into(), partial_fp, partial_reply, now));
+        let partial = partial_cache.complete(partial_id, partial, now);
+        assert_eq!(partial_response.await.unwrap(), partial);
+        let (partial_retry, partial_retry_response) = oneshot::channel();
+        assert!(!partial_cache.admit(partial_id.into(), partial_fp, partial_retry, now));
+        assert_eq!(partial_retry_response.await.unwrap(), partial);
+
+        let removal_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let removal_fp = operation_fingerprint("offers_remove", &[b"selector"]);
+        let (removal_reply, removal_response) = oneshot::channel();
+        assert!(partial_cache.admit(removal_id.into(), removal_fp, removal_reply, now));
+        let mut removal_error =
+            LifecycleErrorV1::new("attachment_removal_partial", "private", "partial", true);
+        removal_error.offer_id = Some("cccccccccccccccccccccccccccccccc".into());
+        removal_error.selected_tags = Some(2);
+        removal_error.removed_tags = Some(1);
+        removal_error.quota_bytes_released = Some(4);
+        let removal = partial_cache.complete(removal_id, removal_error.into_value(), now);
+        assert_eq!(removal_response.await.unwrap(), removal);
+        let (removal_retry, removal_retry_response) = oneshot::channel();
+        assert!(!partial_cache.admit(removal_id.into(), removal_fp, removal_retry, now));
+        assert_eq!(removal_retry_response.await.unwrap(), removal);
 
         let fp2 = operation_fingerprint("send", &[b"two"]);
         let (reply2, _response2) = oneshot::channel();
@@ -7722,6 +8010,22 @@ mod tests {
         let (decoded, ticket) = parse_signed_offer_token(&token, test_topic()).unwrap();
         assert_eq!(decoded, offer);
         assert_eq!(ticket.addr().id, secret.public());
+        let context = download_request_context(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &token,
+            Path::new("/tmp/report.txt"),
+            test_topic(),
+        )
+        .unwrap();
+        assert_eq!(context.offer_id, offer.offer_id);
+        assert_eq!(context.provider, secret.public().to_string());
+        assert_eq!(context.kind, "file");
+        assert_eq!(context.name, "report.txt");
+        assert_eq!(context.declared_size, Some(6));
+        assert_eq!(
+            context.token_digest,
+            crate::ipc::download_token_digest(&token)
+        );
         validate_attachment_event(
             Some(test_topic()),
             Some(42),

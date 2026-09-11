@@ -20,8 +20,11 @@ request's ID.
 An `operation_id` has the same lexical representation but a different meaning: it
 identifies a retry-safe mutation and may be reused only for an identical mutation.
 It is never generated from, compared with, or substituted for `request_id`.
-Different retries have different request IDs and the same operation ID. Attachment
-`offer_id` and signed message IDs retain their documented operation identity.
+Different retries have different request IDs and the same operation ID. `send`,
+`private_send`, `share`, `offers_remove`, `offers_prune`, `download`, and
+`web_download` all require an operation ID. Attachment `offer_id` and signed
+message IDs retain their separate documented operation identity; a download's
+operation ID is not its offer ID.
 
 ## Error envelope
 
@@ -32,7 +35,7 @@ Every machine-readable application error is:
   "type": "error",
   "schema_version": 1,
   "code": "daemon_offline",
-  "message": "Command failed.",
+  "message": "Daemon is offline.",
   "retryable": true,
   "outcome": "not_started",
   "request_id": "0123456789abcdef0123456789abcdef"
@@ -136,8 +139,9 @@ IPC success/event families are:
 - messaging: `queued` v3, `private_accepted` v3, `message` v2,
   `private_message` v1;
 - attachment: `attachment_offer` v2, `attachment_shared` v3, `offers` v1,
-  `offer_removed`/`offers_pruned` v1, `download_started`/`download_progress`/
-  `download_complete` v1;
+  `offer_removed`/`offers_pruned` v2, `download_started`/`download_progress`/
+  `download_complete` v2 (all lifecycle/download v2 records carry their
+  operation ID);
 - benchmark: send `started`, `progress`, and `summary` v2; receive `started`,
   `progress`, and `summary` v1 (one explicit request ID is preserved across each
   complete benchmark stream);
@@ -150,8 +154,19 @@ only on owner-authenticated IPC; HTTP never accepts or returns such paths.
 ## HTTP and SSE
 
 `POST /api/request` uses the same strict outer shape as IPC, with its `request`
-restricted to `send`, `status`, `peers`, `download`, and `download_status`. Unknown
-fields and duplicate keys fail closed. `POST /api/attachment` carries request and
+restricted to `send`, `status`, `peers`, `download`, and `download_status`.
+A download start carries a client-generated operation ID; its returned polling ID
+is that same ID, so response-loss retries and every poll retain one identity.
+`download_started`, `download_pending`, and `download_ready` repeat that exact ID;
+a ready URL is exactly `/api/download/<operation-id>` without alternate encoding,
+query, or fragment. Web admission atomically binds that ID to one immutable offer, owner task, and output;
+concurrent exact starts join and changed offers conflict. Unknown polled outcomes
+stop polling but retain the ID for at most three total same-ID preparation attempts;
+strict `not_started` polling errors rotate the next user attempt to a new ID. If a
+retained unknown operation cannot enter reconciliation because local download
+capacity or staging is unavailable, the bridge replays the retained unknown state
+rather than manufacturing a definite rejection; a later same-ID attempt can still
+recover daemon-cached success. Unknown fields and duplicate keys fail closed. `POST /api/attachment` carries request and
 operation IDs in separate headers. Every JSON response has `type`, exact
 `schema_version`, and `request_id`; every HTTP response also has
 `X-Meshmsg-Request-Id`. Binary downloads carry the header but no synthetic JSON.
@@ -180,8 +195,39 @@ This is an intentional local-API compatibility boundary. New daemons advertise
 require exact correlated replies. Old unversioned clients are rejected; new clients
 reject old uncorrelated replies before any payload is consumed. There is no
 permissive downgrade or field defaulting. Operators must upgrade and restart the
-CLI, web bridge, and daemon together. Network gossip/direct protocol compatibility
-and mutation idempotency/lifecycle semantics are unchanged.
+CLI, web bridge, and daemon together. Attachment lifecycle/download clients also
+require `idempotent_attachment_operations_v1` before submission; an older daemon
+therefore cannot silently interpret an operation without its identity. Network
+gossip/direct protocol compatibility is unchanged.
+
+The shared daemon cache admits at most 1,024 completed plus in-flight operations.
+Matching concurrent requests join one execution. A terminal success, failure, or
+post-install partial success is replayed exactly for ten minutes from completion;
+oldest terminal entries can be evicted under pressure, while in-flight entries are
+never evicted. IDs are global across operation kinds. Fingerprints bind kind and
+exact inputs: message/recipient/body, share path/content digest, lifecycle selectors,
+age/dry-run/limit, and download token plus exact output OS representation. Changed
+input returns `operation_id_conflict` without work. For prune, the cached terminal
+record is the authoritative original selected set/result, so a retry cannot consume
+the next batch and `max_delete` bounds one operation. For remove, an exact retry
+replays the original counts rather than recomputing the already-achieved end state.
+For download, replay occurs before the no-clobber check and prevents duplicate
+network/export/install work. `download_complete` v2 includes a domain-separated
+SHA-256 digest of the exact submitted token; one shared CLI/web request-aware
+validator binds operation ID, token identity, offer ID, provider, kind, name,
+signed declared size when present, and exact output representation. A cached partial-success `download_complete` remains a
+success; callers inspect durability warnings rather than retrying the installed
+path. Once the memory-only entry expires, is evicted, or the daemon restarts, the
+retry guarantee ends: a retry is a new execution and an existing output fails closed
+without clobbering. Status exposes these bounds and `operation_cache_persistent:false`. Unit tests
+exercise synthetic expiry and pressure eviction deterministically; integrations
+exercise real response loss and daemon restart, not a ten-minute wall-clock wait.
+
+Attachment operation errors are additionally request-kind-aware. Share, remove,
+prune, download, and web-download each admit only their documented code set with
+canonical fixed message, outcome, retryability, operation ID, offer-ID applicability,
+and partial-removal accounting. A structurally valid error from another operation
+kind is rejected as an invalid daemon response.
 
 Adding optional fields still requires a new family version because DTOs deny unknown
 fields. A future transport version must use a new capability token, negotiate before

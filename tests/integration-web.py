@@ -72,7 +72,7 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
         initial_path = self.fixture_root / 'incoming.txt'
-        initial_path.write_bytes(b'i' * 1536)
+        initial_path.write_bytes(b'browser attachment payload\n')
         self.initial_offer = self.signed_event(
             initial_path, '0123456789abcdef0123456789abcdef', incoming=True,
             label='private-token')
@@ -163,7 +163,8 @@ class Handler(socketserver.StreamRequestHandler):
                 self.wfile.flush()
 
             if value['command'] == 'status':
-                capabilities = ['peer_directory_v2', 'web_share_v1']
+                capabilities = ['peer_directory_v2', 'web_share_v1',
+                                'idempotent_attachment_operations_v1']
                 if self.server.idempotency_capability:
                     capabilities.append('idempotent_mutations_v1')
                 capabilities.append('typed_contracts_v1')
@@ -198,15 +199,17 @@ class Handler(socketserver.StreamRequestHandler):
                 if label == 'retry-token' and self.server.web_download_attempts[label] == 1:
                     emit({'type': 'error', 'schema_version': 1,
                           'code': 'attachment_storage_busy',
+                          'operation_id': value['operation_id'],
                           'message': 'Local capacity is currently unavailable.',
                           'outcome': 'not_started', 'retryable': True})
                     return
                 output = pathlib.Path(value['output'])
-                if label == 'late-token':
+                if (label == 'late-token'
+                        and self.server.web_download_attempts[label] == 1):
                     def late_export():
                         time.sleep(.3)
                         output.parent.mkdir(parents=True, exist_ok=True)
-                        output.write_bytes(b'late daemon export\n')
+                        output.write_bytes(b'browser attachment payload\n')
                     threading.Thread(target=late_export, daemon=True).start()
                     return  # Accepted, but IPC reply is lost before completion.
 
@@ -216,12 +219,18 @@ class Handler(socketserver.StreamRequestHandler):
                 if label == 'missing-schema-token':
                     emit({'type': 'download_complete', '_omit_schema': True})
                 elif label == 'wrong-schema-token':
-                    emit({'type': 'download_complete', 'schema_version': 2})
+                    emit({'type': 'download_complete', 'schema_version': 1})
                 elif label == 'malformed-schema-token':
-                    emit({'type': 'download_complete', 'schema_version': '1'})
+                    emit({'type': 'download_complete', 'schema_version': '2'})
                 else:
                     signed = self.server.offer_events[offer]
-                    emit({'type': 'download_complete', 'schema_version': 1,
+                    token_bytes = offer.encode()
+                    token_digest = hashlib.sha256(
+                        b'meshmsg-download-token-v1\0'
+                        + len(token_bytes).to_bytes(8, 'little') + token_bytes).hexdigest()
+                    emit({'type': 'download_complete', 'schema_version': 2,
+                          'operation_id': value['operation_id'],
+                          'token_digest': token_digest,
                           'offer_id': signed['offer_id'],
                           'name': signed['name'], 'kind': signed['kind'],
                           'size': output.stat().st_size, 'from': signed['from'],
@@ -290,7 +299,10 @@ class Handler(socketserver.StreamRequestHandler):
                     return  # The terminal outcome is cached but this reply is lost.
                 emit(outcome)
             elif value['command'] == 'subscribe':
-                capabilities = ['web_download_v1'] if self.server.web_download_capability else []
+                capabilities = (
+                    ['web_download_v1', 'idempotent_attachment_operations_v1']
+                    if self.server.web_download_capability else []
+                )
                 emit({'type': 'connected', 'peer': SELF_KEY,
                       'endpoint_online': not self.server.malformed_handshake,
                       'topic_joined': True, 'alias': 'local-node',
@@ -593,7 +605,7 @@ def main():
                         'message_id': '0123456789abcdef0123456789abcdef',
                         'direction': 'incoming', 'from': signed_provider,
                         'timestamp_ms': daemon.initial_offer['timestamp_ms'],
-                        'name': 'incoming.txt', 'kind': 'file', 'size': 1536}
+                        'name': 'incoming.txt', 'kind': 'file', 'size': 27}
                     assert daemon.initial_offer['offer'] not in json.dumps(attachment)
                     value = next_event(response)
                     assert value['type'] == 'message' and '\ndata: injected' in value['body']
@@ -752,17 +764,38 @@ def main():
                 assert pathlib.Path(mismatch_request['path']).exists(), \
                     'unknown malformed share outcome was not retained for race-safe cleanup'
 
-                code, started = api({'command': 'download', 'id': incoming_download_ids[0]})
-                assert code == 202 and started['type'] == 'download_started'
-                assert started['poll_timeout_ms'] == 71 * 60 * 1000
+                download_operation = '40000000000000000000000000000001'
+                start_barrier = threading.Barrier(3)
+                concurrent_starts = []
+                def concurrent_start():
+                    start_barrier.wait()
+                    concurrent_starts.append(api({
+                        'command': 'download', 'id': incoming_download_ids[0],
+                        'operation_id': download_operation}))
+                start_threads = [threading.Thread(target=concurrent_start) for _ in range(2)]
+                for thread in start_threads:
+                    thread.start()
+                start_barrier.wait()
+                for thread in start_threads:
+                    thread.join()
+                assert len(concurrent_starts) == 2
+                assert all(code == 202 and value['type'] == 'download_started'
+                           for code, value in concurrent_starts)
+                assert concurrent_starts[0][1]['id'] == concurrent_starts[1][1]['id']
+                code, started = concurrent_starts[0]
+                assert (started['operation_id'] == started['id'] == download_operation
+                        and started['poll_timeout_ms'] == 71 * 60 * 1000)
                 deadline = time.monotonic() + 5
                 while True:
                     code, download = api({'command': 'download_status', 'id': started['id']})
                     if download.get('type') == 'download_ready':
                         break
-                    assert code == 200 and download['type'] == 'download_pending'
+                    assert (code == 200 and download['type'] == 'download_pending'
+                            and download['operation_id'] == download['id'] == download_operation)
                     assert time.monotonic() < deadline, 'web download did not become ready'
                     time.sleep(.01)
+                assert (download['operation_id'] == download['id'] == download_operation
+                        and download['url'] == f'/api/download/{download_operation}')
                 interrupted = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
                 interrupted.request('GET', download['url'])
                 interrupted_response = interrupted.getresponse()
@@ -785,11 +818,18 @@ def main():
                 assert range_headers['content-range'] == f'bytes 8-17/{len(payload)}'
                 assert range_headers['accept-ranges'] == 'bytes'
                 web_download = next(value for value in daemon.requests if value['command'] == 'web_download')
-                assert set(web_download) == {'command', 'offer', 'output'}
+                assert set(web_download) == {'command', 'operation_id', 'offer', 'output'}
+                assert web_download['operation_id'] == download_operation
                 assert daemon.offer_labels[web_download['offer']] == 'private-token'
                 output_path = pathlib.Path(web_download['output'])
                 assert output_path.parent.parent == root / 'web-downloads-v2'
                 assert output_path.exists(), 'retryable ready file was removed after serving'
+                duplicate_code, duplicate_started = api({
+                    'command': 'download', 'id': incoming_download_ids[0],
+                    'operation_id': download_operation})
+                assert duplicate_code == 202 and duplicate_started['id'] == started['id']
+                assert daemon.web_download_attempts['private-token'] == 1, \
+                    'duplicate browser start repeated daemon export work'
 
                 retry_offer = daemon.fixture_offer(
                     'retry.txt', '30000000000000000000000000000001',
@@ -798,7 +838,15 @@ def main():
                 retry_ids = []
                 for response in [feed, other_tab]:
                     retry_ids.append(next_event(response)['download_id'])
-                code, first_retry = api({'command': 'download', 'id': retry_ids[0]})
+                conflict_code, conflict = api({
+                    'command': 'download', 'id': retry_ids[0],
+                    'operation_id': download_operation})
+                assert conflict_code == 409 and conflict['code'] == 'operation_id_conflict'
+                assert conflict['operation_id'] == download_operation
+                assert daemon.web_download_attempts.get('retry-token', 0) == 0
+                retry_operation = '40000000000000000000000000000002'
+                code, first_retry = api({'command': 'download', 'id': retry_ids[0],
+                                         'operation_id': retry_operation})
                 assert code == 202
                 deadline = time.monotonic() + 5
                 while True:
@@ -811,8 +859,16 @@ def main():
                 assert failed['outcome'] == 'not_started' and failed['retryable'] is True
                 assert failed['message'] == 'Local capacity is currently unavailable.'
                 assert '/home/alice' not in json.dumps(failed) and 'database diagnostic' not in json.dumps(failed)
-                code, second_retry = api({'command': 'download', 'id': retry_ids[0]})
-                assert code == 202, 'definitely-not-started failure consumed the offer handle'
+                code, cached_retry = api({'command': 'download', 'id': retry_ids[0],
+                                          'operation_id': retry_operation})
+                assert code == 202 and cached_retry['id'] == first_retry['id']
+                code, cached_failure = api({'command': 'download_status', 'id': cached_retry['id']})
+                assert code == 422 and cached_failure == failed
+                assert daemon.web_download_attempts['retry-token'] == 1, 'cached failure repeated daemon work'
+                second_operation = '40000000000000000000000000000003'
+                code, second_retry = api({'command': 'download', 'id': retry_ids[0],
+                                          'operation_id': second_operation})
+                assert code == 202, 'new operation could not retry a definitely-not-started failure'
                 deadline = time.monotonic() + 5
                 while True:
                     code, retried = api({'command': 'download_status', 'id': second_retry['id']})
@@ -828,7 +884,9 @@ def main():
                         f'schema-{schema_index}.txt', f'{0x30000000000000000000000000000000 + schema_index:032x}',
                         label=schema_offer))
                     schema_ids = [next_event(response)['download_id'] for response in [feed, other_tab]]
-                    code, schema_started = api({'command': 'download', 'id': schema_ids[0]})
+                    code, schema_started = api({
+                        'command': 'download', 'id': schema_ids[0],
+                        'operation_id': f'{0x40000000000000000000000000000010 + schema_index:032x}'})
                     assert code == 202
                     deadline = time.monotonic() + 5
                     while True:
@@ -840,7 +898,9 @@ def main():
                     schema_request = next(value for value in reversed(daemon.requests)
                                           if value.get('command') == 'web_download'
                                           and daemon.offer_labels.get(value.get('offer')) == schema_offer)
-                    assert not pathlib.Path(schema_request['output']).exists(), 'invalid IPC success exposed a file'
+                    assert pathlib.Path(schema_request['output']).exists(), \
+                        'unknown malformed reply did not quarantine possible late output'
+                    assert code == 422 and schema_status['outcome'] == 'unknown'
 
                 shared_path = daemon.fixture_root / 'shared-directory'
                 shared_path.mkdir(exist_ok=True)
@@ -1023,7 +1083,7 @@ def main():
                 assert next_event(late_feed)['type'] == 'peers_snapshot'
                 late_offer = daemon.fixture_offer(
                     'late.txt', '30000000000000000000000000000007',
-                    size=19, label='late-token')
+                    size=27, label='late-token')
                 daemon.broadcast(late_offer)
                 while True:
                     late_event = next_event(late_feed)
@@ -1031,7 +1091,9 @@ def main():
                         assert late_event.get('from') == signed_provider
                         late_id = late_event['download_id']
                         break
-                code, late_started = api({'command': 'download', 'id': late_id})
+                code, late_started = api({
+                    'command': 'download', 'id': late_id,
+                    'operation_id': '40000000000000000000000000000020'})
                 assert code == 202
                 deadline = time.monotonic() + 5
                 while True:
@@ -1043,11 +1105,34 @@ def main():
                     assert time.monotonic() < deadline
                     time.sleep(.01)
                 late_output = pathlib.Path(matches[0]['output'])
+                deadline = time.monotonic() + 5
+                while True:
+                    status_code, late_status = api({
+                        'command': 'download_status', 'id': late_started['id']})
+                    if status_code == 422:
+                        break
+                    assert time.monotonic() < deadline
+                    time.sleep(.01)
+                assert late_status['outcome'] == 'unknown'
+                time.sleep(.5)
+                code, reconciled_start = api({
+                    'command': 'download', 'id': late_id,
+                    'operation_id': '40000000000000000000000000000020'})
+                assert code == 202 and reconciled_start['id'] == late_started['id']
+                deadline = time.monotonic() + 5
+                while True:
+                    status_code, reconciled = api({
+                        'command': 'download_status', 'id': reconciled_start['id']})
+                    if reconciled.get('type') == 'download_ready':
+                        break
+                    assert status_code == 200 and time.monotonic() < deadline
+                    time.sleep(.01)
+                assert daemon.web_download_attempts['late-token'] == 2
+                assert request('GET', reconciled['url'])[2] == b'browser attachment payload\n'
                 late_feed.close()
                 web.send_signal(signal.SIGINT)
                 assert web.wait(timeout=5) == 0
-                time.sleep(.5)
-                assert late_output.read_bytes() == b'late daemon export\n', 'web shutdown raced late daemon export'
+                assert late_output.read_bytes() == b'browser attachment payload\n', 'web shutdown raced reconciled export'
                 web = subprocess.Popen([BIN, '--state-dir', str(root), 'web', '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
                 deadline = time.monotonic() + 15
                 while True:

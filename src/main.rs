@@ -254,12 +254,14 @@ async fn run() -> Result<()> {
         Command::Offers { command } => match command {
             None => node::offers(&dir, cli.json).await?,
             Some(OffersCommand::Remove {
+                operation_id,
                 offer_id,
                 direction,
                 provider,
             }) => {
                 node::offers_remove(
                     &dir,
+                    operation_id,
                     &offer_id,
                     direction.map(|value| value.as_str()),
                     provider.as_deref(),
@@ -268,6 +270,7 @@ async fn run() -> Result<()> {
                 .await?
             }
             Some(OffersCommand::Prune {
+                operation_id,
                 older_than_secs,
                 direction,
                 dry_run,
@@ -275,6 +278,7 @@ async fn run() -> Result<()> {
             }) => {
                 node::offers_prune(
                     &dir,
+                    operation_id,
                     older_than_secs,
                     direction.map(|value| value.as_str()),
                     dry_run,
@@ -285,9 +289,13 @@ async fn run() -> Result<()> {
             }
         },
         Command::Peers => node::peers(&dir, cli.json).await?,
-        Command::Download { input, output } => {
+        Command::Download {
+            operation_id,
+            input,
+            output,
+        } => {
             let offer = input.into_offer()?;
-            node::download(&dir, &offer, &output, cli.json).await?
+            node::download(&dir, operation_id, &offer, &output, cli.json).await?
         }
         Command::Listen => node::listen(&dir, cli.json).await?,
         Command::BenchSend { args } => {

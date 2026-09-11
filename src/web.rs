@@ -60,6 +60,7 @@ const RETAINED_UPLOAD_TTL: Duration = STALE_DOWNLOAD_ROOT_AGE;
 const MAX_DOWNLOAD_OFFERS: usize = 128;
 const MAX_DOWNLOAD_JOBS: usize = 128;
 const MAX_DOWNLOADS: usize = 2;
+const MAX_DOWNLOAD_RECONCILIATIONS: u8 = 3;
 const MAX_UPLOADS: usize = 2;
 const MAX_UPLOAD_OPERATIONS: usize = 1024;
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -68,7 +69,10 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; conn
 struct StoredOffer {
     offer_id: String,
     offer: String,
+    provider: String,
+    kind: AttachmentKind,
     name: String,
+    size: u64,
     created: Instant,
 }
 
@@ -86,6 +90,27 @@ enum DownloadJob {
         error: ipc::LifecycleErrorV1,
         created: Instant,
     },
+}
+
+struct DownloadEntry {
+    offer_handle: String,
+    input: StoredOffer,
+    owner: String,
+    attempts: u8,
+    job: DownloadJob,
+}
+
+enum DownloadAdmission {
+    Start {
+        owner: String,
+        input: StoredOffer,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Replay,
+    Conflict,
+    NotFound,
+    Capacity,
+    StagingUnavailable,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -109,7 +134,7 @@ struct WebState {
     downloads: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
     offers: Mutex<HashMap<String, StoredOffer>>,
-    jobs: Arc<Mutex<HashMap<String, DownloadJob>>>,
+    jobs: Arc<Mutex<HashMap<String, DownloadEntry>>>,
     download_root: PathBuf,
     upload_root: PathBuf,
     upload_operations: Mutex<HashMap<String, UploadOperation>>,
@@ -327,20 +352,15 @@ impl WebState {
         true
     }
 
-    fn remember_offer(
-        &self,
-        offer_id: &str,
-        offer: &str,
-        name: &str,
-        now: Instant,
-    ) -> Option<String> {
-        if !ipc::valid_operation_id(offer_id)
-            || offer.is_empty()
-            || offer.len() > REQUEST_LIMIT
-            || name.is_empty()
+    fn remember_offer(&self, stored: StoredOffer) -> Option<String> {
+        if !ipc::valid_operation_id(&stored.offer_id)
+            || stored.offer.is_empty()
+            || stored.offer.len() > REQUEST_LIMIT
+            || stored.name.is_empty()
         {
             return None;
         }
+        let now = stored.created;
         let mut offers = self.offers.lock().expect("offer registry mutex poisoned");
         offers.retain(|_, value| now.duration_since(value.created) <= DOWNLOAD_TTL);
         if offers.len() >= MAX_DOWNLOAD_OFFERS {
@@ -353,15 +373,7 @@ impl WebState {
             }
         }
         let id = random_id();
-        offers.insert(
-            id.clone(),
-            StoredOffer {
-                offer_id: offer_id.to_owned(),
-                offer: offer.to_owned(),
-                name: name.to_owned(),
-                created: now,
-            },
-        );
+        offers.insert(id.clone(), stored);
         Some(id)
     }
 
@@ -372,6 +384,91 @@ impl WebState {
         let mut offers = self.offers.lock().expect("offer registry mutex poisoned");
         offers.retain(|_, value| now.duration_since(value.created) <= DOWNLOAD_TTL);
         offers.get(id).cloned()
+    }
+
+    #[cfg(test)]
+    fn admit_download(
+        &self,
+        offer_handle: String,
+        operation_id: &str,
+        candidate: Option<StoredOffer>,
+        now: Instant,
+    ) -> DownloadAdmission {
+        self.admit_download_with_staging(offer_handle, operation_id, candidate, true, now)
+    }
+
+    fn admit_download_with_staging(
+        &self,
+        offer_handle: String,
+        operation_id: &str,
+        candidate: Option<StoredOffer>,
+        staging_available: bool,
+        now: Instant,
+    ) -> DownloadAdmission {
+        let mut jobs = self.jobs.lock().expect("download jobs mutex poisoned");
+        if let Some(entry) = jobs.get_mut(operation_id) {
+            if entry.offer_handle != offer_handle {
+                return DownloadAdmission::Conflict;
+            }
+            match &entry.job {
+                DownloadJob::Pending { .. } | DownloadJob::Ready { .. } => {
+                    return DownloadAdmission::Replay;
+                }
+                DownloadJob::Failed { error, .. }
+                    if error.outcome != "unknown"
+                        || entry.attempts >= MAX_DOWNLOAD_RECONCILIATIONS =>
+                {
+                    return DownloadAdmission::Replay;
+                }
+                DownloadJob::Failed { .. } => {}
+            }
+            // This ID still represents a possibly completed daemon operation.
+            // Failure to admit a local reconciliation must not replace that
+            // unknown record with a definite rejection that rotates the ID.
+            if !staging_available {
+                return DownloadAdmission::Replay;
+            }
+            let Ok(permit) = self.downloads.clone().try_acquire_owned() else {
+                return DownloadAdmission::Replay;
+            };
+            let owner = random_id();
+            entry.owner = owner.clone();
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.job = DownloadJob::Pending { created: now };
+            return DownloadAdmission::Start {
+                owner,
+                input: entry.input.clone(),
+                permit,
+            };
+        }
+        let Some(stored) = candidate else {
+            return DownloadAdmission::NotFound;
+        };
+        if jobs.len() >= MAX_DOWNLOAD_JOBS {
+            return DownloadAdmission::Capacity;
+        }
+        if !staging_available {
+            return DownloadAdmission::StagingUnavailable;
+        }
+        let Ok(permit) = self.downloads.clone().try_acquire_owned() else {
+            return DownloadAdmission::Capacity;
+        };
+        let owner = random_id();
+        jobs.insert(
+            operation_id.to_owned(),
+            DownloadEntry {
+                offer_handle,
+                input: stored.clone(),
+                owner: owner.clone(),
+                attempts: 1,
+                job: DownloadJob::Pending { created: now },
+            },
+        );
+        DownloadAdmission::Start {
+            owner,
+            input: stored,
+            permit,
+        }
     }
 
     fn prune(&self, now: Instant) {
@@ -385,8 +482,8 @@ impl WebState {
 
     fn prune_jobs(&self, now: Instant) {
         let mut jobs = self.jobs.lock().expect("download jobs mutex poisoned");
-        jobs.retain(|_, job| {
-            let (created, path, ttl) = match job {
+        jobs.retain(|_, entry| {
+            let (created, path, ttl) = match &entry.job {
                 DownloadJob::Pending { created } => (*created, None, DOWNLOAD_PENDING_TTL),
                 DownloadJob::Failed { created, .. } => (*created, None, DOWNLOAD_TTL),
                 DownloadJob::Ready { created, path, .. } => {
@@ -402,6 +499,31 @@ impl WebState {
             keep
         });
     }
+}
+
+fn finish_download_if_owner(
+    jobs: &Arc<Mutex<HashMap<String, DownloadEntry>>>,
+    operation_id: &str,
+    owner: &str,
+    job: DownloadJob,
+    remove_output: bool,
+    output: &Path,
+) -> bool {
+    let mut jobs = jobs.lock().expect("download jobs mutex poisoned");
+    let owns = jobs.get(operation_id).is_some_and(|entry| {
+        entry.owner == owner && matches!(entry.job, DownloadJob::Pending { .. })
+    });
+    if !owns {
+        return false;
+    }
+    // Cleanup and terminal publication are one ownership-checked critical section.
+    if remove_output {
+        let _ = fs::remove_file(output);
+    }
+    if let Some(entry) = jobs.get_mut(operation_id) {
+        entry.job = job;
+    }
+    true
 }
 
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -441,7 +563,7 @@ enum WebRequest {
     Send { operation_id: String, body: String },
     Status {},
     Peers {},
-    Download { id: String },
+    Download { id: String, operation_id: String },
     DownloadStatus { id: String },
 }
 
@@ -640,7 +762,13 @@ fn parse_request(bytes: &[u8]) -> Result<WebRequest> {
                 "invalid operation ID"
             );
         }
-        WebRequest::Download { id } | WebRequest::DownloadStatus { id } => {
+        WebRequest::Download { id, operation_id } => {
+            anyhow::ensure!(
+                valid_id(id) && ipc::valid_operation_id(operation_id),
+                "invalid download or operation ID"
+            )
+        }
+        WebRequest::DownloadStatus { id } => {
             anyhow::ensure!(valid_id(id), "invalid download ID")
         }
         _ => {}
@@ -1021,73 +1149,124 @@ async fn bounded_download_ipc<F: Future>(
     timeout(limit, future).await
 }
 
-fn compatible_download_complete(
-    value: &Value,
-    expected_offer_id: &str,
-    expected_name: &str,
-    expected_output: &Path,
-) -> bool {
-    ipc::DownloadCompleteV1::from_value(value).is_ok_and(|complete| {
-        complete.offer_id == expected_offer_id
-            && complete.name == expected_name
-            && complete.output() == expected_output
-    })
+fn web_download_context(
+    operation_id: &str,
+    stored: &StoredOffer,
+    output: &Path,
+) -> ipc::DownloadRequestContext {
+    ipc::DownloadRequestContext {
+        operation_id: operation_id.to_owned(),
+        token_digest: ipc::download_token_digest(&stored.offer),
+        offer_id: stored.offer_id.clone(),
+        provider: stored.provider.clone(),
+        kind: match stored.kind {
+            AttachmentKind::File => "file".to_owned(),
+            AttachmentKind::DirectoryTarV1 => "directory_tar_v1".to_owned(),
+        },
+        name: stored.name.clone(),
+        declared_size: Some(stored.size),
+        output: output.to_path_buf(),
+    }
 }
 
-fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
+fn compatible_download_complete(value: &Value, expected: &ipc::DownloadRequestContext) -> bool {
+    match ipc::DownloadCompleteV2::validate_for_request(value, expected) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("meshmsg web download completion validation: {error:#}");
+            false
+        }
+    }
+}
+
+fn operation_bound_download_http_error(
+    status: StatusCode,
+    code: &str,
+    outcome: &str,
+    retryable: bool,
+    operation_id: &str,
+) -> Response<Body> {
+    let error = operation_bound_download_error(code, code, outcome, retryable, operation_id);
+    json_response(status, error.into_value())
+}
+
+fn download_started_response(operation_id: &str) -> Response<Body> {
+    json_response(
+        StatusCode::ACCEPTED,
+        json!({
+            "type":"download_started", "schema_version":1,
+            "operation_id":operation_id, "id":operation_id,
+            "poll_timeout_ms":DOWNLOAD_PENDING_TTL.as_millis() as u64
+        }),
+    )
+}
+
+fn start_download(state: &WebState, offer_handle: String, operation_id: String) -> Response<Body> {
     let now = Instant::now();
     state.prune_jobs(now);
-    if state
-        .jobs
-        .lock()
-        .expect("download jobs mutex poisoned")
-        .len()
-        >= MAX_DOWNLOAD_JOBS
-    {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "not_started",
-            "Web download queue is full.",
-        );
-    }
-    let Ok(permit) = state.downloads.clone().try_acquire_owned() else {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "not_started",
-            "Web attachment download capacity reached.",
-        );
-    };
-    let Some(stored) = state.get_offer(&offer_id, now) else {
-        return error(
-            StatusCode::NOT_FOUND,
-            "not_started",
-            "Attachment offer is unavailable or expired.",
-        );
-    };
-    if touch_download_root(&state.download_root).is_err() {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "not_started",
-            "Web download staging is unavailable.",
-        );
-    }
-    let job_id = random_id();
-    let output = state.download_root.join(format!("{job_id}.blob"));
-    {
-        let mut jobs = state.jobs.lock().expect("download jobs mutex poisoned");
-        if jobs.len() >= MAX_DOWNLOAD_JOBS {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
+    let staging_available = touch_download_root(&state.download_root).is_ok();
+    // Fetching the candidate does not admit it. The single registry lock below
+    // rechecks an existing ID first, making binding, ownership, capacity, and
+    // Pending publication one atomic decision.
+    let candidate = state.get_offer(&offer_handle, now);
+    let (owner, input, permit) = match state.admit_download_with_staging(
+        offer_handle,
+        &operation_id,
+        candidate,
+        staging_available,
+        now,
+    ) {
+        DownloadAdmission::Start {
+            owner,
+            input,
+            permit,
+        } => (owner, input, permit),
+        DownloadAdmission::Replay => return download_started_response(&operation_id),
+        DownloadAdmission::Conflict => {
+            let mut conflict = ipc::LifecycleErrorV1::new(
+                "operation_id_conflict",
+                "operation ID is bound to a different browser offer",
                 "not_started",
-                "Web download queue is full.",
+                false,
+            );
+            conflict.operation_id = Some(operation_id);
+            return json_response(StatusCode::CONFLICT, conflict.into_value());
+        }
+        DownloadAdmission::NotFound => {
+            return operation_bound_download_http_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "not_started",
+                false,
+                &operation_id,
             );
         }
-        jobs.insert(job_id.clone(), DownloadJob::Pending { created: now });
-    }
+        DownloadAdmission::Capacity => {
+            return operation_bound_download_http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "download_operation_capacity",
+                "not_started",
+                true,
+                &operation_id,
+            );
+        }
+        DownloadAdmission::StagingUnavailable => {
+            return operation_bound_download_http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "download_staging_unavailable",
+                "not_started",
+                true,
+                &operation_id,
+            );
+        }
+    };
+
+    let output = state.download_root.join(format!("{operation_id}.blob"));
+    let expected = web_download_context(&operation_id, &input, &output);
     let dir = state.dir.clone();
     let jobs = state.jobs.clone();
     let download_root = state.download_root.clone();
-    let ready_id = job_id.clone();
+    let operation = operation_id.clone();
     let request_id = http_request_id();
     tokio::spawn(HTTP_REQUEST_ID.scope(request_id, async move {
         let _permit = permit;
@@ -1095,21 +1274,19 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
             web_ipc_request(
                 &dir,
                 &IpcRequest::WebDownload {
-                    offer: stored.offer,
+                    operation_id: operation.clone(),
+                    offer: input.offer.clone(),
                     output: output.clone(),
                 },
             ),
             WEB_DOWNLOAD_IPC_TIMEOUT,
         )
         .await;
-        let job = match result {
+
+        let (job, remove_output) = match result {
             Ok(Ok(value))
-                if compatible_download_complete(
-                    &value,
-                    &stored.offer_id,
-                    &stored.name,
-                    &output,
-                ) =>
+                if value["type"] == "download_complete"
+                    && compatible_download_complete(&value, &expected) =>
             {
                 match open_download_file(&output) {
                     Ok((file, size))
@@ -1117,94 +1294,111 @@ fn start_download(state: &WebState, offer_id: String) -> Response<Body> {
                             && touch_download_root(&download_root).is_ok() =>
                     {
                         drop(file);
-                        DownloadJob::Ready {
-                            path: output,
-                            name: stored.name,
-                            size,
-                            created: Instant::now(),
-                        }
+                        (
+                            DownloadJob::Ready {
+                                path: output.clone(),
+                                name: input.name.clone(),
+                                size,
+                                created: Instant::now(),
+                            },
+                            false,
+                        )
                     }
-                    _ => {
-                        let _ = fs::remove_file(&output);
+                    _ => (
                         DownloadJob::Failed {
-                            error: ipc::LifecycleErrorV1::new(
+                            error: operation_bound_download_error(
                                 "attachment_lifecycle_internal",
                                 "Daemon completed without an exported file.",
                                 "unknown",
                                 true,
+                                &operation,
                             ),
                             created: Instant::now(),
-                        }
-                    }
+                        },
+                        false,
+                    ),
                 }
             }
             Ok(Ok(value)) => {
-                let _ = fs::remove_file(&output);
-                let error = if value["type"] == "error" {
-                    ipc::LifecycleErrorV1::from_value(&value).unwrap_or_else(|_| {
-                        ipc::LifecycleErrorV1::new(
+                let daemon_error = value["type"] == "error";
+                let error = if daemon_error {
+                    ipc::validate_lifecycle_error_for_request(
+                        &value,
+                        ipc::AttachmentOperationKind::WebDownload,
+                        &operation,
+                        None,
+                    )
+                    .unwrap_or_else(|_| {
+                        operation_bound_download_error(
                             "attachment_lifecycle_internal",
                             "Daemon returned a malformed attachment lifecycle error.",
                             "unknown",
                             true,
+                            &operation,
                         )
                     })
                 } else {
-                    ipc::LifecycleErrorV1::new(
+                    operation_bound_download_error(
                         "attachment_lifecycle_internal",
                         "Daemon returned an incompatible attachment download response.",
                         "unknown",
                         true,
+                        &operation,
                     )
                 };
                 log_private_lifecycle_diagnostic("download", &error);
-                DownloadJob::Failed {
-                    error: public_lifecycle_error(error),
-                    created: Instant::now(),
-                }
+                let remove = !daemon_error || error.outcome != "unknown";
+                (
+                    DownloadJob::Failed {
+                        error: public_lifecycle_error(error),
+                        created: Instant::now(),
+                    },
+                    remove,
+                )
             }
-            Ok(Err(_)) => {
-                let _ = fs::remove_file(&output);
+            Ok(Err(_)) => (
                 DownloadJob::Failed {
-                    error: ipc::LifecycleErrorV1::new(
+                    error: operation_bound_download_error(
                         "attachment_storage_shutdown",
                         "Daemon unavailable or disconnected during download.",
                         "unknown",
                         true,
+                        &operation,
                     ),
                     created: Instant::now(),
-                }
-            }
-            Err(_) => {
-                // Dropping IPC cannot cancel a command the daemon already accepted.
-                // Remove what exists now; the unique root quarantines any later export
-                // until stale-root cleanup is safe.
-                let _ = fs::remove_file(&output);
+                },
+                false,
+            ),
+            Err(_) => (
                 DownloadJob::Failed {
-                    error: ipc::LifecycleErrorV1::new(
+                    error: operation_bound_download_error(
                         "attachment_command_timeout",
                         "Daemon attachment preparation exceeded its time limit.",
                         "unknown",
                         true,
+                        &operation,
                     ),
                     created: Instant::now(),
-                }
-            }
+                },
+                false,
+            ),
         };
-        let mut jobs = jobs.lock().expect("download jobs mutex poisoned");
-        if matches!(jobs.get(&ready_id), Some(DownloadJob::Pending { .. })) {
-            jobs.insert(ready_id, job);
-        } else if let DownloadJob::Ready { path, .. } = job {
-            let _ = fs::remove_file(path);
-        }
+
+        finish_download_if_owner(&jobs, &operation, &owner, job, remove_output, &output);
     }));
-    json_response(
-        StatusCode::ACCEPTED,
-        json!({
-            "type":"download_started", "id":job_id,
-            "poll_timeout_ms":DOWNLOAD_PENDING_TTL.as_millis() as u64
-        }),
-    )
+    download_started_response(&operation_id)
+}
+
+fn operation_bound_download_error(
+    code: &str,
+    diagnostic: &str,
+    outcome: &str,
+    retryable: bool,
+    operation_id: &str,
+) -> ipc::LifecycleErrorV1 {
+    let mut error = ipc::LifecycleErrorV1::new(code, diagnostic, outcome, retryable);
+    error.operation_id = Some(operation_id.to_owned());
+    error
 }
 
 fn public_lifecycle_error(error: ipc::LifecycleErrorV1) -> ipc::LifecycleErrorV1 {
@@ -1223,13 +1417,17 @@ fn log_private_lifecycle_diagnostic(context: &str, error: &ipc::LifecycleErrorV1
 fn download_status(state: &WebState, id: &str) -> Response<Body> {
     state.prune_jobs(Instant::now());
     let jobs = state.jobs.lock().expect("download jobs mutex poisoned");
-    match jobs.get(id) {
-        Some(DownloadJob::Pending { .. }) => {
-            json_response(StatusCode::OK, json!({"type":"download_pending", "id":id}))
-        }
+    match jobs.get(id).map(|entry| &entry.job) {
+        Some(DownloadJob::Pending { .. }) => json_response(
+            StatusCode::OK,
+            json!({"type":"download_pending", "operation_id":id, "id":id}),
+        ),
         Some(DownloadJob::Ready { .. }) => json_response(
             StatusCode::OK,
-            json!({"type":"download_ready", "url":format!("/api/download/{id}")}),
+            json!({
+                "type":"download_ready", "operation_id":id, "id":id,
+                "url":format!("/api/download/{id}")
+            }),
         ),
         Some(DownloadJob::Failed { error, .. }) => json_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1306,7 +1504,9 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         );
     };
     let request = match request {
-        WebRequest::Download { id } => return start_download(state, id),
+        WebRequest::Download { id, operation_id } => {
+            return start_download(state, id, operation_id)
+        }
         WebRequest::DownloadStatus { id } => return download_status(state, &id),
         request => request,
     };
@@ -1602,7 +1802,15 @@ fn public_event(
             });
             if download_supported {
                 public["download_id"] = state
-                    .remember_offer(&decoded.offer_id, offer, name, Instant::now())?
+                    .remember_offer(StoredOffer {
+                        offer_id: decoded.offer_id.clone(),
+                        offer: offer.to_owned(),
+                        provider: decoded.from.clone(),
+                        kind: decoded.kind_name,
+                        name: name.to_owned(),
+                        size: decoded.size,
+                        created: Instant::now(),
+                    })?
                     .into();
             }
             Some(public)
@@ -1749,9 +1957,16 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
         let download_supported = first["ipc_capabilities"]
             .as_array()
             .is_some_and(|capabilities| {
-                capabilities
-                    .iter()
-                    .any(|value| value.as_str() == Some(WEB_DOWNLOAD_CAPABILITY))
+                [
+                    WEB_DOWNLOAD_CAPABILITY,
+                    ipc::IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY,
+                ]
+                .iter()
+                .all(|expected| {
+                    capabilities
+                        .iter()
+                        .any(|value| value.as_str() == Some(*expected))
+                })
             });
         let Some(connected) = public_event(&state, subscription_topic, first, download_supported) else {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
@@ -1909,12 +2124,19 @@ async fn serve_download(state: &WebState, id: &str, headers: &HeaderMap) -> Resp
     state.prune_jobs(now);
     let (path, name, expected_size) = {
         let mut jobs = state.jobs.lock().expect("download jobs mutex poisoned");
-        let Some(DownloadJob::Ready {
+        let Some(entry) = jobs.get_mut(id) else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "failed",
+                "Download is not ready or is unavailable.",
+            );
+        };
+        let DownloadJob::Ready {
             path,
             name,
             size,
             created,
-        }) = jobs.get_mut(id)
+        } = &mut entry.job
         else {
             return error(
                 StatusCode::NOT_FOUND,
@@ -2261,13 +2483,17 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     match result {
         Ok(Ok(value)) if value["type"] == "error" => {
             let _ = fs::remove_dir_all(&operation_root);
-            let public_error = ipc::LifecycleErrorV1::from_value(&value)
-                .ok()
-                .filter(|error| error.operation_id.as_deref() == Some(&operation_id))
-                .map(|error| {
-                    log_private_lifecycle_diagnostic("share", &error);
-                    public_lifecycle_error(error).into_value()
-                });
+            let public_error = ipc::validate_lifecycle_error_for_request(
+                &value,
+                ipc::AttachmentOperationKind::Share,
+                &operation_id,
+                None,
+            )
+            .ok()
+            .map(|error| {
+                log_private_lifecycle_diagnostic("share", &error);
+                public_lifecycle_error(error).into_value()
+            });
             match public_error.and_then(|value| MutationErrorDto::parse(value, &operation_id)) {
                 Some(error) => mutation_error_response(error),
                 None => mutation_error_response(local_mutation_error(
@@ -2780,7 +3006,7 @@ mod tests {
         assert!(parse_request(&web_request(json!({"command":"status"}))).is_ok());
         assert!(parse_request(&web_request(json!({"command":"peers"}))).is_ok());
         assert!(parse_request(&web_request(
-            json!({"command":"download","id":"0123456789abcdef0123456789abcdef"})
+            json!({"command":"download","id":"0123456789abcdef0123456789abcdef","operation_id":"22222222222222222222222222222222"})
         ))
         .is_ok());
         assert!(parse_request(&web_request(
@@ -2809,12 +3035,15 @@ mod tests {
         assert_ne!(state.download_root, second.download_root);
         let now = Instant::now();
         let id = state
-            .remember_offer(
-                "11111111111111111111111111111111",
-                "signed-secret",
-                "résumé\r\n.txt",
-                now,
-            )
+            .remember_offer(StoredOffer {
+                offer_id: "11111111111111111111111111111111".into(),
+                offer: "signed-secret".into(),
+                provider: "0".repeat(64),
+                kind: AttachmentKind::File,
+                name: "résumé\r\n.txt".into(),
+                size: 4,
+                created: now,
+            })
             .unwrap();
         assert!(valid_id(&id));
         let stored = state.get_offer(&id, now).unwrap();
@@ -2825,22 +3054,389 @@ mod tests {
         assert!(!header.contains('\r') && !header.contains('\n'));
         assert!(header.contains("filename*=UTF-8''r%C3%A9sum%C3%A9%0D%0A.txt"));
         let expired = state
-            .remember_offer(
-                "22222222222222222222222222222222",
-                "expired",
-                "old.txt",
-                now - DOWNLOAD_TTL - Duration::from_secs(1),
-            )
+            .remember_offer(StoredOffer {
+                offer_id: "22222222222222222222222222222222".into(),
+                offer: "expired".into(),
+                provider: "0".repeat(64),
+                kind: AttachmentKind::File,
+                name: "old.txt".into(),
+                size: 4,
+                created: now - DOWNLOAD_TTL - Duration::from_secs(1),
+            })
             .unwrap();
         assert!(state.get_offer(&expired, now).is_none());
         state.jobs.lock().unwrap().insert(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            DownloadJob::Pending {
-                created: now - DOWNLOAD_PENDING_TTL - Duration::from_secs(1),
+            DownloadEntry {
+                offer_handle: id,
+                input: stored.clone(),
+                owner: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                attempts: 1,
+                job: DownloadJob::Pending {
+                    created: now - DOWNLOAD_PENDING_TTL - Duration::from_secs(1),
+                },
+            },
+        );
+        state.jobs.lock().unwrap().insert(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            DownloadEntry {
+                offer_handle: "cccccccccccccccccccccccccccccccc".into(),
+                input: stored,
+                owner: "dddddddddddddddddddddddddddddddd".into(),
+                attempts: MAX_DOWNLOAD_RECONCILIATIONS,
+                job: DownloadJob::Failed {
+                    error: operation_bound_download_error(
+                        "attachment_command_timeout",
+                        "expired",
+                        "unknown",
+                        true,
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ),
+                    created: now - DOWNLOAD_TTL - Duration::from_secs(1),
+                },
             },
         );
         state.prune_jobs(now);
         assert!(state.jobs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn download_admission_is_atomic_and_only_current_owner_can_publish_or_delete() {
+        use std::sync::Barrier;
+
+        let state = Arc::new(state());
+        let now = Instant::now();
+        let first_handle = state
+            .remember_offer(StoredOffer {
+                offer_id: "11111111111111111111111111111111".into(),
+                offer: "token-one".into(),
+                provider: "0".repeat(64),
+                kind: AttachmentKind::File,
+                name: "one.txt".into(),
+                size: 3,
+                created: now,
+            })
+            .unwrap();
+        let second_handle = state
+            .remember_offer(StoredOffer {
+                offer_id: "22222222222222222222222222222222".into(),
+                offer: "token-two".into(),
+                provider: "1".repeat(64),
+                kind: AttachmentKind::File,
+                name: "two.txt".into(),
+                size: 3,
+                created: now,
+            })
+            .unwrap();
+        let operation = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for handle in [first_handle.clone(), second_handle.clone()] {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            let operation = operation.clone();
+            threads.push(std::thread::spawn(move || {
+                let candidate = state.get_offer(&handle, now);
+                barrier.wait();
+                match state.admit_download(handle, &operation, candidate, now) {
+                    DownloadAdmission::Start { .. } => "start",
+                    DownloadAdmission::Conflict => "conflict",
+                    _ => "unexpected",
+                }
+            }));
+        }
+        barrier.wait();
+        let mut outcomes = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        outcomes.sort();
+        assert_eq!(outcomes, ["conflict", "start"]);
+        assert_eq!(state.jobs.lock().unwrap().len(), 1);
+
+        let (bound_handle, owner) = {
+            let jobs = state.jobs.lock().unwrap();
+            let entry = jobs.get(&operation).unwrap();
+            (entry.offer_handle.clone(), entry.owner.clone())
+        };
+        let exact = state.admit_download(
+            bound_handle.clone(),
+            &operation,
+            state.get_offer(&bound_handle, now),
+            now,
+        );
+        assert!(matches!(exact, DownloadAdmission::Replay));
+        let changed = if bound_handle == first_handle {
+            second_handle
+        } else {
+            first_handle
+        };
+        assert!(matches!(
+            state.admit_download(
+                changed.clone(),
+                &operation,
+                state.get_offer(&changed, now),
+                now
+            ),
+            DownloadAdmission::Conflict
+        ));
+
+        let output = state.download_root.join("owner-test.blob");
+        fs::write(&output, b"owned").unwrap();
+        let stale = DownloadJob::Failed {
+            error: operation_bound_download_error(
+                "download_failed",
+                "stale",
+                "not_started",
+                false,
+                &operation,
+            ),
+            created: now,
+        };
+        assert!(!finish_download_if_owner(
+            &state.jobs,
+            &operation,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            stale,
+            true,
+            &output,
+        ));
+        assert!(output.exists());
+        let authoritative = DownloadJob::Failed {
+            error: operation_bound_download_error(
+                "download_failed",
+                "owner",
+                "not_started",
+                false,
+                &operation,
+            ),
+            created: now,
+        };
+        assert!(finish_download_if_owner(
+            &state.jobs,
+            &operation,
+            &owner,
+            authoritative,
+            true,
+            &output,
+        ));
+        assert!(!output.exists());
+        assert!(matches!(
+            state.admit_download(
+                bound_handle.clone(),
+                &operation,
+                state.get_offer(&bound_handle, now),
+                now,
+            ),
+            DownloadAdmission::Replay
+        ));
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            let entry = jobs.get_mut(&operation).unwrap();
+            entry.job = DownloadJob::Failed {
+                error: operation_bound_download_error(
+                    "attachment_command_timeout",
+                    "unknown",
+                    "unknown",
+                    true,
+                    &operation,
+                ),
+                created: now,
+            };
+        }
+        assert!(matches!(
+            state.admit_download(
+                bound_handle.clone(),
+                &operation,
+                state.get_offer(&bound_handle, now),
+                now,
+            ),
+            DownloadAdmission::Start { .. }
+        ));
+        assert_eq!(state.jobs.lock().unwrap()[&operation].attempts, 2);
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.get_mut(&operation).unwrap().job = DownloadJob::Failed {
+                error: operation_bound_download_error(
+                    "attachment_command_timeout",
+                    "unknown",
+                    "unknown",
+                    true,
+                    &operation,
+                ),
+                created: now,
+            };
+        }
+        assert!(matches!(
+            state.admit_download(
+                bound_handle.clone(),
+                &operation,
+                state.get_offer(&bound_handle, now),
+                now,
+            ),
+            DownloadAdmission::Start { .. }
+        ));
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            let entry = jobs.get_mut(&operation).unwrap();
+            assert_eq!(entry.attempts, MAX_DOWNLOAD_RECONCILIATIONS);
+            entry.job = DownloadJob::Failed {
+                error: operation_bound_download_error(
+                    "attachment_command_timeout",
+                    "unknown",
+                    "unknown",
+                    true,
+                    &operation,
+                ),
+                created: now,
+            };
+        }
+        assert!(matches!(
+            state.admit_download(
+                bound_handle.clone(),
+                &operation,
+                state.get_offer(&bound_handle, now),
+                now,
+            ),
+            DownloadAdmission::Replay
+        ));
+        assert_eq!(
+            state.jobs.lock().unwrap()[&operation].attempts,
+            MAX_DOWNLOAD_RECONCILIATIONS
+        );
+    }
+
+    #[test]
+    fn unknown_reconciliation_survives_local_capacity_and_staging_failures_then_recovers() {
+        let state = state();
+        let now = Instant::now();
+        let handle = state
+            .remember_offer(StoredOffer {
+                offer_id: "11111111111111111111111111111111".into(),
+                offer: "late-token".into(),
+                provider: "0".repeat(64),
+                kind: AttachmentKind::File,
+                name: "late.txt".into(),
+                size: 4,
+                created: now,
+            })
+            .unwrap();
+        let operation = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fresh = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(matches!(
+            state.admit_download_with_staging(
+                handle.clone(),
+                fresh,
+                state.get_offer(&handle, now),
+                false,
+                now,
+            ),
+            DownloadAdmission::StagingUnavailable
+        ));
+        assert!(!state.jobs.lock().unwrap().contains_key(fresh));
+        let first = state.admit_download(
+            handle.clone(),
+            operation,
+            state.get_offer(&handle, now),
+            now,
+        );
+        let DownloadAdmission::Start { owner, permit, .. } = first else {
+            panic!("new operation was not admitted");
+        };
+        drop(permit);
+        let output = state.download_root.join(format!("{operation}.blob"));
+        assert!(finish_download_if_owner(
+            &state.jobs,
+            operation,
+            &owner,
+            DownloadJob::Failed {
+                error: operation_bound_download_error(
+                    "attachment_command_timeout",
+                    "unknown",
+                    "unknown",
+                    true,
+                    operation,
+                ),
+                created: now,
+            },
+            false,
+            &output,
+        ));
+
+        let permits = (0..MAX_DOWNLOADS)
+            .map(|_| state.downloads.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            state.admit_download_with_staging(
+                handle.clone(),
+                fresh,
+                state.get_offer(&handle, now),
+                true,
+                now,
+            ),
+            DownloadAdmission::Capacity
+        ));
+        assert!(!state.jobs.lock().unwrap().contains_key(fresh));
+        assert!(matches!(
+            state.admit_download_with_staging(
+                handle.clone(),
+                operation,
+                state.get_offer(&handle, now),
+                true,
+                now,
+            ),
+            DownloadAdmission::Replay
+        ));
+        assert!(matches!(
+            state.admit_download_with_staging(
+                handle.clone(),
+                operation,
+                state.get_offer(&handle, now),
+                false,
+                now,
+            ),
+            DownloadAdmission::Replay
+        ));
+        {
+            let jobs = state.jobs.lock().unwrap();
+            let entry = &jobs[operation];
+            assert_eq!(entry.attempts, 1);
+            assert!(matches!(
+                entry.job,
+                DownloadJob::Failed { ref error, .. } if error.outcome == "unknown"
+            ));
+        }
+        drop(permits);
+
+        let retry = state.admit_download_with_staging(
+            handle.clone(),
+            operation,
+            state.get_offer(&handle, now),
+            true,
+            now,
+        );
+        let DownloadAdmission::Start { owner, permit, .. } = retry else {
+            panic!("retained unknown operation did not reconcile");
+        };
+        drop(permit);
+        fs::write(&output, b"late").unwrap();
+        assert!(finish_download_if_owner(
+            &state.jobs,
+            operation,
+            &owner,
+            DownloadJob::Ready {
+                path: output.clone(),
+                name: "late.txt".into(),
+                size: 4,
+                created: now,
+            },
+            false,
+            &output,
+        ));
+        assert!(matches!(
+            state.jobs.lock().unwrap()[operation].job,
+            DownloadJob::Ready { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2859,55 +3455,49 @@ mod tests {
 
         let output = PathBuf::from("/tmp/expected.blob");
         let complete = json!({
-            "type":"download_complete", "schema_version":1,
+            "type":"download_complete", "schema_version":2,
             "request_id":"11111111111111111111111111111111",
+            "operation_id":"33333333333333333333333333333333",
+            "token_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "offer_id":"22222222222222222222222222222222",
             "kind":"file", "name":"safe.txt", "size":4,
             "from":"0000000000000000000000000000000000000000000000000000000000000000",
             "output":output.clone(), "installed":true, "pinned":true,
             "destination_synced":true, "cleanup_complete":true, "warnings":[]
         });
-        assert!(compatible_download_complete(
-            &complete,
-            "22222222222222222222222222222222",
-            "safe.txt",
-            &output,
-        ));
+        let expected = ipc::DownloadRequestContext {
+            operation_id: "33333333333333333333333333333333".into(),
+            token_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            offer_id: "22222222222222222222222222222222".into(),
+            provider: "0".repeat(64),
+            kind: "file".into(),
+            name: "safe.txt".into(),
+            declared_size: Some(4),
+            output: output.clone(),
+        };
+        assert!(compatible_download_complete(&complete, &expected));
         for mutation in [
-            ("schema_version", json!(2)),
+            ("schema_version", json!(1)),
             ("request_id", json!("bad")),
-            ("offer_id", json!("bad")),
-            ("kind", json!("unknown")),
-            ("name", json!("bad\nname")),
-            ("from", json!("peer")),
-            ("output", json!("")),
+            ("operation_id", json!("44444444444444444444444444444444")),
+            ("token_digest", json!("b".repeat(64))),
+            ("offer_id", json!("44444444444444444444444444444444")),
+            ("kind", json!("directory_tar_v1")),
+            ("name", json!("other.txt")),
+            ("size", json!(5)),
+            ("from", json!("1".repeat(64))),
+            ("output", json!("/tmp/other.blob")),
             ("installed", json!(false)),
             ("pinned", json!(false)),
             ("warnings", json!(["bad\twarning"])),
         ] {
             let mut malformed = complete.clone();
             malformed[mutation.0] = mutation.1;
-            assert!(!compatible_download_complete(
-                &malformed,
-                "22222222222222222222222222222222",
-                "safe.txt",
-                &output,
-            ));
+            assert!(!compatible_download_complete(&malformed, &expected));
         }
         let mut unknown = complete.clone();
         unknown["extra"] = true.into();
-        assert!(!compatible_download_complete(
-            &unknown,
-            "22222222222222222222222222222222",
-            "safe.txt",
-            &output,
-        ));
-        assert!(!compatible_download_complete(
-            &complete,
-            "33333333333333333333333333333333",
-            "safe.txt",
-            &output,
-        ));
+        assert!(!compatible_download_complete(&unknown, &expected));
     }
 
     #[test]

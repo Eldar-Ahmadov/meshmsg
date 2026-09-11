@@ -26,10 +26,108 @@ pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v2";
 pub(crate) const WEB_DOWNLOAD_CAPABILITY: &str = "web_download_v1";
 pub(crate) const WEB_SHARE_CAPABILITY: &str = "web_share_v1";
 pub(crate) const IDEMPOTENT_MUTATIONS_CAPABILITY: &str = "idempotent_mutations_v1";
+pub(crate) const IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY: &str =
+    "idempotent_attachment_operations_v1";
 pub(crate) const ATTACHMENT_LIFECYCLE_CAPABILITY: &str = "attachment_lifecycle_v1";
 pub(crate) type LifecycleErrorV1 = ErrorEnvelopeV1;
 
 pub(crate) use contracts::valid_operation_id;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttachmentOperationKind {
+    Share,
+    Remove,
+    Prune,
+    Download,
+    WebDownload,
+}
+
+fn lifecycle_error_semantics(
+    kind: AttachmentOperationKind,
+    code: &str,
+    outcome: &str,
+) -> Option<bool> {
+    let fixed = match code {
+        "operation_id_conflict" => ("not_started", false),
+        "operation_capacity" | "attachment_storage_busy" => ("not_started", true),
+        "attachment_command_timeout" | "attachment_storage_shutdown" => ("unknown", true),
+        _ => match kind {
+            AttachmentOperationKind::Share => match code {
+                "share_failed" => ("unknown", true),
+                "attachment_quota_exceeded" | "attachment_tag_capacity" => ("not_started", false),
+                "attachment_min_free_space" => ("not_started", true),
+                _ => return None,
+            },
+            AttachmentOperationKind::Remove => match code {
+                "invalid_offer_selector" => ("not_started", false),
+                "attachment_lifecycle_internal" => ("unknown", true),
+                "attachment_removal_partial" if matches!(outcome, "partial" | "unknown") => {
+                    return Some(true)
+                }
+                _ => return None,
+            },
+            AttachmentOperationKind::Prune => match code {
+                "invalid_prune_request" => ("not_started", false),
+                "attachment_lifecycle_internal" => ("unknown", true),
+                "attachment_removal_partial" if matches!(outcome, "partial" | "unknown") => {
+                    return Some(true)
+                }
+                _ => return None,
+            },
+            AttachmentOperationKind::Download | AttachmentOperationKind::WebDownload => {
+                match code {
+                    "download_failed" => ("not_started", true),
+                    "attachment_quota_exceeded" | "attachment_tag_capacity" => {
+                        ("not_started", false)
+                    }
+                    "attachment_min_free_space" => ("not_started", true),
+                    _ => return None,
+                }
+            }
+        },
+    };
+    (outcome == fixed.0).then_some(fixed.1)
+}
+
+pub(crate) fn validate_lifecycle_error_for_request(
+    value: &serde_json::Value,
+    kind: AttachmentOperationKind,
+    operation_id: &str,
+    expected_offer_id: Option<&str>,
+) -> Result<LifecycleErrorV1> {
+    let error = LifecycleErrorV1::from_value(value)?;
+    anyhow::ensure!(
+        error.operation_id.as_deref() == Some(operation_id),
+        "daemon lifecycle error operation ID does not match the request"
+    );
+    let expected_retryable = lifecycle_error_semantics(kind, &error.code, &error.outcome)
+        .context("error code or outcome is not applicable to this attachment operation")?;
+    anyhow::ensure!(
+        error.retryable == expected_retryable,
+        "attachment operation error retryability is not canonical"
+    );
+    let partial_removal = error.code == "attachment_removal_partial";
+    let offer_specific = error.code == "invalid_offer_selector"
+        || (partial_removal && kind == AttachmentOperationKind::Remove);
+    if offer_specific {
+        anyhow::ensure!(
+            expected_offer_id.is_some() && error.offer_id.as_deref() == expected_offer_id,
+            "offer-specific lifecycle error omitted or mismatched its offer ID"
+        );
+    } else {
+        anyhow::ensure!(
+            error.offer_id.is_none(),
+            "daemon lifecycle error included an inapplicable offer ID"
+        );
+    }
+    anyhow::ensure!(
+        partial_removal == error.selected_tags.is_some()
+            && partial_removal == error.removed_tags.is_some()
+            && partial_removal == error.quota_bytes_released.is_some(),
+        "daemon lifecycle error included inapplicable removal accounting"
+    );
+    Ok(error)
+}
 
 pub(crate) fn valid_content_digest(value: &str) -> bool {
     value.len() == 64
@@ -225,11 +323,12 @@ struct AttachmentSharedV3 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LifecycleSuccessV1 {
+struct LifecycleSuccessV2 {
     #[serde(rename = "type")]
     family: String,
     schema_version: u8,
     request_id: String,
+    operation_id: String,
     dry_run: bool,
     selected_tags: usize,
     removed_tags: usize,
@@ -240,21 +339,23 @@ struct LifecycleSuccessV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DownloadStartedV1 {
+struct DownloadStartedV2 {
     #[serde(rename = "type")]
     family: String,
     schema_version: u8,
     request_id: String,
+    operation_id: String,
     output: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DownloadProgressV1 {
+struct DownloadProgressV2 {
     #[serde(rename = "type")]
     family: String,
     schema_version: u8,
     request_id: String,
+    operation_id: String,
     received_bytes: u64,
     total_bytes: u64,
     output: PathBuf,
@@ -262,11 +363,13 @@ struct DownloadProgressV1 {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DownloadCompleteV1 {
+pub(crate) struct DownloadCompleteV2 {
     #[serde(rename = "type")]
     family: String,
     schema_version: u8,
     request_id: String,
+    pub(crate) operation_id: String,
+    pub(crate) token_digest: String,
     pub(crate) offer_id: String,
     pub(crate) kind: String,
     pub(crate) name: String,
@@ -466,7 +569,28 @@ struct BenchReceiveSummaryV1 {
     malformed_messages: u64,
 }
 
-impl DownloadCompleteV1 {
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadRequestContext {
+    pub(crate) operation_id: String,
+    pub(crate) token_digest: String,
+    pub(crate) offer_id: String,
+    pub(crate) provider: String,
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) declared_size: Option<u64>,
+    pub(crate) output: PathBuf,
+}
+
+pub(crate) fn download_token_digest(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"meshmsg-download-token-v1\0");
+    digest.update((token.len() as u64).to_le_bytes());
+    digest.update(token.as_bytes());
+    data_encoding::HEXLOWER.encode(&digest.finalize())
+}
+
+impl DownloadCompleteV2 {
     pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
         let dto: Self = serde_json::from_value(value.clone())
             .context("malformed download-complete response")?;
@@ -476,7 +600,9 @@ impl DownloadCompleteV1 {
                 "download_complete",
                 dto.schema_version,
                 &dto.request_id
-            ) && dto.schema_version == 1
+            ) && dto.schema_version == 2
+                && valid_operation_id(&dto.operation_id)
+                && valid_content_digest(&dto.token_digest)
                 && valid_operation_id(&dto.offer_id)
                 && matches!(dto.kind.as_str(), "file" | "directory_tar_v1")
                 && valid_public_text(&dto.name, 255)
@@ -495,8 +621,35 @@ impl DownloadCompleteV1 {
         Ok(dto)
     }
 
-    pub(crate) fn output(&self) -> &Path {
-        &self.output
+    pub(crate) fn validate_for_request(
+        value: &serde_json::Value,
+        expected: &DownloadRequestContext,
+    ) -> Result<Self> {
+        let dto = Self::from_value(value)?;
+        anyhow::ensure!(
+            dto.operation_id == expected.operation_id,
+            "download operation ID mismatch"
+        );
+        anyhow::ensure!(
+            dto.token_digest == expected.token_digest,
+            "download token identity mismatch"
+        );
+        anyhow::ensure!(
+            dto.offer_id == expected.offer_id,
+            "download offer ID mismatch"
+        );
+        anyhow::ensure!(dto.from == expected.provider, "download provider mismatch");
+        anyhow::ensure!(dto.kind == expected.kind, "download kind mismatch");
+        anyhow::ensure!(dto.name == expected.name, "download name mismatch");
+        anyhow::ensure!(
+            expected.declared_size.is_none_or(|size| dto.size == size),
+            "download declared size mismatch"
+        );
+        anyhow::ensure!(
+            dto.output.as_os_str() == expected.output.as_os_str(),
+            "download output mismatch"
+        );
+        Ok(dto)
     }
 }
 
@@ -965,39 +1118,42 @@ pub(crate) fn validate_success_payload_for_context(
                 serde_json::from_value(value.clone()).context("malformed offers response")?;
             dto.validate()?;
         }
-        ("offer_removed" | "offers_pruned", 1) => {
-            let dto: LifecycleSuccessV1 =
+        ("offer_removed" | "offers_pruned", 2) => {
+            let dto: LifecycleSuccessV2 =
                 serde_json::from_value(value.clone()).context("malformed lifecycle response")?;
             anyhow::ensure!(
                 valid_family(&dto.family, family, dto.schema_version, &dto.request_id)
+                    && valid_operation_id(&dto.operation_id)
                     && dto.removed_tags <= dto.selected_tags
                     && (!dto.dry_run || dto.removed_tags == 0),
                 "invalid lifecycle response"
             );
             let _ = (dto.released_bytes, dto.limited, dto.cutoff_ms);
         }
-        ("download_started", 1) => {
-            let dto: DownloadStartedV1 = serde_json::from_value(value.clone())
+        ("download_started", 2) => {
+            let dto: DownloadStartedV2 = serde_json::from_value(value.clone())
                 .context("malformed download-started event")?;
             anyhow::ensure!(
                 valid_family(&dto.family, family, dto.schema_version, &dto.request_id)
+                    && valid_operation_id(&dto.operation_id)
                     && !dto.output.as_os_str().is_empty(),
                 "invalid download-started event"
             );
         }
-        ("download_progress", 1) => {
-            let dto: DownloadProgressV1 = serde_json::from_value(value.clone())
+        ("download_progress", 2) => {
+            let dto: DownloadProgressV2 = serde_json::from_value(value.clone())
                 .context("malformed download-progress event")?;
             anyhow::ensure!(
                 valid_family(&dto.family, family, dto.schema_version, &dto.request_id)
+                    && valid_operation_id(&dto.operation_id)
                     && !dto.output.as_os_str().is_empty()
                     && dto.received_bytes <= dto.total_bytes
                     && (dto.total_bytes > 0 || dto.received_bytes == 0),
                 "invalid download-progress event"
             );
         }
-        ("download_complete", 1) => {
-            DownloadCompleteV1::from_value(value)?;
+        ("download_complete", 2) => {
+            DownloadCompleteV2::from_value(value)?;
         }
         ("stopping", 1) => {
             let dto: StoppingV1 =
@@ -1438,11 +1594,13 @@ pub(crate) enum IpcRequest {
     Peers,
     Offers,
     OffersRemove {
+        operation_id: String,
         offer_id: String,
         direction: Option<String>,
         provider: Option<String>,
     },
     OffersPrune {
+        operation_id: String,
         older_than_secs: Option<u64>,
         direction: Option<String>,
         dry_run: bool,
@@ -1454,12 +1612,14 @@ pub(crate) enum IpcRequest {
         path: PathBuf,
     },
     Download {
+        operation_id: String,
         offer: String,
         output: PathBuf,
     },
     /// Export the verified offered blob without interpreting it. Used by the
     /// local web bridge with a server-selected temporary output path.
     WebDownload {
+        operation_id: String,
         offer: String,
         output: PathBuf,
     },
@@ -2104,6 +2264,7 @@ mod tests {
         write_request(
             &mut bytes,
             &IpcRequest::WebDownload {
+                operation_id: "0123456789abcdef0123456789abcdef".into(),
                 offer: "signed-offer".into(),
                 output: PathBuf::from("server-selected.blob"),
             },
@@ -2132,12 +2293,182 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lifecycle_errors_are_kind_applicable_canonical_and_request_bound() {
+        let operation = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let offer = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let cases = [
+            (
+                AttachmentOperationKind::Share,
+                "share_failed",
+                "unknown",
+                true,
+            ),
+            (
+                AttachmentOperationKind::Remove,
+                "invalid_offer_selector",
+                "not_started",
+                false,
+            ),
+            (
+                AttachmentOperationKind::Prune,
+                "invalid_prune_request",
+                "not_started",
+                false,
+            ),
+            (
+                AttachmentOperationKind::Download,
+                "download_failed",
+                "not_started",
+                true,
+            ),
+            (
+                AttachmentOperationKind::WebDownload,
+                "download_failed",
+                "not_started",
+                true,
+            ),
+        ];
+        for (kind, code, outcome, retryable) in cases {
+            let mut error = LifecycleErrorV1::new(code, "private", outcome, retryable);
+            error.operation_id = Some(operation.into());
+            if code == "invalid_offer_selector" {
+                error.offer_id = Some(offer.into());
+            }
+            let value = error.clone().into_value();
+            assert!(
+                validate_lifecycle_error_for_request(&value, kind, operation, Some(offer)).is_ok()
+            );
+            for wrong_kind in [
+                AttachmentOperationKind::Share,
+                AttachmentOperationKind::Remove,
+                AttachmentOperationKind::Prune,
+                AttachmentOperationKind::Download,
+                AttachmentOperationKind::WebDownload,
+            ] {
+                if wrong_kind != kind
+                    && !(code == "download_failed"
+                        && matches!(
+                            wrong_kind,
+                            AttachmentOperationKind::Download
+                                | AttachmentOperationKind::WebDownload
+                        ))
+                {
+                    assert!(
+                        validate_lifecycle_error_for_request(
+                            &value,
+                            wrong_kind,
+                            operation,
+                            Some(offer)
+                        )
+                        .is_err(),
+                        "{code} crossed into {wrong_kind:?}"
+                    );
+                }
+            }
+            let mut wrong_retry = error.clone();
+            wrong_retry.retryable = !retryable;
+            assert!(validate_lifecycle_error_for_request(
+                &wrong_retry.into_value(),
+                kind,
+                operation,
+                Some(offer)
+            )
+            .is_err());
+            let mut wrong_outcome = error;
+            wrong_outcome.outcome = if outcome == "unknown" {
+                "not_started"
+            } else {
+                "unknown"
+            }
+            .into();
+            assert!(validate_lifecycle_error_for_request(
+                &wrong_outcome.into_value(),
+                kind,
+                operation,
+                Some(offer)
+            )
+            .is_err());
+        }
+
+        for kind in [
+            AttachmentOperationKind::Share,
+            AttachmentOperationKind::Remove,
+            AttachmentOperationKind::Prune,
+            AttachmentOperationKind::Download,
+            AttachmentOperationKind::WebDownload,
+        ] {
+            for (code, outcome, retryable) in [
+                ("operation_id_conflict", "not_started", false),
+                ("operation_capacity", "not_started", true),
+                ("attachment_storage_busy", "not_started", true),
+                ("attachment_command_timeout", "unknown", true),
+                ("attachment_storage_shutdown", "unknown", true),
+            ] {
+                let mut error = LifecycleErrorV1::new(code, "private", outcome, retryable);
+                error.operation_id = Some(operation.into());
+                assert!(validate_lifecycle_error_for_request(
+                    &error.into_value(),
+                    kind,
+                    operation,
+                    Some(offer)
+                )
+                .is_ok());
+            }
+        }
+
+        for (kind, with_offer) in [
+            (AttachmentOperationKind::Remove, true),
+            (AttachmentOperationKind::Prune, false),
+        ] {
+            for outcome in ["partial", "unknown"] {
+                let mut partial =
+                    LifecycleErrorV1::new("attachment_removal_partial", "private", outcome, true);
+                partial.operation_id = Some(operation.into());
+                partial.offer_id = with_offer.then(|| offer.into());
+                partial.selected_tags = Some(2);
+                partial.removed_tags = Some(1);
+                partial.quota_bytes_released = Some(4);
+                assert!(validate_lifecycle_error_for_request(
+                    &partial.clone().into_value(),
+                    kind,
+                    operation,
+                    Some(offer)
+                )
+                .is_ok());
+                partial.selected_tags = None;
+                partial.removed_tags = None;
+                partial.quota_bytes_released = None;
+                assert!(validate_lifecycle_error_for_request(
+                    &partial.into_value(),
+                    kind,
+                    operation,
+                    Some(offer)
+                )
+                .is_err());
+            }
+        }
+
+        let mut generic =
+            LifecycleErrorV1::new("operation_capacity", "private", "not_started", true);
+        generic.operation_id = Some(operation.into());
+        generic.offer_id = Some(offer.into());
+        assert!(validate_lifecycle_error_for_request(
+            &generic.into_value(),
+            AttachmentOperationKind::Remove,
+            operation,
+            Some(offer)
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn attachment_lifecycle_requests_are_strict_and_versioned_by_response_contract() {
         let mut bytes = Vec::new();
         write_request(
             &mut bytes,
             &IpcRequest::OffersRemove {
+                operation_id: "fedcba9876543210fedcba9876543210".into(),
                 offer_id: "0123456789abcdef0123456789abcdef".into(),
                 direction: Some("outgoing".into()),
                 provider: None,
@@ -2148,14 +2479,13 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["request"]["command"], "offers_remove");
         assert!(serde_json::from_slice::<IpcRequest>(
-            br#"{"command":"offers_prune","older_than_secs":0,"direction":null,"dry_run":true,"max_delete":1,"extra":false}"#
+            br#"{"command":"offers_prune","operation_id":"fedcba9876543210fedcba9876543210","older_than_secs":0,"direction":null,"dry_run":true,"max_delete":1,"extra":false}"#
         ).is_err());
-        validate_response(
-            &serde_json::json!({"type":"offers_pruned","schema_version":1}),
-            "offers_pruned",
-            Some(1),
-        )
-        .unwrap();
+        assert!(validate_success_payload(&serde_json::json!({
+            "type":"offers_pruned", "schema_version":1,
+            "request_id":"11111111111111111111111111111111"
+        }))
+        .is_err());
     }
 
     #[tokio::test]
@@ -2437,12 +2767,12 @@ mod tests {
             attachment_offer,
             attachment_shared,
             serde_json::json!({"type":"offers","schema_version":1,"request_id":request_id,"blobs":[{"direction":"outgoing","offer_id":operation_id,"name":"safe.txt","kind":"file","hash":digest,"format":"raw","status":"complete","size":4}],"truncated":false,"has_more":false,"item_errors":0}),
-            serde_json::json!({"type":"offer_removed","schema_version":1,"request_id":request_id,"dry_run":false,"selected_tags":1,"removed_tags":1,"released_bytes":4,"limited":false,"cutoff_ms":null}),
-            serde_json::json!({"type":"offers_pruned","schema_version":1,"request_id":request_id,"dry_run":true,"selected_tags":1,"removed_tags":0,"released_bytes":4,"limited":false,"cutoff_ms":1}),
-            serde_json::json!({"type":"download_started","schema_version":1,"request_id":request_id,"output":"/tmp/file"}),
-            serde_json::json!({"type":"download_progress","schema_version":1,"request_id":request_id,"received_bytes":2,"total_bytes":4,"output":"/tmp/file"}),
-            serde_json::json!({"type":"download_progress","schema_version":1,"request_id":request_id,"received_bytes":0,"total_bytes":0,"output":"/tmp/empty"}),
-            serde_json::json!({"type":"download_complete","schema_version":1,"request_id":request_id,"offer_id":operation_id,"kind":"file","name":"safe.txt","size":4,"from":peer,"output":"/tmp/file","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}),
+            serde_json::json!({"type":"offer_removed","schema_version":2,"request_id":request_id,"operation_id":operation_id,"dry_run":false,"selected_tags":1,"removed_tags":1,"released_bytes":4,"limited":false,"cutoff_ms":null}),
+            serde_json::json!({"type":"offers_pruned","schema_version":2,"request_id":request_id,"operation_id":operation_id,"dry_run":true,"selected_tags":1,"removed_tags":0,"released_bytes":4,"limited":false,"cutoff_ms":1}),
+            serde_json::json!({"type":"download_started","schema_version":2,"request_id":request_id,"operation_id":operation_id,"output":"/tmp/file"}),
+            serde_json::json!({"type":"download_progress","schema_version":2,"request_id":request_id,"operation_id":operation_id,"received_bytes":2,"total_bytes":4,"output":"/tmp/file"}),
+            serde_json::json!({"type":"download_progress","schema_version":2,"request_id":request_id,"operation_id":operation_id,"received_bytes":0,"total_bytes":0,"output":"/tmp/empty"}),
+            serde_json::json!({"type":"download_complete","schema_version":2,"request_id":request_id,"operation_id":operation_id,"token_digest":digest,"offer_id":operation_id,"kind":"file","name":"safe.txt","size":4,"from":peer,"output":"/tmp/file","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}),
             serde_json::json!({"type":"stopping","schema_version":1,"request_id":request_id,"outcome":"accepted"}),
             serde_json::json!({"type":"peer_up","schema_version":1,"request_id":request_id,"peer":peer}),
             serde_json::json!({"type":"peer_down","schema_version":1,"request_id":request_id,"peer":peer}),

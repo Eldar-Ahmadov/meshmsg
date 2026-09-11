@@ -168,6 +168,67 @@ fi
 [[ ! -s "$ROOT/share.spelling.err" ]] || fail "JSON path conflict wrote to stderr"
 python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "operation_id_conflict" and v["outcome"] == "not_started"' "$ROOT/share.spelling" || fail "submitted-path spelling conflict was not reported"
 
+# Prune caches its original deterministic selection and terminal result. A lost
+# response retry cannot select the next batch, and max-delete is operation-bound.
+printf 'second attachment\n' >"$ROOT/source-2.txt"
+printf 'third attachment\n' >"$ROOT/source-3.txt"
+SECOND_ID=33333333333333333333333333333334
+THIRD_ID=33333333333333333333333333333335
+SECOND=$($BIN --state-dir "$ROOT/sender" --json share --operation-id "$SECOND_ID" "$ROOT/source-2.txt")
+THIRD=$($BIN --state-dir "$ROOT/sender" --json share --operation-id "$THIRD_ID" "$ROOT/source-3.txt")
+PRUNE_ID=55555555555555555555555555555555
+PRUNE_REQUEST="{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":1}"
+ipc sender "$PRUNE_REQUEST" >/dev/null
+PRUNE_RETRY=$($BIN --state-dir "$ROOT/sender" --json offers prune --operation-id "$PRUNE_ID" --older-than-secs 0 --direction outgoing --max-delete 1)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["schema_version"] == 2 and v["operation_id"] == sys.argv[1] and v["selected_tags"] == v["removed_tags"] == 1' "$PRUNE_ID" <<<"$PRUNE_RETRY" \
+  || fail "lost-response prune did not replay its authoritative original result"
+COUNT=$($BIN --state-dir "$ROOT/sender" --json offers | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["blobs"]))')
+[[ "$COUNT" == 2 ]] || fail "prune retry deleted the next eligible batch"
+PRUNE_CONFLICT=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":2}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict" and v["operation_id"] == sys.argv[1]' "$PRUNE_ID" <<<"$PRUNE_CONFLICT" \
+  || fail "changed prune limit did not conflict"
+
+# Remove replays the authoritative original count even though the end state is
+# already absent, and selector changes conflict.
+REMOVE_TARGET=$($BIN --state-dir "$ROOT/sender" --json offers | python3 -c 'import json,sys; print(json.load(sys.stdin)["blobs"][0]["offer_id"])')
+REMOVE_ID=66666666666666666666666666666666
+REMOVE1=$($BIN --state-dir "$ROOT/sender" --json offers remove --operation-id "$REMOVE_ID" "$REMOVE_TARGET")
+REMOVE2=$($BIN --state-dir "$ROOT/sender" --json offers remove --operation-id "$REMOVE_ID" "$REMOVE_TARGET")
+python3 -c 'import json,sys; a=json.loads(sys.argv[1]); b=json.loads(sys.argv[2]); a.pop("request_id"); b.pop("request_id"); assert a == b and a["operation_id"] == sys.argv[3] and a["removed_tags"] == 1' "$REMOVE1" "$REMOVE2" "$REMOVE_ID" \
+  || fail "remove did not replay the original authoritative result"
+if $BIN --state-dir "$ROOT/sender" --json offers remove --operation-id "$REMOVE_ID" \
+    "$REMOVE_TARGET" --direction incoming >"$ROOT/remove-conflict.out" 2>"$ROOT/remove-conflict.err"; then
+  fail "changed remove selector succeeded"
+fi
+[[ ! -s "$ROOT/remove-conflict.err" ]] || fail "CLI JSON selector conflict wrote stderr"
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict" and v["operation_id"] == sys.argv[1] and "offer_id" not in v' "$REMOVE_ID" <"$ROOT/remove-conflict.out" \
+  || fail "CLI JSON changed-selector conflict was not preserved"
+
+# A discarded download response is replayed without re-running export/install.
+# The already-installed no-clobber destination therefore remains a success only
+# while the operation cache can authoritatively replay it.
+DOWNLOAD_OFFER=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["offer"])' "$THIRD")
+DOWNLOAD_ID=77777777777777777777777777777777
+DOWNLOAD_OUT="$ROOT/downloaded.txt"
+DOWNLOAD_FIRST=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3]}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$DOWNLOAD_OUT")")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["operation_id"] == sys.argv[1]' "$DOWNLOAD_ID" <<<"$DOWNLOAD_FIRST" \
+  || fail "initial lost-response download did not complete"
+[[ -f "$DOWNLOAD_OUT" ]] || fail "lost-response download did not install output"
+set +e
+DOWNLOAD_RETRY=$($BIN --state-dir "$ROOT/sender" --json download --operation-id "$DOWNLOAD_ID" --output "$DOWNLOAD_OUT" "$DOWNLOAD_OFFER" 2>"$ROOT/download-retry.err")
+DOWNLOAD_STATUS=$?
+set -e
+if [[ $DOWNLOAD_STATUS != 0 ]]; then
+  DEBUG_ERROR=$($BIN --state-dir "$ROOT/sender" download --operation-id "$DOWNLOAD_ID" --output "$DOWNLOAD_OUT" "$DOWNLOAD_OFFER" 2>&1 || true)
+  fail "download retry failed: $DEBUG_ERROR $DOWNLOAD_RETRY"
+fi
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["schema_version"] == 2 and v["operation_id"] == sys.argv[1] and v["output"] == sys.argv[2]' "$DOWNLOAD_ID" "$DOWNLOAD_OUT" <<<"$DOWNLOAD_RETRY" \
+  || fail "download retry did not replay cached completion"
+DOWNLOAD_CONFLICT=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3]}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$ROOT/changed-output.txt")")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict"' <<<"$DOWNLOAD_CONFLICT" \
+  || fail "changed download output did not conflict"
+[[ ! -e "$ROOT/changed-output.txt" ]] || fail "download conflict performed extra export/install work"
+
 # Terminal failures are cached exactly and do not become a fresh attempt.
 FAIL_ID=44444444444444444444444444444444
 FAILED1=$(ipc sender "{\"command\":\"private_send\",\"operation_id\":\"$FAIL_ID\",\"to\":\"not-a-peer\",\"body\":\"failure\"}")
@@ -208,4 +269,4 @@ grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: empty CLI/IPC rejection without side effects and operation-ID consumption; broadcast response-loss retry, concurrent private/share joins, wire IDs, conflicts, terminal failures, bounded-cache status, sender restarts, recipient WAL replay persistence, duplicate classification, and signed fingerprint conflicts"
+echo "PASS: empty rejection; send/private/share joins and replay; prune selection stability and per-operation limit; authoritative remove replay; download response-loss replay/no-extra-install and changed-input conflicts; terminal failures; bounded-cache expiry/eviction/restart semantics; recipient WAL replay persistence"

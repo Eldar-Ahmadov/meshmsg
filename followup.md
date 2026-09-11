@@ -23,11 +23,11 @@ The producer/consumer validation findings 1 and 2 below are now addressed, and f
 
 ### 3. End-to-end idempotency does not cover every mutating operation — Medium-high
 
-`IpcRequest` carries operation IDs for `send`, `private_send`, and `share`, but not for `offers_remove`, `offers_prune`, `download`, or `web_download`: `src/ipc.rs:1360-1402`.
-
-Removal is end-state idempotent, and downloads have strong no-clobber and reconciliation behavior. Prune is nevertheless not request-idempotent: after a successful prune whose response is lost, repeating the same command can select and remove the next eligible batch rather than replaying the original result.
-
-The completed status under the broad heading “Mutating operations have no end-to-end idempotency” should therefore either be narrowed to the three covered mutations or extended to lifecycle/download operations. In particular, prune should use an operation ID and cached selection/result if `--max-delete` is intended as a per-request side-effect bound.
+- [x] **Status: completed.** `offers_remove`, `offers_prune`, `download`, and `web_download` now carry reusable client-generated lowercase 128-bit operation IDs from CLI/HTTP through strict IPC DTOs to the daemon, distinct from each attempt's request ID. A new `idempotent_attachment_operations_v1` capability is negotiated before CLI lifecycle/download submission and browser controls are exposed; mixed old/new components fail closed. Lifecycle and download success/progress families moved to strict schema version 2 with mandatory operation IDs, and all operation errors are ID-bound.
+- The existing bounded 1,024-entry/10-minute memory-only operation cache now covers all seven operation kinds. Exact concurrent duplicates join; exact terminal successes, failures, and post-install partial successes replay; cross-kind or changed selectors, age/dry-run/limit, signed/raw token, exact output representation, path, digest, recipient, or content return `operation_id_conflict` before work. In-flight entries are retained under pressure and oldest terminal entries are evicted. Expiry, eviction, and daemon restart explicitly end replay guarantees.
+- Prune's first execution owns the selected set and terminal result, so response-loss retries cannot delete a later batch and `--max-delete` is a per-operation side-effect bound. Remove still has safe absent end-state behavior but same-ID retries replay the authoritative original counts/result. Downloads replay before no-clobber and therefore do not repeat network/export/install work; cached warning-bearing partial success remains success. After replay state is lost, existing output fails closed without clobbering and requires reconciliation.
+- Browser download admission now uses one locked operation registry that atomically binds immutable offer input, one owner task, and one output. Concurrent exact starts join and changed offers conflict; only the current owner can publish Ready/failure or remove output. Canonical download-applicable polled `not_started` failures rotate the next user attempt's ID; malformed/cross-kind errors do not. Unknown timeout/disconnect failures stop polling, retain the ID, and allow at most three total same-ID preparation attempts (the initial attempt plus two reconciliations) so daemon-cached late success can be recovered without an unbounded stale-failure loop. Local capacity or staging failures during reconciliation replay the retained unknown without consuming an attempt or rotating its ID. Start/pending/ready records repeat that ID, and ready URLs must be the exact unencoded same-origin download route.
+- Focused contract/cache tests cover strict versions, code-applicable lifecycle errors, full request-aware completion binding, controlled concurrent web admission/ownership ordering, kind/input fingerprints, joins, terminal failures/partial success, pressure eviction, and synthetic expiry/restart. `tests/integration-idempotency.sh`, fake/real web, UI, attachment, CLI/IPC compatibility, and lifecycle suites cover real lost responses, unknown late-success reconciliation, polled rejection/ID rotation, prune selection stability/no additional deletion, authoritative remove replay, no extra download/install, changed-input conflicts, browser polling/retries, and negotiated fail-closed behavior. Ten-minute expiry and pressure eviction are deterministic unit evidence; integrations cover process restart rather than sleeping through production TTLs.
 
 ### 4. Typed contracts remain structurally strict but semantically incomplete — Medium
 
@@ -35,7 +35,7 @@ The contract work provides useful deny-unknown-fields DTOs, exact family version
 
 - `ErrorEnvelopeV1::validate` accepts arbitrary combinations of a known `code`, `retryable`, and `outcome`, and does not restrict optional IDs/counts to applicable codes: `src/contracts.rs:250-299`.
 - Lifecycle success validation does not bind `dry_run`, `cutoff_ms`, selectors, or limits to the originating request: `src/ipc.rs:904-913` and `src/node.rs:5745-5766`.
-- `DownloadCompleteV1` does not enforce consistency between `destination_synced`, `cleanup_complete`, and `warnings`: `src/ipc.rs:467-493`.
+- [x] Download completion is now request-bound through one shared CLI/web validator: schema-v2 records carry a digest of the exact token and must match operation ID, offer ID, provider, kind, name, signed size where available, and exact output. The pre-existing durability flags/warnings remain descriptive post-install fields rather than being inferred from one another.
 - `OffersV1` accepts up to 1,024 entries even though the producer and documentation cap listing at 512: `src/ipc.rs:1255-1266` and `src/node.rs:164`.
 
 The main architectural source of drift is that producers often construct ad-hoc `serde_json::Value` objects while consumers deserialize separately defined DTOs. Shared serializable DTOs and request-aware validators would make incompatible producer output harder to create.
@@ -116,7 +116,7 @@ Several statements in the existing review are stale or too broad:
 - The listed module sizes are substantially outdated.
 - `truncated` and `has_more` remain redundant compatibility fields without a removal version.
 - The 1 MiB offer input limit still conflicts with the approximately 25 KiB maximum IPC request frame.
-- The idempotency finding should explicitly state that only send, private-send, and share use operation IDs.
+- The idempotency finding was stale; all mutating lifecycle and download operations now use operation IDs and the new attachment-operation capability.
 - The typed-contract finding should remain partially open until producer/consumer and request-semantic validation are unified.
 
 ## Verification performed
@@ -132,6 +132,8 @@ At the clean `v0.1.18` tagged revision:
 
 Native Windows and musl execution and local `cargo-audit`/`cargo-deny` execution were unavailable during the audit; those remain CI responsibilities.
 
+Finding 3 and its review follow-ups were subsequently verified with formatting, 234 full Rust tests, Clippy with warnings denied, locked debug and release builds, shell/Python/JavaScript syntax checks, and the complete CLI-error, fake/real web, UI, idempotency, five-peer, peer-directory, attachment, direct-message, IPC-version, and pinned-v0.1.18 compatibility integrations. The extended idempotency harness proves lost prune/download replies, stable prune selection and per-operation limits, authoritative remove replay, no second deletion/install, and CLI changed-selector/limit/output conflicts. Focused tests prove code-applicable lifecycle errors, exact partial-failure replay, full valid-but-wrong completion-field rejection, controlled concurrent browser admission and owner-only publication/cleanup ordering, bounded unknown reconciliation, synthetic cache/job expiry, pressure eviction, and daemon restart; fake/real web and UI integrations cover concurrent starts, late cached-success recovery, polled rejection ID rotation, timeout/disconnect handling, and process restart. Native Windows and musl execution remain CI-only.
+
 Findings 1, 2, and the finding 5 integration gates were subsequently verified with `cargo fmt --all -- --check`, 231 full Rust tests, Clippy with warnings denied, and a locked debug build. The CLI-error, isolated fake/real web (including live SSE `internal_contract_error` continuity, suppression accounting, and same-process daemon topic replacement with old-topic rejection and new-topic offer/share delivery), idempotency, five-peer, peer-directory, attachment, direct-message (including positional/file/stdin 3900/3901/4096/4097 private boundaries), published-version IPC, and pinned v0.1.18 mixed-boundary integration (old daemon production to a current daemon/client, and current daemon production to an old daemon/client) all passed; browser asset syntax and UI tests also passed. Crafted signed malformed text and attachment EnvelopeV2 cases are exercised in the focused receive pipeline because there is intentionally no public raw-envelope injection command. Native Windows and musl execution remain CI-only.
 
 ## Recommended order
@@ -139,7 +141,7 @@ Findings 1, 2, and the finding 5 integration gates were subsequently verified wi
 1. Reject empty broadcasts before any side effect and prevent invalid internal events from reaching subscribers.
 2. Canonicalize attachment IDs and bind offer IDs to envelope message IDs.
 3. Add producer-to-consumer contract round-trip tests and request-aware semantic validation.
-4. Decide and document the operation-ID boundary; add it to prune/download if request-level replay is required.
+4. [x] Extend and document the operation-ID boundary through lifecycle and CLI/browser download operations.
 5. Reuse one authoritative CI/release verification workflow and require successful main-branch CI for release tags.
 6. Introduce bounded state reads and a versioned migration policy.
 7. Move daemon output off the event loop and add explicit readiness/degraded health.

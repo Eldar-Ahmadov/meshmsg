@@ -63,21 +63,83 @@ function attachmentSize(size) {
   return `${amount.toFixed(digits).replace(/\.0$/, '')} ${units[unit]}`;
 }
 
-async function downloadAttachment(id, button, status, item) {
+const canonicalDownloadErrors = new Map([
+  ['operation_id_conflict', ['The operation ID is bound to different input.', 'not_started', false]],
+  ['operation_capacity', ['Local capacity is currently unavailable.', 'not_started', true]],
+  ['attachment_storage_busy', ['Local capacity is currently unavailable.', 'not_started', true]],
+  ['attachment_command_timeout', ['The request timed out; reconcile before retrying.', 'unknown', true]],
+  ['attachment_storage_shutdown', ['The daemon is shutting down or unavailable.', 'unknown', true]],
+  ['download_failed', ['Attachment download failed.', 'not_started', true]],
+  ['attachment_quota_exceeded', ['The attachment storage quota is exceeded.', 'not_started', false]],
+  ['attachment_min_free_space', ['The attachment free-space reserve is unavailable.', 'not_started', true]],
+  ['attachment_tag_capacity', ['The attachment pin capacity is exhausted.', 'not_started', false]],
+  ['download_operation_capacity', ['Attachment download capacity is unavailable.', 'not_started', true]],
+  ['download_staging_unavailable', ['Attachment download staging is unavailable.', 'not_started', true]],
+  ['attachment_lifecycle_internal', ['The attachment lifecycle operation failed.', 'unknown', true]],
+  ['not_found', ['The requested resource was not found.', 'not_started', false]]
+]);
+const canonicalId = /^[0-9a-f]{32}$/;
+
+function exactKeys(value, expected) {
+  return Object.keys(value).length === expected.length
+    && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function strictOperationError(value, operation_id) {
+  if (!value || !exactKeys(value, [
+    'type', 'schema_version', 'request_id', 'operation_id', 'code', 'message',
+    'retryable', 'outcome'
+  ]) || value.type !== 'error' || value.schema_version !== 1
+    || !canonicalId.test(value.request_id) || value.operation_id !== operation_id) return false;
+  const canonical = canonicalDownloadErrors.get(value.code);
+  return canonical !== undefined && value.message === canonical[0]
+    && value.outcome === canonical[1] && value.retryable === canonical[2];
+}
+
+function strictDownloadRecord(value, family, operation_id) {
+  const common = ['type', 'schema_version', 'request_id', 'operation_id', 'id'];
+  const expected = family === 'download_started'
+    ? [...common, 'poll_timeout_ms']
+    : family === 'download_ready' ? [...common, 'url'] : common;
+  if (!value || !exactKeys(value, expected) || value.type !== family
+    || value.schema_version !== 1 || !canonicalId.test(value.request_id)
+    || value.operation_id !== operation_id || value.id !== operation_id) return false;
+  if (family === 'download_started') {
+    return Number.isSafeInteger(value.poll_timeout_ms)
+      && value.poll_timeout_ms >= 1 && value.poll_timeout_ms <= 71 * 60 * 1000;
+  }
+  return family !== 'download_ready' || value.url === `/api/download/${operation_id}`;
+}
+
+async function downloadAttachment(id, operation, button, status, item) {
   button.disabled = true;
   status.textContent = 'Starting download…';
   try {
-    const started = await request({ command: 'download', id });
-    if (!started.ok || started.value.type !== 'download_started'
-      || !Number.isSafeInteger(started.value.poll_timeout_ms)
-      || started.value.poll_timeout_ms < 1 || started.value.poll_timeout_ms > 71 * 60 * 1000) {
+    const operation_id = operation.id;
+    const started = await request({ command: 'download', id, operation_id });
+    if (!started.ok && strictOperationError(started.value, operation_id)
+      && started.value.outcome === 'not_started') {
+      // Only a strict, operation-bound definite rejection is terminal for this
+      // ID. Malformed and unknown responses retain it for reconciliation.
+      operation.id = operationId();
+    }
+    if (!started.ok
+      || !strictDownloadRecord(started.value, 'download_started', operation_id)) {
       throw new Error(started.value.message || 'Download could not be started.');
     }
     const pollDeadline = Date.now() + started.value.poll_timeout_ms;
     while (Date.now() < pollDeadline) {
       const result = await request({ command: 'download_status', id: started.value.id });
-      if (!result.ok) throw new Error(result.value.message || 'Download failed.');
-      if (result.value.type === 'download_ready') {
+      if (!result.ok) {
+        if (strictOperationError(result.value, operation_id)
+          && result.value.outcome === 'not_started') {
+          operation.id = operationId();
+        }
+        // Unknown outcomes deliberately retain the ID. A later explicit click
+        // asks the bridge to reconcile it; this polling loop always terminates.
+        throw new Error(result.value.message || 'Download failed.');
+      }
+      if (strictDownloadRecord(result.value, 'download_ready', operation_id)) {
         status.textContent = 'Download ready for at least one hour. Choose Save file.';
         const link = document.createElement('a');
         link.className = 'attachment-save';
@@ -87,7 +149,9 @@ async function downloadAttachment(id, button, status, item) {
         button.remove();
         return;
       }
-      if (result.value.type !== 'download_pending') throw new Error('Unexpected download status.');
+      if (!strictDownloadRecord(result.value, 'download_pending', operation_id)) {
+        throw new Error('Unexpected download status.');
+      }
       status.textContent = 'Downloading and verifying…';
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
@@ -138,7 +202,9 @@ function addAttachment(value) {
     button.className = 'attachment-download quiet';
     button.type = 'button';
     button.textContent = directory ? 'Download .tar' : 'Download';
-    button.addEventListener('click', () => downloadAttachment(value.download_id, button, status, item));
+    const operation = { id: operationId() };
+    button.addEventListener('click', () => downloadAttachment(
+      value.download_id, operation, button, status, item));
     item.append(button);
   }
   prependEntry(item);

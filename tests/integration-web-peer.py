@@ -127,8 +127,12 @@ def main():
                 return result
 
             def browser_download(offer_id):
-                code, started = post({'command': 'download', 'id': offer_id})
-                assert code == 202 and started['type'] == 'download_started'
+                download_operation_id = operation_id()
+                code, started = post({
+                    'command': 'download', 'id': offer_id,
+                    'operation_id': download_operation_id})
+                assert (code == 202 and started['type'] == 'download_started'
+                        and started['operation_id'] == download_operation_id)
                 deadline = time.monotonic() + 30
                 while True:
                     code, status = post({'command': 'download_status', 'id': started['id']})

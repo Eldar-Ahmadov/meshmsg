@@ -71,6 +71,7 @@ pub(crate) fn known_error_code(code: &str) -> bool {
             | "attachment_removal_partial"
             | "share_operation_capacity"
             | "download_operation_capacity"
+            | "download_staging_unavailable"
             | "invalid_daemon_response"
             | "request_rejected"
             | "feed_error"
@@ -129,6 +130,7 @@ fn stable_message(code: &str) -> &'static str {
         "attachment_removal_partial" => "Attachment removal completed only partially.",
         "share_operation_capacity" => "Attachment sharing capacity is unavailable.",
         "download_operation_capacity" => "Attachment download capacity is unavailable.",
+        "download_staging_unavailable" => "Attachment download staging is unavailable.",
         "invalid_daemon_response" => "The daemon returned an invalid response.",
         "daemon_disconnected" => "The daemon disconnected; the event feed has a gap.",
         "request_rejected" => "The request was rejected.",

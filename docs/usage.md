@@ -147,18 +147,20 @@ A successful send reports `queued`:
 
 ### Retry-safe operation IDs
 
-`send`, `send --to`, and `share` accept `--operation-id` with exactly 32 lowercase hexadecimal characters. The CLI generates a cryptographically random ID when omitted. To recover from a lost response, retry the identical command with the same explicit ID:
+`send`, `send --to`, `share`, `offers remove`, `offers prune`, and `download` accept `--operation-id` with exactly 32 lowercase hexadecimal characters. The CLI generates a cryptographically random ID when omitted. To recover from a lost response, retry the identical command with the same explicit ID:
 
 ```sh
 meshmsg --json send --operation-id 0123456789abcdef0123456789abcdef 'hello'
 meshmsg --json share --operation-id fedcba9876543210fedcba9876543210 ./report.pdf
+meshmsg --json offers prune --operation-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --max-delete 10
+meshmsg --json download --operation-id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb '<offer>' --output ./report.pdf
 ```
 
-The daemon joins concurrent duplicates and returns the exact cached terminal success or failure without repeating the broadcast, private transfer, or attachment publication. Reusing an ID with a different operation kind, recipient, body, exact submitted absolute share-path representation, or share-content digest fails with versioned `operation_id_conflict`; errors and successful mutation responses include `operation_id`. A terminal failure remains terminal for that ID—use a new ID only when intentionally starting a new attempt.
+The daemon joins concurrent duplicates and returns the exact cached terminal success, failure, or download partial success without repeating broadcast, transfer, publication, deletion, export, or installation work. Reusing an ID with a different operation kind, recipient, body, exact submitted absolute share-path representation, share-content digest, lifecycle selector/age/dry-run/limit, download token, or exact output representation fails with versioned `operation_id_conflict`; errors and successful mutation responses include `operation_id`. Prune retries retain the original selected set, so `--max-delete` bounds one operation rather than each transport attempt. Remove retries replay the original authoritative counts. A terminal failure remains terminal for that ID—use a new ID only when intentionally starting a new attempt.
 
 The daemon retains at most 1,024 in-flight/terminal IDs. Terminal entries expire after 10 minutes and oldest terminal entries can be evicted under pressure; in-flight entries are never evicted. The cache is intentionally memory-only and is cleared by daemon restart. Status reports `operation_cache_capacity`, `operation_cache_ttl_ms`, and `operation_cache_persistent:false`. Therefore same-ID retry protection applies only while the ID remains in the current daemon's cache. After expiry, eviction, or restart, do not reuse an old ID unless repeating the side effect is acceptable. Private receivers still durably suppress the same wire ID for their separate replay window, but that does not make sender operation outcomes restart-persistent.
 
-This IPC is intentionally incompatible with mutation requests from older clients: `send`, `private_send`, and `share` require `operation_id`, and `share` additionally requires its validated 64-character lowercase `source_digest`. New CLI/web clients first require `idempotent_mutations_v1`; they fail before submission against an older daemon. Local `queued`, `private_accepted`, and `attachment_shared` responses are schema 3. Incoming wire records retain their existing schemas.
+This IPC is intentionally incompatible with mutation requests from older clients: all seven operations above (including daemon-only `web_download`) require `operation_id`, and `share` additionally requires its validated 64-character lowercase `source_digest`. Messaging/share clients require `idempotent_mutations_v1`; lifecycle/download clients and the web bridge require `idempotent_attachment_operations_v1`. They fail before submission against an older daemon. Local `queued`, `private_accepted`, and `attachment_shared` responses are schema 3; lifecycle/download results and progress are schema 2. Incoming wire records retain their existing schemas.
 
 ### Private sends
 
