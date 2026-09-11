@@ -42,15 +42,35 @@ Every machine-readable application error is:
 }
 ```
 
-`code` is a closed, stable lowercase ASCII token. Each admitted code maps to one
-fixed bounded public message; unknown codes and noncanonical messages fail closed.
-`message` contains no control characters (including tabs) and is at most 1024 UTF-8
-bytes. Internal causes and paths remain only in local diagnostics; automation must
-branch on `code`. `outcome` is exactly
-`not_started`, `unknown`, or `partial`. `request_id` is omitted only when no request
-could be decoded or admitted (for example pre-frame IPC timeout/capacity output).
-`operation_id`, `offer_id`, and attachment partial-count fields appear only where
-relevant. HTTP replaces private daemon diagnostics with fixed public messages.
+`code` is a closed, stable lowercase ASCII token. One canonical code specification
+shared by every producer and consumer defines its exact public message, admitted
+`(outcome, retryable)` pairs, operation-kind applicability, and whether request,
+operation, offer, removal-count, or suppression fields are required, optional, or
+forbidden. Unknown codes, noncanonical messages, and impossible combinations fail
+closed. `message` contains no control characters (including tabs) and is at most
+1024 UTF-8 bytes. `outcome` is exactly `not_started`, `unknown`, or `partial`, but
+only outcomes listed for that code are admitted. `request_id` is omitted only when
+no request could be decoded or admitted (for example pre-frame IPC timeout/capacity
+output). Operation-aware consumers additionally require the exact originating
+operation ID; offer IDs and partial-removal counts are accepted only for applicable
+codes.
+
+Before public-message replacement, constructors retain the private cause (including
+useful local paths) in a bounded 256-record in-process telemetry ring. Records are
+control-sanitized and bounded to 2048 UTF-8 bytes. In human mode they are also offered
+to a 128-record nonblocking channel whose dedicated worker owns stderr, so the
+producer never waits on diagnostic output; contended evidence admission and full or
+disconnected output queues increment an in-process drop counter. Poisoned evidence
+state is cleared and recovered rather than panicking. Exact status schema v1 remains
+unchanged for released-client compatibility. Daemons advertising
+`diagnostic_status_v1` accept the separate `diagnostics` command and return strict
+`diagnostic_status` v1 with cumulative `records_accepted`, cumulative
+`records_dropped`, and current `records_retained`; accepted and dropped are
+independent stage counters, not a partition of attempts. JSON mode intentionally disables the stderr sink to
+preserve its empty-stderr contract, although the bounded telemetry ring still
+receives the cause for the process lifetime. Private causes are not present in IPC/HTTP/SSE/JSON,
+and operators must not assume every diagnostic survives queue pressure or process
+exit. Automation must branch on `code`, never diagnostic text.
 
 With `--json`, one-shot failures write exactly one error object to **stdout**, write
 nothing to stderr, and exit 1. Success exits 0. Streaming commands use stdout NDJSON;
@@ -139,9 +159,8 @@ IPC success/event families are:
 - messaging: `queued` v3, `private_accepted` v3, `message` v2,
   `private_message` v1;
 - attachment: `attachment_offer` v2, `attachment_shared` v3, `offers` v1,
-  `offer_removed`/`offers_pruned` v2, `download_started`/`download_progress`/
-  `download_complete` v2 (all lifecycle/download v2 records carry their
-  operation ID);
+  `offer_removed`/`offers_pruned` v3, `download_started`/`download_progress`/
+  `download_complete` v2 (all lifecycle/download records carry their operation ID);
 - benchmark: send `started`, `progress`, and `summary` v2; receive `started`,
   `progress`, and `summary` v1 (one explicit request ID is preserved across each
   complete benchmark stream);
@@ -222,6 +241,42 @@ retry guarantee ends: a retry is a new execution and an existing output fails cl
 without clobbering. Status exposes these bounds and `operation_cache_persistent:false`. Unit tests
 exercise synthetic expiry and pressure eviction deterministically; integrations
 exercise real response loss and daemon restart, not a ten-minute wall-clock wait.
+
+`offers` v1 contains at most 512 entries. `truncated` and its compatibility alias
+`has_more` must be equal; malformed meshmsg tags, unsupported formats, missing or
+partial blobs, and per-item store failures are omitted, counted, privately diagnosed,
+and force truncation. Producer validation is bounded to 4096 tag records plus one
+presence lookahead, including records after the 512th public item. A list/stream
+failure returns canonical `offers_failed` rather than panicking. Version 1 has no
+cursor, so truncation is a bounded prefix rather than pagination.
+
+Lifecycle-v3 successes and partial errors repeat the exact operation ID,
+remove/prune selectors, effective age, dry-run mode, maximum, and applicable cutoff.
+Remove has no cutoff. The sole schema-1 prune request representation contains
+`operation_id`, required `older_than_secs`, nullable `direction`, `dry_run`, and
+`max_delete`; it never contains `cutoff_ms`. Strict deny-unknown-fields decoding
+therefore rejects cutoff-only, age-plus-cutoff, future-cutoff, saturated-cutoff, and
+selector/cutoff combinations instead of letting raw clients choose a boundary.
+
+The operation fingerprint binds only stable caller intent: kind, effective age,
+direction, dry-run, and maximum. For the first admitted owner, the daemon resolves
+`cutoff_ms = daemon_now_ms.saturating_sub(
+older_than_secs.saturating_mul(1000))`; multiplication and subtraction cannot
+overflow, age zero uses admission time, and sufficiently large ages resolve to zero.
+That resolution is retained as authoritative in the in-flight and completed cache
+entry, drives selection, and is repeated in success or partial-error output.
+Concurrent duplicates join it and terminal retries replay it without consulting the
+clock. This preserves delayed execution, backward-clock behavior, and retries up to
+the cache TTL while ensuring an identical CLI retry does not need a value from the
+lost response. Changed age/selectors/mode/limit conflict; cutoff is not caller input.
+Selection is bounded by `maximum`; `limited:true` requires a full selection;
+successful non-dry-run removal has equal selected and removed counts; dry-run removes
+zero; and an empty selection releases zero bytes. The same request-aware DTO
+validator is used by production, generic IPC dispatch, and CLI consumption;
+caller-side validation accepts one required daemon-authoritative cutoff while
+producer/generic validation binds its exact value. `attachment_lifecycle_v3` is
+negotiated before submission, so a daemon that only supports lifecycle-v2 or earlier
+fails closed before mutation.
 
 Attachment operation errors are additionally request-kind-aware. Share, remove,
 prune, download, and web-download each admit only their documented code set with

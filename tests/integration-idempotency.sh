@@ -176,17 +176,73 @@ SECOND_ID=33333333333333333333333333333334
 THIRD_ID=33333333333333333333333333333335
 SECOND=$($BIN --state-dir "$ROOT/sender" --json share --operation-id "$SECOND_ID" "$ROOT/source-2.txt")
 THIRD=$($BIN --state-dir "$ROOT/sender" --json share --operation-id "$THIRD_ID" "$ROOT/source-3.txt")
+# Strict IPC carries caller intent only. The daemon resolves one overflow-safe
+# cutoff after cache admission; raw clients cannot inject a matching or future
+# cutoff. Saturating age remains well-defined.
+NONZERO_ID=55555555555555555555555555555553
+NONZERO=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$NONZERO_ID\",\"older_than_secs\":1,\"direction\":\"incoming\",\"dry_run\":true,\"max_delete\":1}")
+python3 -c 'import json,sys,time; v=json.load(sys.stdin); now=time.time_ns()//1000000; assert v["type"] == "offers_pruned" and v["older_than_secs"] == 1 and 0 <= v["cutoff_ms"] <= now-1000' <<<"$NONZERO" \
+  || fail "daemon did not resolve a safe nonzero-age cutoff"
+SATURATED_ID=55555555555555555555555555555554
+SATURATED=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$SATURATED_ID\",\"older_than_secs\":18446744073709551615,\"direction\":\"incoming\",\"dry_run\":true,\"max_delete\":1}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["older_than_secs"] == 18446744073709551615 and v["cutoff_ms"] == 0' <<<"$SATURATED" \
+  || fail "saturating u64 prune cutoff was not preserved"
+for BAD_CUTOFF in 0 18446744073709551615; do
+  REJECTED=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"55555555555555555555555555555552\",\"older_than_secs\":0,\"cutoff_ms\":$BAD_CUTOFF,\"direction\":\"outgoing\",\"dry_run\":true,\"max_delete\":1}")
+  python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "invalid_request"' <<<"$REJECTED" \
+    || fail "raw IPC accepted client-selected prune cutoff $BAD_CUTOFF"
+done
+
+# Put a transparent Unix-socket proxy in front of the daemon. It forwards the
+# real CLI's status negotiation and prune request, waits for the daemon's terminal
+# prune result, then discards that response. The identical CLI retry must replay.
 PRUNE_ID=55555555555555555555555555555555
-PRUNE_REQUEST="{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":1}"
-ipc sender "$PRUNE_REQUEST" >/dev/null
-PRUNE_RETRY=$($BIN --state-dir "$ROOT/sender" --json offers prune --operation-id "$PRUNE_ID" --older-than-secs 0 --direction outgoing --max-delete 1)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["schema_version"] == 2 and v["operation_id"] == sys.argv[1] and v["selected_tags"] == v["removed_tags"] == 1' "$PRUNE_ID" <<<"$PRUNE_RETRY" \
-  || fail "lost-response prune did not replay its authoritative original result"
+SOCKET="$ROOT/sender/daemon.sock"
+REAL_SOCKET="$ROOT/sender/daemon.real.sock"
+mv "$SOCKET" "$REAL_SOCKET"
+python3 - "$SOCKET" "$REAL_SOCKET" "$ROOT/prune.discarded" <<'PY' &
+import json,socket,sys
+front,back,discarded=sys.argv[1:]
+listener=socket.socket(socket.AF_UNIX); listener.bind(front); listener.listen(4)
+while True:
+    client,_=listener.accept(); request=b''
+    while not request.endswith(b'\n'):
+        request += client.recv(65536)
+    upstream=socket.socket(socket.AF_UNIX); upstream.connect(back); upstream.sendall(request)
+    response=b''
+    while not response.endswith(b'\n'):
+        chunk=upstream.recv(65536)
+        if not chunk: break
+        response += chunk
+    command=json.loads(request)['request']['command']
+    if command == 'offers_prune':
+        open(discarded, 'wb').write(response)
+        client.close(); upstream.close(); break
+    client.sendall(response); client.close(); upstream.close()
+listener.close()
+PY
+PROXY_PID=$!
+wait_for 10 "prune response-loss proxy" test -S "$SOCKET"
+if "$BIN" --state-dir "$ROOT/sender" --json offers prune --operation-id "$PRUNE_ID" --older-than-secs 0 --direction outgoing --max-delete 1 >"$ROOT/prune.lost" 2>"$ROOT/prune.lost.err"; then
+  fail "CLI unexpectedly received discarded prune response"
+fi
+wait "$PROXY_PID"
+rm -f "$SOCKET"
+mv "$REAL_SOCKET" "$SOCKET"
+PRUNE_RETRY=$("$BIN" --state-dir "$ROOT/sender" --json offers prune --operation-id "$PRUNE_ID" --older-than-secs 0 --direction outgoing --max-delete 1)
+python3 - "$ROOT/prune.discarded" "$PRUNE_RETRY" "$PRUNE_ID" <<'PY' || fail "identical CLI prune retry did not replay its authoritative original result"
+import json,sys
+original=json.load(open(sys.argv[1])); replay=json.loads(sys.argv[2])
+assert original["type"] == "offers_pruned" and original["schema_version"] == 3
+assert original["operation_id"] == sys.argv[3] and original["selected_tags"] == original["removed_tags"] == 1
+assert isinstance(original["cutoff_ms"], int)
+original.pop("request_id"); replay.pop("request_id"); assert replay == original
+PY
 COUNT=$($BIN --state-dir "$ROOT/sender" --json offers | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["blobs"]))')
-[[ "$COUNT" == 2 ]] || fail "prune retry deleted the next eligible batch"
-PRUNE_CONFLICT=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":0,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":2}")
+[[ "$COUNT" == 2 ]] || fail "CLI prune retry deleted the next eligible batch"
+PRUNE_CONFLICT=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$PRUNE_ID\",\"older_than_secs\":1,\"direction\":\"outgoing\",\"dry_run\":false,\"max_delete\":1}")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict" and v["operation_id"] == sys.argv[1]' "$PRUNE_ID" <<<"$PRUNE_CONFLICT" \
-  || fail "changed prune limit did not conflict"
+  || fail "changed prune age did not conflict"
 
 # Remove replays the authoritative original count even though the end state is
 # already absent, and selector changes conflict.
@@ -269,4 +325,4 @@ grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
 
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: empty rejection; send/private/share joins and replay; prune selection stability and per-operation limit; authoritative remove replay; download response-loss replay/no-extra-install and changed-input conflicts; terminal failures; bounded-cache expiry/eviction/restart semantics; recipient WAL replay persistence"
+echo "PASS: empty rejection; send/private/share joins and replay; daemon-resolved prune cutoff age/saturation/raw-rejection/real-CLI-response-loss replay/conflict and selection stability; authoritative remove replay; download response-loss replay/no-extra-install and changed-input conflicts; terminal failures; bounded-cache expiry/eviction/restart semantics; recipient WAL replay persistence"

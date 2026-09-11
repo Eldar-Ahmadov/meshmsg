@@ -159,10 +159,10 @@ python3 -c 'import json,sys; assert json.load(sys.stdin)["offer_id"] == sys.argv
 python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; same=[x for x in b if x["name"] == "source.txt"]; assert len(same) == 2 and len({x["hash"] for x in same}) == 1' \
   <<<"$($BIN --state-dir "$ROOT/provider" --json offers)" || fail "deduplicated tags were not independently listed"
 REMOVED=$($BIN --state-dir "$ROOT/provider" --json offers remove "$FILE_ID" --direction outgoing)
-python3 -c 'import json,sys; v=json.load(sys.stdin); r=v.pop("request_id"); o=v.pop("operation_id"); assert len(r) == len(o) == 32 and v == {"type":"offer_removed","schema_version":2,"dry_run":False,"selected_tags":1,"removed_tags":1,"released_bytes":0,"limited":False,"cutoff_ms":None}' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["request_id"]) == len(v["operation_id"]) == 32 and v["type"] == "offer_removed" and v["schema_version"] == 3 and v["offer_id"] == sys.argv[1] and v["direction"] == "outgoing" and v["provider"] is None and v["older_than_secs"] is None and v["maximum"] == 512 and v["dry_run"] is False and v["selected_tags"] == v["removed_tags"] == 1 and v["released_bytes"] == 0 and v["limited"] is False and v["cutoff_ms"] is None' "$FILE_ID" \
   <<<"$REMOVED" || fail "removing one deduplicated reference released shared bytes"
 DRY=$($BIN --state-dir "$ROOT/provider" --json offers prune --older-than-secs 0 --dry-run --max-delete 1)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["dry_run"] is True and v["selected_tags"] == 1 and v["removed_tags"] == 0 and v["limited"] is True' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["schema_version"] == 3 and v["offer_id"] is None and v["direction"] is None and v["provider"] is None and v["older_than_secs"] == 0 and v["maximum"] == 1 and v["dry_run"] is True and v["selected_tags"] == 1 and v["removed_tags"] == 0 and v["limited"] is True and isinstance(v["cutoff_ms"], int)' \
   <<<"$DRY" || fail "bounded prune dry-run was not deterministic/non-mutating"
 
 # A remote transfer remains protected after it has started while the provider

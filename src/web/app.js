@@ -69,13 +69,12 @@ const canonicalDownloadErrors = new Map([
   ['attachment_storage_busy', ['Local capacity is currently unavailable.', 'not_started', true]],
   ['attachment_command_timeout', ['The request timed out; reconcile before retrying.', 'unknown', true]],
   ['attachment_storage_shutdown', ['The daemon is shutting down or unavailable.', 'unknown', true]],
-  ['download_failed', ['Attachment download failed.', 'not_started', true]],
+  ['download_failed', ['Attachment download failed.', [['not_started', true], ['unknown', true]]]],
   ['attachment_quota_exceeded', ['The attachment storage quota is exceeded.', 'not_started', false]],
   ['attachment_min_free_space', ['The attachment free-space reserve is unavailable.', 'not_started', true]],
   ['attachment_tag_capacity', ['The attachment pin capacity is exhausted.', 'not_started', false]],
   ['download_operation_capacity', ['Attachment download capacity is unavailable.', 'not_started', true]],
   ['download_staging_unavailable', ['Attachment download staging is unavailable.', 'not_started', true]],
-  ['attachment_lifecycle_internal', ['The attachment lifecycle operation failed.', 'unknown', true]],
   ['not_found', ['The requested resource was not found.', 'not_started', false]]
 ]);
 const canonicalId = /^[0-9a-f]{32}$/;
@@ -92,8 +91,10 @@ function strictOperationError(value, operation_id) {
   ]) || value.type !== 'error' || value.schema_version !== 1
     || !canonicalId.test(value.request_id) || value.operation_id !== operation_id) return false;
   const canonical = canonicalDownloadErrors.get(value.code);
-  return canonical !== undefined && value.message === canonical[0]
-    && value.outcome === canonical[1] && value.retryable === canonical[2];
+  if (canonical === undefined || value.message !== canonical[0]) return false;
+  const semantics = Array.isArray(canonical[1]) ? canonical[1] : [[canonical[1], canonical[2]]];
+  return semantics.some(([outcome, retryable]) =>
+    value.outcome === outcome && value.retryable === retryable);
 }
 
 function strictDownloadRecord(value, family, operation_id) {

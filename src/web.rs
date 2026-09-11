@@ -76,6 +76,7 @@ struct StoredOffer {
     created: Instant,
 }
 
+#[allow(clippy::large_enum_variant)] // The retained strict error DTO carries replay context.
 enum DownloadJob {
     Pending {
         created: Instant,
@@ -920,6 +921,15 @@ fn public_status(value: &Value) -> Value {
     if let Some(persistent) = value["operation_cache_persistent"].as_bool() {
         result["operation_cache_persistent"] = persistent.into();
     }
+    for key in [
+        "diagnostic_records_accepted",
+        "diagnostic_records_dropped",
+        "diagnostic_records_retained",
+    ] {
+        if let Some(metric) = value[key].as_u64() {
+            result[key] = metric.into();
+        }
+    }
     if let Some(retention) = value["attachment_retention_secs"].as_u64() {
         result["attachment_retention_secs"] = retention.into();
     }
@@ -1307,7 +1317,7 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
                     _ => (
                         DownloadJob::Failed {
                             error: operation_bound_download_error(
-                                "attachment_lifecycle_internal",
+                                "download_failed",
                                 "Daemon completed without an exported file.",
                                 "unknown",
                                 true,
@@ -1327,10 +1337,11 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
                         ipc::AttachmentOperationKind::WebDownload,
                         &operation,
                         None,
+                        None,
                     )
                     .unwrap_or_else(|_| {
                         operation_bound_download_error(
-                            "attachment_lifecycle_internal",
+                            "download_failed",
                             "Daemon returned a malformed attachment lifecycle error.",
                             "unknown",
                             true,
@@ -1339,7 +1350,7 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
                     })
                 } else {
                     operation_bound_download_error(
-                        "attachment_lifecycle_internal",
+                        "download_failed",
                         "Daemon returned an incompatible attachment download response.",
                         "unknown",
                         true,
@@ -1408,10 +1419,7 @@ fn public_lifecycle_error(error: ipc::LifecycleErrorV1) -> ipc::LifecycleErrorV1
 }
 
 fn log_private_lifecycle_diagnostic(context: &str, error: &ipc::LifecycleErrorV1) {
-    eprintln!(
-        "meshmsg web {context} diagnostic [{}; {}]: {:?}",
-        error.code, error.outcome, error.message
-    );
+    contracts::log_private_diagnostic(context, &error.code, &error.message);
 }
 
 fn download_status(state: &WebState, id: &str) -> Response<Body> {
@@ -2488,6 +2496,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
                 ipc::AttachmentOperationKind::Share,
                 &operation_id,
                 None,
+                None,
             )
             .ok()
             .map(|error| {
@@ -2825,39 +2834,142 @@ mod tests {
     }
 
     #[test]
+    fn browser_error_matrix_has_independent_rust_parity() {
+        let source = include_str!("web/app.js");
+        let expected = [
+            (
+                "operation_id_conflict",
+                "The operation ID is bound to different input.",
+                "not_started",
+                false,
+            ),
+            (
+                "operation_capacity",
+                "Local capacity is currently unavailable.",
+                "not_started",
+                true,
+            ),
+            (
+                "attachment_storage_busy",
+                "Local capacity is currently unavailable.",
+                "not_started",
+                true,
+            ),
+            (
+                "attachment_command_timeout",
+                "The request timed out; reconcile before retrying.",
+                "unknown",
+                true,
+            ),
+            (
+                "attachment_storage_shutdown",
+                "The daemon is shutting down or unavailable.",
+                "unknown",
+                true,
+            ),
+            (
+                "attachment_quota_exceeded",
+                "The attachment storage quota is exceeded.",
+                "not_started",
+                false,
+            ),
+            (
+                "attachment_min_free_space",
+                "The attachment free-space reserve is unavailable.",
+                "not_started",
+                true,
+            ),
+            (
+                "attachment_tag_capacity",
+                "The attachment pin capacity is exhausted.",
+                "not_started",
+                false,
+            ),
+            (
+                "download_operation_capacity",
+                "Attachment download capacity is unavailable.",
+                "not_started",
+                true,
+            ),
+            (
+                "download_staging_unavailable",
+                "Attachment download staging is unavailable.",
+                "not_started",
+                true,
+            ),
+            (
+                "not_found",
+                "The requested resource was not found.",
+                "not_started",
+                false,
+            ),
+        ];
+        for (code, message, outcome, retryable) in expected {
+            let spec = contracts::error_code_spec(code).unwrap();
+            assert_eq!(spec.message, message);
+            assert!(spec.semantics.contains(&(outcome, retryable)));
+            assert!(spec
+                .operations
+                .contains(&contracts::ErrorOperationKind::WebDownload));
+            assert!(source.contains(&format!(
+                "['{code}', ['{message}', '{outcome}', {retryable}]]"
+            )));
+        }
+        let download = contracts::error_code_spec("download_failed").unwrap();
+        assert_eq!(
+            download.semantics,
+            &[("not_started", true), ("unknown", true)]
+        );
+        assert!(source.contains("[['not_started', true], ['unknown', true]]"));
+        assert!(!source.contains("['attachment_lifecycle_internal',"));
+    }
+
+    #[test]
     fn public_attachment_errors_preserve_actions_but_hide_private_diagnostics() {
         let operation_id = "0123456789abcdef0123456789abcdef";
         let offer_id = "fedcba9876543210fedcba9876543210";
-        for code in [
-            "download_failed",
-            "share_failed",
-            "attachment_lifecycle_internal",
-            "attachment_min_free_space",
-            "attachment_removal_partial",
+        for (code, outcome, with_removal) in [
+            ("download_failed", "not_started", false),
+            ("share_failed", "unknown", false),
+            ("attachment_lifecycle_internal", "unknown", false),
+            ("attachment_min_free_space", "not_started", false),
+            ("attachment_removal_partial", "unknown", true),
         ] {
             let mut private = ipc::LifecycleErrorV1::new(
                 code,
                 "open /home/alice/private/file.bin failed: database secret detail",
-                "unknown",
+                outcome,
                 true,
             );
             private.operation_id = Some(operation_id.into());
-            private.offer_id = Some(offer_id.into());
-            private.selected_tags = Some(2);
-            private.removed_tags = Some(1);
-            private.quota_bytes_released = Some(7);
+            if with_removal {
+                private.offer_id = Some(offer_id.into());
+                private.selected_tags = Some(2);
+                private.removed_tags = Some(1);
+                private.quota_bytes_released = Some(7);
+                private.maximum = Some(2);
+                private.dry_run = Some(false);
+            }
             let public = public_lifecycle_error(private);
             assert_eq!(public.code, code);
-            assert_eq!(public.outcome, "unknown");
-            assert!(public.retryable);
-            assert_eq!(public.operation_id.as_deref(), Some(operation_id));
-            assert_eq!(public.offer_id.as_deref(), Some(offer_id));
-            assert_eq!(public.selected_tags, Some(2));
-            assert_eq!(public.removed_tags, Some(1));
-            assert_eq!(public.quota_bytes_released, Some(7));
+            assert_eq!(public.outcome, outcome);
             assert!(!public.message.contains("/home/alice"));
             assert!(!public.message.contains("database"));
             assert!(ipc::LifecycleErrorV1::from_value(&public.into_value()).is_ok());
+            for _ in 0..100 {
+                if contracts::private_diagnostic_evidence_contains("/home/alice/private/file.bin") {
+                    break;
+                }
+                contracts::log_private_diagnostic(
+                    "web-test",
+                    code,
+                    "open /home/alice/private/file.bin failed: database secret detail",
+                );
+                std::thread::yield_now();
+            }
+            assert!(contracts::private_diagnostic_evidence_contains(
+                "/home/alice/private/file.bin"
+            ));
         }
     }
 
@@ -3033,7 +3145,7 @@ mod tests {
         let state = state();
         let second = WebState::new(&state.dir, "127.0.0.1:8788".parse().unwrap(), None).unwrap();
         assert_ne!(state.download_root, second.download_root);
-        let now = Instant::now();
+        let base = Instant::now();
         let id = state
             .remember_offer(StoredOffer {
                 offer_id: "11111111111111111111111111111111".into(),
@@ -3042,13 +3154,13 @@ mod tests {
                 kind: AttachmentKind::File,
                 name: "résumé\r\n.txt".into(),
                 size: 4,
-                created: now,
+                created: base,
             })
             .unwrap();
         assert!(valid_id(&id));
-        let stored = state.get_offer(&id, now).unwrap();
+        let stored = state.get_offer(&id, base).unwrap();
         assert_eq!(stored.offer, "signed-secret");
-        assert_eq!(state.get_offer(&id, now).unwrap().offer, "signed-secret");
+        assert_eq!(state.get_offer(&id, base).unwrap().offer, "signed-secret");
         let disposition = content_disposition(&stored.name);
         let header = disposition.to_str().unwrap();
         assert!(!header.contains('\r') && !header.contains('\n'));
@@ -3061,28 +3173,36 @@ mod tests {
                 kind: AttachmentKind::File,
                 name: "old.txt".into(),
                 size: 4,
-                created: now - DOWNLOAD_TTL - Duration::from_secs(1),
+                created: base,
             })
             .unwrap();
-        assert!(state.get_offer(&expired, now).is_none());
-        state.jobs.lock().unwrap().insert(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        assert!(state.get_offer(&expired, base + DOWNLOAD_TTL).is_some());
+        assert!(state
+            .get_offer(&expired, base + DOWNLOAD_TTL + Duration::from_millis(1))
+            .is_none());
+
+        let pending = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let failed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let ready = "cccccccccccccccccccccccccccccccc";
+        let ready_path = state.download_root.join("ready-boundary.blob");
+        fs::write(&ready_path, b"safe").unwrap();
+        let mut jobs = state.jobs.lock().unwrap();
+        jobs.insert(
+            pending.into(),
             DownloadEntry {
                 offer_handle: id,
                 input: stored.clone(),
-                owner: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                owner: "dddddddddddddddddddddddddddddddd".into(),
                 attempts: 1,
-                job: DownloadJob::Pending {
-                    created: now - DOWNLOAD_PENDING_TTL - Duration::from_secs(1),
-                },
+                job: DownloadJob::Pending { created: base },
             },
         );
-        state.jobs.lock().unwrap().insert(
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        jobs.insert(
+            failed.into(),
             DownloadEntry {
-                offer_handle: "cccccccccccccccccccccccccccccccc".into(),
-                input: stored,
-                owner: "dddddddddddddddddddddddddddddddd".into(),
+                offer_handle: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                input: stored.clone(),
+                owner: "ffffffffffffffffffffffffffffffff".into(),
                 attempts: MAX_DOWNLOAD_RECONCILIATIONS,
                 job: DownloadJob::Failed {
                     error: operation_bound_download_error(
@@ -3090,13 +3210,54 @@ mod tests {
                         "expired",
                         "unknown",
                         true,
-                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        failed,
                     ),
-                    created: now - DOWNLOAD_TTL - Duration::from_secs(1),
+                    created: base,
                 },
             },
         );
-        state.prune_jobs(now);
+        jobs.insert(
+            ready.into(),
+            DownloadEntry {
+                offer_handle: "99999999999999999999999999999999".into(),
+                input: stored,
+                owner: "88888888888888888888888888888888".into(),
+                attempts: 1,
+                job: DownloadJob::Ready {
+                    path: ready_path.clone(),
+                    name: "safe.txt".into(),
+                    size: 4,
+                    created: base,
+                },
+            },
+        );
+        drop(jobs);
+
+        state.prune_jobs(base + DOWNLOAD_TTL);
+        assert_eq!(state.jobs.lock().unwrap().len(), 3);
+        state.prune_jobs(base + DOWNLOAD_TTL + Duration::from_millis(1));
+        {
+            let jobs = state.jobs.lock().unwrap();
+            assert!(!jobs.contains_key(failed));
+            assert!(matches!(jobs[pending].job, DownloadJob::Pending { .. }));
+            assert!(matches!(jobs[ready].job, DownloadJob::Ready { .. }));
+        }
+        assert!(ready_path.exists());
+
+        state.prune_jobs(base + DOWNLOAD_READY_TTL);
+        assert!(state.jobs.lock().unwrap().contains_key(ready));
+        assert!(ready_path.exists());
+        state.prune_jobs(base + DOWNLOAD_READY_TTL + Duration::from_millis(1));
+        {
+            let jobs = state.jobs.lock().unwrap();
+            assert!(!jobs.contains_key(ready));
+            assert!(matches!(jobs[pending].job, DownloadJob::Pending { .. }));
+        }
+        assert!(!ready_path.exists());
+
+        state.prune_jobs(base + DOWNLOAD_PENDING_TTL);
+        assert!(state.jobs.lock().unwrap().contains_key(pending));
+        state.prune_jobs(base + DOWNLOAD_PENDING_TTL + Duration::from_millis(1));
         assert!(state.jobs.lock().unwrap().is_empty());
     }
 
@@ -3188,7 +3349,7 @@ mod tests {
                 "download_failed",
                 "stale",
                 "not_started",
-                false,
+                true,
                 &operation,
             ),
             created: now,
@@ -3207,7 +3368,7 @@ mod tests {
                 "download_failed",
                 "owner",
                 "not_started",
-                false,
+                true,
                 &operation,
             ),
             created: now,

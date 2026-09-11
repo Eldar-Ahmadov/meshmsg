@@ -13,73 +13,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: rustup component add rustfmt clippy
-      - run: cargo fmt --all -- --check
-      - name: Check installer syntax
-        run: bash -n install.sh
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --all-targets
+  verification:
+    uses: ./.github/workflows/verification.yml
+    permissions:
+      contents: read
 
-  windows-rust:
-    runs-on: windows-2022
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: rustup component add clippy
-      - name: Test native Windows named-pipe IPC and all Rust targets
-        shell: pwsh
-        run: cargo test --locked --all-targets
-      - name: Clippy native Windows targets
-        shell: pwsh
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Build native Windows binary
-        shell: pwsh
-        run: cargo build --locked
-
-  dependency-policy:
+  required:
+    name: Required verification
+    if: ${{ always() }}
+    needs: verification
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 2
+    permissions: {}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Install policy tools
-        run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo install cargo-deny --version 0.20.2 --locked
-      - run: cargo audit
-      - run: cargo deny check advisories bans licenses sources
-
-  linux-integration:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: cargo build --locked
-      - name: Check web JavaScript syntax
-        run: timeout 30 bash -c 'node --check src/web/app.js && node --check src/web/settings.js'
-      - name: Run web UI checks
-        run: timeout 60 node tests/web-ui.cjs
-      - name: Run fake-daemon CLI error scenario
-        run: timeout 60 python3 tests/integration-cli-errors.py target/debug/meshmsg
-      - name: Run web HTTP scenario
-        run: timeout 180 python3 tests/integration-web.py target/debug/meshmsg
-      - name: Run web peer scenario
-        run: timeout 600 python3 tests/integration-web-peer.py target/debug/meshmsg
-      - name: Run peer directory scenario
-        run: timeout 600 python3 tests/integration-peer-directory.py target/debug/meshmsg
-      - name: Run five-peer scenario
-        run: timeout 1100 bash tests/integration-5-peer.sh target/debug/meshmsg
-      - name: Run attachment transfer scenario
-        run: timeout 600 bash tests/integration-attachments.sh target/debug/meshmsg
-      - name: Run direct-message scenario
-        run: timeout 600 bash tests/integration-direct-messages.sh target/debug/meshmsg
-      - name: Run IPC version compatibility scenario
-        run: timeout 600 bash tests/integration-ipc-version-compat.sh target/debug/meshmsg
-      - name: Run v0.1.18 message-boundary compatibility scenario
-        run: timeout 600 bash tests/integration-v018-message-boundary.sh target/debug/meshmsg
-      - name: Run idempotency scenario
-        run: timeout 600 bash tests/integration-idempotency.sh target/debug/meshmsg
+      - name: Require exact-SHA reusable verification
+        env:
+          VERIFICATION_RESULT: ${{ needs.verification.result }}
+        run: test "$VERIFICATION_RESULT" = success
