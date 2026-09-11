@@ -6,16 +6,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    io::{Seek, SeekFrom, Write},
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     str::FromStr,
     thread,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot, watch};
-
-#[cfg(test)]
-use std::fs;
 
 const SNAPSHOT_VERSION: u8 = 2;
 const WAL_VERSION: u8 = 2;
@@ -708,14 +706,22 @@ impl ReplayStore {
         let recorded = wal_record(self.recipient, self.topic, sender, id, metadata)
             .map_err(AdmissionFailure::unavailable)?;
         let confirmation_reserve = MAX_WAL_RECORD_BYTES as u64 + 1;
-        let initially_appended = append_wal(&self.wal_path, &recorded, confirmation_reserve)
-            .map_err(AdmissionFailure::unknown)?;
-        if !initially_appended
-            && (self.compact(now_wall).is_err()
-                || !append_wal(&self.wal_path, &recorded, confirmation_reserve)
-                    .map_err(AdmissionFailure::unknown)?)
+        let mut wal = open_wal_transaction(&self.wal_path, self.recipient, self.topic)
+            .map_err(AdmissionFailure::unavailable)?;
+        if !append_wal(&mut wal, &self.wal_path, &recorded, confirmation_reserve)
+            .map_err(AdmissionFailure::unknown)?
         {
-            return Ok(ReplayDecision::Busy);
+            drop(wal);
+            if self.compact(now_wall).is_err() {
+                return Ok(ReplayDecision::Busy);
+            }
+            wal = open_wal_transaction(&self.wal_path, self.recipient, self.topic)
+                .map_err(AdmissionFailure::unavailable)?;
+            if !append_wal(&mut wal, &self.wal_path, &recorded, confirmation_reserve)
+                .map_err(AdmissionFailure::unknown)?
+            {
+                return Ok(ReplayDecision::Busy);
+            }
         }
         self.entries.insert(key, metadata);
         let sender_state = self.senders.entry(sender).or_insert_with(|| SenderState {
@@ -737,7 +743,9 @@ impl ReplayStore {
         metadata.state = PersistedState::DeliveryConfirmed;
         let confirmed = wal_record(self.recipient, self.topic, sender, id, metadata)
             .map_err(AdmissionFailure::unknown)?;
-        if !append_wal(&self.wal_path, &confirmed, 0).map_err(AdmissionFailure::unknown)? {
+        if !append_wal(&mut wal, &self.wal_path, &confirmed, 0)
+            .map_err(AdmissionFailure::unknown)?
+        {
             return Err(AdmissionFailure::unknown(anyhow::anyhow!(
                 "reserved direct replay WAL capacity was lost"
             )));
@@ -1061,15 +1069,106 @@ fn load_wal(
     Ok((records, true))
 }
 
-fn append_wal(path: &Path, record: &WalRecord, reserved_bytes: u64) -> Result<bool> {
-    append_wal_with_hook(path, record, reserved_bytes, || {})
+struct WalTransaction {
+    file: fs::File,
+    expected_len: u64,
+    expected_header: Vec<u8>,
 }
 
-fn append_wal_with_hook(
+fn open_wal_transaction(
+    path: &Path,
+    recipient: PublicKey,
+    topic: TopicId,
+) -> Result<WalTransaction> {
+    let mut file = persistent::open_read_append(path, "direct replay WAL")?;
+    anyhow::ensure!(
+        persistent::opened_file_is_current_path(&file, path, "direct replay WAL")?,
+        "direct replay WAL was replaced while opening transaction"
+    );
+    let metadata = file
+        .metadata()
+        .context("inspect direct replay WAL transaction handle")?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_WAL_BYTES,
+        "direct replay WAL is too large"
+    );
+    file.seek(SeekFrom::Start(0))?;
+    let mut prefix = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_WAL_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut prefix)
+        .context("read direct replay WAL transaction header")?;
+    let header_end = prefix
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("direct replay WAL header is torn or missing")?;
+    let probe: ReplayVersionProbe = persistent::parse_json_bounded_strings(
+        &prefix[..header_end],
+        "direct replay WAL header",
+        64,
+    )?;
+    anyhow::ensure!(
+        probe.version == u64::from(WAL_VERSION),
+        "unsupported direct replay WAL version"
+    );
+    let header: WalHeader = persistent::parse_json_bounded_strings(
+        &prefix[..header_end],
+        "direct replay WAL header",
+        64,
+    )?;
+    validate_binding(&header.recipient, &header.topic, recipient, topic)?;
+    anyhow::ensure!(
+        persistent::opened_file_is_current_path(&file, path, "direct replay WAL")?,
+        "direct replay WAL was replaced while validating transaction"
+    );
+    Ok(WalTransaction {
+        file,
+        expected_len: metadata.len(),
+        expected_header: prefix[..=header_end].to_vec(),
+    })
+}
+
+fn validate_wal_transaction(wal: &mut WalTransaction, path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        persistent::opened_file_is_current_path(&wal.file, path, "direct replay WAL")?,
+        "direct replay WAL was replaced during transaction"
+    );
+    let size = wal
+        .file
+        .metadata()
+        .context("inspect direct replay WAL transaction continuity")?
+        .len();
+    anyhow::ensure!(
+        size == wal.expected_len,
+        "direct replay WAL length continuity was lost"
+    );
+    wal.file.seek(SeekFrom::Start(0))?;
+    let mut header = vec![0_u8; wal.expected_header.len()];
+    wal.file
+        .read_exact(&mut header)
+        .context("re-read direct replay WAL transaction header")?;
+    anyhow::ensure!(
+        header == wal.expected_header,
+        "direct replay WAL header continuity was lost"
+    );
+    Ok(())
+}
+
+fn append_wal(
+    wal: &mut WalTransaction,
     path: &Path,
     record: &WalRecord,
     reserved_bytes: u64,
-    after_open: impl FnOnce(),
+) -> Result<bool> {
+    append_wal_with_hook(wal, path, record, reserved_bytes, || {})
+}
+
+fn append_wal_with_hook(
+    wal: &mut WalTransaction,
+    path: &Path,
+    record: &WalRecord,
+    reserved_bytes: u64,
+    before_write: impl FnOnce(),
 ) -> Result<bool> {
     let mut bytes = serde_json::to_vec(record)?;
     anyhow::ensure!(
@@ -1077,26 +1176,20 @@ fn append_wal_with_hook(
         "direct replay WAL record exceeds size limit"
     );
     bytes.push(b'\n');
-    let mut file = persistent::open_append(path, "direct replay WAL")?;
-    after_open();
-    // Type validation, capacity measurement, append, and sync all use this one
-    // no-follow/reparse-safe handle. The append handle also serializes offsets
-    // with other appenders; supported meshmsg processes are additionally
-    // excluded by the state lock held for the worker lifetime.
-    let size = file
-        .metadata()
-        .context("inspect direct replay WAL append handle")?
-        .len();
+    validate_wal_transaction(wal, path)?;
     let required = (bytes.len() as u64).saturating_add(reserved_bytes);
-    if size.saturating_add(required) > MAX_WAL_BYTES {
+    if wal.expected_len.saturating_add(required) > MAX_WAL_BYTES {
         return Ok(false);
     }
-    file.write_all(&bytes).context("append direct replay WAL")?;
-    file.sync_all().context("sync direct replay WAL append")?;
-    anyhow::ensure!(
-        persistent::opened_file_is_current_path(&file, path, "direct replay WAL")?,
-        "direct replay WAL was replaced during append"
-    );
+    before_write();
+    wal.file
+        .write_all(&bytes)
+        .context("append direct replay WAL")?;
+    wal.file
+        .sync_all()
+        .context("sync direct replay WAL append")?;
+    wal.expected_len = wal.expected_len.saturating_add(bytes.len() as u64);
+    validate_wal_transaction(wal, path)?;
     Ok(true)
 }
 
@@ -1509,19 +1602,7 @@ mod tests {
         symlink(&target, &wal).unwrap();
         let recipient = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([26; 32]);
-        let record = wal_record(
-            recipient,
-            topic,
-            recipient,
-            [1; 16],
-            ReplayMetadata {
-                fingerprint: [1; 32],
-                expires_at_ms: 1,
-                state: PersistedState::Recorded,
-            },
-        )
-        .unwrap();
-        assert!(append_wal(&wal, &record, 0).is_err());
+        assert!(open_wal_transaction(&wal, recipient, topic).is_err());
         assert_eq!(fs::read(target).unwrap(), b"unchanged");
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1553,12 +1634,13 @@ mod tests {
             },
         )
         .unwrap();
-        let error = append_wal_with_hook(&wal, &record, 0, || {
+        let mut transaction = open_wal_transaction(&wal, recipient, topic).unwrap();
+        let error = append_wal_with_hook(&mut transaction, &wal, &record, 0, || {
             fs::rename(&wal, &saved).unwrap();
             fs::write(&wal, replacement).unwrap();
         })
         .unwrap_err();
-        assert!(error.to_string().contains("replaced during append"));
+        assert!(error.to_string().contains("replaced during transaction"));
         assert_eq!(fs::read(&wal).unwrap(), replacement);
         assert!(
             fs::metadata(&saved).unwrap().len()
@@ -1596,16 +1678,147 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(append_wal_with_hook(&wal, &record, 0, || {
-            fs::rename(&wal, &saved).unwrap();
-            symlink(&target, &wal).unwrap();
-        })
-        .is_err());
+        let mut transaction = open_wal_transaction(&wal, recipient, topic).unwrap();
+        assert!(
+            append_wal_with_hook(&mut transaction, &wal, &record, 0, || {
+                fs::rename(&wal, &saved).unwrap();
+                symlink(&target, &wal).unwrap();
+            })
+            .is_err()
+        );
         assert_eq!(fs::read(target).unwrap(), b"unchanged");
         assert!(
             fs::metadata(saved).unwrap().len()
                 > wal_header_bytes(recipient, topic).unwrap().len() as u64
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_rejects_every_wal_replacement_between_record_and_confirmation() {
+        use std::os::unix::fs::symlink;
+
+        for kind in [
+            "empty",
+            "valid_new_file",
+            "malformed",
+            "symlink",
+            "directory",
+        ] {
+            let recipient = iroh::SecretKey::generate().public();
+            let sender = iroh::SecretKey::generate().public();
+            let topic = TopicId::from_bytes([23; 32]);
+            let (snapshot, wal, legacy, dir) = test_paths();
+            let mut store = loaded_store(snapshot, wal.clone(), legacy.clone(), recipient, topic);
+            let saved = dir.join("recorded-generation.wal");
+            let target = dir.join("replacement-target");
+            fs::write(&target, b"target remains unchanged").unwrap();
+            let replacement_bytes = match kind {
+                "empty" => Some(Vec::new()),
+                "valid_new_file" => Some(wal_header_bytes(recipient, topic).unwrap()),
+                "malformed" => Some(b"not a WAL\n".to_vec()),
+                "symlink" | "directory" => None,
+                _ => unreachable!(),
+            };
+            let wal_for_delivery = wal.clone();
+            let saved_for_delivery = saved.clone();
+            let target_for_delivery = target.clone();
+            let replacement_for_delivery = replacement_bytes.clone();
+            let delivery = Box::new(move || {
+                fs::rename(&wal_for_delivery, &saved_for_delivery).unwrap();
+                match kind {
+                    "symlink" => symlink(&target_for_delivery, &wal_for_delivery).unwrap(),
+                    "directory" => fs::create_dir(&wal_for_delivery).unwrap(),
+                    _ => fs::write(&wal_for_delivery, replacement_for_delivery.unwrap()).unwrap(),
+                }
+            });
+            let now = wall_ms().unwrap();
+            let failure = store
+                .admit_transaction(
+                    Admission {
+                        sender,
+                        id: [4; 16],
+                        fingerprint: [4; 32],
+                        expires_at_ms: now + 60_000,
+                        delivery: Some(delivery),
+                    },
+                    now,
+                    Instant::now(),
+                )
+                .unwrap_err();
+            assert_eq!(failure.outcome, ReplayDecision::DeliveryOutcomeUnknown);
+            let recorded_generation = fs::read(&saved).unwrap();
+            assert!(String::from_utf8_lossy(&recorded_generation).contains("\"recorded\""));
+            assert!(
+                !String::from_utf8_lossy(&recorded_generation).contains("\"delivery_confirmed\"")
+            );
+            match kind {
+                "symlink" => {
+                    assert!(fs::symlink_metadata(&wal).unwrap().file_type().is_symlink());
+                    assert_eq!(fs::read(&target).unwrap(), b"target remains unchanged");
+                    fs::remove_file(&wal).unwrap();
+                }
+                "directory" => {
+                    assert!(wal.is_dir());
+                    fs::remove_dir(&wal).unwrap();
+                }
+                _ => assert_eq!(fs::read(&wal).unwrap(), replacement_bytes.unwrap()),
+            }
+            if wal.exists() {
+                fs::remove_file(&wal).unwrap();
+            }
+            fs::rename(&saved, &wal).unwrap();
+            drop(store);
+            let mut restarted =
+                loaded_store(dir.join("snapshot.json"), wal, legacy, recipient, topic);
+            assert_eq!(
+                restarted
+                    .admit(sender, [4; 16], now + 60_000, true, now, Instant::now())
+                    .unwrap(),
+                ReplayDecision::DeliveryOutcomeUnknown
+            );
+            drop(restarted);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn transaction_rejects_in_place_header_discontinuity_before_confirmation() {
+        let recipient = iroh::SecretKey::generate().public();
+        let sender = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([21; 32]);
+        let (snapshot, wal, legacy, dir) = test_paths();
+        let mut store = loaded_store(snapshot, wal.clone(), legacy, recipient, topic);
+        let wal_for_delivery = wal.clone();
+        let delivery = Box::new(move || {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_for_delivery)
+                .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"!").unwrap();
+            file.sync_all().unwrap();
+        });
+        let now = wall_ms().unwrap();
+        let failure = store
+            .admit_transaction(
+                Admission {
+                    sender,
+                    id: [6; 16],
+                    fingerprint: [6; 32],
+                    expires_at_ms: now + 60_000,
+                    delivery: Some(delivery),
+                },
+                now,
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(failure.outcome, ReplayDecision::DeliveryOutcomeUnknown);
+        let bytes = fs::read(&wal).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"recorded\""));
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"delivery_confirmed\""));
+        drop(store);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1619,20 +1832,45 @@ mod tests {
         symlink_file(&target, &wal).unwrap();
         let recipient = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([26; 32]);
-        let record = wal_record(
-            recipient,
-            topic,
-            recipient,
-            [1; 16],
-            ReplayMetadata {
-                fingerprint: [1; 32],
-                expires_at_ms: 1,
-                state: PersistedState::Recorded,
-            },
-        )
-        .unwrap();
-        assert!(append_wal(&wal, &record, 0).is_err());
+        assert!(open_wal_transaction(&wal, recipient, topic).is_err());
         assert_eq!(fs::read(target).unwrap(), b"unchanged");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_transaction_rejects_reparse_replacement_between_appends() {
+        use std::os::windows::fs::symlink_file;
+
+        let recipient = iroh::SecretKey::generate().public();
+        let sender = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([22; 32]);
+        let (snapshot, wal, legacy, dir) = test_paths();
+        let mut store = loaded_store(snapshot, wal.clone(), legacy, recipient, topic);
+        let saved = dir.join("recorded-generation.wal");
+        let target = dir.join("replacement-target");
+        fs::write(&target, b"unchanged").unwrap();
+        let wal_for_delivery = wal.clone();
+        let delivery = Box::new(move || {
+            fs::rename(&wal_for_delivery, &saved).unwrap();
+            symlink_file(&target, &wal_for_delivery).unwrap();
+        });
+        let now = wall_ms().unwrap();
+        let failure = store
+            .admit_transaction(
+                Admission {
+                    sender,
+                    id: [5; 16],
+                    fingerprint: [5; 32],
+                    expires_at_ms: now + 60_000,
+                    delivery: Some(delivery),
+                },
+                now,
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(failure.outcome, ReplayDecision::DeliveryOutcomeUnknown);
+        drop(store);
         fs::remove_dir_all(dir).unwrap();
     }
 

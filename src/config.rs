@@ -313,20 +313,41 @@ fn migrate_legacy_config(
     dir: &Path,
     legacy_bytes: &[u8],
     state: &State,
-    _lock: &StateLock,
+    lock: &StateLock,
     fail_after_backup: bool,
 ) -> Result<()> {
+    migrate_legacy_config_with_hook(dir, legacy_bytes, state, lock, fail_after_backup, || {})
+}
+
+fn migrate_legacy_config_with_hook(
+    dir: &Path,
+    legacy_bytes: &[u8],
+    state: &State,
+    _lock: &StateLock,
+    fail_after_backup: bool,
+    before_backup_commit: impl FnOnce(),
+) -> Result<()> {
     let backup_path = dir.join(CONFIG_BACKUP_V0_NAME);
-    match persistent::read_file_bounded(&backup_path, CONFIG_BACKUP_V0_NAME, MAX_CONFIG_BYTES) {
-        Ok(existing) => anyhow::ensure!(
-            existing == legacy_bytes,
-            "existing config migration backup does not match legacy config"
-        ),
-        Err(error) if error.kind() == crate::persistent::PersistentErrorKind::Missing => {
-            atomic_write(dir, CONFIG_BACKUP_V0_NAME, legacy_bytes, 0o600)
-                .context("write config migration backup")?;
+    match atomic_write_new_with_hook_impl(
+        dir,
+        CONFIG_BACKUP_V0_NAME,
+        legacy_bytes,
+        0o600,
+        before_backup_commit,
+    ) {
+        Ok(()) => {}
+        Err(error) if error.downcast_ref::<NoReplaceCollision>().is_some() => {
+            let existing = persistent::read_file_bounded(
+                &backup_path,
+                CONFIG_BACKUP_V0_NAME,
+                MAX_CONFIG_BYTES,
+            )?;
+            anyhow::ensure!(
+                existing == legacy_bytes,
+                "existing config migration backup does not match legacy config"
+            );
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error.context("write config migration backup")),
     }
     config_migration_crash_point("after_backup_sync");
     if fail_after_backup {
@@ -406,16 +427,40 @@ fn read_secret(path: &Path) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&bytes))
 }
 
+#[derive(Debug)]
+struct NoReplaceCollision;
+
+impl std::fmt::Display for NoReplaceCollision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "state already exists (use --force to replace it)"
+        )
+    }
+}
+
+impl std::error::Error for NoReplaceCollision {}
+
 pub(crate) fn atomic_write(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
     atomic_write_impl(dir, name, contents, mode, true, || {})
 }
 
 fn atomic_write_new(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
-    atomic_write_impl(dir, name, contents, mode, false, || {})
+    atomic_write_new_with_hook_impl(dir, name, contents, mode, || {})
 }
 
 #[cfg(test)]
 fn atomic_write_new_with_hook(
+    dir: &Path,
+    name: &str,
+    contents: &[u8],
+    mode: u32,
+    before_commit: impl FnOnce(),
+) -> Result<()> {
+    atomic_write_new_with_hook_impl(dir, name, contents, mode, before_commit)
+}
+
+fn atomic_write_new_with_hook_impl(
     dir: &Path,
     name: &str,
     contents: &[u8],
@@ -457,7 +502,7 @@ fn atomic_write_impl(
                 if error.kind() == std::io::ErrorKind::AlreadyExists
                     || fs::symlink_metadata(&destination).is_ok()
                 {
-                    bail!("state already exists (use --force to replace it)");
+                    return Err(NoReplaceCollision.into());
                 }
                 return Err(error.into());
             }
@@ -972,6 +1017,117 @@ mod tests {
         atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
         let (_, restored_secret) = State::load_for_doctor(&dir).unwrap();
         assert_eq!(restored_secret.public().to_string(), expected_peer);
+        drop(lock);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_backup_no_replace_accepts_only_matching_concurrent_file() {
+        for matches in [true, false] {
+            let dir = test_dir();
+            State::new_topic().save_new(&dir, false).unwrap();
+            let legacy = legacy_config_bytes(&dir);
+            atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
+            let (state, is_legacy) = decode_state(&legacy).unwrap();
+            assert!(is_legacy);
+            let lock = StateLock::acquire(&dir).unwrap();
+            let backup = dir.join(CONFIG_BACKUP_V0_NAME);
+            let collision = if matches {
+                legacy.clone()
+            } else {
+                b"concurrent mismatching backup".to_vec()
+            };
+
+            let result =
+                migrate_legacy_config_with_hook(&dir, &legacy, &state, &lock, false, || {
+                    fs::write(&backup, &collision).unwrap()
+                });
+            assert_eq!(fs::read(&backup).unwrap(), collision);
+            if matches {
+                result.unwrap();
+                assert_eq!(
+                    State::load(&dir).unwrap().schema_version,
+                    CONFIG_SCHEMA_VERSION
+                );
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match legacy config"));
+                assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
+            }
+            drop(lock);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_backup_no_replace_rejects_concurrent_symlink_and_directory() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["symlink", "directory"] {
+            let dir = test_dir();
+            State::new_topic().save_new(&dir, false).unwrap();
+            let legacy = legacy_config_bytes(&dir);
+            atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
+            let (state, _) = decode_state(&legacy).unwrap();
+            let lock = StateLock::acquire(&dir).unwrap();
+            let backup = dir.join(CONFIG_BACKUP_V0_NAME);
+            let target = dir.join("backup-target");
+            fs::write(&target, &legacy).unwrap();
+
+            let error = migrate_legacy_config_with_hook(
+                &dir,
+                &legacy,
+                &state,
+                &lock,
+                false,
+                || match kind {
+                    "symlink" => symlink(&target, &backup).unwrap(),
+                    "directory" => fs::create_dir(&backup).unwrap(),
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap_err();
+            assert!(!error.to_string().is_empty());
+            assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
+            if kind == "symlink" {
+                assert!(fs::symlink_metadata(&backup)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert_eq!(fs::read(&target).unwrap(), legacy);
+            } else {
+                assert!(backup.is_dir());
+            }
+            drop(lock);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_backup_no_replace_rejects_concurrent_reparse_point() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = test_dir();
+        State::new_topic().save_new(&dir, false).unwrap();
+        let legacy = legacy_config_bytes(&dir);
+        atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
+        let (state, _) = decode_state(&legacy).unwrap();
+        let lock = StateLock::acquire(&dir).unwrap();
+        let backup = dir.join(CONFIG_BACKUP_V0_NAME);
+        let target = dir.join("backup-target");
+        fs::write(&target, &legacy).unwrap();
+
+        let error = migrate_legacy_config_with_hook(&dir, &legacy, &state, &lock, false, || {
+            symlink_file(&target, &backup).unwrap()
+        })
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
+        assert_eq!(fs::read(&target).unwrap(), legacy);
         drop(lock);
         fs::remove_dir_all(dir).unwrap();
     }

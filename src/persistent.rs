@@ -163,11 +163,12 @@ impl Error for PersistentError {
 fn open_existing(
     path: &Path,
     label: &'static str,
+    read: bool,
     write: bool,
     append: bool,
 ) -> Result<fs::File, PersistentError> {
     let mut options = fs::OpenOptions::new();
-    options.read(!append).write(write).append(append);
+    options.read(read).write(write).append(append);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -209,11 +210,14 @@ pub(crate) fn open_read_write(
     path: &Path,
     label: &'static str,
 ) -> Result<fs::File, PersistentError> {
-    open_existing(path, label, true, false)
+    open_existing(path, label, true, true, false)
 }
 
-pub(crate) fn open_append(path: &Path, label: &'static str) -> Result<fs::File, PersistentError> {
-    open_existing(path, label, true, true)
+pub(crate) fn open_read_append(
+    path: &Path,
+    label: &'static str,
+) -> Result<fs::File, PersistentError> {
+    open_existing(path, label, true, true, true)
 }
 
 pub(crate) fn opened_file_is_current_path(
@@ -221,7 +225,7 @@ pub(crate) fn opened_file_is_current_path(
     path: &Path,
     label: &'static str,
 ) -> Result<bool, PersistentError> {
-    let current = open_existing(path, label, false, false)?;
+    let current = open_existing(path, label, true, false, false)?;
     let original_metadata = file
         .metadata()
         .map_err(|error| PersistentError::new(PersistentErrorKind::Io, label).with_source(error))?;
@@ -261,7 +265,7 @@ pub(crate) fn read_file_bounded(
     label: &'static str,
     limit: usize,
 ) -> Result<Vec<u8>, PersistentError> {
-    let mut file = open_existing(path, label, false, false)?;
+    let mut file = open_existing(path, label, true, false, false)?;
     let metadata = file
         .metadata()
         .map_err(|error| PersistentError::new(PersistentErrorKind::Io, label).with_source(error))?;
