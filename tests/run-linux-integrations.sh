@@ -3,6 +3,11 @@ set -euo pipefail
 
 BIN=${1:-target/debug/meshmsg}
 BIN=$(realpath "$BIN")
+WEB_BIN=$(dirname "$BIN")/meshmsg-web
+[[ -x $WEB_BIN ]] || {
+  echo "missing meshmsg-web integration artifact: build with --features web" >&2
+  exit 1
+}
 INVENTORY=tests/linux-integration-inventory.tsv
 
 # Syntax/static checks live beside the parsed integration inventory so local and
@@ -22,7 +27,10 @@ while IFS=$'\t' read -r seconds command arguments; do
   total_timeout=$((total_timeout + seconds))
   read -r -a args <<<"$arguments"
   for index in "${!args[@]}"; do
-    [[ ${args[$index]} == "{BIN}" ]] && args[$index]=$BIN
+    case ${args[$index]} in
+      "{BIN}") args[$index]=$BIN ;;
+      "{WEB_BIN}") args[$index]=$WEB_BIN ;;
+    esac
   done
   timeout "$seconds" "$command" "${args[@]}"
 done <"$INVENTORY"

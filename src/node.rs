@@ -1545,7 +1545,7 @@ enum DaemonCommand {
         operation_id: String,
         offer: String,
         output: PathBuf,
-        raw_export: bool,
+        mode: meshmsg_protocol::DownloadMode,
         reply: oneshot::Sender<serde_json::Value>,
     },
     Stop,
@@ -2610,8 +2610,7 @@ where
         | IpcRequest::OffersRemove { operation_id, .. }
         | IpcRequest::OffersPrune { operation_id, .. }
         | IpcRequest::Share { operation_id, .. }
-        | IpcRequest::Download { operation_id, .. }
-        | IpcRequest::WebDownload { operation_id, .. } => Some(operation_id),
+        | IpcRequest::Download { operation_id, .. } => Some(operation_id),
         _ => None,
     };
     if operation_id.is_some_and(|id| !valid_operation_id(id)) {
@@ -2870,6 +2869,7 @@ where
             operation_id,
             offer,
             output,
+            mode,
         } => {
             let (reply, response) = oneshot::channel();
             let value = lifecycle_command_response(
@@ -2879,32 +2879,7 @@ where
                         operation_id: operation_id.to_string(),
                         offer,
                         output,
-                        raw_export: false,
-                        reply,
-                    },
-                    response,
-                ),
-                timeouts.transfer_command,
-                Some(operation_id.into_string()),
-                None,
-            )
-            .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
-        }
-        IpcRequest::WebDownload {
-            operation_id,
-            offer,
-            output,
-        } => {
-            let (reply, response) = oneshot::channel();
-            let value = lifecycle_command_response(
-                send_command(
-                    &commands,
-                    DaemonCommand::Download {
-                        operation_id: operation_id.to_string(),
-                        offer,
-                        output,
-                        raw_export: true,
+                        mode,
                         reply,
                     },
                     response,
@@ -5725,10 +5700,14 @@ pub async fn run_daemon(
                         }
                     });
                 }
-                Some(DaemonCommand::Download { operation_id, offer, output, raw_export, reply }) => {
+                Some(DaemonCommand::Download { operation_id, offer, output, mode, reply }) => {
+                    let mode_name = match mode {
+                        meshmsg_protocol::DownloadMode::Install => "install",
+                        meshmsg_protocol::DownloadMode::Raw => "raw",
+                    };
                     let fingerprint = operation_fingerprint(
-                        if raw_export { "web_download" } else { "download" },
-                        &[offer.as_bytes(), output.as_os_str().as_encoded_bytes()],
+                        "download",
+                        &[offer.as_bytes(), output.as_os_str().as_encoded_bytes(), mode_name.as_bytes()],
                     );
                     if !operation_cache.lock().expect("operation cache poisoned").admit(
                         operation_id.clone(), fingerprint, reply, StdInstant::now()
@@ -5778,7 +5757,7 @@ pub async fn run_daemon(
                             offer,
                             output,
                             max_attachment_bytes,
-                            raw_export,
+                            mode == meshmsg_protocol::DownloadMode::Raw,
                         ).await {
                             Ok(value) => value,
                             Err(error) => storage_operation_error("download_failed", &error, false, Some(&operation_id), None),
@@ -6451,6 +6430,7 @@ pub async fn download(
             operation_id: operation_id.parse()?,
             offer: offer.to_owned(),
             output: requested_output.clone(),
+            mode: meshmsg_protocol::DownloadMode::Install,
         },
         "download_complete",
         2,
@@ -7898,8 +7878,8 @@ mod tests {
             operation_fingerprint("download", &[b"changed-token", b"/tmp/one"]),
         );
         assert_ne!(
-            operation_fingerprint("download", &[b"token", b"/tmp/one"]),
-            operation_fingerprint("web_download", &[b"token", b"/tmp/one"]),
+            operation_fingerprint("download", &[b"token", b"/tmp/one", b"install"]),
+            operation_fingerprint("download", &[b"token", b"/tmp/one", b"raw"]),
         );
 
         let (reply1, response1) = oneshot::channel();
@@ -13168,11 +13148,13 @@ mod tests {
                 operation_id: operation.clone(),
                 offer: "x".into(),
                 output: PathBuf::from("x"),
+                mode: meshmsg_protocol::DownloadMode::Install,
             },
-            IpcRequest::WebDownload {
+            IpcRequest::Download {
                 operation_id: operation,
                 offer: "x".into(),
                 output: PathBuf::from("x"),
+                mode: meshmsg_protocol::DownloadMode::Raw,
             },
         ];
         for mutation in mutations {

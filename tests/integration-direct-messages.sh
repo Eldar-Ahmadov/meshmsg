@@ -3,6 +3,8 @@ set -euo pipefail
 
 BIN=${1:-target/debug/meshmsg}
 BIN=$(realpath "$BIN")
+WEB_BIN=${2:-${MESHMSG_WEB_BIN:-$(dirname "$BIN")/meshmsg-web}}
+WEB_BIN=$(realpath "$WEB_BIN")
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/meshmsg-direct-integration.XXXXXX")
 declare -A PIDS=()
 declare -a LISTENER_PIDS=()
@@ -213,7 +215,7 @@ import socket
 s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()
 PY
 )
-timeout 300 "$BIN" --state-dir "$ROOT/receiver" web --listen "127.0.0.1:$WEB_PORT" \
+timeout 300 "$WEB_BIN" --state-dir "$ROOT/receiver" --listen "127.0.0.1:$WEB_PORT" \
   >"$ROOT/web.log" 2>"$ROOT/web.err" & WEB_PID=$!
 wait_for 10 "web listener" curl -fsS "http://127.0.0.1:$WEB_PORT/"
 timeout 60 curl --no-buffer --silent --show-error "http://127.0.0.1:$WEB_PORT/api/events" \

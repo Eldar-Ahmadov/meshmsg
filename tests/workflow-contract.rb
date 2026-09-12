@@ -127,7 +127,7 @@ def validate(ci, verification, release, inventory)
     "cargo install cargo-audit --version 0.22.2 --locked",
     "cargo install cargo-deny --version 0.20.2 --locked"
   ], "policy tool installation must remain exact and pinned")
-  assert_run(jobs["linux-integration"], "integration-build", "cargo build --locked")
+  assert_run(jobs["linux-integration"], "integration-build", "cargo build --locked --features web")
   assert_run(jobs["linux-integration"], "linux-integrations",
              "bash tests/run-linux-integrations.sh target/debug/meshmsg")
   assert(jobs.dig("linux-integration", "timeout-minutes") == 130, "integration job timeout must cover inventory")
@@ -137,12 +137,12 @@ def validate(ci, verification, release, inventory)
     [60, "python3", "tests/integration-cli-errors.py", "{BIN}"],
     [30, "python3", "tests/logging-process-tests.py", "{BIN}"],
     [120, "python3", "tests/integration-nonblocking-logging.py", "{BIN}"],
-    [180, "python3", "tests/integration-web.py", "{BIN}"],
-    [600, "python3", "tests/integration-web-peer.py", "{BIN}"],
+    [180, "python3", "tests/integration-web.py", "{BIN} {WEB_BIN}"],
+    [600, "python3", "tests/integration-web-peer.py", "{BIN} {WEB_BIN}"],
     [600, "python3", "tests/integration-peer-directory.py", "{BIN}"],
     [1100, "bash", "tests/integration-5-peer.sh", "{BIN}"],
     [600, "bash", "tests/integration-attachments.sh", "{BIN}"],
-    [600, "bash", "tests/integration-direct-messages.sh", "{BIN}"],
+    [600, "bash", "tests/integration-direct-messages.sh", "{BIN} {WEB_BIN}"],
     [600, "bash", "tests/integration-v018-message-boundary.sh", "{BIN}"],
     [600, "bash", "tests/integration-idempotency.sh", "{BIN}"],
     [120, "bash", "tests/integration-state-migration.sh", "{BIN}"],

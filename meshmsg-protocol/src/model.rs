@@ -111,11 +111,7 @@ pub enum Request {
         operation_id: OperationId,
         offer: String,
         output: PathBuf,
-    },
-    WebDownload {
-        operation_id: OperationId,
-        offer: String,
-        output: PathBuf,
+        mode: DownloadMode,
     },
     Stop,
 }

@@ -267,7 +267,7 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operat
 DOWNLOAD_OFFER=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["offer"])' "$THIRD")
 DOWNLOAD_ID=77777777777777777777777777777777
 DOWNLOAD_OUT="$ROOT/downloaded.txt"
-DOWNLOAD_FIRST=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3]}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$DOWNLOAD_OUT")")
+DOWNLOAD_FIRST=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3],"mode":"install"}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$DOWNLOAD_OUT")")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["operation_id"] == sys.argv[1]' "$DOWNLOAD_ID" <<<"$DOWNLOAD_FIRST" \
   || fail "initial lost-response download did not complete"
 [[ -f "$DOWNLOAD_OUT" ]] || fail "lost-response download did not install output"
@@ -281,7 +281,7 @@ if [[ $DOWNLOAD_STATUS != 0 ]]; then
 fi
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["schema_version"] == 2 and v["operation_id"] == sys.argv[1] and v["output"] == sys.argv[2]' "$DOWNLOAD_ID" "$DOWNLOAD_OUT" <<<"$DOWNLOAD_RETRY" \
   || fail "download retry did not replay cached completion"
-DOWNLOAD_CONFLICT=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3]}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$ROOT/changed-output.txt")")
+DOWNLOAD_CONFLICT=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3],"mode":"install"}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$ROOT/changed-output.txt")")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict"' <<<"$DOWNLOAD_CONFLICT" \
   || fail "changed download output did not conflict"
 [[ ! -e "$ROOT/changed-output.txt" ]] || fail "download conflict performed extra export/install work"

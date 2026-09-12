@@ -16,6 +16,7 @@ import time
 import urllib.parse
 
 BIN = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/meshmsg').resolve())
+WEB_BIN = str(pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else pathlib.Path(BIN).with_name('meshmsg-web')).resolve())
 
 
 def main():
@@ -68,7 +69,12 @@ def main():
                 reservation.bind(('127.0.0.1', 0))
                 port = reservation.getsockname()[1]
             origin = f'http://127.0.0.1:{port}'
-            web, _ = spawn('one', 'web', '--listen', f'127.0.0.1:{port}')
+            web_log = (root / 'one-web.log').open('w+')
+            logs.append(web_log)
+            web = subprocess.Popen([WEB_BIN, '--state-dir', str(root / 'one'),
+                                    '--listen', f'127.0.0.1:{port}'],
+                                   stdout=web_log, stderr=web_log)
+            processes.append(web)
             request_counter = 100000
 
             def next_request_id():

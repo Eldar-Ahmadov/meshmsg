@@ -9,6 +9,15 @@ edition = "2021"
 description = "Small peer-to-peer messaging and file-sharing CLI built on Iroh"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+web = ["dep:http-body-util", "dep:hyper", "dep:hyper-util"]
+
+[[bin]]
+name = "meshmsg-web"
+path = "src/bin/meshmsg-web.rs"
+required-features = ["web"]
+
 [dependencies]
 anyhow = "1"
 blake3 = "1"
@@ -18,10 +27,10 @@ crossterm = "0.29"
 data-encoding = "2"
 dirs = "6"
 futures-util = "0.3"
-http-body-util = "0.1"
+http-body-util = { version = "0.1", optional = true }
 hostname = "0.4"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 fs2 = "0.4"
 libc = "0.2"
 iroh = "1"

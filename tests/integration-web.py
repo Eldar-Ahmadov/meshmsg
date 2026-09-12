@@ -17,6 +17,7 @@ import time
 import urllib.parse
 
 BIN = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/meshmsg').resolve())
+WEB_BIN = str(pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else pathlib.Path(BIN).with_name('meshmsg-web')).resolve())
 SELF_KEY = '7c9f3405d1e6ca4df5947f98bbe1301227ca6b82973940ed2d04b71ffa54b25c'
 REMOTE_KEY = '6356c835326c19e98e8b0874f03de7d90f2d7d261a00e2eeb608781bb4784718'
 EVENT_KEY = '971dafe5454792b588f162818f11df9c2accd649774f19a5c67360a91bacf6de'
@@ -61,7 +62,7 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
         self.requests = []
         self.operations = {}
         self.share_operations = {}
-        self.web_download_attempts = {}
+        self.raw_download_attempts = {}
         self.malformed_handshake = False
         self.clients = set()
         self.subscribers = {}
@@ -186,11 +187,11 @@ class Handler(socketserver.StreamRequestHandler):
                       'attachment_retention_secs': 0})
             elif value['command'] == 'peers':
                 emit(malicious_peers_snapshot())
-            elif value['command'] == 'web_download':
+            elif value['command'] == 'download' and value.get('mode') == 'raw':
                 offer = value['offer']
                 label = self.server.offer_labels.get(offer, offer)
-                self.server.web_download_attempts[label] = self.server.web_download_attempts.get(label, 0) + 1
-                if label == 'retry-token' and self.server.web_download_attempts[label] == 1:
+                self.server.raw_download_attempts[label] = self.server.raw_download_attempts.get(label, 0) + 1
+                if label == 'retry-token' and self.server.raw_download_attempts[label] == 1:
                     emit({'type': 'error', 'schema_version': 1,
                           'code': 'attachment_storage_busy',
                           'operation_id': value['operation_id'],
@@ -199,7 +200,7 @@ class Handler(socketserver.StreamRequestHandler):
                     return
                 output = pathlib.Path(value['output'])
                 if (label == 'late-token'
-                        and self.server.web_download_attempts[label] == 1):
+                        and self.server.raw_download_attempts[label] == 1):
                     def late_export():
                         time.sleep(.3)
                         output.parent.mkdir(parents=True, exist_ok=True)
@@ -342,7 +343,7 @@ def main():
         daemon = Daemon(root / 'daemon.sock', signer_state)
         signed_provider = daemon.initial_offer['from']
         with (root / 'web.log').open('w+') as log:
-            web = subprocess.Popen([BIN, '--state-dir', str(root), 'web', '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
+            web = subprocess.Popen([WEB_BIN, '--state-dir', str(root), '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
             streams = []
 
             request_counter = 0
@@ -780,18 +781,19 @@ def main():
                 assert range_code == 206 and range_payload == payload[8:18]
                 assert range_headers['content-range'] == f'bytes 8-17/{len(payload)}'
                 assert range_headers['accept-ranges'] == 'bytes'
-                web_download = next(value for value in daemon.requests if value['command'] == 'web_download')
-                assert set(web_download) == {'command', 'operation_id', 'offer', 'output'}
-                assert web_download['operation_id'] == download_operation
-                assert daemon.offer_labels[web_download['offer']] == 'private-token'
-                output_path = pathlib.Path(web_download['output'])
+                raw_download = next(value for value in daemon.requests if value['command'] == 'download' and value.get('mode') == 'raw')
+                assert set(raw_download) == {'command', 'operation_id', 'offer', 'output', 'mode'}
+                assert raw_download['operation_id'] == download_operation
+                assert raw_download['mode'] == 'raw'
+                assert daemon.offer_labels[raw_download['offer']] == 'private-token'
+                output_path = pathlib.Path(raw_download['output'])
                 assert output_path.parent.parent == root / 'web-downloads-v2'
                 assert output_path.exists(), 'retryable ready file was removed after serving'
                 duplicate_code, duplicate_started = api({
                     'command': 'download', 'id': incoming_download_ids[0],
                     'operation_id': download_operation})
                 assert duplicate_code == 202 and duplicate_started['id'] == started['id']
-                assert daemon.web_download_attempts['private-token'] == 1, \
+                assert daemon.raw_download_attempts['private-token'] == 1, \
                     'duplicate browser start repeated daemon export work'
 
                 retry_offer = daemon.fixture_offer(
@@ -806,7 +808,7 @@ def main():
                     'operation_id': download_operation})
                 assert conflict_code == 409 and conflict['code'] == 'operation_id_conflict'
                 assert conflict['operation_id'] == download_operation
-                assert daemon.web_download_attempts.get('retry-token', 0) == 0
+                assert daemon.raw_download_attempts.get('retry-token', 0) == 0
                 retry_operation = '40000000000000000000000000000002'
                 code, first_retry = api({'command': 'download', 'id': retry_ids[0],
                                          'operation_id': retry_operation})
@@ -827,7 +829,7 @@ def main():
                 assert code == 202 and cached_retry['id'] == first_retry['id']
                 code, cached_failure = api({'command': 'download_status', 'id': cached_retry['id']})
                 assert code == 422 and cached_failure == failed
-                assert daemon.web_download_attempts['retry-token'] == 1, 'cached failure repeated daemon work'
+                assert daemon.raw_download_attempts['retry-token'] == 1, 'cached failure repeated daemon work'
                 second_operation = '40000000000000000000000000000003'
                 code, second_retry = api({'command': 'download', 'id': retry_ids[0],
                                           'operation_id': second_operation})
@@ -859,7 +861,7 @@ def main():
                         assert time.monotonic() < deadline
                         time.sleep(.01)
                     schema_request = next(value for value in reversed(daemon.requests)
-                                          if value.get('command') == 'web_download'
+                                          if value.get('command') == 'download' and value.get('mode') == 'raw'
                                           and daemon.offer_labels.get(value.get('offer')) == schema_offer)
                     assert pathlib.Path(schema_request['output']).exists(), \
                         'unknown malformed reply did not quarantine possible late output'
@@ -1061,7 +1063,7 @@ def main():
                 deadline = time.monotonic() + 5
                 while True:
                     matches = [value for value in daemon.requests
-                               if value.get('command') == 'web_download'
+                               if value.get('command') == 'download' and value.get('mode') == 'raw'
                                and daemon.offer_labels.get(value.get('offer')) == 'late-token']
                     if matches:
                         break
@@ -1090,13 +1092,13 @@ def main():
                         break
                     assert status_code == 200 and time.monotonic() < deadline
                     time.sleep(.01)
-                assert daemon.web_download_attempts['late-token'] == 2
+                assert daemon.raw_download_attempts['late-token'] == 2
                 assert request('GET', reconciled['url'])[2] == b'browser attachment payload\n'
                 late_feed.close()
                 web.send_signal(signal.SIGINT)
                 assert web.wait(timeout=5) == 0
                 assert late_output.read_bytes() == b'browser attachment payload\n', 'web shutdown raced reconciled export'
-                web = subprocess.Popen([BIN, '--state-dir', str(root), 'web', '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
+                web = subprocess.Popen([WEB_BIN, '--state-dir', str(root), '--listen', f'127.0.0.1:{port}', '--origin', public], stdout=log, stderr=log)
                 deadline = time.monotonic() + 15
                 while True:
                     assert web.poll() is None, 'web restart failed after late export'

@@ -122,9 +122,9 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.91.0 --profile minimal
-      - name: Build integration binary
+      - name: Build core and optional web integration binaries
         id: integration-build
-        run: cargo build --locked
+        run: cargo build --locked --features web
       - name: Run authoritative Linux static and integration inventory
         id: linux-integrations
         run: bash tests/run-linux-integrations.sh target/debug/meshmsg

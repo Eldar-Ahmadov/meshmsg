@@ -21,8 +21,9 @@ An `operation_id` has the same lexical representation but a different meaning: i
 identifies a retry-safe mutation and may be reused only for an identical mutation.
 It is never generated from, compared with, or substituted for `request_id`.
 Different retries have different request IDs and the same operation ID. `send`,
-`private_send`, `share`, `offers_remove`, `offers_prune`, `download`, and
-`web_download` all require an operation ID. Attachment `offer_id` and signed
+`private_send`, `share`, `offers_remove`, `offers_prune`, and `download` all
+require an operation ID. Downloads also require a typed `mode` of `install` or `raw`;
+the web bridge uses the ordinary download request in `raw` mode. Attachment `offer_id` and signed
 message IDs retain their separate documented operation identity; a download's
 operation ID is not its offer ID.
 
@@ -81,7 +82,7 @@ Each newline-delimited request is a strict nested envelope:
 
 The typed command union is: `send`, `private_send`, `bench_send`, `subscribe`,
 `status`, `peers`, `offers`, `offers_remove`, `offers_prune`, `share`, `download`,
-`web_download`, and `stop`. Unknown, missing, duplicate, or wrong-typed envelope or
+and `stop`. Unknown, missing, duplicate, or wrong-typed envelope or
 command fields are rejected. Unsupported versions and malformed IDs fail closed.
 Responses are dispatched by the exact `(type, schema_version)` pair and then fully
 deserialized into a deny-unknown-fields DTO with semantic and bounded-value checks.
@@ -212,7 +213,9 @@ post-install partial success is replayed exactly for ten minutes from completion
 oldest terminal entries can be evicted under pressure, while in-flight entries are
 never evicted. IDs are global across operation kinds. Fingerprints bind kind and
 exact inputs: message/recipient/body, share path/content digest, lifecycle selectors,
-age/dry-run/limit, and download token plus exact output OS representation. Changed
+age/dry-run/limit, and download token, typed `DownloadMode::{Install, Raw}`, plus exact
+output OS representation. The CLI submits `Install`; `meshmsg-web` submits `Raw` on
+the same ordinary `download` request. Changed
 input returns `operation_id_conflict` without work. For prune, the cached terminal
 record is the authoritative original selected set/result, so a retry cannot consume
 the next batch and `max_delete` bounds one operation. For remove, an exact retry
@@ -265,10 +268,11 @@ producer/generic validation binds its exact value. The protocol-v2 lifecycle com
 validated before consumption.
 
 Attachment operation errors are additionally request-kind-aware. Share, remove,
-prune, download, and web-download each admit only their documented code set with
+prune, and ordinary typed download each admit only their documented code set with
 canonical fixed message, outcome, retryability, operation ID, offer-ID applicability,
-and partial-removal accounting. A structurally valid error from another operation
-kind is rejected as an invalid daemon response.
+and partial-removal accounting. `DownloadMode::Raw` does not create a separate error
+operation kind. A structurally valid error from another operation kind is rejected as
+an invalid daemon response.
 
 Adding optional fields still requires a new family version because DTOs deny unknown
 fields. A future transport version requires an explicit breaking migration;

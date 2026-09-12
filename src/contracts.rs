@@ -36,7 +36,6 @@ pub(crate) enum ErrorOperationKind {
     Remove,
     Prune,
     Download,
-    WebDownload,
     Benchmark,
     Feed,
 }
@@ -72,7 +71,6 @@ const ALL_OPERATIONS: &[ErrorOperationKind] = &[
     ErrorOperationKind::Remove,
     ErrorOperationKind::Prune,
     ErrorOperationKind::Download,
-    ErrorOperationKind::WebDownload,
     ErrorOperationKind::Benchmark,
     ErrorOperationKind::Feed,
 ];
@@ -83,21 +81,16 @@ const MUTATIONS: &[ErrorOperationKind] = &[
     ErrorOperationKind::Remove,
     ErrorOperationKind::Prune,
     ErrorOperationKind::Download,
-    ErrorOperationKind::WebDownload,
 ];
 const ATTACHMENT_MUTATIONS: &[ErrorOperationKind] = &[
     ErrorOperationKind::Share,
     ErrorOperationKind::Remove,
     ErrorOperationKind::Prune,
     ErrorOperationKind::Download,
-    ErrorOperationKind::WebDownload,
 ];
 const REMOVE_PRUNE: &[ErrorOperationKind] =
     &[ErrorOperationKind::Remove, ErrorOperationKind::Prune];
-const DOWNLOADS: &[ErrorOperationKind] = &[
-    ErrorOperationKind::Download,
-    ErrorOperationKind::WebDownload,
-];
+const DOWNLOADS: &[ErrorOperationKind] = &[ErrorOperationKind::Download];
 const NS_FALSE: &[(&str, bool)] = &[("not_started", false)];
 const NS_TRUE: &[(&str, bool)] = &[("not_started", true)];
 const UNKNOWN_TRUE: &[(&str, bool)] = &[("unknown", true)];
@@ -148,8 +141,7 @@ pub(crate) fn error_code_spec(code: &str) -> Option<ErrorCodeSpec> {
             &[
                 ErrorOperationKind::General,
                 ErrorOperationKind::Feed,
-                ErrorOperationKind::Download,
-                ErrorOperationKind::WebDownload
+                ErrorOperationKind::Download
             ]
         ),
         "invalid_offer_selector" => error_spec!(code, NS_FALSE, &[ErrorOperationKind::Remove]),
@@ -198,20 +190,12 @@ pub(crate) fn error_code_spec(code: &str) -> Option<ErrorCodeSpec> {
         "attachment_quota_exceeded" | "attachment_tag_capacity" => error_spec!(
             code,
             NS_FALSE,
-            &[
-                ErrorOperationKind::Share,
-                ErrorOperationKind::Download,
-                ErrorOperationKind::WebDownload
-            ]
+            &[ErrorOperationKind::Share, ErrorOperationKind::Download]
         ),
         "attachment_min_free_space" => error_spec!(
             code,
             NS_TRUE,
-            &[
-                ErrorOperationKind::Share,
-                ErrorOperationKind::Download,
-                ErrorOperationKind::WebDownload
-            ]
+            &[ErrorOperationKind::Share, ErrorOperationKind::Download]
         ),
         "attachment_removal_partial" => error_spec!(code, PARTIAL_OR_UNKNOWN_TRUE, REMOVE_PRUNE),
         "share_operation_capacity" => error_spec!(code, NS_TRUE, &[ErrorOperationKind::Share]),
@@ -761,7 +745,6 @@ mod tests {
             ErrorOperationKind::Remove,
             ErrorOperationKind::Prune,
             ErrorOperationKind::Download,
-            ErrorOperationKind::WebDownload,
             ErrorOperationKind::Benchmark,
             ErrorOperationKind::Feed,
         ];
@@ -823,18 +806,10 @@ mod tests {
 
     #[test]
     fn independent_mutation_consumer_error_matrix_matches_contract() {
-        use ErrorOperationKind::{Download, PrivateSend, Prune, Remove, Send, Share, WebDownload};
-        let all = &[
-            Send,
-            PrivateSend,
-            Share,
-            Remove,
-            Prune,
-            Download,
-            WebDownload,
-        ];
-        let attachment = &[Share, Remove, Prune, Download, WebDownload];
-        let downloads = &[Download, WebDownload];
+        use ErrorOperationKind::{Download, PrivateSend, Prune, Remove, Send, Share};
+        let all = &[Send, PrivateSend, Share, Remove, Prune, Download];
+        let attachment = &[Share, Remove, Prune, Download];
+        let downloads = &[Download];
         type ExpectedError = (
             &'static str,
             &'static str,
@@ -1110,19 +1085,19 @@ mod tests {
                 "attachment_quota_exceeded",
                 "The attachment storage quota is exceeded.",
                 &[("not_started", false)],
-                &[Share, Download, WebDownload],
+                &[Share, Download],
             ),
             (
                 "attachment_min_free_space",
                 "The attachment free-space reserve is unavailable.",
                 &[("not_started", true)],
-                &[Share, Download, WebDownload],
+                &[Share, Download],
             ),
             (
                 "attachment_tag_capacity",
                 "The attachment pin capacity is exhausted.",
                 &[("not_started", false)],
-                &[Share, Download, WebDownload],
+                &[Share, Download],
             ),
             (
                 "attachment_removal_partial",

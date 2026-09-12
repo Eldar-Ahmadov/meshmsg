@@ -33,7 +33,6 @@ pub(crate) enum AttachmentOperationKind {
     Remove,
     Prune,
     Download,
-    WebDownload,
 }
 
 fn contract_operation_kind(kind: AttachmentOperationKind) -> contracts::ErrorOperationKind {
@@ -42,7 +41,6 @@ fn contract_operation_kind(kind: AttachmentOperationKind) -> contracts::ErrorOpe
         AttachmentOperationKind::Remove => contracts::ErrorOperationKind::Remove,
         AttachmentOperationKind::Prune => contracts::ErrorOperationKind::Prune,
         AttachmentOperationKind::Download => contracts::ErrorOperationKind::Download,
-        AttachmentOperationKind::WebDownload => contracts::ErrorOperationKind::WebDownload,
     }
 }
 
@@ -1791,10 +1789,6 @@ fn error_expectation(request: &IpcRequest) -> (contracts::ErrorOperationKind, Op
         IpcRequest::Download { operation_id, .. } => {
             (contracts::ErrorOperationKind::Download, Some(operation_id))
         }
-        IpcRequest::WebDownload { operation_id, .. } => (
-            contracts::ErrorOperationKind::WebDownload,
-            Some(operation_id),
-        ),
         IpcRequest::Status | IpcRequest::Peers | IpcRequest::Stop => {
             (contracts::ErrorOperationKind::General, None)
         }
@@ -2117,6 +2111,7 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
         self.reader.get_mut()
     }
 
+    #[cfg(feature = "web")]
     pub(crate) fn expected_topic(&self) -> Option<TopicId> {
         self.expected_topic
     }
@@ -2408,22 +2403,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_download_is_a_distinct_raw_export_command() {
+    async fn download_mode_is_explicit_in_the_canonical_command() {
         let mut bytes = Vec::new();
         write_request(
             &mut bytes,
-            &IpcRequest::WebDownload {
+            &IpcRequest::Download {
                 operation_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
                 offer: "signed-offer".into(),
                 output: PathBuf::from("server-selected.blob"),
+                mode: meshmsg_protocol::DownloadMode::Raw,
             },
         )
         .await
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["request"]["command"], "web_download");
+        assert_eq!(value["request"]["command"], "download");
+        assert_eq!(value["request"]["mode"], "raw");
         assert_eq!(value["request"]["offer"], "signed-offer");
         assert_eq!(value["request"]["output"], "server-selected.blob");
+        for obsolete in [
+            serde_json::json!({
+                "command":"download", "operation_id":"0123456789abcdef0123456789abcdef",
+                "offer":"signed-offer", "output":"server-selected.blob"
+            }),
+            serde_json::json!({
+                "command":"web_download", "operation_id":"0123456789abcdef0123456789abcdef",
+                "offer":"signed-offer", "output":"server-selected.blob"
+            }),
+        ] {
+            assert!(serde_json::from_value::<IpcRequest>(obsolete).is_err());
+        }
     }
 
     #[test]
@@ -2650,12 +2659,6 @@ mod tests {
                 "not_started",
                 true,
             ),
-            (
-                AttachmentOperationKind::WebDownload,
-                "download_failed",
-                "not_started",
-                true,
-            ),
         ];
         for (kind, code, outcome, retryable) in cases {
             let mut error = LifecycleErrorV1::new(code, "private", outcome, retryable);
@@ -2677,16 +2680,8 @@ mod tests {
                 AttachmentOperationKind::Remove,
                 AttachmentOperationKind::Prune,
                 AttachmentOperationKind::Download,
-                AttachmentOperationKind::WebDownload,
             ] {
-                if wrong_kind != kind
-                    && !(code == "download_failed"
-                        && matches!(
-                            wrong_kind,
-                            AttachmentOperationKind::Download
-                                | AttachmentOperationKind::WebDownload
-                        ))
-                {
+                if wrong_kind != kind {
                     assert!(
                         validate_lifecycle_error_for_request(
                             &value,
@@ -2727,7 +2722,6 @@ mod tests {
             AttachmentOperationKind::Remove,
             AttachmentOperationKind::Prune,
             AttachmentOperationKind::Download,
-            AttachmentOperationKind::WebDownload,
         ] {
             for (code, outcome, retryable) in [
                 ("operation_id_conflict", "not_started", false),
@@ -3056,11 +3050,7 @@ mod tests {
                 operation_id: operation.parse().unwrap(),
                 offer: "x".into(),
                 output: PathBuf::from("x"),
-            },
-            IpcRequest::WebDownload {
-                operation_id: operation.parse().unwrap(),
-                offer: "x".into(),
-                output: PathBuf::from("x"),
+                mode: meshmsg_protocol::DownloadMode::Install,
             },
         ];
         for request in requests {

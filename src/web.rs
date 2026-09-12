@@ -1158,7 +1158,7 @@ async fn bounded_download_ipc<F: Future>(
     timeout(limit, future).await
 }
 
-fn web_download_context(
+fn raw_download_context(
     operation_id: &str,
     stored: &StoredOffer,
     output: &Path,
@@ -1265,7 +1265,7 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
     };
 
     let output = state.download_root.join(format!("{operation_id}.blob"));
-    let expected = web_download_context(&operation_id, &input, &output);
+    let expected = raw_download_context(&operation_id, &input, &output);
     let dir = state.dir.clone();
     let jobs = state.jobs.clone();
     let download_root = state.download_root.clone();
@@ -1276,10 +1276,11 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
         let result = bounded_download_ipc(
             web_ipc_request(
                 &dir,
-                &IpcRequest::WebDownload {
+                &IpcRequest::Download {
                     operation_id: operation.parse().expect("validated web operation ID"),
                     offer: input.offer.clone(),
                     output: output.clone(),
+                    mode: meshmsg_protocol::DownloadMode::Raw,
                 },
             ),
             WEB_DOWNLOAD_IPC_TIMEOUT,
@@ -1327,7 +1328,7 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
                 let error = if daemon_error {
                     ipc::validate_lifecycle_error_for_request(
                         &value,
-                        ipc::AttachmentOperationKind::WebDownload,
+                        ipc::AttachmentOperationKind::Download,
                         &operation,
                         None,
                         None,
@@ -2605,7 +2606,7 @@ async fn route(
         .await
 }
 
-pub(crate) async fn run(dir: &Path, address: SocketAddr, origin: Option<String>) -> Result<()> {
+pub async fn run(dir: &Path, address: SocketAddr, origin: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(address)
         .await
         .context("bind web listener")?;
@@ -2833,7 +2834,7 @@ mod tests {
             assert!(spec.semantics.contains(&(outcome, retryable)));
             assert!(spec
                 .operations
-                .contains(&contracts::ErrorOperationKind::WebDownload));
+                .contains(&contracts::ErrorOperationKind::Download));
             assert!(source.contains(&format!(
                 "['{code}', ['{message}', '{outcome}', {retryable}]]"
             )));
