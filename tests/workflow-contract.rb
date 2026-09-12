@@ -135,6 +135,8 @@ def validate(ci, verification, release, inventory)
   expected_inventory = [
     [60, "node", "tests/web-ui.cjs"],
     [60, "python3", "tests/integration-cli-errors.py", "{BIN}"],
+    [30, "python3", "tests/logging-process-tests.py", "{BIN}"],
+    [120, "python3", "tests/integration-nonblocking-logging.py", "{BIN}"],
     [180, "python3", "tests/integration-web.py", "{BIN}"],
     [600, "python3", "tests/integration-web-peer.py", "{BIN}"],
     [600, "python3", "tests/integration-peer-directory.py", "{BIN}"],
@@ -144,6 +146,7 @@ def validate(ci, verification, release, inventory)
     [600, "bash", "tests/integration-ipc-version-compat.sh", "{BIN}"],
     [600, "bash", "tests/integration-v018-message-boundary.sh", "{BIN}"],
     [600, "bash", "tests/integration-idempotency.sh", "{BIN}"],
+    [120, "bash", "tests/integration-state-migration.sh", "{BIN}"],
     [60, "bash", "tests/integration-installer.sh", "{BIN}"]
   ]
   assert(inventory == expected_inventory, "parsed Linux integration inventory changed unexpectedly")

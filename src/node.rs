@@ -169,6 +169,14 @@ const MAX_ENCODED_PUBLIC_KEY_BYTES: usize = 64;
 const BLOB_TAG_PREFIX: &[u8] = b"meshmsg/";
 const OUTBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/out/v1/";
 const INBOUND_BLOB_TAG_PREFIX: &str = "meshmsg/in/v1/";
+const MAX_ATTACHMENT_INDEX_TAG_BYTES: usize = INBOUND_BLOB_TAG_PREFIX.len()
+    + MAX_ENCODED_PUBLIC_KEY_BYTES
+    + 1
+    + 32
+    + 1
+    + "directory_tar_v1".len()
+    + 1
+    + MAX_ENCODED_TAG_NAME_BYTES;
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -395,7 +403,7 @@ impl InternalContractGuard {
 }
 
 impl RejectionSampler {
-    fn event(&mut self, now_ms: u64, message: &str) -> Option<serde_json::Value> {
+    fn event(&mut self, now_ms: u64, _private_diagnostic: &str) -> Option<serde_json::Value> {
         let interval_ms = REJECTION_SAMPLE_INTERVAL.as_millis() as u64;
         if self
             .last_emitted_ms
@@ -403,10 +411,11 @@ impl RejectionSampler {
         {
             let suppressed = std::mem::take(&mut self.suppressed);
             self.last_emitted_ms = Some(now_ms);
-            return Some(serde_json::json!({
-                "type":"error", "code":"invalid_message", "message":message,
-                "rate_limited":true, "suppressed_since_last":suppressed
-            }));
+            let mut error =
+                ErrorEnvelopeV1::try_new_public("network_event_rejected", "not_started", false)
+                    .ok()?;
+            error.suppressed_since_last = Some(suppressed);
+            return Some(error.into_value());
         }
         self.suppressed = self.suppressed.saturating_add(1);
         None
@@ -2108,8 +2117,15 @@ where
             .context("benchmark attempted-count overflow")?;
         let timestamp_ms = match unix_timestamp_ms() {
             Ok(timestamp_ms) => timestamp_ms,
-            Err(error) => {
-                eprintln!("benchmark send diagnostic: {error:#}");
+            Err(_) => {
+                let _ = crate::output::sampled_diagnostic(
+                    crate::output::DiagnosticRecord::new(
+                        crate::output::Level::Error,
+                        "benchmark_send",
+                        "timestamp_failed",
+                    )
+                    .run_id(Some(&config.run_id)),
+                );
                 stats.failed = stats
                     .failed
                     .checked_add(1)
@@ -2127,8 +2143,15 @@ where
             config.payload_bytes,
         ) {
             Ok(body) => body,
-            Err(error) => {
-                eprintln!("benchmark send diagnostic: {error:#}");
+            Err(_) => {
+                let _ = crate::output::sampled_diagnostic(
+                    crate::output::DiagnosticRecord::new(
+                        crate::output::Level::Error,
+                        "benchmark_send",
+                        "body_build_failed",
+                    )
+                    .run_id(Some(&config.run_id)),
+                );
                 stats.failed = stats
                     .failed
                     .checked_add(1)
@@ -2205,8 +2228,15 @@ where
                     .checked_add(u64::try_from(encoded_bytes)?)
                     .context("benchmark envelope-byte overflow")?;
             }
-            Some(Ok(Err(error))) => {
-                eprintln!("benchmark send diagnostic: {error}");
+            Some(Ok(Err(_))) => {
+                let _ = crate::output::sampled_diagnostic(
+                    crate::output::DiagnosticRecord::new(
+                        crate::output::Level::Error,
+                        "benchmark_send",
+                        "submission_failed",
+                    )
+                    .run_id(Some(&config.run_id)),
+                );
                 stats.failed = stats
                     .failed
                     .checked_add(1)
@@ -2293,6 +2323,13 @@ impl Default for LocalIpcTimeouts {
 
 tokio::task_local! {
     static IPC_REQUEST_ID: std::cell::RefCell<Option<String>>;
+}
+
+pub(crate) fn current_ipc_request_id() -> Option<String> {
+    IPC_REQUEST_ID
+        .try_with(|current| current.borrow().clone())
+        .ok()
+        .flatten()
 }
 
 fn normalize_ipc_response(value: &serde_json::Value, request_id: &str) -> serde_json::Value {
@@ -3084,7 +3121,54 @@ async fn list_pinned_blobs(store: &Store) -> Result<(Vec<OfferItemV1>, bool, usi
 #[serde(deny_unknown_fields)]
 struct AttachmentRetentionIndex {
     schema_version: u8,
+    #[serde(deserialize_with = "deserialize_attachment_index_entries")]
     created_at_ms: BTreeMap<String, u64>,
+}
+
+#[derive(Deserialize)]
+struct AttachmentIndexVersionProbe {
+    schema_version: u64,
+}
+
+fn deserialize_attachment_index_entries<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct EntriesVisitor;
+    impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+        type Value = BTreeMap<String, u64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_ATTACHMENT_TAGS} bounded attachment index entries"
+            )
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = BTreeMap::new();
+            while let Some(key) = access
+                .next_key::<crate::persistent::BoundedString<MAX_ATTACHMENT_INDEX_TAG_BYTES>>()?
+            {
+                if entries.len() == MAX_ATTACHMENT_TAGS {
+                    return Err(serde::de::Error::invalid_length(entries.len() + 1, &self));
+                }
+                let value = access.next_value::<u64>()?;
+                if entries.insert(key.into_string(), value).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate attachment retention index key",
+                    ));
+                }
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_map(EntriesVisitor)
 }
 
 impl Default for AttachmentRetentionIndex {
@@ -4020,24 +4104,38 @@ fn clone_attachment_index(index: &AttachmentRetentionIndex) -> AttachmentRetenti
 
 fn load_attachment_index(state_dir: &Path) -> Result<AttachmentRetentionIndex> {
     let path = state_dir.join(ATTACHMENT_INDEX_NAME);
-    if !path.exists() {
+    let Some(bytes) = crate::persistent::read_optional_file_bounded(
+        &path,
+        "attachment retention index",
+        MAX_ATTACHMENT_INDEX_BYTES,
+    )?
+    else {
         return Ok(AttachmentRetentionIndex::default());
+    };
+    let probe: AttachmentIndexVersionProbe = crate::persistent::parse_json_bounded_strings(
+        &bytes,
+        "attachment retention index",
+        MAX_ATTACHMENT_INDEX_TAG_BYTES,
+    )?;
+    if probe.schema_version != 1 {
+        return Err(crate::persistent::PersistentError::unsupported_version(
+            "attachment retention index",
+            probe.schema_version,
+        )
+        .into());
     }
-    let bytes = std::fs::read(path).context("read attachment retention index")?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_ATTACHMENT_INDEX_BYTES,
-        "attachment retention index is too large"
-    );
-    let index: AttachmentRetentionIndex =
-        serde_json::from_slice(&bytes).context("parse attachment retention index")?;
-    anyhow::ensure!(
-        index.schema_version == 1,
-        "unsupported attachment retention index version"
-    );
-    anyhow::ensure!(
-        index.created_at_ms.len() <= MAX_ATTACHMENT_TAGS,
-        "attachment retention index exceeds pin capacity"
-    );
+    let index: AttachmentRetentionIndex = crate::persistent::parse_json_bounded_strings(
+        &bytes,
+        "attachment retention index",
+        MAX_ATTACHMENT_INDEX_TAG_BYTES,
+    )?;
+    if index.schema_version != 1 {
+        return Err(crate::persistent::PersistentError::unsupported_version(
+            "attachment retention index",
+            u64::from(index.schema_version),
+        )
+        .into());
+    }
     Ok(index)
 }
 
@@ -5018,7 +5116,11 @@ where
     tasks.spawn(async move {
         if let Err(error) = handle_admitted_local_client(stream, session, timeouts, permit).await {
             if !is_local_disconnect(&error) {
-                eprintln!("local client error: {error:#}");
+                let _ = crate::output::sampled_diagnostic(crate::output::DiagnosticRecord::new(
+                    crate::output::Level::Warn,
+                    "local_client",
+                    "client_task_failed",
+                ));
             }
         }
     });
@@ -5041,7 +5143,7 @@ async fn drain_local_client_tasks(tasks: &mut tokio::task::JoinSet<()>, grace: D
 fn emit_peer_transitions(
     transitions: impl IntoIterator<Item = PeerTransition>,
     events: &broadcast::Sender<serde_json::Value>,
-    json: bool,
+    output: &crate::output::DaemonOutput,
     directory_epoch: &str,
     directory_revision: &mut u64,
 ) {
@@ -5058,9 +5160,17 @@ fn emit_peer_transitions(
         {
             *directory_revision = candidate_revision;
             let _ = events.send(value.clone());
-            event(json, value);
+            let _ = output.event(value);
         }
     }
+}
+
+fn daemon_warning(event: &str, code: &str) {
+    let _ = crate::output::sampled_diagnostic(crate::output::DiagnosticRecord::new(
+        crate::output::Level::Warn,
+        event,
+        code,
+    ));
 }
 
 fn direct_replay_status(health: crate::direct_replay::ReplayHealth) -> serde_json::Value {
@@ -5104,15 +5214,25 @@ pub async fn run_daemon(
     let mut node = match startup {
         Ok(Ok(node)) => node,
         Ok(Err(error)) => {
-            startup_error(json, "topic_join", &error.to_string());
+            let _ = crate::output::diagnostic(
+                crate::output::DiagnosticRecord::new(
+                    crate::output::Level::Fatal,
+                    "startup",
+                    "topic_join_failed",
+                )
+                .field(crate::output::Field::new("phase", "topic_join")),
+            );
             return Err(error)
                 .context("start gossip topic; verify the invite and bootstrap-peer reachability");
         }
         Err(_) => {
-            startup_error(
-                json,
-                "topic_join",
-                "startup timed out while joining the gossip topic",
+            let _ = crate::output::diagnostic(
+                crate::output::DiagnosticRecord::new(
+                    crate::output::Level::Fatal,
+                    "startup",
+                    "topic_join_timeout",
+                )
+                .field(crate::output::Field::new("phase", "topic_join")),
             );
             anyhow::bail!(
                 "startup timed out after {}s while joining the gossip topic; verify that at least one configured bootstrap peer is reachable",
@@ -5129,10 +5249,13 @@ pub async fn run_daemon(
         }
     };
     if online.is_err() {
-        startup_error(
-            json,
-            "endpoint_online",
-            "endpoint did not become online before the deadline",
+        let _ = crate::output::diagnostic(
+            crate::output::DiagnosticRecord::new(
+                crate::output::Level::Fatal,
+                "startup",
+                "endpoint_online_timeout",
+            )
+            .field(crate::output::Field::new("phase", "endpoint_online")),
         );
         node.router.shutdown().await?;
         node.direct_replay.shutdown().await?;
@@ -5173,6 +5296,11 @@ pub async fn run_daemon(
     // Expose IPC only after networking is ready, so clients never connect to a
     // socket whose daemon is still blocked during bootstrap.
     let (mut listener, _endpoint_guard) = bind_local_endpoint(dir, &state_lock).await?;
+    // Declare the RAII output owner after network/listener resources so every
+    // `?`, early return, and unwind closes stdout admission and performs a
+    // bounded drain before those resources are dropped.
+    let daemon_output = crate::output::DaemonOutput::start(json, render_daemon_event)
+        .context("start bounded daemon output writer")?;
     let peer = node.endpoint.id().to_string();
     let started = serde_json::json!({
         "type":"daemon_started", "peer":peer, "topic":state.topic,
@@ -5184,7 +5312,28 @@ pub async fn run_daemon(
         "attachment_storage":initial_storage_status,
         "attachment_retention_secs":attachment_retention_secs
     });
-    event(json, started);
+    let _ = daemon_output.event(started);
+    if crate::output::test_switch("MESHMSG_TEST_OUTPUT_BURST") {
+        for index in 0..64_u64 {
+            let _ = daemon_output.event(serde_json::json!({
+                "type":"logging_test_event", "index":index
+            }));
+        }
+    }
+    if crate::output::test_switch("MESHMSG_TEST_DAEMON_ERROR_AFTER_OUTPUT")
+        || crate::output::test_switch("MESHMSG_TEST_DAEMON_PANIC_AFTER_OUTPUT")
+    {
+        if let Some(path) = std::env::var_os("MESHMSG_TEST_POST_START_READY_FILE") {
+            let _ = std::fs::write(path, b"ready");
+        }
+        let _ = daemon_output.event(serde_json::json!({
+            "type":"logging_test_marker", "sequence":1
+        }));
+        if crate::output::test_switch("MESHMSG_TEST_DAEMON_PANIC_AFTER_OUTPUT") {
+            panic!("injected post-start daemon panic");
+        }
+        anyhow::bail!("injected post-start daemon error");
+    }
 
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
@@ -5251,7 +5400,7 @@ pub async fn run_daemon(
                         // Expiration is authoritative in the daemon. Emit it before
                         // capturing the new subscriber's snapshot so queued events
                         // are strictly later than that snapshot.
-                        emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
+                        emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
                         let generated_at_ms = unix_timestamp_ms()?;
                         let startup_peers = peer_snapshot(
                             &node, &directory, &peer, alias_config.effective(), generated_at_ms,
@@ -5323,7 +5472,7 @@ pub async fn run_daemon(
                     ) {
                         continue;
                     }
-                    emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
+                    emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
                     let address = match directory.resolve(&to) {
                         Ok(address) => address,
                         Err(error) => {
@@ -5468,15 +5617,34 @@ pub async fn run_daemon(
                     }));
                 }
                 Some(DaemonCommand::Diagnostics { reply }) => {
-                    let (accepted, dropped, retained) = contracts::diagnostic_metrics();
+                    let diagnostics = crate::output::diagnostic_metrics();
+                    let output = daemon_output.metrics();
                     let _ = reply.send(serde_json::json!({
-                        "type":"diagnostic_status", "schema_version":1,
-                        "records_accepted":accepted, "records_dropped":dropped,
-                        "records_retained":retained
+                        "type":"diagnostic_status", "schema_version":2,
+                        "records_accepted":diagnostics.accepted.saturating_add(output.accepted),
+                        "records_dropped":diagnostics.dropped.saturating_add(output.dropped),
+                        "records_retained":0,
+                        "stdout_queue_occupancy":output.occupancy,
+                        "stdout_queue_capacity":crate::output::OUTPUT_QUEUE_CAPACITY,
+                        "stdout_queue_high_watermark":output.high_watermark,
+                        "diagnostic_queue_occupancy":diagnostics.occupancy,
+                        "diagnostic_queue_capacity":crate::output::diagnostic_capacity(),
+                        "diagnostic_queue_high_watermark":diagnostics.high_watermark,
+                        "records_sampled":diagnostics.sampled,
+                        "records_suppressed":diagnostics.suppressed,
+                        "queue_drops":diagnostics.queue_dropped.saturating_add(output.queue_dropped),
+                        "contention_drops":diagnostics.contention_dropped.saturating_add(output.contention_dropped),
+                        "records_written":diagnostics.written.saturating_add(output.written),
+                        "write_failures":diagnostics.write_failed.saturating_add(output.write_failed),
+                        "writer_panics":diagnostics.writer_panicked.saturating_add(output.writer_panicked),
+                        "writer_records_lost":diagnostics.writer_lost.saturating_add(output.writer_lost),
+                        "writer_healthy":output.writer_healthy && (crate::output::diagnostic_capacity() == 0 || diagnostics.writer_healthy),
+                        "writer_terminal":output.writer_terminal || diagnostics.writer_terminal,
+                        "process_panics":diagnostics.process_panics.max(output.process_panics)
                     }));
                 }
                 Some(DaemonCommand::Peers { reply }) => {
-                    emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
+                    emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
                     let generated_at_ms = unix_timestamp_ms()?;
                     let _ = reply.send(peer_snapshot(
                         &node, &directory, &peer, alias_config.effective(), generated_at_ms,
@@ -5803,7 +5971,7 @@ pub async fn run_daemon(
                             topic,
                             now_ms,
                         ) {
-                            event(json, suppress_message_body(full_value));
+                            let _ = daemon_output.event(suppress_message_body(full_value));
                         }
                     }
                 }
@@ -5816,9 +5984,9 @@ pub async fn run_daemon(
                     if presence_sources.allow(message.delivered_from) {
                         // Never let receive-time cleanup swallow an expiry. The
                         // explicit cleanup transition is emitted first.
-                        emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
+                        emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
                         if let Ok(Some(transition)) = directory.receive(&message.content, topic) {
-                            emit_peer_transitions([transition], &event_tx, json, &directory_epoch, &mut directory_revision);
+                            emit_peer_transitions([transition], &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
                         }
                     }
                 }
@@ -5830,7 +5998,7 @@ pub async fn run_daemon(
                 if let Some(message) = incoming {
                     let value = private_message_event(message);
                     let _ = event_tx.send(value.clone());
-                    event(json, suppress_message_body(value));
+                    let _ = daemon_output.event(suppress_message_body(value));
                 }
             },
             _ = presence.tick() => {
@@ -5844,14 +6012,14 @@ pub async fn run_daemon(
                 }
             },
             _ = presence_cleanup.tick() => {
-                emit_peer_transitions(directory.cleanup(), &event_tx, json, &directory_epoch, &mut directory_revision);
+                emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
                 presence_sources.cleanup();
             },
             _ = attachment_space_refresh.tick() => {
                 let storage = attachment_storage.clone();
                 offer_list_tasks.spawn(async move {
-                    if let Err(error) = storage.refresh_free_space().await {
-                        eprintln!("attachment free-space refresh failed: {error:#}");
+                    if storage.refresh_free_space().await.is_err() {
+                        daemon_warning("attachment_storage", "free_space_refresh_failed");
                     }
                 });
             }
@@ -5860,7 +6028,7 @@ pub async fn run_daemon(
                 offer_list_tasks.spawn(async move {
                     if let Err(error) = storage.automatic_retention_pass().await {
                         if !error.to_string().starts_with("attachment_storage_busy:") {
-                            eprintln!("automatic attachment prune failed: {error:#}");
+                            daemon_warning("attachment_storage", "automatic_prune_failed");
                         }
                     }
                 });
@@ -5880,18 +6048,18 @@ pub async fn run_daemon(
                 }
             },
             completed = local_client_tasks.join_next(), if !local_client_tasks.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    eprintln!("local client task error: {error}");
+                if let Some(Err(_)) = completed {
+                    daemon_warning("local_client", "task_join_failed");
                 }
             },
             completed = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    eprintln!("attachment task error: {error}");
+                if let Some(Err(_)) = completed {
+                    daemon_warning("attachment_transfer", "task_join_failed");
                 }
             },
             completed = offer_list_tasks.join_next(), if !offer_list_tasks.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    eprintln!("attachment listing task error: {error}");
+                if let Some(Err(_)) = completed {
+                    daemon_warning("attachment_listing", "task_join_failed");
                 }
             },
             _ = shutdown.recv() => break,
@@ -5913,6 +6081,9 @@ pub async fn run_daemon(
     while transfer_tasks.join_next().await.is_some() {}
     while offer_list_tasks.join_next().await.is_some() {}
     drain_local_client_tasks(&mut local_client_tasks, LOCAL_IPC_SHUTDOWN_GRACE).await;
+    // Terminal ordering is strict: first close event admission and drain stdout,
+    // then begin fallible network teardown. No event can be queued after this.
+    let _ = daemon_output.shutdown(crate::output::DRAIN_TIMEOUT);
     node.router.shutdown().await?;
     node.direct_replay.shutdown().await?;
     Ok(())
@@ -7621,10 +7792,6 @@ fn startup_error_value(_phase: &str, message: &str) -> serde_json::Value {
     error.into_value()
 }
 
-fn startup_error(_json: bool, _phase: &str, _message: &str) {
-    // The top-level JSON failure path emits exactly one standard error record.
-}
-
 fn terminal_safe(value: &str) -> String {
     value
         .chars()
@@ -7654,6 +7821,46 @@ fn offer_listing_warnings(value: &serde_json::Value) -> Vec<String> {
 
 fn daemon_started_human_output(value: &serde_json::Value) -> String {
     format!("daemon running as {}", value["peer"].as_str().unwrap_or(""))
+}
+
+fn render_daemon_event(value: serde_json::Value) -> String {
+    match value["type"].as_str().unwrap_or("event") {
+        "daemon_started" => daemon_started_human_output(&value),
+        "message" => format!(
+            "message from {} ({} bytes; body suppressed)",
+            value["from"].as_str().unwrap_or("peer"),
+            value["body_bytes"].as_u64().unwrap_or(0)
+        ),
+        "private_message" => format!(
+            "private message from {} ({} bytes; body suppressed)",
+            value["from"].as_str().unwrap_or("peer"),
+            value["body_bytes"].as_u64().unwrap_or(0)
+        ),
+        "attachment_offer" => format!(
+            "attachment offer from {} ({} bytes; details suppressed)",
+            value["from"].as_str().unwrap_or("peer"),
+            value["size"].as_u64().unwrap_or(0)
+        ),
+        "peer_up" => format!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
+        "peer_down" => format!("peer left: {}", value["peer"].as_str().unwrap_or("")),
+        "peer_discovered" | "peer_updated" | "peer_expired" => {
+            let peer = &value["peer"];
+            format!(
+                "{}: {}{}",
+                value["type"].as_str().unwrap_or("peer").replace('_', " "),
+                peer["public_key"].as_str().unwrap_or(""),
+                peer["alias"]
+                    .as_str()
+                    .map(|alias| format!(" ({})", terminal_safe(alias)))
+                    .unwrap_or_default()
+            )
+        }
+        "lagged" => format!(
+            "warning: {}",
+            terminal_safe(value["message"].as_str().unwrap_or("receiver lagged"))
+        ),
+        _ => value.to_string(),
+    }
 }
 
 fn event(json: bool, mut value: serde_json::Value) {
@@ -8299,7 +8506,7 @@ mod tests {
 
         let oversized_name = format!(
             "meshmsg/out/v1/0123456789abcdef0123456789abcdef/file/{}",
-            "A".repeat(MAX_ENCODED_TAG_NAME_BYTES + 1)
+            "A".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1)
         );
         assert_eq!(parse_pinned_blob_tag(oversized_name.as_bytes()), None);
         let oversized_provider = format!(
@@ -8550,11 +8757,44 @@ mod tests {
             now_ms,
         );
         assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0]["code"], "invalid_message");
+        let strict_rejection = ErrorEnvelopeV1::from_value(&rejected[0]).unwrap();
+        assert_eq!(strict_rejection.code, "network_event_rejected");
+        assert_eq!(strict_rejection.message, "A network event was rejected.");
+        assert_eq!(strict_rejection.outcome, "not_started");
+        assert!(!strict_rejection.retryable);
         assert_eq!(
             replay.live_ids, 0,
             "invalid semantics consumed replay state"
         );
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let rendered = Arc::new(Mutex::new(Vec::new()));
+        let output = crate::output::DaemonOutput::start_with_sink(
+            true,
+            render_daemon_event,
+            Box::new(Capture(rendered.clone())),
+            "network-rejection-output-test",
+        )
+        .unwrap();
+        assert!(output.event(rejected[0].clone()));
+        assert!(output.shutdown(Duration::from_secs(1)));
+        let bytes = rendered.lock().unwrap().clone();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        ErrorEnvelopeV1::from_value(&value).unwrap();
+        let encoded = String::from_utf8(bytes).unwrap();
+        assert!(!encoded.contains("message body"));
+        assert!(!encoded.contains("private"));
+        assert!(value.get("rate_limited").is_none());
 
         let accepted = network_event(
             Event::Received(iroh_gossip::api::Message {
@@ -8889,7 +9129,8 @@ mod tests {
             now_ms,
         );
         assert_eq!(duplicate.len(), 1);
-        assert_eq!(duplicate[0]["message"], "replayed message");
+        assert_eq!(duplicate[0]["message"], "A network event was rejected.");
+        ErrorEnvelopeV1::from_value(&duplicate[0]).unwrap();
         assert_eq!(replay.live_ids, 1);
 
         let alternate = encode_unchecked_signed_envelope(
@@ -9191,11 +9432,11 @@ mod tests {
             now_ms,
         );
         assert_eq!(values.len(), 1);
-        assert_eq!(values[0]["rate_limited"], true);
-        assert_eq!(
-            values[0]["message"],
-            "broadcast verification rate limit exceeded"
-        );
+        let rejection = ErrorEnvelopeV1::from_value(&values[0]).unwrap();
+        assert_eq!(rejection.code, "network_event_rejected");
+        assert_eq!(rejection.message, "A network event was rejected.");
+        assert_eq!(rejection.outcome, "not_started");
+        assert!(!rejection.retryable);
         assert_eq!(replay.live_ids, 0);
         assert_eq!(sources.sources.len(), 1);
         assert_eq!(
@@ -11400,6 +11641,116 @@ mod tests {
             .unwrap();
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_index_read_is_bounded_versioned_and_permission_safe() {
+        let state = std::env::temp_dir().join(format!(
+            "meshmsg-attachment-index-test-{}",
+            rand::random::<u64>()
+        ));
+        crate::config::prepare_state_dir(&state).unwrap();
+        let path = state.join(ATTACHMENT_INDEX_NAME);
+        assert!(load_attachment_index(&state)
+            .unwrap()
+            .created_at_ms
+            .is_empty());
+
+        persist_attachment_index(&state, &AttachmentRetentionIndex::default()).unwrap();
+        let mut exact = std::fs::read(&path).unwrap();
+        exact.resize(MAX_ATTACHMENT_INDEX_BYTES, b' ');
+        std::fs::write(&path, &exact).unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap()
+            .created_at_ms
+            .is_empty());
+
+        std::fs::write(&path, vec![b' '; MAX_ATTACHMENT_INDEX_BYTES + 1]).unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds its size limit"));
+        std::fs::write(&path, b"{\"schema_version\":1").unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("could not parse attachment retention index"));
+        std::fs::write(&path, br#"{"schema_version":256,"created_at_ms":{}}"#).unwrap();
+        assert!(load_attachment_index(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported attachment retention index schema version 256"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"schema_version\":1,\"created_at_ms\":{{\"{}\":1}}}}",
+                "x".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1)
+            ),
+        )
+        .unwrap();
+        assert!(load_attachment_index(&state).is_err());
+
+        for (exact, oversized) in [
+            (
+                r"\u0078".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES),
+                r"\u0078".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1),
+            ),
+            (
+                r"\\".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES),
+                r"\\".repeat(MAX_ATTACHMENT_INDEX_TAG_BYTES + 1),
+            ),
+        ] {
+            std::fs::write(
+                &path,
+                format!("{{\"schema_version\":1,\"created_at_ms\":{{\"{exact}\":1}}}}"),
+            )
+            .unwrap();
+            let loaded = load_attachment_index(&state).unwrap();
+            assert_eq!(
+                loaded.created_at_ms.keys().next().unwrap().len(),
+                MAX_ATTACHMENT_INDEX_TAG_BYTES
+            );
+            std::fs::write(
+                &path,
+                format!("{{\"schema_version\":1,\"created_at_ms\":{{\"{oversized}\":1}}}}"),
+            )
+            .unwrap();
+            assert!(load_attachment_index(&state).is_err());
+        }
+
+        let mut compact = BTreeMap::new();
+        for index in 0..MAX_ATTACHMENT_TAGS {
+            compact.insert(format!("k{index:04x}"), index as u64);
+        }
+        let boundary = serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,
+            "created_at_ms":compact,
+        }))
+        .unwrap();
+        assert!(boundary.len() < MAX_ATTACHMENT_INDEX_BYTES);
+        std::fs::write(&path, &boundary).unwrap();
+        assert_eq!(
+            load_attachment_index(&state).unwrap().created_at_ms.len(),
+            MAX_ATTACHMENT_TAGS
+        );
+        let insertion = boundary.len() - 2;
+        let mut amplified = boundary;
+        amplified.splice(insertion..insertion, b",\"overflow\":1".iter().copied());
+        std::fs::write(&path, amplified).unwrap();
+        assert!(load_attachment_index(&state).is_err());
+
+        persist_attachment_index(&state, &AttachmentRetentionIndex::default()).unwrap();
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(state.join("missing"), &path).unwrap();
+            assert!(load_attachment_index(&state).is_err());
+        }
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     #[tokio::test]

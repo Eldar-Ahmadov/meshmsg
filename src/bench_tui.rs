@@ -763,6 +763,22 @@ mod tests {
     }
 
     #[test]
+    fn repeated_tui_construction_render_and_drop_is_stable() {
+        for index in 0..100 {
+            let app = App {
+                role: if index % 2 == 0 {
+                    Role::Sender
+                } else {
+                    Role::Receiver
+                },
+                ..App::default()
+            };
+            let output = rendered(&app, 80, 24);
+            assert!(output.contains("meshmsg benchmark"));
+        }
+    }
+
+    #[test]
     fn renders_sender_delivery_disclaimer() {
         let app = App {
             view: View::Running,

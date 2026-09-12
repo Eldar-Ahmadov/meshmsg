@@ -4,11 +4,6 @@
 //! while an operation ID identifies a retry-safe mutation across requests.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc::{sync_channel, SyncSender, TrySendError},
-    Mutex, OnceLock, TryLockError,
-};
 
 pub(crate) const SCHEMA_VERSION: u8 = 1;
 pub(crate) const API_CONTRACT_CAPABILITY: &str = "typed_contracts_v1";
@@ -182,6 +177,9 @@ pub(crate) fn error_code_spec(code: &str) -> Option<ErrorCodeSpec> {
             NS_FALSE,
             &[ErrorOperationKind::Send, ErrorOperationKind::Feed]
         ),
+        "network_event_rejected" => {
+            error_spec!(code, NS_FALSE, &[ErrorOperationKind::Feed])
+        }
         "invalid_benchmark" => error_spec!(code, NS_FALSE, &[ErrorOperationKind::Benchmark]),
         "initial_frame_timeout" => error_spec!(code, NS_TRUE, ALL_OPERATIONS),
         "private_send_busy" | "private_recipient_busy" => {
@@ -259,7 +257,7 @@ pub(crate) fn error_code_spec(code: &str) -> Option<ErrorCodeSpec> {
         spec.removal_counts = FieldRule::Required;
         spec.lifecycle_context = FieldRule::Required;
     }
-    if code == "internal_contract_error" {
+    if code == "internal_contract_error" || code == "network_event_rejected" {
         spec.suppression_count = FieldRule::Optional;
     }
     Some(spec)
@@ -293,6 +291,7 @@ fn stable_message(code: &str) -> &'static str {
         }
         "initial_frame_timeout" => "The initial local request timed out.",
         "invalid_message" => "The message is invalid.",
+        "network_event_rejected" => "A network event was rejected.",
         "private_send_busy" | "private_recipient_busy" | "benchmark_busy" => {
             "The requested operation is currently busy."
         }
@@ -381,110 +380,25 @@ fn validate_field_rule(rule: FieldRule, present: bool, name: &str) -> Result<()>
     Ok(())
 }
 
-const PRIVATE_DIAGNOSTIC_BYTES: usize = 2048;
-const PRIVATE_DIAGNOSTIC_QUEUE: usize = 128;
-static PRIVATE_DIAGNOSTIC_TX: OnceLock<SyncSender<String>> = OnceLock::new();
-static PRIVATE_DIAGNOSTIC_DROPPED: AtomicU64 = AtomicU64::new(0);
-static PRIVATE_DIAGNOSTIC_ACCEPTED: AtomicU64 = AtomicU64::new(0);
-static PRIVATE_DIAGNOSTIC_OUTPUT: AtomicBool = AtomicBool::new(true);
-static PRIVATE_DIAGNOSTIC_EVIDENCE: OnceLock<Mutex<std::collections::VecDeque<String>>> =
-    OnceLock::new();
-
-pub(crate) fn set_private_diagnostic_output(enabled: bool) {
-    PRIVATE_DIAGNOSTIC_OUTPUT.store(enabled, Ordering::Relaxed);
-    if enabled {
-        let _ = PRIVATE_DIAGNOSTIC_TX.get_or_init(|| {
-            let (tx, rx) = sync_channel::<String>(PRIVATE_DIAGNOSTIC_QUEUE);
-            std::thread::Builder::new()
-                .name("meshmsg-diagnostics".into())
-                .spawn(move || {
-                    while let Ok(record) = rx.recv() {
-                        eprintln!("{record}");
-                    }
-                })
-                .expect("spawn bounded diagnostic worker during startup");
-            tx
-        });
-    }
-}
-
-pub(crate) fn diagnostic_metrics() -> (u64, u64, usize) {
-    let retained = PRIVATE_DIAGNOSTIC_EVIDENCE
-        .get()
-        .and_then(|records| records.try_lock().ok())
-        .map_or(0, |records| records.len());
-    (
-        PRIVATE_DIAGNOSTIC_ACCEPTED.load(Ordering::Relaxed),
-        PRIVATE_DIAGNOSTIC_DROPPED.load(Ordering::Relaxed),
-        retained,
-    )
-}
-
-/// Retain the private cause before constructing fixed public output. Admission is
-/// bounded and nonblocking; a dedicated worker owns the potentially blocking sink.
-pub(crate) fn log_private_diagnostic(context: &str, code: &str, diagnostic: &str) {
-    let diagnostic = sanitize_message_to(diagnostic, PRIVATE_DIAGNOSTIC_BYTES);
-    if diagnostic.is_empty() {
-        return;
-    }
-    let record = format!("meshmsg {context} diagnostic [{code}]: {diagnostic}");
-    let evidence = PRIVATE_DIAGNOSTIC_EVIDENCE.get_or_init(Default::default);
-    match evidence.try_lock() {
-        Ok(mut evidence) => {
-            if evidence.len() == 256 {
-                evidence.pop_front();
-            }
-            evidence.push_back(record.clone());
-            PRIVATE_DIAGNOSTIC_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(TryLockError::Poisoned(poisoned)) => {
-            let mut records = poisoned.into_inner();
-            if records.len() == 256 {
-                records.pop_front();
-            }
-            records.push_back(record.clone());
-            drop(records);
-            evidence.clear_poison();
-            PRIVATE_DIAGNOSTIC_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(TryLockError::WouldBlock) => {
-            PRIVATE_DIAGNOSTIC_DROPPED.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if !PRIVATE_DIAGNOSTIC_OUTPUT.load(Ordering::Relaxed) {
-        return;
-    }
-    let Some(tx) = PRIVATE_DIAGNOSTIC_TX.get() else {
-        PRIVATE_DIAGNOSTIC_DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = tx.try_send(record) {
-        PRIVATE_DIAGNOSTIC_DROPPED.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-fn sanitize_message_to(message: &str, maximum: usize) -> String {
-    let mut result = String::with_capacity(message.len().min(maximum));
-    for character in message.chars() {
-        let replacement = if character.is_control() {
-            '\u{fffd}'
-        } else {
-            character
-        };
-        if result.len() + replacement.len_utf8() > maximum {
-            break;
-        }
-        result.push(replacement);
-    }
-    result
+pub(crate) fn set_private_diagnostic_output(enabled: bool) -> std::io::Result<()> {
+    crate::output::init_diagnostics(enabled)
 }
 
 #[cfg(test)]
-pub(crate) fn private_diagnostic_evidence_contains(needle: &str) -> bool {
-    PRIVATE_DIAGNOSTIC_EVIDENCE
-        .get_or_init(Default::default)
-        .lock()
-        .is_ok_and(|records| records.iter().any(|record| record.contains(needle)))
+pub(crate) fn diagnostic_metrics() -> (u64, u64, usize) {
+    let metrics = crate::output::diagnostic_metrics();
+    (metrics.accepted, metrics.dropped, 0)
+}
+
+/// Emit only bounded typed metadata. `diagnostic` is intentionally not retained
+/// or rendered because arbitrary causes can contain paths, secrets, message
+/// bodies, tickets, or private routes.
+pub(crate) fn log_private_diagnostic(context: &str, code: &str, _diagnostic: &str) {
+    let request_id = crate::node::current_ipc_request_id();
+    let _ = crate::output::sampled_diagnostic(
+        crate::output::DiagnosticRecord::new(crate::output::Level::Warn, context, code)
+            .request_id(request_id.as_deref()),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,15 +455,12 @@ impl std::fmt::Display for ContractFailure {
 impl std::error::Error for ContractFailure {}
 
 impl ErrorEnvelopeV1 {
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_public(
         code: impl Into<String>,
-        diagnostic: impl AsRef<str>,
         outcome: impl Into<String>,
         retryable: bool,
     ) -> Result<Self> {
         let code = code.into();
-        let diagnostic = diagnostic.as_ref();
-        log_private_diagnostic("error_envelope", &code, diagnostic);
         let spec =
             error_code_spec(&code).context("error envelope producer used an unknown code")?;
         let outcome = outcome.into();
@@ -579,6 +490,17 @@ impl ErrorEnvelopeV1 {
             dry_run: None,
             cutoff_ms: None,
         })
+    }
+
+    pub(crate) fn try_new(
+        code: impl Into<String>,
+        diagnostic: impl AsRef<str>,
+        outcome: impl Into<String>,
+        retryable: bool,
+    ) -> Result<Self> {
+        let code = code.into();
+        log_private_diagnostic("error_envelope", &code, diagnostic.as_ref());
+        Self::try_new_public(code, outcome, retryable)
     }
 
     /// Infallible boundary for existing producers: invalid producer semantics
@@ -819,6 +741,7 @@ mod tests {
         "unsupported_schema",
         "initial_frame_timeout",
         "invalid_message",
+        "network_event_rejected",
         "private_send_busy",
         "private_recipient_busy",
         "benchmark_busy",
@@ -855,35 +778,20 @@ mod tests {
     ];
 
     #[test]
-    fn diagnostic_admission_is_nonblocking_counted_and_poison_safe() {
-        let evidence = PRIVATE_DIAGNOSTIC_EVIDENCE.get_or_init(Default::default);
-        let guard = evidence
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dropped_before = diagnostic_metrics().1;
-        let writer = std::thread::spawn(|| {
-            log_private_diagnostic("contention-test", "internal_contract_error", "contended");
-        });
-        writer.join().unwrap();
-        assert!(diagnostic_metrics().1 > dropped_before);
-        drop(guard);
-
-        let poisoner = std::thread::spawn(|| {
-            let _guard = PRIVATE_DIAGNOSTIC_EVIDENCE
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            panic!("intentional diagnostic mutex poison");
-        });
-        assert!(poisoner.join().is_err());
-        let accepted_before = diagnostic_metrics().0;
-        log_private_diagnostic(
-            "poison-test",
-            "internal_contract_error",
-            "recovered evidence",
-        );
-        assert!(diagnostic_metrics().0 > accepted_before);
-        assert!(private_diagnostic_evidence_contains("recovered evidence"));
+    fn diagnostic_admission_is_nonblocking_and_does_not_retain_private_causes() {
+        let before = diagnostic_metrics();
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            log_private_diagnostic(
+                "contention_test",
+                "internal_contract_error",
+                "open /private/path containing a secret ticket",
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let after = diagnostic_metrics();
+        assert!(after.0 > before.0 || after.1 > before.1);
+        assert_eq!(after.2, 0);
     }
 
     #[test]
@@ -952,7 +860,7 @@ mod tests {
         }
         assert_eq!(
             ERROR_CODES.len(),
-            61,
+            62,
             "update the exhaustive code table when adding a code"
         );
     }

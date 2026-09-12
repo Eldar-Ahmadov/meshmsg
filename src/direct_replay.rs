@@ -1,4 +1,4 @@
-use crate::config::atomic_write;
+use crate::{config::atomic_write, persistent};
 use anyhow::{Context, Result};
 use iroh::PublicKey;
 use iroh_gossip::proto::TopicId;
@@ -182,8 +182,11 @@ enum PersistedState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplayEntry {
+    #[serde(deserialize_with = "persistent::string_64")]
     sender: String,
+    #[serde(deserialize_with = "persistent::string_32")]
     id: String,
+    #[serde(deserialize_with = "persistent::string_64")]
     fingerprint: String,
     expires_at_ms: u64,
     state: PersistedState,
@@ -193,8 +196,11 @@ struct ReplayEntry {
 #[serde(deny_unknown_fields)]
 struct SnapshotPayload {
     version: u8,
+    #[serde(deserialize_with = "persistent::string_64")]
     recipient: String,
+    #[serde(deserialize_with = "persistent::string_64")]
     topic: String,
+    #[serde(deserialize_with = "deserialize_replay_entries")]
     entries: Vec<ReplayEntry>,
 }
 
@@ -202,6 +208,7 @@ struct SnapshotPayload {
 #[serde(deny_unknown_fields)]
 struct SnapshotFile {
     payload: SnapshotPayload,
+    #[serde(deserialize_with = "persistent::string_64")]
     checksum: String,
 }
 
@@ -209,7 +216,9 @@ struct SnapshotFile {
 #[serde(deny_unknown_fields)]
 struct WalHeader {
     version: u8,
+    #[serde(deserialize_with = "persistent::string_64")]
     recipient: String,
+    #[serde(deserialize_with = "persistent::string_64")]
     topic: String,
 }
 
@@ -217,6 +226,7 @@ struct WalHeader {
 #[serde(deny_unknown_fields)]
 struct WalRecord {
     entry: ReplayEntry,
+    #[serde(deserialize_with = "persistent::string_64")]
     checksum: String,
 }
 
@@ -224,17 +234,112 @@ struct WalRecord {
 #[serde(deny_unknown_fields)]
 struct LegacyReplayState {
     version: u8,
+    #[serde(deserialize_with = "persistent::string_64")]
     recipient: String,
+    #[serde(deserialize_with = "persistent::string_64")]
     topic: String,
+    #[serde(deserialize_with = "deserialize_legacy_replay_entries")]
     entries: Vec<LegacyReplayEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyReplayEntry {
+    #[serde(deserialize_with = "persistent::string_64")]
     sender: String,
+    #[serde(deserialize_with = "persistent::string_32")]
     id: String,
     expires_at_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct SnapshotVersionProbe {
+    payload: SnapshotPayloadVersionProbe,
+}
+
+#[derive(Deserialize)]
+struct SnapshotPayloadVersionProbe {
+    version: u64,
+}
+
+#[derive(Deserialize)]
+struct ReplayVersionProbe {
+    version: u64,
+}
+
+fn deserialize_replay_entries<'de, D>(deserializer: D) -> Result<Vec<ReplayEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct EntriesVisitor;
+    impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+        type Value = Vec<ReplayEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "at most {MAX_REPLAY_ENTRIES} replay entries")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = Vec::new();
+            while entries.len() < MAX_REPLAY_ENTRIES {
+                let Some(entry) = access.next_element::<ReplayEntry>()? else {
+                    return Ok(entries);
+                };
+                entries.push(entry);
+            }
+            if access.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(
+                    MAX_REPLAY_ENTRIES + 1,
+                    &self,
+                ));
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_seq(EntriesVisitor)
+}
+
+fn deserialize_legacy_replay_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<LegacyReplayEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct EntriesVisitor;
+    impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+        type Value = Vec<LegacyReplayEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_REPLAY_ENTRIES} legacy replay entries"
+            )
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = Vec::new();
+            while entries.len() < MAX_REPLAY_ENTRIES {
+                let Some(entry) = access.next_element::<LegacyReplayEntry>()? else {
+                    return Ok(entries);
+                };
+                entries.push(entry);
+            }
+            if access.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(
+                    MAX_REPLAY_ENTRIES + 1,
+                    &self,
+                ));
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_seq(EntriesVisitor)
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +380,8 @@ struct ReplayMetadata {
     state: PersistedState,
 }
 
+type ReplayEntries = HashMap<(PublicKey, [u8; 16]), ReplayMetadata>;
+
 struct Admission {
     sender: PublicKey,
     id: [u8; 16],
@@ -311,7 +418,7 @@ struct ReplayStore {
     topic: TopicId,
     snapshot_path: PathBuf,
     wal_path: PathBuf,
-    entries: HashMap<(PublicKey, [u8; 16]), ReplayMetadata>,
+    entries: ReplayEntries,
     senders: HashMap<PublicKey, SenderState>,
     global_rate: TokenBucket,
     wal_records: usize,
@@ -403,14 +510,16 @@ impl ReplayStore {
     ) -> Result<Self> {
         let now_wall = wall_ms()?;
         let now_mono = Instant::now();
-        let mut entries = if snapshot_path.exists() {
-            load_snapshot(&snapshot_path, recipient, topic, now_wall)?
-        } else if legacy_path.exists() {
-            load_legacy(&legacy_path, recipient, topic, now_wall)?
-        } else {
-            HashMap::new()
-        };
-        let wal_records = load_wal(&wal_path, recipient, topic, now_wall, &mut entries)?;
+        let (mut entries, snapshot_present) =
+            match load_snapshot(&snapshot_path, recipient, topic, now_wall)? {
+                Some(entries) => (entries, true),
+                None => (
+                    load_legacy(&legacy_path, recipient, topic, now_wall)?.unwrap_or_default(),
+                    false,
+                ),
+            };
+        let (wal_records, wal_present) =
+            load_wal(&wal_path, recipient, topic, now_wall, &mut entries)?;
         anyhow::ensure!(
             entries.len() <= MAX_REPLAY_ENTRIES,
             "direct replay state capacity exceeded"
@@ -440,7 +549,7 @@ impl ReplayStore {
             global_rate: TokenBucket::full(GLOBAL_RATE_BURST, now_mono),
             wal_records,
         };
-        if !store.snapshot_path.exists() || !store.wal_path.exists() {
+        if !snapshot_present || !wal_present {
             store.compact(now_wall)?;
         }
         Ok(store)
@@ -585,16 +694,7 @@ impl ReplayStore {
         if expires_at_ms <= now_wall {
             return Ok(ReplayDecision::Busy);
         }
-        let near_wal_limit = fs::metadata(&self.wal_path)
-            .context("inspect direct replay WAL before append")
-            .map_err(AdmissionFailure::unavailable)?
-            .len()
-            >= MAX_WAL_BYTES.saturating_sub((MAX_WAL_RECORD_BYTES as u64 + 1) * 2);
-        if near_wal_limit {
-            if self.compact(now_wall).is_err() {
-                return Ok(ReplayDecision::Busy);
-            }
-        } else if self.wal_records >= COMPACT_AFTER_RECORDS {
+        if self.wal_records >= COMPACT_AFTER_RECORDS {
             let _ = self.compact(now_wall);
         }
 
@@ -605,7 +705,24 @@ impl ReplayStore {
         };
         let recorded = wal_record(self.recipient, self.topic, sender, id, metadata)
             .map_err(AdmissionFailure::unavailable)?;
-        append_wal(&self.wal_path, &recorded).map_err(AdmissionFailure::unknown)?;
+        let confirmation_reserve = MAX_WAL_RECORD_BYTES as u64 + 1;
+        let mut wal = open_wal_transaction(&self.wal_path, self.recipient, self.topic)
+            .map_err(AdmissionFailure::unavailable)?;
+        if !append_wal(&mut wal, &self.wal_path, &recorded, confirmation_reserve)
+            .map_err(AdmissionFailure::unknown)?
+        {
+            drop(wal);
+            if self.compact(now_wall).is_err() {
+                return Ok(ReplayDecision::Busy);
+            }
+            wal = open_wal_transaction(&self.wal_path, self.recipient, self.topic)
+                .map_err(AdmissionFailure::unavailable)?;
+            if !append_wal(&mut wal, &self.wal_path, &recorded, confirmation_reserve)
+                .map_err(AdmissionFailure::unknown)?
+            {
+                return Ok(ReplayDecision::Busy);
+            }
+        }
         self.entries.insert(key, metadata);
         let sender_state = self.senders.entry(sender).or_insert_with(|| SenderState {
             live_ids: 0,
@@ -626,7 +743,13 @@ impl ReplayStore {
         metadata.state = PersistedState::DeliveryConfirmed;
         let confirmed = wal_record(self.recipient, self.topic, sender, id, metadata)
             .map_err(AdmissionFailure::unknown)?;
-        append_wal(&self.wal_path, &confirmed).map_err(AdmissionFailure::unknown)?;
+        if !append_wal(&mut wal, &self.wal_path, &confirmed, 0)
+            .map_err(AdmissionFailure::unknown)?
+        {
+            return Err(AdmissionFailure::unknown(anyhow::anyhow!(
+                "reserved direct replay WAL capacity was lost"
+            )));
+        }
         self.entries.insert(key, metadata);
         self.wal_records += 1;
         test_crash_point("after_delivery_transition_sync");
@@ -729,25 +852,37 @@ fn load_snapshot(
     recipient: PublicKey,
     topic: TopicId,
     now: u64,
-) -> Result<HashMap<(PublicKey, [u8; 16]), ReplayMetadata>> {
-    let bytes = read_bounded(path, MAX_SNAPSHOT_BYTES).context("read direct replay snapshot")?;
+) -> Result<Option<ReplayEntries>> {
+    let Some(bytes) =
+        persistent::read_optional_file_bounded(path, "direct replay snapshot", MAX_SNAPSHOT_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let probe: SnapshotVersionProbe =
+        persistent::parse_json_bounded_strings(&bytes, "direct replay snapshot", 64)?;
+    if probe.payload.version != u64::from(SNAPSHOT_VERSION) {
+        return Err(persistent::PersistentError::unsupported_version(
+            "direct replay snapshot",
+            probe.payload.version,
+        )
+        .into());
+    }
     let file: SnapshotFile =
-        serde_json::from_slice(&bytes).context("parse direct replay snapshot")?;
-    anyhow::ensure!(
-        file.payload.version == SNAPSHOT_VERSION,
-        "unsupported direct replay snapshot version"
-    );
+        persistent::parse_json_bounded_strings(&bytes, "direct replay snapshot", 64)?;
     validate_binding(
         &file.payload.recipient,
         &file.payload.topic,
         recipient,
         topic,
     )?;
-    anyhow::ensure!(
-        file.checksum == snapshot_checksum(&file.payload)?,
-        "direct replay snapshot checksum mismatch"
-    );
-    entries_from_records(file.payload.entries, now)
+    if file.checksum != snapshot_checksum(&file.payload)? {
+        return Err(persistent::PersistentError::corrupt(
+            "direct replay snapshot",
+            "checksum mismatch",
+        )
+        .into());
+    }
+    entries_from_records(file.payload.entries, now).map(Some)
 }
 
 fn load_legacy(
@@ -755,15 +890,26 @@ fn load_legacy(
     recipient: PublicKey,
     topic: TopicId,
     now: u64,
-) -> Result<HashMap<(PublicKey, [u8; 16]), ReplayMetadata>> {
-    let bytes =
-        read_bounded(path, MAX_SNAPSHOT_BYTES).context("read legacy direct replay state")?;
+) -> Result<Option<ReplayEntries>> {
+    let Some(bytes) = persistent::read_optional_file_bounded(
+        path,
+        "legacy direct replay state",
+        MAX_SNAPSHOT_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let probe: ReplayVersionProbe =
+        persistent::parse_json_bounded_strings(&bytes, "legacy direct replay state", 64)?;
+    if probe.version != 1 {
+        return Err(persistent::PersistentError::unsupported_version(
+            "legacy direct replay state",
+            probe.version,
+        )
+        .into());
+    }
     let state: LegacyReplayState =
-        serde_json::from_slice(&bytes).context("parse legacy direct replay state")?;
-    anyhow::ensure!(
-        state.version == 1,
-        "unsupported legacy replay state version"
-    );
+        persistent::parse_json_bounded_strings(&bytes, "legacy direct replay state", 64)?;
     validate_binding(&state.recipient, &state.topic, recipient, topic)?;
     anyhow::ensure!(
         state.entries.len() <= MAX_REPLAY_ENTRIES,
@@ -788,13 +934,10 @@ fn load_legacy(
             );
         }
     }
-    Ok(entries)
+    Ok(Some(entries))
 }
 
-fn entries_from_records(
-    records: Vec<ReplayEntry>,
-    now: u64,
-) -> Result<HashMap<(PublicKey, [u8; 16]), ReplayMetadata>> {
+fn entries_from_records(records: Vec<ReplayEntry>, now: u64) -> Result<ReplayEntries> {
     anyhow::ensure!(
         records.len() <= MAX_REPLAY_ENTRIES,
         "direct replay state capacity exceeded"
@@ -817,54 +960,77 @@ fn load_wal(
     recipient: PublicKey,
     topic: TopicId,
     now: u64,
-    entries: &mut HashMap<(PublicKey, [u8; 16]), ReplayMetadata>,
-) -> Result<usize> {
-    if !path.exists() {
-        let parent = path.parent().context("direct replay WAL has no parent")?;
-        atomic_write(
-            parent,
-            file_name(path)?,
-            &wal_header_bytes(recipient, topic)?,
-            0o600,
-        )?;
-        return Ok(0);
-    }
-    let metadata = fs::metadata(path).context("inspect direct replay WAL")?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "direct replay WAL is not a regular file"
-    );
-    anyhow::ensure!(
-        metadata.len() <= MAX_WAL_BYTES,
-        "direct replay WAL is too large"
-    );
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path).context("open direct replay WAL")?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .context("read direct replay WAL")?;
-    let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') else {
-        anyhow::bail!("direct replay WAL header is torn or missing");
+    entries: &mut ReplayEntries,
+) -> Result<(usize, bool)> {
+    let mut file = match persistent::open_read_write(path, "direct replay WAL") {
+        Ok(file) => file,
+        Err(error) if error.kind() == persistent::PersistentErrorKind::Missing => {
+            let parent = path.parent().context("direct replay WAL has no parent")?;
+            atomic_write(
+                parent,
+                file_name(path)?,
+                &wal_header_bytes(recipient, topic)?,
+                0o600,
+            )?;
+            return Ok((0, false));
+        }
+        Err(error) => return Err(error.into()),
     };
-    let header: WalHeader =
-        serde_json::from_slice(&bytes[..header_end]).context("parse direct replay WAL header")?;
-    anyhow::ensure!(
-        header.version == WAL_VERSION,
-        "unsupported direct replay WAL version"
-    );
+    let metadata = file
+        .metadata()
+        .context("inspect direct replay WAL handle")?;
+    if metadata.len() > MAX_WAL_BYTES {
+        return Err(persistent::PersistentError::too_large(
+            "direct replay WAL",
+            MAX_WAL_BYTES as usize,
+        )
+        .into());
+    }
+    let bytes = persistent::read_bounded(
+        &mut file,
+        "direct replay WAL",
+        MAX_WAL_BYTES as usize,
+        metadata.len() as usize,
+    )?;
+    let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Err(persistent::PersistentError::corrupt(
+            "direct replay WAL",
+            "header is torn or missing",
+        )
+        .into());
+    };
+    let probe: ReplayVersionProbe = persistent::parse_json_bounded_strings(
+        &bytes[..header_end],
+        "direct replay WAL header",
+        64,
+    )?;
+    if probe.version != u64::from(WAL_VERSION) {
+        return Err(persistent::PersistentError::unsupported_version(
+            "direct replay WAL",
+            probe.version,
+        )
+        .into());
+    }
+    let header: WalHeader = persistent::parse_json_bounded_strings(
+        &bytes[..header_end],
+        "direct replay WAL header",
+        64,
+    )?;
     validate_binding(&header.recipient, &header.topic, recipient, topic)?;
     let mut offset = header_end + 1;
     let mut records = 0usize;
     while offset < bytes.len() {
         let Some(relative_end) = bytes[offset..].iter().position(|byte| *byte == b'\n') else {
-            // Only a non-newline-terminated final fragment is classified as a torn
-            // append. A complete malformed/checksum-invalid record fails closed.
+            // Only one bounded non-newline-terminated append can be torn. A larger
+            // tail could contain multiple/corrupt records and must remain untouched.
+            let tail_len = bytes.len() - offset;
+            if tail_len > MAX_WAL_RECORD_BYTES {
+                return Err(persistent::PersistentError::corrupt(
+                    "direct replay WAL",
+                    "unterminated tail exceeds record limit",
+                )
+                .into());
+            }
             file.set_len(offset as u64)
                 .context("truncate torn direct replay WAL tail")?;
             file.seek(SeekFrom::Start(offset as u64))?;
@@ -876,13 +1042,20 @@ fn load_wal(
             end - offset <= MAX_WAL_RECORD_BYTES,
             "direct replay WAL record is too large"
         );
-        let record: WalRecord = serde_json::from_slice(&bytes[offset..end])
-            .with_context(|| format!("parse direct replay WAL record {records}"))?;
+        let record: WalRecord = persistent::parse_json_bounded_strings(
+            &bytes[offset..end],
+            "direct replay WAL record",
+            64,
+        )
+        .with_context(|| format!("parse direct replay WAL record {records}"))?;
         let (key, metadata) = parse_entry(&record.entry)?;
-        anyhow::ensure!(
-            record.checksum == wal_checksum(recipient, topic, key.0, key.1, metadata),
-            "direct replay WAL record {records} checksum mismatch"
-        );
+        if record.checksum != wal_checksum(recipient, topic, key.0, key.1, metadata) {
+            return Err(persistent::PersistentError::corrupt(
+                "direct replay WAL",
+                format!("record {records} checksum mismatch"),
+            )
+            .into());
+        }
         if metadata.expires_at_ms > now {
             merge_wal_metadata(entries, key, metadata)?;
         }
@@ -893,37 +1066,131 @@ fn load_wal(
         );
         offset = end + 1;
     }
-    Ok(records)
+    Ok((records, true))
 }
 
-fn append_wal(path: &Path, record: &WalRecord) -> Result<()> {
+struct WalTransaction {
+    file: fs::File,
+    expected_len: u64,
+    expected_header: Vec<u8>,
+}
+
+fn open_wal_transaction(
+    path: &Path,
+    recipient: PublicKey,
+    topic: TopicId,
+) -> Result<WalTransaction> {
+    let mut file = persistent::open_read_append(path, "direct replay WAL")?;
+    anyhow::ensure!(
+        persistent::opened_file_is_current_path(&file, path, "direct replay WAL")?,
+        "direct replay WAL was replaced while opening transaction"
+    );
+    let metadata = file
+        .metadata()
+        .context("inspect direct replay WAL transaction handle")?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_WAL_BYTES,
+        "direct replay WAL is too large"
+    );
+    file.seek(SeekFrom::Start(0))?;
+    let mut prefix = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_WAL_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut prefix)
+        .context("read direct replay WAL transaction header")?;
+    let header_end = prefix
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("direct replay WAL header is torn or missing")?;
+    let probe: ReplayVersionProbe = persistent::parse_json_bounded_strings(
+        &prefix[..header_end],
+        "direct replay WAL header",
+        64,
+    )?;
+    anyhow::ensure!(
+        probe.version == u64::from(WAL_VERSION),
+        "unsupported direct replay WAL version"
+    );
+    let header: WalHeader = persistent::parse_json_bounded_strings(
+        &prefix[..header_end],
+        "direct replay WAL header",
+        64,
+    )?;
+    validate_binding(&header.recipient, &header.topic, recipient, topic)?;
+    anyhow::ensure!(
+        persistent::opened_file_is_current_path(&file, path, "direct replay WAL")?,
+        "direct replay WAL was replaced while validating transaction"
+    );
+    Ok(WalTransaction {
+        file,
+        expected_len: metadata.len(),
+        expected_header: prefix[..=header_end].to_vec(),
+    })
+}
+
+fn validate_wal_transaction(wal: &mut WalTransaction, path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        persistent::opened_file_is_current_path(&wal.file, path, "direct replay WAL")?,
+        "direct replay WAL was replaced during transaction"
+    );
+    let size = wal
+        .file
+        .metadata()
+        .context("inspect direct replay WAL transaction continuity")?
+        .len();
+    anyhow::ensure!(
+        size == wal.expected_len,
+        "direct replay WAL length continuity was lost"
+    );
+    wal.file.seek(SeekFrom::Start(0))?;
+    let mut header = vec![0_u8; wal.expected_header.len()];
+    wal.file
+        .read_exact(&mut header)
+        .context("re-read direct replay WAL transaction header")?;
+    anyhow::ensure!(
+        header == wal.expected_header,
+        "direct replay WAL header continuity was lost"
+    );
+    Ok(())
+}
+
+fn append_wal(
+    wal: &mut WalTransaction,
+    path: &Path,
+    record: &WalRecord,
+    reserved_bytes: u64,
+) -> Result<bool> {
+    append_wal_with_hook(wal, path, record, reserved_bytes, || {})
+}
+
+fn append_wal_with_hook(
+    wal: &mut WalTransaction,
+    path: &Path,
+    record: &WalRecord,
+    reserved_bytes: u64,
+    before_write: impl FnOnce(),
+) -> Result<bool> {
     let mut bytes = serde_json::to_vec(record)?;
     anyhow::ensure!(
         bytes.len() <= MAX_WAL_RECORD_BYTES,
         "direct replay WAL record exceeds size limit"
     );
     bytes.push(b'\n');
-    let mut options = fs::OpenOptions::new();
-    options.append(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+    validate_wal_transaction(wal, path)?;
+    let required = (bytes.len() as u64).saturating_add(reserved_bytes);
+    if wal.expected_len.saturating_add(required) > MAX_WAL_BYTES {
+        return Ok(false);
     }
-    let mut file = options
-        .open(path)
-        .context("open direct replay WAL for append")?;
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "direct replay WAL is not a regular file"
-    );
-    let size = file.metadata()?.len();
-    anyhow::ensure!(
-        size.saturating_add(bytes.len() as u64) <= MAX_WAL_BYTES,
-        "direct replay WAL capacity reached"
-    );
-    file.write_all(&bytes).context("append direct replay WAL")?;
-    file.sync_all().context("sync direct replay WAL append")
+    before_write();
+    wal.file
+        .write_all(&bytes)
+        .context("append direct replay WAL")?;
+    wal.file
+        .sync_all()
+        .context("sync direct replay WAL append")?;
+    wal.expected_len = wal.expected_len.saturating_add(bytes.len() as u64);
+    validate_wal_transaction(wal, path)?;
+    Ok(true)
 }
 
 fn wal_header_bytes(recipient: PublicKey, topic: TopicId) -> Result<Vec<u8>> {
@@ -1029,7 +1296,7 @@ fn parse_entry(entry: &ReplayEntry) -> Result<((PublicKey, [u8; 16]), ReplayMeta
 }
 
 fn merge_wal_metadata(
-    entries: &mut HashMap<(PublicKey, [u8; 16]), ReplayMetadata>,
+    entries: &mut ReplayEntries,
     key: (PublicKey, [u8; 16]),
     incoming: ReplayMetadata,
 ) -> Result<()> {
@@ -1072,27 +1339,6 @@ fn validate_binding(
         "direct replay state topic mismatch"
     );
     Ok(())
-}
-
-fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "state path is not a regular file"
-    );
-    let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() <= limit, "state file exceeds size limit");
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1190,6 +1436,445 @@ mod tests {
     }
 
     #[test]
+    fn replay_versions_are_probed_as_u64_before_specific_decode() {
+        let recipient = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([29; 32]);
+        let (snapshot, wal, legacy, dir) = test_paths();
+        fs::write(
+            &snapshot,
+            format!(
+                "{{\"payload\":{{\"version\":256,\"recipient\":\"{recipient}\",\"topic\":\"{topic}\",\"entries\":[]}},\"checksum\":\"{}\"}}",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        let error = ReplayStore::load(
+            snapshot.clone(),
+            wal.clone(),
+            legacy.clone(),
+            recipient,
+            topic,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("schema version 256"));
+        fs::remove_file(&snapshot).unwrap();
+
+        fs::write(
+            &legacy,
+            format!(
+                "{{\"version\":256,\"recipient\":\"{recipient}\",\"topic\":\"{topic}\",\"entries\":[]}}"
+            ),
+        )
+        .unwrap();
+        let error = ReplayStore::load(
+            snapshot.clone(),
+            wal.clone(),
+            legacy.clone(),
+            recipient,
+            topic,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("schema version 256"));
+        fs::remove_file(&legacy).unwrap();
+
+        fs::write(
+            &wal,
+            format!("{{\"version\":256,\"recipient\":\"{recipient}\",\"topic\":\"{topic}\"}}\n"),
+        )
+        .unwrap();
+        let error = ReplayStore::load(snapshot, wal, legacy, recipient, topic).unwrap_err();
+        assert!(error.to_string().contains("schema version 256"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replay_entry_visitors_bound_compact_collections_and_strings() {
+        let sender = iroh::SecretKey::generate().public().to_string();
+        let topic = TopicId::from_bytes([28; 32]).to_string();
+        let entry = format!(
+            "{{\"sender\":\"{sender}\",\"id\":\"{}\",\"fingerprint\":\"{}\",\"expires_at_ms\":1,\"state\":\"recorded\"}}",
+            "0".repeat(32),
+            "0".repeat(64)
+        );
+        let snapshot = |count: usize, sender_value: &str| {
+            let item = entry.replace(&sender, sender_value);
+            format!(
+                "{{\"payload\":{{\"version\":2,\"recipient\":\"{sender}\",\"topic\":\"{topic}\",\"entries\":[{}]}},\"checksum\":\"{}\"}}",
+                std::iter::repeat_n(item.as_str(), count).collect::<Vec<_>>().join(","),
+                "0".repeat(64)
+            )
+        };
+        let boundary = snapshot(MAX_REPLAY_ENTRIES, &sender);
+        assert!(boundary.len() < MAX_SNAPSHOT_BYTES);
+        let parsed: SnapshotFile = persistent::parse_json_bounded_strings(
+            boundary.as_bytes(),
+            "direct replay snapshot",
+            64,
+        )
+        .unwrap();
+        assert_eq!(parsed.payload.entries.len(), MAX_REPLAY_ENTRIES);
+
+        let amplified = snapshot(MAX_REPLAY_ENTRIES + 1, &sender);
+        assert!(amplified.len() < MAX_SNAPSHOT_BYTES);
+        assert!(persistent::parse_json_bounded_strings::<SnapshotFile>(
+            amplified.as_bytes(),
+            "direct replay snapshot",
+            64,
+        )
+        .is_err());
+        for (exact, oversized) in [
+            (r"\u0061".repeat(64), r"\u0061".repeat(65)),
+            (r"\\".repeat(64), r"\\".repeat(65)),
+            (r"\uD83D\uDE00".repeat(16), r"\uD83D\uDE00".repeat(17)),
+        ] {
+            persistent::parse_json_bounded_strings::<SnapshotFile>(
+                snapshot(1, &exact).as_bytes(),
+                "direct replay snapshot",
+                64,
+            )
+            .unwrap();
+            assert!(persistent::parse_json_bounded_strings::<SnapshotFile>(
+                snapshot(1, &oversized).as_bytes(),
+                "direct replay snapshot",
+                64,
+            )
+            .is_err());
+        }
+
+        let legacy_entry = format!(
+            "{{\"sender\":\"{sender}\",\"id\":\"{}\",\"expires_at_ms\":1}}",
+            "0".repeat(32)
+        );
+        let legacy = format!(
+            "{{\"version\":1,\"recipient\":\"{sender}\",\"topic\":\"{topic}\",\"entries\":[{}]}}",
+            std::iter::repeat_n(legacy_entry.as_str(), MAX_REPLAY_ENTRIES + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(legacy.len() < MAX_SNAPSHOT_BYTES);
+        assert!(persistent::parse_json_bounded_strings::<LegacyReplayState>(
+            legacy.as_bytes(),
+            "legacy direct replay state",
+            64,
+        )
+        .is_err());
+        let escaped_legacy = |sender_value: &str| {
+            format!(
+                "{{\"version\":1,\"recipient\":\"{sender}\",\"topic\":\"{topic}\",\"entries\":[{{\"sender\":\"{sender_value}\",\"id\":\"{}\",\"expires_at_ms\":1}}]}}",
+                "0".repeat(32)
+            )
+        };
+        persistent::parse_json_bounded_strings::<LegacyReplayState>(
+            escaped_legacy(&r"\u0061".repeat(64)).as_bytes(),
+            "legacy direct replay state",
+            64,
+        )
+        .unwrap();
+        assert!(persistent::parse_json_bounded_strings::<LegacyReplayState>(
+            escaped_legacy(&r"\u0061".repeat(65)).as_bytes(),
+            "legacy direct replay state",
+            64,
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_optional_files_and_wal_append_reject_dangling_links() {
+        use std::os::unix::fs::symlink;
+        for role in ["snapshot", "legacy", "wal"] {
+            let recipient = iroh::SecretKey::generate().public();
+            let topic = TopicId::from_bytes([27; 32]);
+            let (snapshot, wal, legacy, dir) = test_paths();
+            let path = match role {
+                "snapshot" => &snapshot,
+                "legacy" => &legacy,
+                _ => &wal,
+            };
+            symlink(dir.join("missing-target"), path).unwrap();
+            assert!(ReplayStore::load(snapshot, wal, legacy, recipient, topic).is_err());
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let target = dir.join("redirected");
+        fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &wal).unwrap();
+        let recipient = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([26; 32]);
+        assert!(open_wal_transaction(&wal, recipient, topic).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_append_detects_path_replacement_after_checked_open() {
+        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let saved = dir.join("opened-wal");
+        let replacement = b"replacement WAL";
+        let recipient = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([25; 32]);
+        atomic_write(
+            &dir,
+            file_name(&wal).unwrap(),
+            &wal_header_bytes(recipient, topic).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        let record = wal_record(
+            recipient,
+            topic,
+            recipient,
+            [2; 16],
+            ReplayMetadata {
+                fingerprint: [2; 32],
+                expires_at_ms: 2,
+                state: PersistedState::Recorded,
+            },
+        )
+        .unwrap();
+        let mut transaction = open_wal_transaction(&wal, recipient, topic).unwrap();
+        let error = append_wal_with_hook(&mut transaction, &wal, &record, 0, || {
+            fs::rename(&wal, &saved).unwrap();
+            fs::write(&wal, replacement).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("replaced during transaction"));
+        assert_eq!(fs::read(&wal).unwrap(), replacement);
+        assert!(
+            fs::metadata(&saved).unwrap().len()
+                > wal_header_bytes(recipient, topic).unwrap().len() as u64
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_append_detects_symlink_replacement_after_checked_open() {
+        use std::os::unix::fs::symlink;
+        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let saved = dir.join("opened-wal");
+        let target = dir.join("redirect-target");
+        fs::write(&target, b"unchanged").unwrap();
+        let recipient = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([24; 32]);
+        atomic_write(
+            &dir,
+            file_name(&wal).unwrap(),
+            &wal_header_bytes(recipient, topic).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        let record = wal_record(
+            recipient,
+            topic,
+            recipient,
+            [3; 16],
+            ReplayMetadata {
+                fingerprint: [3; 32],
+                expires_at_ms: 3,
+                state: PersistedState::Recorded,
+            },
+        )
+        .unwrap();
+        let mut transaction = open_wal_transaction(&wal, recipient, topic).unwrap();
+        assert!(
+            append_wal_with_hook(&mut transaction, &wal, &record, 0, || {
+                fs::rename(&wal, &saved).unwrap();
+                symlink(&target, &wal).unwrap();
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
+        assert!(
+            fs::metadata(saved).unwrap().len()
+                > wal_header_bytes(recipient, topic).unwrap().len() as u64
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transaction_rejects_every_wal_replacement_between_record_and_confirmation() {
+        use std::os::unix::fs::symlink;
+
+        for kind in [
+            "empty",
+            "valid_new_file",
+            "malformed",
+            "symlink",
+            "directory",
+        ] {
+            let recipient = iroh::SecretKey::generate().public();
+            let sender = iroh::SecretKey::generate().public();
+            let topic = TopicId::from_bytes([23; 32]);
+            let (snapshot, wal, legacy, dir) = test_paths();
+            let mut store = loaded_store(snapshot, wal.clone(), legacy.clone(), recipient, topic);
+            let saved = dir.join("recorded-generation.wal");
+            let target = dir.join("replacement-target");
+            fs::write(&target, b"target remains unchanged").unwrap();
+            let replacement_bytes = match kind {
+                "empty" => Some(Vec::new()),
+                "valid_new_file" => Some(wal_header_bytes(recipient, topic).unwrap()),
+                "malformed" => Some(b"not a WAL\n".to_vec()),
+                "symlink" | "directory" => None,
+                _ => unreachable!(),
+            };
+            let wal_for_delivery = wal.clone();
+            let saved_for_delivery = saved.clone();
+            let target_for_delivery = target.clone();
+            let replacement_for_delivery = replacement_bytes.clone();
+            let delivery = Box::new(move || {
+                fs::rename(&wal_for_delivery, &saved_for_delivery).unwrap();
+                match kind {
+                    "symlink" => symlink(&target_for_delivery, &wal_for_delivery).unwrap(),
+                    "directory" => fs::create_dir(&wal_for_delivery).unwrap(),
+                    _ => fs::write(&wal_for_delivery, replacement_for_delivery.unwrap()).unwrap(),
+                }
+            });
+            let now = wall_ms().unwrap();
+            let failure = store
+                .admit_transaction(
+                    Admission {
+                        sender,
+                        id: [4; 16],
+                        fingerprint: [4; 32],
+                        expires_at_ms: now + 60_000,
+                        delivery: Some(delivery),
+                    },
+                    now,
+                    Instant::now(),
+                )
+                .unwrap_err();
+            assert_eq!(failure.outcome, ReplayDecision::DeliveryOutcomeUnknown);
+            let recorded_generation = fs::read(&saved).unwrap();
+            assert!(String::from_utf8_lossy(&recorded_generation).contains("\"recorded\""));
+            assert!(
+                !String::from_utf8_lossy(&recorded_generation).contains("\"delivery_confirmed\"")
+            );
+            match kind {
+                "symlink" => {
+                    assert!(fs::symlink_metadata(&wal).unwrap().file_type().is_symlink());
+                    assert_eq!(fs::read(&target).unwrap(), b"target remains unchanged");
+                    fs::remove_file(&wal).unwrap();
+                }
+                "directory" => {
+                    assert!(wal.is_dir());
+                    fs::remove_dir(&wal).unwrap();
+                }
+                _ => assert_eq!(fs::read(&wal).unwrap(), replacement_bytes.unwrap()),
+            }
+            if wal.exists() {
+                fs::remove_file(&wal).unwrap();
+            }
+            fs::rename(&saved, &wal).unwrap();
+            drop(store);
+            let mut restarted =
+                loaded_store(dir.join("snapshot.json"), wal, legacy, recipient, topic);
+            assert_eq!(
+                restarted
+                    .admit(sender, [4; 16], now + 60_000, true, now, Instant::now())
+                    .unwrap(),
+                ReplayDecision::DeliveryOutcomeUnknown
+            );
+            drop(restarted);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn transaction_rejects_in_place_header_discontinuity_before_confirmation() {
+        let recipient = iroh::SecretKey::generate().public();
+        let sender = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([21; 32]);
+        let (snapshot, wal, legacy, dir) = test_paths();
+        let mut store = loaded_store(snapshot, wal.clone(), legacy, recipient, topic);
+        let wal_for_delivery = wal.clone();
+        let delivery = Box::new(move || {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_for_delivery)
+                .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"!").unwrap();
+            file.sync_all().unwrap();
+        });
+        let now = wall_ms().unwrap();
+        let failure = store
+            .admit_transaction(
+                Admission {
+                    sender,
+                    id: [6; 16],
+                    fingerprint: [6; 32],
+                    expires_at_ms: now + 60_000,
+                    delivery: Some(delivery),
+                },
+                now,
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(failure.outcome, ReplayDecision::DeliveryOutcomeUnknown);
+        let bytes = fs::read(&wal).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"recorded\""));
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"delivery_confirmed\""));
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_append_rejects_reparse_points() {
+        use std::os::windows::fs::symlink_file;
+        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let target = dir.join("redirected");
+        fs::write(&target, b"unchanged").unwrap();
+        symlink_file(&target, &wal).unwrap();
+        let recipient = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([26; 32]);
+        assert!(open_wal_transaction(&wal, recipient, topic).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_transaction_rejects_reparse_replacement_between_appends() {
+        use std::os::windows::fs::symlink_file;
+
+        let recipient = iroh::SecretKey::generate().public();
+        let sender = iroh::SecretKey::generate().public();
+        let topic = TopicId::from_bytes([22; 32]);
+        let (snapshot, wal, legacy, dir) = test_paths();
+        let mut store = loaded_store(snapshot, wal.clone(), legacy, recipient, topic);
+        let saved = dir.join("recorded-generation.wal");
+        let target = dir.join("replacement-target");
+        fs::write(&target, b"unchanged").unwrap();
+        let wal_for_delivery = wal.clone();
+        let delivery = Box::new(move || {
+            fs::rename(&wal_for_delivery, &saved).unwrap();
+            symlink_file(&target, &wal_for_delivery).unwrap();
+        });
+        let now = wall_ms().unwrap();
+        let failure = store
+            .admit_transaction(
+                Admission {
+                    sender,
+                    id: [5; 16],
+                    fingerprint: [5; 32],
+                    expires_at_ms: now + 60_000,
+                    delivery: Some(delivery),
+                },
+                now,
+                Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(failure.outcome, ReplayDecision::DeliveryOutcomeUnknown);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn wal_torn_tail_is_truncated_but_complete_corruption_fails_closed() {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
@@ -1227,6 +1912,49 @@ mod tests {
         assert!(recovered.entries.contains_key(&(sender, [1; 16])));
         assert_eq!(fs::metadata(&wal).unwrap().len(), valid_len);
         drop(recovered);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .unwrap()
+            .write_all(&vec![b'x'; MAX_WAL_RECORD_BYTES])
+            .unwrap();
+        let recovered = loaded_store(
+            snapshot.clone(),
+            wal.clone(),
+            legacy.clone(),
+            recipient,
+            topic,
+        );
+        assert!(recovered.entries.contains_key(&(sender, [1; 16])));
+        assert_eq!(fs::metadata(&wal).unwrap().len(), valid_len);
+        drop(recovered);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .unwrap()
+            .write_all(&vec![b'x'; MAX_WAL_RECORD_BYTES + 1])
+            .unwrap();
+        let oversized_tail = fs::read(&wal).unwrap();
+        assert!(ReplayStore::load(
+            snapshot.clone(),
+            wal.clone(),
+            legacy.clone(),
+            recipient,
+            topic
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unterminated tail exceeds record limit"));
+        assert_eq!(fs::read(&wal).unwrap(), oversized_tail);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(valid_len)
+            .unwrap();
+
         fs::OpenOptions::new()
             .append(true)
             .open(&wal)

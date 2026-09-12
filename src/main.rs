@@ -10,7 +10,9 @@ mod invite;
 mod ipc;
 mod message;
 mod node;
+mod output;
 mod peers;
+mod persistent;
 mod web;
 
 use alias::AliasConfig;
@@ -18,7 +20,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{AliasCommand, Cli, Command, OffersCommand};
 use config::State;
+use futures_util::FutureExt;
 use invite::Invite;
+use std::process::ExitCode;
 
 fn json_mode_requested(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
     arguments
@@ -35,16 +39,58 @@ fn authoritative_contract_failure(error: &anyhow::Error) -> Option<contracts::Er
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let json = json_mode_requested(std::env::args_os());
-    // Preserve the documented machine-output guarantee: private diagnostics use
-    // the bounded local sink only in human mode, never the JSON stderr stream.
-    contracts::set_private_diagnostic_output(!json);
-    if let Err(error) = run().await {
-        if json {
-            // JSON failures use stdout, the same documented stream as JSON
-            // successes/NDJSON events. Internal causes and local paths remain on
-            // the human-only diagnostic path.
+    // Suppress hook I/O only inside this guarded process boundary. Every unwind
+    // is caught, daemon output locals drain during unwinding, terminal output is
+    // serialized afterward, and the caller's hook is restored before returning.
+    let panic_hook = output::install_panic_hook();
+    let outcome = std::panic::AssertUnwindSafe(async {
+        contracts::set_private_diagnostic_output(!json)
+            .context("start bounded diagnostic writer")?;
+        if output::test_switch("MESHMSG_TEST_PROCESS_PANIC") {
+            panic!("injected process panic");
+        }
+        if output::test_switch("MESHMSG_TEST_EMIT_DIAGNOSTIC") {
+            contracts::log_private_diagnostic("process_test", "injected", "private");
+        }
+        run().await
+    })
+    .catch_unwind()
+    .await;
+
+    // No final stderr owner is created unless the diagnostic owner exited. If it
+    // timed out, it may still hold a blocked stderr forever and the final human
+    // diagnostic is deliberately suppressed.
+    let diagnostics_drained = output::shutdown_diagnostics(output::DRAIN_TIMEOUT);
+    let result = match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            let mut error = contracts::ErrorEnvelopeV1::new(
+                "internal_contract_error",
+                "process panicked",
+                "unknown",
+                false,
+            );
+            error.request_id = Some(contracts::new_request_id());
+            if json && output::stdout_available() {
+                let mut bytes = error.into_value().to_string().into_bytes();
+                bytes.push(b'\n');
+                let _ = output::write_terminal_bounded(false, bytes, output::DRAIN_TIMEOUT);
+            } else if !json && diagnostics_drained {
+                let _ = output::write_terminal_bounded(
+                    true,
+                    b"error: internal process panic\n".to_vec(),
+                    output::DRAIN_TIMEOUT,
+                );
+            }
+            drop(panic_hook);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(error) = result {
+        if json && output::stdout_available() {
             let authoritative = authoritative_contract_failure(&error);
             let envelope = authoritative.unwrap_or_else(|| {
                 let diagnostic = format!("{error:#}");
@@ -62,12 +108,18 @@ async fn main() {
                 envelope.request_id = Some(contracts::new_request_id());
                 envelope
             });
-            println!("{}", envelope.into_value());
-        } else {
-            eprintln!("error: {error:#}");
+            let mut bytes = envelope.into_value().to_string().into_bytes();
+            bytes.push(b'\n');
+            let _ = output::write_terminal_bounded(false, bytes, output::DRAIN_TIMEOUT);
+        } else if !json && diagnostics_drained {
+            let text = format!("error: {error:#}\n");
+            let _ = output::write_terminal_bounded(true, text.into_bytes(), output::DRAIN_TIMEOUT);
         }
-        std::process::exit(1);
+        drop(panic_hook);
+        return ExitCode::FAILURE;
     }
+    drop(panic_hook);
+    ExitCode::SUCCESS
 }
 
 async fn run() -> Result<()> {
@@ -89,13 +141,6 @@ async fn run() -> Result<()> {
         !(is_bench_tui && cli.json),
         "--json cannot be used with bench-tui; use bench-send or bench-receive for NDJSON"
     );
-    if !is_bench_tui {
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_writer(std::io::stderr)
-            .init();
-    }
-
     let dir = cli.state_dir();
     match cli.command {
         Command::Init { force, no_alias } => {
