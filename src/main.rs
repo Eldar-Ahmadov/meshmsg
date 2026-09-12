@@ -366,6 +366,7 @@ async fn run() -> Result<()> {
         Command::BenchTui => bench_tui::run(&dir).await?,
         Command::Chat => node::chat(&dir, cli.json).await?,
         Command::Status => node::status(&dir, cli.json).await?,
+        Command::Diagnostics => node::diagnostics(&dir).await?,
         Command::Doctor => node::doctor(&dir, cli.json).await?,
     }
     Ok(())

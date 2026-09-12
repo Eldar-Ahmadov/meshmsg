@@ -201,6 +201,7 @@ fn now_ms() -> u64 {
 #[derive(Default)]
 struct Metrics {
     accepted: AtomicU64,
+    admission_rejected: AtomicU64,
     queue_dropped: AtomicU64,
     contention_dropped: AtomicU64,
     sampled: AtomicU64,
@@ -218,6 +219,7 @@ struct Metrics {
 pub(crate) struct MetricsSnapshot {
     pub(crate) accepted: u64,
     pub(crate) dropped: u64,
+    pub(crate) admission_rejected: u64,
     pub(crate) queue_dropped: u64,
     pub(crate) contention_dropped: u64,
     pub(crate) sampled: u64,
@@ -244,6 +246,7 @@ impl Metrics {
             dropped: queue_dropped
                 .saturating_add(contention_dropped)
                 .saturating_add(writer_lost),
+            admission_rejected: self.admission_rejected.load(Ordering::Relaxed),
             queue_dropped,
             contention_dropped,
             sampled: self.sampled.load(Ordering::Relaxed),
@@ -368,8 +371,10 @@ impl Dispatcher {
         }
     }
 
-    fn reject(&self) {
-        self.metrics.queue_dropped.fetch_add(1, Ordering::Relaxed);
+    fn reject_admission(&self) {
+        self.metrics
+            .admission_rejected
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> MetricsSnapshot {
@@ -540,7 +545,7 @@ impl DaemonOutput {
     pub(crate) fn event(&self, mut value: serde_json::Value) -> bool {
         if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
             let Ok(error) = crate::contracts::ErrorEnvelopeV1::from_value(&value) else {
-                self.0.reject();
+                self.0.reject_admission();
                 return false;
             };
             // Re-serialize the strict DTO rather than preserving the caller's
@@ -902,6 +907,10 @@ mod tests {
             )
             .into_value()
         ));
+        let metrics = output.metrics();
+        assert_eq!(metrics.admission_rejected, 1);
+        assert_eq!(metrics.queue_dropped, 0);
+        assert_eq!(metrics.dropped, 0);
         assert!(output.shutdown(Duration::from_secs(1)));
         let text = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         assert_eq!(text.lines().count(), 1);
