@@ -1291,7 +1291,7 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
             web_ipc_request(
                 &dir,
                 &IpcRequest::WebDownload {
-                    operation_id: operation.clone(),
+                    operation_id: operation.parse().expect("validated web operation ID"),
                     offer: input.offer.clone(),
                     output: output.clone(),
                 },
@@ -1573,7 +1573,10 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         _ => None,
     };
     let request = match request {
-        WebRequest::Send { operation_id, body } => IpcRequest::Send { operation_id, body },
+        WebRequest::Send { operation_id, body } => IpcRequest::Send {
+            operation_id: operation_id.parse().expect("validated web operation ID"),
+            body: meshmsg_protocol::BroadcastBody::new(body).expect("validated web message body"),
+        },
         WebRequest::Status {} => IpcRequest::Status,
         WebRequest::Peers {} => IpcRequest::Peers,
         WebRequest::Download { .. } | WebRequest::DownloadStatus { .. } => unreachable!(),
@@ -2485,8 +2488,8 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
         web_ipc_request(
             &state.dir,
             &IpcRequest::Share {
-                operation_id: operation_id.clone(),
-                source_digest: source_digest.clone(),
+                operation_id: operation_id.parse().expect("validated upload operation ID"),
+                source_digest: source_digest.parse().expect("computed SHA-256 digest"),
                 path: path.clone(),
             },
         ),

@@ -46,7 +46,7 @@ def raw_request(state, command):
     request_id = "1" * 32
     request = {"command": command}
     frame = json.dumps({
-        "schema_version": 1, "request_id": request_id, "request": request,
+        "protocol_version": 2, "request_id": request_id, "request": request,
     }).encode() + b"\n"
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(5)
@@ -113,25 +113,24 @@ try:
 
     old_state = root / "old-state"
     start(old, old_state)
-    old_status = status(current, old_state)
-    assert "diagnostic_status_v2" in old_status["ipc_capabilities"]
-    assert "diagnostic_status_v3" not in old_status["ipc_capabilities"]
-    fallback = run(current, old_state, "--json", "diagnostics")
-    assert fallback.returncode == 0, (fallback.stdout, fallback.stderr)
-    assert fallback.stderr == b""
-    assert_schema(json.loads(fallback.stdout), 2, V2_FIELDS)
+    # The single-version boundary deliberately rejects the released schema-1
+    # client/daemon in both directions rather than negotiating or falling back.
+    rejected_old_daemon = run(current, old_state, "--json", "status")
+    assert rejected_old_daemon.returncode != 0
+    assert json.loads(rejected_old_daemon.stdout)["code"] == "command_failed"
 
     current_state = root / "current-state"
     env = os.environ.copy()
     env["MESHMSG_TEST_REJECT_DAEMON_ERROR"] = "1"
     start(current, current_state, env)
-    current_status = status(old, current_state)
-    assert "diagnostic_status_v2" in current_status["ipc_capabilities"]
-    assert "diagnostic_status_v3" in current_status["ipc_capabilities"]
+    rejected_old_client = run(old, current_state, "--json", "status")
+    assert rejected_old_client.returncode != 0
 
-    # A v0.1.19 protocol client continues to issue `diagnostics` and receives its
-    # exact strict v2 response, with no v3 field collision.
-    assert_schema(raw_request(current_state, "diagnostics"), 2, V2_FIELDS)
+    # Current raw protocol-v2 clients can still request the retained diagnostic
+    # v2 family explicitly; transport version and family schema are independent.
+    raw_v2 = raw_request(current_state, "diagnostics")
+    assert raw_v2.pop("protocol_version") == 2
+    assert_schema(raw_v2, 2, V2_FIELDS)
 
     # A current client prefers the separately negotiated v3 command and observes
     # the pre-queue rejection without changing aggregate drop accounting.
@@ -156,4 +155,4 @@ finally:
             process.wait()
     shutil.rmtree(root, ignore_errors=True)
 
-print("PASS: v0.1.19/current diagnostic status v2 compatibility and negotiated v3 telemetry")
+print("PASS: protocol-v2 rejects legacy clients/daemons and retains strict diagnostic v2/v3 families")

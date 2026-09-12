@@ -2290,6 +2290,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-gossip",
  "libc",
+ "meshmsg-protocol",
  "postcard",
  "rand",
  "ratatui",
@@ -2301,6 +2302,17 @@ dependencies = [
  "tar",
  "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "meshmsg-protocol"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "rand",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

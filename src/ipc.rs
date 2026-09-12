@@ -14,14 +14,15 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 
-// JSON may escape each envelope byte as six ASCII bytes.
-pub(crate) const MAX_IPC_REQUEST_SIZE: usize = 4096 * 6 + 1024;
-// A complete, non-paginated directory can contain the bounded maximum of 1024
-// remote identities. Individual live events remain tiny reconstructed objects,
-// while this hard frame limit accommodates the proven worst-case snapshot.
-pub(crate) const MAX_IPC_EVENT_SIZE: usize = 512 * 1024;
+// The shared protocol crate owns framing bounds. Legacy in-crate DTOs use
+// these aliases until their producers and consumers migrate to protocol v2.
+pub(crate) use meshmsg_protocol::framing::{
+    MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT_SIZE, MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE,
+};
 pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v2";
 pub(crate) const WEB_DOWNLOAD_CAPABILITY: &str = "web_download_v1";
 pub(crate) const WEB_SHARE_CAPABILITY: &str = "web_share_v1";
@@ -184,17 +185,10 @@ pub(crate) fn prune_cutoff_upper_bound(now_ms: u64, older_than_secs: u64) -> u64
 }
 
 pub(crate) fn new_operation_id() -> String {
-    data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>())
+    meshmsg_protocol::OperationId::new_random().into_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BenchConfig {
-    pub(crate) run_id: String,
-    pub(crate) rate: u32,
-    pub(crate) duration_secs: u64,
-    pub(crate) payload_bytes: usize,
-}
+pub(crate) use meshmsg_protocol::BenchConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1978,138 +1972,42 @@ pub(crate) fn negotiated_diagnostic_request(status: &StatusV1) -> Result<(IpcReq
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum IpcRequest {
-    Send {
-        operation_id: String,
-        body: String,
-    },
-    PrivateSend {
-        operation_id: String,
-        to: String,
-        body: String,
-    },
-    BenchSend {
-        config: BenchConfig,
-    },
-    Subscribe,
-    Status,
-    Diagnostics,
-    DiagnosticsV3,
-    Peers,
-    Offers,
-    OffersRemove {
-        operation_id: String,
-        offer_id: String,
-        direction: Option<String>,
-        provider: Option<String>,
-    },
-    OffersPrune {
-        operation_id: String,
-        /// Explicit effective age. The daemon resolves and owns the cutoff.
-        older_than_secs: u64,
-        direction: Option<String>,
-        dry_run: bool,
-        max_delete: usize,
-    },
-    Share {
-        operation_id: String,
-        source_digest: String,
-        path: PathBuf,
-    },
-    Download {
-        operation_id: String,
-        offer: String,
-        output: PathBuf,
-    },
-    /// Export the verified offered blob without interpreting it. Used by the
-    /// local web bridge with a server-selected temporary output path.
-    WebDownload {
-        operation_id: String,
-        offer: String,
-        output: PathBuf,
-    },
-    Stop,
-}
+pub(crate) use meshmsg_protocol::{Request as IpcRequest, RequestFrame as IpcRequestFrame};
 
-/// Every IPC command is wrapped in this strict transport contract. Schema 1 is
-/// intentionally fail-closed: pre-contract clients/daemons must upgrade rather
-/// than silently interpreting a partial request.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IpcRequestFrame {
-    pub(crate) schema_version: u8,
-    pub(crate) request_id: String,
-    pub(crate) request: IpcRequest,
-}
-
-impl IpcRequest {
-    fn error_expectation(&self) -> (contracts::ErrorOperationKind, Option<&str>) {
-        match self {
-            Self::Send { operation_id, .. } => {
-                (contracts::ErrorOperationKind::Send, Some(operation_id))
-            }
-            Self::PrivateSend { operation_id, .. } => (
-                contracts::ErrorOperationKind::PrivateSend,
-                Some(operation_id),
-            ),
-            Self::BenchSend { .. } => (contracts::ErrorOperationKind::Benchmark, None),
-            Self::Subscribe => (contracts::ErrorOperationKind::Feed, None),
-            Self::Offers => (contracts::ErrorOperationKind::Offers, None),
-            Self::OffersRemove { operation_id, .. } => {
-                (contracts::ErrorOperationKind::Remove, Some(operation_id))
-            }
-            Self::OffersPrune { operation_id, .. } => {
-                (contracts::ErrorOperationKind::Prune, Some(operation_id))
-            }
-            Self::Share { operation_id, .. } => {
-                (contracts::ErrorOperationKind::Share, Some(operation_id))
-            }
-            Self::Download { operation_id, .. } => {
-                (contracts::ErrorOperationKind::Download, Some(operation_id))
-            }
-            Self::WebDownload { operation_id, .. } => (
-                contracts::ErrorOperationKind::WebDownload,
-                Some(operation_id),
-            ),
-            Self::Status | Self::Diagnostics | Self::DiagnosticsV3 | Self::Peers | Self::Stop => {
-                (contracts::ErrorOperationKind::General, None)
-            }
+fn error_expectation(request: &IpcRequest) -> (contracts::ErrorOperationKind, Option<&str>) {
+    match request {
+        IpcRequest::Send { operation_id, .. } => {
+            (contracts::ErrorOperationKind::Send, Some(operation_id))
         }
-    }
-}
-
-impl IpcRequestFrame {
-    pub(crate) fn new(request_id: String, request: IpcRequest) -> Self {
-        Self {
-            schema_version: contracts::SCHEMA_VERSION,
-            request_id,
-            request,
+        IpcRequest::PrivateSend { operation_id, .. } => (
+            contracts::ErrorOperationKind::PrivateSend,
+            Some(operation_id),
+        ),
+        IpcRequest::BenchSend { .. } => (contracts::ErrorOperationKind::Benchmark, None),
+        IpcRequest::Subscribe => (contracts::ErrorOperationKind::Feed, None),
+        IpcRequest::Offers => (contracts::ErrorOperationKind::Offers, None),
+        IpcRequest::OffersRemove { operation_id, .. } => {
+            (contracts::ErrorOperationKind::Remove, Some(operation_id))
         }
+        IpcRequest::OffersPrune { operation_id, .. } => {
+            (contracts::ErrorOperationKind::Prune, Some(operation_id))
+        }
+        IpcRequest::Share { operation_id, .. } => {
+            (contracts::ErrorOperationKind::Share, Some(operation_id))
+        }
+        IpcRequest::Download { operation_id, .. } => {
+            (contracts::ErrorOperationKind::Download, Some(operation_id))
+        }
+        IpcRequest::WebDownload { operation_id, .. } => (
+            contracts::ErrorOperationKind::WebDownload,
+            Some(operation_id),
+        ),
+        IpcRequest::Status
+        | IpcRequest::Diagnostics
+        | IpcRequest::DiagnosticsV3
+        | IpcRequest::Peers
+        | IpcRequest::Stop => (contracts::ErrorOperationKind::General, None),
     }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.schema_version == contracts::SCHEMA_VERSION,
-            "unsupported local IPC request schema version"
-        );
-        anyhow::ensure!(
-            contracts::valid_request_id(&self.request_id),
-            "invalid local IPC request ID"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Deserialize)]
-struct ResponseMetadata {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: Option<String>,
-    #[serde(flatten)]
-    _payload: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -2123,16 +2021,18 @@ fn decode_response_for_context(
     expected_topic: Option<TopicId>,
     live_now_ms: Option<u64>,
 ) -> Result<serde_json::Value> {
-    let metadata: ResponseMetadata =
-        serde_json::from_slice(frame).context("daemon returned a malformed response envelope")?;
-    anyhow::ensure!(
-        metadata.schema_version > 0,
-        "daemon returned an invalid response schema version"
-    );
-    anyhow::ensure!(!metadata.kind.is_empty(), "daemon response type is empty");
-    let value: serde_json::Value =
-        serde_json::from_slice(frame).context("invalid response from local daemon")?;
-    if metadata.kind == "error" {
+    let typed: meshmsg_protocol::DaemonFrame =
+        serde_json::from_slice(frame).context("invalid typed frame from local daemon")?;
+    let request_id = typed.request_id().map(ToString::to_string);
+    let value = typed
+        .into_payload_value()
+        .context("re-encode typed daemon frame")?;
+    let kind = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .context("daemon response type is missing")?
+        .to_owned();
+    if kind == "error" {
         let error = ErrorEnvelopeV1::from_value(&value)?;
         match error.request_id.as_deref() {
             Some(request_id) => anyhow::ensure!(
@@ -2150,7 +2050,7 @@ fn decode_response_for_context(
         return Ok(value);
     }
     anyhow::ensure!(
-        metadata.request_id.as_deref() == Some(expected_request_id),
+        request_id.as_deref() == Some(expected_request_id),
         "daemon response request ID does not match the request"
     );
     validate_success_payload_for_context(&value, expected_topic, live_now_ms)?;
@@ -2161,38 +2061,19 @@ pub(crate) async fn read_frame<S>(stream: &mut S, maximum: usize) -> Result<Vec<
 where
     S: AsyncRead + Unpin,
 {
-    let mut frame = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        let read = stream.read(&mut byte).await.context("read daemon socket")?;
-        anyhow::ensure!(read != 0, "daemon socket closed before a complete response");
-        if byte[0] == b'\n' {
-            break;
-        }
-        anyhow::ensure!(
-            frame.len() < maximum,
-            "local IPC frame exceeds {maximum} bytes"
-        );
-        frame.push(byte[0]);
-    }
-    Ok(frame)
+    meshmsg_protocol::read_frame(stream, meshmsg_protocol::FrameLimit::Custom(maximum))
+        .await
+        .map_err(anyhow::Error::from)
 }
 
+#[cfg(test)]
 pub(crate) async fn write_value<S>(stream: &mut S, value: &serde_json::Value) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let mut encoded = serde_json::to_vec(value)?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_IPC_EVENT_SIZE,
-        "local IPC event exceeds {MAX_IPC_EVENT_SIZE} bytes"
-    );
-    encoded.push(b'\n');
-    stream
-        .write_all(&encoded)
+    meshmsg_protocol::write_json(stream, value, meshmsg_protocol::FrameLimit::Event)
         .await
-        .context("write daemon socket")?;
-    Ok(())
+        .map_err(anyhow::Error::from)
 }
 
 pub(crate) async fn send_request(dir: &Path, request: &IpcRequest) -> Result<serde_json::Value> {
@@ -2239,7 +2120,7 @@ pub(crate) fn validate_error_for_request(
             "ipc_capacity" | "initial_frame_timeout"
         );
     if !pre_admission_transport_error {
-        let (kind, operation_id) = request.error_expectation();
+        let (kind, operation_id) = error_expectation(request);
         error.validate_for_operation(kind, operation_id)?;
     }
     Ok(())
@@ -2380,15 +2261,13 @@ pub(crate) async fn write_request_with_id<S: AsyncWrite + Unpin>(
         contracts::valid_request_id(request_id),
         "invalid local IPC request ID"
     );
-    let frame = IpcRequestFrame::new(request_id.to_owned(), request.clone());
-    let mut encoded = serde_json::to_vec(&frame)?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_IPC_REQUEST_SIZE,
-        "local IPC request is too large"
-    );
-    encoded.push(b'\n');
-    stream.write_all(&encoded).await?;
-    Ok(())
+    let frame = IpcRequestFrame::new(request_id.parse()?, request.clone());
+    // Apply the same strict shared deserializer to locally constructed DTOs so
+    // invalid IDs and command-specific body bounds cannot be serialized.
+    let frame = serde_json::from_value::<IpcRequestFrame>(serde_json::to_value(frame)?)?;
+    meshmsg_protocol::write_json(stream, &frame, meshmsg_protocol::FrameLimit::Request)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 pub(crate) struct SubscriptionReader<S> {
@@ -2650,13 +2529,13 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(4096);
         let mut subscription = SubscriptionReader::new_correlated(reader, request_id.into());
         let malformed = serde_json::json!({
-            "type":"attachment_offer", "schema_version":2, "request_id":request_id,
+            "protocol_version":2, "type":"attachment_offer", "schema_version":2, "request_id":request_id,
             "from":"4".repeat(64), "message_id":operation_id, "timestamp_ms":1,
             "offer_id":operation_id.to_ascii_uppercase(), "kind":"file",
             "name":"safe.txt", "size":4, "ticket":"malformed", "offer":"malformed"
         });
         let valid = serde_json::json!({
-            "type":"message", "schema_version":2, "request_id":request_id,
+            "protocol_version":2, "type":"message", "schema_version":2, "request_id":request_id,
             "from":"4".repeat(64), "message_id":operation_id,
             "timestamp_ms":2, "body":"feed continues"
         });
@@ -2735,23 +2614,15 @@ mod tests {
         write_request_with_id(
             &mut bytes,
             &IpcRequest::Send {
-                operation_id: "0123456789abcdef0123456789abcdef".into(),
-                body: "a\nb".into(),
+                operation_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
+                body: meshmsg_protocol::BroadcastBody::new("a\nb").unwrap(),
             },
             "11111111111111111111111111111111",
         )
         .await
         .unwrap();
-        assert_eq!(bytes, b"{\"schema_version\":1,\"request_id\":\"11111111111111111111111111111111\",\"request\":{\"command\":\"send\",\"operation_id\":\"0123456789abcdef0123456789abcdef\",\"body\":\"a\\nb\"}}\n");
-        assert!(write_request(
-            &mut bytes,
-            &IpcRequest::Send {
-                operation_id: "0123456789abcdef0123456789abcdef".into(),
-                body: "x".repeat(MAX_IPC_REQUEST_SIZE),
-            }
-        )
-        .await
-        .is_err());
+        assert_eq!(bytes, b"{\"protocol_version\":2,\"request_id\":\"11111111111111111111111111111111\",\"request\":{\"command\":\"send\",\"operation_id\":\"0123456789abcdef0123456789abcdef\",\"body\":\"a\\nb\"}}\n");
+        assert!(meshmsg_protocol::BroadcastBody::new("x".repeat(MAX_IPC_REQUEST_SIZE)).is_err());
     }
 
     #[tokio::test]
@@ -2760,7 +2631,7 @@ mod tests {
         write_request(
             &mut bytes,
             &IpcRequest::WebDownload {
-                operation_id: "0123456789abcdef0123456789abcdef".into(),
+                operation_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
                 offer: "signed-offer".into(),
                 output: PathBuf::from("server-selected.blob"),
             },
@@ -3190,9 +3061,9 @@ mod tests {
         write_request(
             &mut bytes,
             &IpcRequest::OffersRemove {
-                operation_id: "fedcba9876543210fedcba9876543210".into(),
-                offer_id: "0123456789abcdef0123456789abcdef".into(),
-                direction: Some("outgoing".into()),
+                operation_id: "fedcba9876543210fedcba9876543210".parse().unwrap(),
+                offer_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
+                direction: Some("outgoing".parse().unwrap()),
                 provider: None,
             },
         )
@@ -3201,7 +3072,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["request"]["command"], "offers_remove");
         let prune = IpcRequest::OffersPrune {
-            operation_id: "fedcba9876543210fedcba9876543210".into(),
+            operation_id: "fedcba9876543210fedcba9876543210".parse().unwrap(),
             older_than_secs: 0,
             direction: None,
             dry_run: true,
@@ -3234,7 +3105,7 @@ mod tests {
         let mut bytes = Vec::new();
         write_request(&mut bytes, &IpcRequest::Peers).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["protocol_version"], 2);
         assert!(contracts::valid_request_id(
             value["request_id"].as_str().unwrap()
         ));
@@ -3256,15 +3127,15 @@ mod tests {
         write_request(
             &mut bytes,
             &IpcRequest::PrivateSend {
-                operation_id: "0123456789abcdef0123456789abcdef".into(),
-                to: "peer".into(),
-                body: "private text".into(),
+                operation_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
+                to: "2".repeat(64).parse().unwrap(),
+                body: meshmsg_protocol::PrivateBody::new("private text").unwrap(),
             },
         )
         .await
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["protocol_version"], 2);
         assert_eq!(value["request"]["command"], "private_send");
         assert_eq!(
             value["request"]["operation_id"],
@@ -3284,23 +3155,23 @@ mod tests {
 
     #[test]
     fn request_envelope_rejects_missing_unknown_duplicate_wrong_ids_and_versions() {
-        let valid = br#"{"schema_version":1,"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#;
+        let valid = br#"{"protocol_version":2,"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#;
         let frame: IpcRequestFrame = serde_json::from_slice(valid).unwrap();
         frame.validate().unwrap();
         for malformed in [
             br#"{"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#.as_slice(),
-            br#"{"schema_version":1,"request_id":"11111111111111111111111111111111","request":{"command":"status"},"extra":true}"#.as_slice(),
-            br#"{"schema_version":1,"schema_version":1,"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#.as_slice(),
-            br#"{"schema_version":1,"request_id":1,"request":{"command":"status"}}"#.as_slice(),
+            br#"{"protocol_version":2,"request_id":"11111111111111111111111111111111","request":{"command":"status"},"extra":true}"#.as_slice(),
+            br#"{"protocol_version":2,"protocol_version":2,"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#.as_slice(),
+            br#"{"protocol_version":2,"request_id":1,"request":{"command":"status"}}"#.as_slice(),
         ] {
             assert!(serde_json::from_slice::<IpcRequestFrame>(malformed).is_err());
         }
         for unsupported in [
-            br#"{"schema_version":2,"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#.as_slice(),
-            br#"{"schema_version":1,"request_id":"UPPER000000000000000000000000000","request":{"command":"status"}}"#.as_slice(),
+            br#"{"protocol_version":1,"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#.as_slice(),
+            br#"{"protocol_version":3,"request_id":"11111111111111111111111111111111","request":{"command":"status"}}"#.as_slice(),
+            br#"{"protocol_version":2,"request_id":"UPPER000000000000000000000000000","request":{"command":"status"}}"#.as_slice(),
         ] {
-            let frame: IpcRequestFrame = serde_json::from_slice(unsupported).unwrap();
-            assert!(frame.validate().is_err());
+            assert!(serde_json::from_slice::<IpcRequestFrame>(unsupported).is_err());
         }
     }
 
@@ -3373,39 +3244,39 @@ mod tests {
         let operation = "11111111111111111111111111111111";
         let requests = [
             IpcRequest::Send {
-                operation_id: operation.into(),
-                body: "x".into(),
+                operation_id: operation.parse().unwrap(),
+                body: meshmsg_protocol::BroadcastBody::new("x").unwrap(),
             },
             IpcRequest::PrivateSend {
-                operation_id: operation.into(),
-                to: "2".repeat(64),
-                body: "x".into(),
+                operation_id: operation.parse().unwrap(),
+                to: "2".repeat(64).parse().unwrap(),
+                body: meshmsg_protocol::PrivateBody::new("x").unwrap(),
             },
             IpcRequest::Share {
-                operation_id: operation.into(),
-                source_digest: "3".repeat(64),
+                operation_id: operation.parse().unwrap(),
+                source_digest: "3".repeat(64).parse().unwrap(),
                 path: PathBuf::from("x"),
             },
             IpcRequest::OffersRemove {
-                operation_id: operation.into(),
-                offer_id: "4".repeat(32),
+                operation_id: operation.parse().unwrap(),
+                offer_id: "4".repeat(32).parse().unwrap(),
                 direction: None,
                 provider: None,
             },
             IpcRequest::OffersPrune {
-                operation_id: operation.into(),
+                operation_id: operation.parse().unwrap(),
                 older_than_secs: 1,
                 direction: None,
                 dry_run: false,
                 max_delete: 1,
             },
             IpcRequest::Download {
-                operation_id: operation.into(),
+                operation_id: operation.parse().unwrap(),
                 offer: "x".into(),
                 output: PathBuf::from("x"),
             },
             IpcRequest::WebDownload {
-                operation_id: operation.into(),
+                operation_id: operation.parse().unwrap(),
                 offer: "x".into(),
                 output: PathBuf::from("x"),
             },
@@ -3423,12 +3294,14 @@ mod tests {
     #[test]
     fn response_envelope_rejects_duplicate_or_mismatched_correlation() {
         let id = "11111111111111111111111111111111";
-        let valid = br#"{"type":"stopping","schema_version":1,"request_id":"11111111111111111111111111111111","outcome":"accepted"}"#;
+        let valid = br#"{"protocol_version":2,"type":"stopping","schema_version":1,"request_id":"11111111111111111111111111111111","outcome":"accepted"}"#;
         assert!(decode_response(valid, id).is_ok());
-        assert!(decode_response(br#"{"type":"stopping","type":"stopping","schema_version":1,"request_id":"11111111111111111111111111111111","outcome":"accepted"}"#, id).is_err());
-        assert!(decode_response(br#"{"type":"stopping","schema_version":1,"request_id":"22222222222222222222222222222222","outcome":"accepted"}"#, id).is_err());
+        assert!(decode_response(br#"{"type":"stopping","schema_version":1,"request_id":"11111111111111111111111111111111","outcome":"accepted"}"#, id).is_err());
+        assert!(decode_response(br#"{"protocol_version":3,"type":"stopping","schema_version":1,"request_id":"11111111111111111111111111111111","outcome":"accepted"}"#, id).is_err());
+        assert!(decode_response(br#"{"protocol_version":2,"type":"stopping","type":"stopping","schema_version":1,"request_id":"11111111111111111111111111111111","outcome":"accepted"}"#, id).is_err());
+        assert!(decode_response(br#"{"protocol_version":2,"type":"stopping","schema_version":1,"request_id":"22222222222222222222222222222222","outcome":"accepted"}"#, id).is_err());
         assert!(decode_response(
-            br#"{"type":"stopping","request_id":"11111111111111111111111111111111","outcome":"accepted"}"#,
+            br#"{"protocol_version":2,"type":"stopping","request_id":"11111111111111111111111111111111","outcome":"accepted"}"#,
             id
         )
         .is_err());
@@ -4117,7 +3990,7 @@ mod tests {
         assert!(matches!(
             serde_json::from_slice::<IpcRequest>(br#"{"command":"send","operation_id":"0123456789abcdef0123456789abcdef","body":"broadcast"}"#)
                 .unwrap(),
-            IpcRequest::Send { body, .. } if body == "broadcast"
+            IpcRequest::Send { body, .. } if body.as_str() == "broadcast"
         ));
     }
 }

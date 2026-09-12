@@ -36,7 +36,7 @@ def wait_status(state):
 def diagnostics(state, command="diagnostics_v3"):
     request_id = "1" * 32
     frame = json.dumps({
-        "schema_version": 1,
+        "protocol_version": 2,
         "request_id": request_id,
         "request": {"command": command},
     }).encode() + b"\n"

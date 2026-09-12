@@ -121,6 +121,7 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
             try:
                 event = canonical_broadcast_event(dict(value))
                 event.setdefault('schema_version', 1)
+                event['protocol_version'] = 2
                 event['request_id'] = request_id
                 client.sendall(json.dumps(event).encode() + b'\n')
             except OSError:
@@ -144,8 +145,8 @@ class Handler(socketserver.StreamRequestHandler):
             self.server.clients.add(self.request)
         try:
             envelope = json.loads(self.rfile.readline())
-            assert set(envelope) == {'schema_version', 'request_id', 'request'}
-            assert envelope['schema_version'] == 1
+            assert set(envelope) == {'protocol_version', 'request_id', 'request'}
+            assert envelope['protocol_version'] == 2
             request_id = envelope['request_id']
             value = envelope['request']
             self.server.requests.append(value)
@@ -158,6 +159,7 @@ class Handler(socketserver.StreamRequestHandler):
                 value = canonical_broadcast_event(value)
                 if not omit_schema:
                     value.setdefault('schema_version', 1)
+                value['protocol_version'] = 2
                 value['request_id'] = request_id
                 self.wfile.write(json.dumps(value).encode() + b'\n')
                 self.wfile.flush()
@@ -961,7 +963,7 @@ def main():
 
                 with socket.socket(socket.AF_UNIX) as local_cli:
                     local_cli.connect(str(root / 'daemon.sock'))
-                    local_cli.sendall(b'{"schema_version":1,"request_id":"77777777777777777777777777777777","request":{"command":"send","operation_id":"10000000000000000000000000000006","body":"sent-from-cli"}}\n')
+                    local_cli.sendall(b'{"protocol_version":2,"request_id":"77777777777777777777777777777777","request":{"command":"send","operation_id":"10000000000000000000000000000006","body":"sent-from-cli"}}\n')
                     assert json.loads(local_cli.recv(4096))['type'] == 'queued'
                 for response in [feed, other_tab]:
                     value = next_event(response)
@@ -1150,7 +1152,7 @@ def main():
                 # Web shutdown must leave the separate daemon endpoint usable.
                 with socket.socket(socket.AF_UNIX) as client:
                     client.connect(str(root / 'daemon.sock'))
-                    client.sendall(b'{"schema_version":1,"request_id":"66666666666666666666666666666666","request":{"command":"status"}}\n')
+                    client.sendall(b'{"protocol_version":2,"request_id":"66666666666666666666666666666666","request":{"command":"status"}}\n')
                     assert json.loads(client.recv(4096))['running'] is True
                 print('PASS: isolated offline signed fixtures, HTTP security/allowlist/assets, bounded browser attachment uploads and negotiated opaque retryable/ranged downloads with safe staging/headers, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, live web-process daemon topic replacement with old-topic rejection and correlated new-topic offer/share delivery, offline/restart, independent web shutdown')
             finally:

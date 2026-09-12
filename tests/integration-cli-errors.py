@@ -37,13 +37,14 @@ def run_case(command, response, expected_code="command_failed",
                     connection, _ = listener.accept()
                     with connection:
                         request = json.loads(connection.makefile("rb").readline())
-                        assert request["schema_version"] == 1
+                        assert request["protocol_version"] == 2
                         assert len(request["request_id"]) == 32
                         assert "command" in request["request"]
                         reply = dict(response(request) if callable(response) else response)
                         if reply.pop("_correlate", True):
                             reply.setdefault("schema_version", 1)
                             reply["request_id"] = request["request_id"]
+                        reply.setdefault("protocol_version", 2)
                         connection.sendall(json.dumps(reply).encode() + b"\n")
             except BaseException as error:
                 failure.append(error)
@@ -251,6 +252,7 @@ def run_benchmark_case(changes, expected_exit, expected_reason,
                     config = request["request"]["config"]
                     assert request["request"]["command"] == "bench_send"
                     common = {
+                        "protocol_version": 2,
                         "schema_version": 1, "request_id": request_id,
                         "run_id": config["run_id"], "rate": config["rate"],
                         "duration_secs": config["duration_secs"],
@@ -271,8 +273,8 @@ def run_benchmark_case(changes, expected_exit, expected_reason,
                     if changes.get("_disconnect"):
                         return
                     if "_error" in changes:
-                        terminal_error = dict(changes["_error"], schema_version=1,
-                                              type="error")
+                        terminal_error = dict(changes["_error"], protocol_version=2,
+                                              schema_version=1, type="error")
                         correlation = terminal_error.pop("_correlation", "matching")
                         if correlation == "matching":
                             terminal_error["request_id"] = request_id
@@ -429,6 +431,7 @@ with tempfile.TemporaryDirectory(prefix="meshmsg-cli-benchmark-cancel-") as temp
                 request_id = request["request_id"]
                 config = request["request"]["config"]
                 common = {
+                    "protocol_version": 2,
                     "schema_version": 2, "request_id": request_id,
                     "run_id": config["run_id"], "rate": 1,
                     "duration_secs": 1, "payload_bytes": 128, "planned": 1,

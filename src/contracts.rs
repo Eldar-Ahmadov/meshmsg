@@ -11,7 +11,7 @@ pub(crate) const MAX_PUBLIC_MESSAGE_BYTES: usize = 1024;
 pub(crate) const BENCHMARK_SEND_FAILED_MESSAGE: &str = "Message submission failed.";
 
 pub(crate) fn new_request_id() -> String {
-    data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>())
+    meshmsg_protocol::RequestId::new_random().into_string()
 }
 
 /// Canonical lexical form shared by request, operation, wire-message, and

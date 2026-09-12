@@ -13,9 +13,9 @@ use crate::{
     ipc::{
         negotiated_diagnostic_request, read_frame, send_request_checked, subscribe,
         subscribe_with_id, valid_content_digest, valid_operation_id, validate_success_payload,
-        write_request_with_id, write_value, AttachmentOperationKind, BenchConfig, IpcRequest,
-        IpcRequestFrame, LifecycleErrorV1, LifecycleRequestContext, LifecycleSuccessV3,
-        OfferItemV1, OffersV1, StatusV1, SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY,
+        write_request_with_id, AttachmentOperationKind, BenchConfig, IpcRequest, IpcRequestFrame,
+        LifecycleErrorV1, LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1,
+        StatusV1, SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY,
         DIAGNOSTIC_STATUS_V2_CAPABILITY, DIAGNOSTIC_STATUS_V3_CAPABILITY,
         IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY,
         MAX_IPC_REQUEST_SIZE, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
@@ -754,7 +754,7 @@ pub(crate) fn validate_bench_sender_config(
     payload_bytes: usize,
 ) -> Result<u64> {
     validate_bench_config(&BenchConfig {
-        run_id: run_id.to_owned(),
+        run_id: run_id.parse().context("invalid benchmark run ID")?,
         rate,
         duration_secs,
         payload_bytes,
@@ -2417,7 +2417,7 @@ async fn write_local_response<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let correlated = IPC_REQUEST_ID
+    let mut response = IPC_REQUEST_ID
         .try_with(|current| {
             current
                 .borrow()
@@ -2425,13 +2425,18 @@ where
                 .map(|id| normalize_ipc_response(value, id))
         })
         .ok()
-        .flatten();
+        .flatten()
+        .unwrap_or_else(|| value.clone());
+    response["protocol_version"] = meshmsg_protocol::PROTOCOL_VERSION.into();
+    let response: meshmsg_protocol::DaemonFrame = serde_json::from_value(response.clone())
+        .with_context(|| format!("daemon produced a noncanonical typed local frame: {response}"))?;
     tokio::time::timeout(
         deadline,
-        write_value(stream, correlated.as_ref().unwrap_or(value)),
+        meshmsg_protocol::write_json(stream, &response, meshmsg_protocol::FrameLimit::Event),
     )
     .await
     .context("timed out writing local IPC response")?
+    .map_err(anyhow::Error::from)
 }
 
 fn annotate_operation_response(value: &mut serde_json::Value, operation_id: &str) {
@@ -2449,12 +2454,13 @@ where
 {
     match tokio::time::timeout(deadline, operation).await {
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => serde_json::json!({
-            "type":"error", "code":"daemon_stopping", "message":error.to_string()
+        Ok(Err(_)) => serde_json::json!({
+            "type":"error", "code":"daemon_stopping", "retryable":true,
+            "message":"The daemon is shutting down or unavailable."
         }),
         Err(_) => serde_json::json!({
-            "type":"error", "code":"command_timeout",
-            "message":"local IPC command exceeded its deadline; its outcome may be unknown"
+            "type":"error", "code":"command_timeout", "retryable":true,
+            "message":"The request timed out; reconcile before retrying."
         }),
     }
 }
@@ -2533,6 +2539,34 @@ where
 }
 
 async fn handle_local_client_with_timeouts<S>(
+    stream: S,
+    commands: mpsc::Sender<DaemonCommand>,
+    events: broadcast::Receiver<serde_json::Value>,
+    connected: serde_json::Value,
+    startup_peers: Option<serde_json::Value>,
+    benchmark_busy: Arc<AtomicBool>,
+    timeouts: LocalIpcTimeouts,
+) -> Result<()>
+where
+    S: SubscriptionStream,
+{
+    IPC_REQUEST_ID
+        .scope(
+            std::cell::RefCell::new(None),
+            handle_local_client_inner(
+                stream,
+                commands,
+                events,
+                connected,
+                startup_peers,
+                benchmark_busy,
+                timeouts,
+            ),
+        )
+        .await
+}
+
+async fn handle_local_client_inner<S>(
     mut stream: S,
     commands: mpsc::Sender<DaemonCommand>,
     mut events: broadcast::Receiver<serde_json::Value>,
@@ -2566,31 +2600,50 @@ where
     let request_frame: IpcRequestFrame = match serde_json::from_slice(&frame) {
         Ok(frame) => frame,
         Err(_) => {
-            let error = ErrorEnvelopeV1::new(
-                "invalid_request",
-                "Malformed local IPC request.",
-                "not_started",
-                false,
-            );
+            // Preserve the established reusable-operation behavior for a
+            // structurally valid v2 send envelope whose bounded typed body is
+            // the only rejected field. No command is admitted from this path.
+            let raw = serde_json::from_slice::<serde_json::Value>(&frame).ok();
+            let recoverable_send = raw.as_ref().and_then(|value| {
+                let request_id = value.get("request_id")?.as_str()?;
+                let request = value.get("request")?;
+                let operation_id = request.get("operation_id")?.as_str()?;
+                let body = request.get("body")?.as_str()?;
+                (value.get("protocol_version")?.as_u64()
+                    == Some(u64::from(meshmsg_protocol::PROTOCOL_VERSION))
+                    && request.get("command")?.as_str() == Some("send")
+                    && contracts::valid_request_id(request_id)
+                    && valid_operation_id(operation_id)
+                    && crate::message::validate_broadcast_body(body).is_err())
+                .then(|| (request_id.to_owned(), operation_id.to_owned()))
+            });
+            let mut error = if recoverable_send.is_some() {
+                ErrorEnvelopeV1::new(
+                    "invalid_message",
+                    "The message is invalid.",
+                    "not_started",
+                    false,
+                )
+            } else {
+                ErrorEnvelopeV1::new(
+                    "invalid_request",
+                    "The request contract is invalid or unsupported.",
+                    "not_started",
+                    false,
+                )
+            };
+            if let Some((request_id, operation_id)) = recoverable_send {
+                error.request_id = Some(request_id);
+                error.operation_id = Some(operation_id);
+            }
             let _ = write_local_response(&mut stream, &error.into_value(), timeouts.response_write)
                 .await;
             return Ok(());
         }
     };
-    let _ = IPC_REQUEST_ID
-        .try_with(|current| *current.borrow_mut() = Some(request_frame.request_id.clone()));
-    if request_frame.validate().is_err() {
-        let mut error = ErrorEnvelopeV1::new(
-            "unsupported_schema",
-            "Unsupported or invalid local IPC contract.",
-            "not_started",
-            false,
-        );
-        error.request_id = contracts::valid_request_id(&request_frame.request_id)
-            .then_some(request_frame.request_id);
-        write_local_response(&mut stream, &error.into_value(), timeouts.response_write).await?;
-        return Ok(());
-    }
+    let _ = IPC_REQUEST_ID.try_with(|current| {
+        *current.borrow_mut() = Some(request_frame.request_id.to_string());
+    });
     let request = request_frame.request;
     let operation_id = match &request {
         IpcRequest::Send { operation_id, .. }
@@ -2707,8 +2760,8 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::Send {
-                        operation_id,
-                        body,
+                        operation_id: operation_id.into_string(),
+                        body: body.into_string(),
                         reply,
                     },
                     response,
@@ -2730,9 +2783,9 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::PrivateSend {
-                        operation_id,
-                        to,
-                        body,
+                        operation_id: operation_id.into_string(),
+                        to: to.into_string(),
+                        body: body.into_string(),
                         reply,
                     },
                     response,
@@ -2818,16 +2871,16 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::OffersRemove {
-                        operation_id: operation_id.clone(),
-                        offer_id,
-                        direction,
-                        provider,
+                        operation_id: operation_id.to_string(),
+                        offer_id: offer_id.into_string(),
+                        direction: direction.map(|value| value.to_string()),
+                        provider: provider.map(meshmsg_protocol::PeerId::into_string),
                         reply,
                     },
                     response,
                 ),
                 timeouts.list_command,
-                Some(operation_id),
+                Some(operation_id.into_string()),
                 None,
             )
             .await;
@@ -2845,9 +2898,9 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::OffersPrune {
-                        operation_id: operation_id.clone(),
+                        operation_id: operation_id.to_string(),
                         older_than_secs,
-                        direction,
+                        direction: direction.map(|value| value.to_string()),
                         dry_run,
                         max_delete,
                         reply,
@@ -2855,7 +2908,7 @@ where
                     response,
                 ),
                 timeouts.list_command,
-                Some(operation_id),
+                Some(operation_id.into_string()),
                 None,
             )
             .await;
@@ -2872,15 +2925,15 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::Share {
-                        operation_id,
-                        source_digest,
+                        operation_id: operation_id.into_string(),
+                        source_digest: source_digest.into_string(),
                         path,
                         reply,
                     },
                     response,
                 ),
                 timeouts.transfer_command,
-                Some(response_operation_id),
+                Some(response_operation_id.into_string()),
                 None,
             )
             .await;
@@ -2896,7 +2949,7 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::Download {
-                        operation_id: operation_id.clone(),
+                        operation_id: operation_id.to_string(),
                         offer,
                         output,
                         raw_export: false,
@@ -2905,7 +2958,7 @@ where
                     response,
                 ),
                 timeouts.transfer_command,
-                Some(operation_id),
+                Some(operation_id.into_string()),
                 None,
             )
             .await;
@@ -2921,7 +2974,7 @@ where
                 send_command(
                     &commands,
                     DaemonCommand::Download {
-                        operation_id: operation_id.clone(),
+                        operation_id: operation_id.to_string(),
                         offer,
                         output,
                         raw_export: true,
@@ -2930,7 +2983,7 @@ where
                     response,
                 ),
                 timeouts.transfer_command,
-                Some(operation_id),
+                Some(operation_id.into_string()),
                 None,
             )
             .await;
@@ -2949,11 +3002,11 @@ where
                 }
                 Ok(Err(_)) => serde_json::json!({
                     "type":"error", "code":"daemon_stopping", "outcome":"not_started",
-                    "message":"stop command was not admitted because the daemon command channel is closed"
+                    "retryable":true, "message":"The daemon is shutting down or unavailable."
                 }),
                 Err(_) => serde_json::json!({
                     "type":"error", "code":"command_timeout", "outcome":"not_started",
-                    "message":"stop command was not admitted before its deadline; the daemon was not stopped by this request"
+                    "retryable":true, "message":"The request timed out; reconcile before retrying."
                 }),
             };
             write_local_response(&mut stream, &response, timeouts.response_write).await?;
@@ -6467,9 +6520,9 @@ pub async fn send_once(
         let value = send_request_checked(
             dir,
             &IpcRequest::PrivateSend {
-                operation_id: operation_id.clone(),
-                to: to.to_owned(),
-                body: body.to_owned(),
+                operation_id: operation_id.parse()?,
+                to: to.parse()?,
+                body: meshmsg_protocol::PrivateBody::new(body)?,
             },
             "private_accepted",
             Some(3),
@@ -6482,8 +6535,8 @@ pub async fn send_once(
         let value = send_request_checked(
             dir,
             &IpcRequest::Send {
-                operation_id: operation_id.clone(),
-                body: body.to_owned(),
+                operation_id: operation_id.parse()?,
+                body: meshmsg_protocol::BroadcastBody::new(body)?,
             },
             "queued",
             Some(3),
@@ -6535,8 +6588,8 @@ pub async fn share(
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::Share {
-            operation_id: operation_id.clone(),
-            source_digest: source_digest.clone(),
+            operation_id: operation_id.parse()?,
+            source_digest: source_digest.parse()?,
             path,
         },
         "attachment_shared",
@@ -6637,10 +6690,10 @@ pub async fn offers_remove(
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::OffersRemove {
-            operation_id: operation_id.clone(),
-            offer_id: offer_id.to_owned(),
-            direction: direction.map(str::to_owned),
-            provider: provider.map(str::to_owned),
+            operation_id: operation_id.parse()?,
+            offer_id: offer_id.parse()?,
+            direction: direction.map(str::parse).transpose()?,
+            provider: provider.map(str::parse).transpose()?,
         },
         "offer_removed",
         3,
@@ -6683,9 +6736,9 @@ pub async fn offers_prune(
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::OffersPrune {
-            operation_id: operation_id.clone(),
+            operation_id: operation_id.parse()?,
             older_than_secs: effective_age,
-            direction: direction.map(str::to_owned),
+            direction: direction.map(str::parse).transpose()?,
             dry_run,
             max_delete,
         },
@@ -6737,7 +6790,7 @@ pub async fn download(
     let value = send_lifecycle_request(
         dir,
         &IpcRequest::Download {
-            operation_id: operation_id.clone(),
+            operation_id: operation_id.parse()?,
             offer: offer.to_owned(),
             output: requested_output.clone(),
         },
@@ -6951,7 +7004,10 @@ async fn bench_send_events(
     mut cancellation: oneshot::Receiver<()>,
 ) -> Result<()> {
     let config = BenchConfig {
-        run_id: run_id.unwrap_or_else(generated_run_id),
+        run_id: run_id
+            .unwrap_or_else(generated_run_id)
+            .parse()
+            .context("invalid benchmark run ID")?,
         rate,
         duration_secs,
         payload_bytes,
@@ -7743,8 +7799,8 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
                     send_request_checked(
                         dir,
                         &IpcRequest::Send {
-                            operation_id: crate::ipc::new_operation_id(),
-                            body,
+                            operation_id: crate::ipc::new_operation_id().parse()?,
+                            body: meshmsg_protocol::BroadcastBody::new(body)?,
                         },
                         "queued",
                         Some(3),
@@ -8100,6 +8156,7 @@ fn event(json: bool, mut value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::write_value;
     const TEST_OPERATION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
     use iroh_blobs::protocol::ChunkRangesExt;
@@ -8113,6 +8170,14 @@ mod tests {
         assert_eq!(caller_path(relative).unwrap(), current.join(relative));
         let absolute = current.join("./directory/../file.txt");
         assert_eq!(caller_path(&absolute).unwrap(), absolute);
+    }
+
+    fn connected_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "type":"connected", "peer":"2".repeat(64),
+            "endpoint_online":true, "topic_joined":true,
+            "alias":null, "ipc_capabilities":[]
+        })
     }
 
     fn test_topic() -> TopicId {
@@ -8868,6 +8933,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_daemon_interoperates_with_v2_and_rejects_legacy_versions() {
+        let exercise = |request: Vec<u8>| async move {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let (commands, mut command_rx) = mpsc::channel(1);
+            let (events, _) = broadcast::channel(1);
+            let task = tokio::spawn(handle_local_client(
+                server,
+                commands,
+                events.subscribe(),
+                connected_fixture(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+            ));
+            client.write_all(&request).await.unwrap();
+            let frame = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            let typed: meshmsg_protocol::DaemonFrame = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(typed.protocol_version(), meshmsg_protocol::PROTOCOL_VERSION);
+            drop(client);
+            let _ = command_rx.recv().await;
+            task.await.unwrap().unwrap();
+            value
+        };
+
+        let mut request = Vec::new();
+        write_request_with_id(
+            &mut request,
+            &IpcRequest::Stop,
+            "11111111111111111111111111111111",
+        )
+        .await
+        .unwrap();
+        let response = exercise(request).await;
+        assert_eq!(response["type"], "stopping");
+        assert_eq!(response["request_id"], "11111111111111111111111111111111");
+        let response_dto: meshmsg_protocol::ResponseFrame =
+            serde_json::from_value(response.clone()).unwrap();
+        assert!(matches!(
+            response_dto.response,
+            meshmsg_protocol::Response::Stopping { .. }
+        ));
+        let mut unsupported_response = response.clone();
+        unsupported_response["protocol_version"] = 3.into();
+        assert!(
+            serde_json::from_value::<meshmsg_protocol::ResponseFrame>(unsupported_response)
+                .is_err()
+        );
+
+        // Decode a frame produced by the real subscription path directly through
+        // the public event DTO, not through an in-crate compatibility shape.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let subscriber = tokio::spawn(handle_local_client(
+            server,
+            commands,
+            events.subscribe(),
+            serde_json::json!({
+                "type":"connected", "peer":"2".repeat(64),
+                "endpoint_online":true, "topic_joined":true,
+                "alias":null, "ipc_capabilities":[]
+            }),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        write_request_with_id(
+            &mut client,
+            &IpcRequest::Subscribe,
+            "33333333333333333333333333333333",
+        )
+        .await
+        .unwrap();
+        let connected = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
+        let event_dto: meshmsg_protocol::EventFrame = serde_json::from_slice(&connected).unwrap();
+        assert!(matches!(
+            event_dto.event,
+            meshmsg_protocol::Event::Connected(_)
+        ));
+        let mut unsupported_event: serde_json::Value = serde_json::from_slice(&connected).unwrap();
+        unsupported_event["protocol_version"] = 3.into();
+        assert!(serde_json::from_value::<meshmsg_protocol::EventFrame>(unsupported_event).is_err());
+        drop(client);
+        subscriber.await.unwrap().unwrap();
+
+        for version in [1, 3] {
+            let request = format!(
+                "{{\"protocol_version\":{version},\"request_id\":\"22222222222222222222222222222222\",\"request\":{{\"command\":\"stop\"}}}}\n"
+            )
+            .into_bytes();
+            let response = exercise(request).await;
+            assert_eq!(response["type"], "error");
+            assert_eq!(response["code"], "invalid_request");
+            assert!(response.get("request_id").is_none());
+            let response_dto: meshmsg_protocol::ResponseFrame =
+                serde_json::from_value(response).unwrap();
+            assert!(matches!(
+                response_dto.response,
+                meshmsg_protocol::Response::Error(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn generated_event_guard_keeps_live_strict_subscribers_and_reports_bounded_errors() {
         let secret = SecretKey::generate();
         let canonical = message_event(unsigned_test_envelope(
@@ -8883,7 +9051,7 @@ mod tests {
             first_server,
             commands.clone(),
             events.subscribe(),
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -8891,7 +9059,7 @@ mod tests {
             second_server,
             commands,
             events.subscribe(),
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -8926,7 +9094,12 @@ mod tests {
         ));
         for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
             let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let error = serde_json::from_slice(&frame).unwrap();
+            let mut error: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(
+                error["protocol_version"],
+                meshmsg_protocol::PROTOCOL_VERSION
+            );
+            error.as_object_mut().unwrap().remove("protocol_version");
             let error = ErrorEnvelopeV1::from_value(&error).unwrap();
             assert_eq!(error.code, "internal_contract_error");
             assert_eq!(
@@ -8962,7 +9135,12 @@ mod tests {
         ));
         for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
             let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let error = serde_json::from_slice(&frame).unwrap();
+            let mut error: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(
+                error["protocol_version"],
+                meshmsg_protocol::PROTOCOL_VERSION
+            );
+            error.as_object_mut().unwrap().remove("protocol_version");
             let error = ErrorEnvelopeV1::from_value(&error).unwrap();
             assert_eq!(error.code, "internal_contract_error");
             assert_eq!(
@@ -8999,7 +9177,12 @@ mod tests {
         ));
         for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
             let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(
+                value["protocol_version"],
+                meshmsg_protocol::PROTOCOL_VERSION
+            );
+            value.as_object_mut().unwrap().remove("protocol_version");
             crate::ipc::validate_success_payload(&value).unwrap();
             assert_eq!(value["request_id"], subscriber_ids[index]);
             assert_eq!(value["body"], "subscriber remains connected");
@@ -9027,7 +9210,12 @@ mod tests {
         ));
         for stream in [&mut first, &mut second] {
             let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(
+                value["protocol_version"],
+                meshmsg_protocol::PROTOCOL_VERSION
+            );
+            value.as_object_mut().unwrap().remove("protocol_version");
             crate::ipc::validate_success_payload_for_context(
                 &value,
                 Some(test_topic()),
@@ -9880,7 +10068,7 @@ mod tests {
             })
             .unwrap();
         let config = BenchConfig {
-            run_id: run_id.into(),
+            run_id: run_id.parse().unwrap(),
             rate: 1,
             duration_secs: 1,
             payload_bytes: largest_payload,
@@ -9897,7 +10085,7 @@ mod tests {
     #[test]
     fn benchmark_config_boundaries_are_authoritatively_validated() {
         let base = BenchConfig {
-            run_id: "0123456789abcdef0123456789abcdef".into(),
+            run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
             rate: 1,
             duration_secs: 1,
             payload_bytes: 106,
@@ -10006,7 +10194,7 @@ mod tests {
     #[test]
     fn disconnected_sender_summary_preserves_latest_partial_snapshot() {
         let config = BenchConfig {
-            run_id: "0123456789abcdef0123456789abcdef".into(),
+            run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
             rate: 10,
             duration_secs: 1,
             payload_bytes: 128,
@@ -10088,7 +10276,7 @@ mod tests {
         assert_eq!(schedule_missed, 4);
 
         let config = BenchConfig {
-            run_id: "0123456789abcdef0123456789abcdef".into(),
+            run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
             rate: 10,
             duration_secs: 1,
             payload_bytes: 128,
@@ -12775,7 +12963,7 @@ mod tests {
                     &mut stream,
                     &contracts::correlate(
                         serde_json::json!({
-                            "type":"bench_send_started", "schema_version":2,
+                            "protocol_version":2, "type":"bench_send_started", "schema_version":2,
                             "run_id":config.run_id, "rate":config.rate,
                             "duration_secs":config.duration_secs,
                             "payload_bytes":config.payload_bytes, "planned":1,
@@ -12789,11 +12977,11 @@ mod tests {
                 let request_id = match correlation {
                     "matching" => Some(request.request_id),
                     "missing" => None,
-                    "mismatched" => Some("f".repeat(32)),
+                    "mismatched" => Some("f".repeat(32).parse().unwrap()),
                     _ => unreachable!(),
                 };
                 let error = serde_json::json!({
-                    "type":"error", "schema_version":1, "code":code,
+                    "protocol_version":2, "type":"error", "schema_version":1, "code":code,
                     "message":contracts::error_code_spec(code).unwrap().message,
                     "outcome":outcome, "retryable":true, "request_id":request_id,
                 });
@@ -12871,7 +13059,7 @@ mod tests {
                     &mut stream,
                     &contracts::correlate(
                         serde_json::json!({
-                            "type":"connected", "schema_version":1,
+                            "protocol_version":2, "type":"connected", "schema_version":1,
                             "peer":"2".repeat(64), "endpoint_online":true,
                             "topic_joined":true, "alias":null, "ipc_capabilities":[]
                         }),
@@ -12880,13 +13068,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let request_id = match correlation {
+                let request_id: Option<meshmsg_protocol::RequestId> = match correlation {
                     "missing" => None,
-                    "mismatched" => Some("f".repeat(32)),
+                    "mismatched" => Some("f".repeat(32).parse().unwrap()),
                     _ => unreachable!(),
                 };
                 let error = serde_json::json!({
-                    "type":"error", "schema_version":1, "code":code,
+                    "protocol_version":2, "type":"error", "schema_version":1, "code":code,
                     "message":contracts::error_code_spec(code).unwrap().message,
                     "outcome":outcome, "retryable":true, "request_id":request_id,
                 });
@@ -12944,7 +13132,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             busy.clone(),
         ));
@@ -12952,7 +13140,7 @@ mod tests {
             &mut client,
             &IpcRequest::BenchSend {
                 config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
                     rate: 1,
                     duration_secs: 10,
                     payload_bytes: 128,
@@ -13001,7 +13189,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13009,7 +13197,7 @@ mod tests {
             &mut client,
             &IpcRequest::BenchSend {
                 config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
                     rate: 1,
                     duration_secs: 1,
                     payload_bytes: 128,
@@ -13053,7 +13241,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13061,7 +13249,7 @@ mod tests {
             &mut client,
             &IpcRequest::BenchSend {
                 config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
                     rate: 1,
                     duration_secs: 10,
                     payload_bytes: 128,
@@ -13105,7 +13293,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13113,7 +13301,7 @@ mod tests {
             &mut client,
             &IpcRequest::BenchSend {
                 config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
                     rate: 1,
                     duration_secs: 10,
                     payload_bytes: 128,
@@ -13147,7 +13335,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13155,7 +13343,7 @@ mod tests {
             &mut client,
             &IpcRequest::BenchSend {
                 config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".into(),
+                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
                     rate: 100,
                     duration_secs: 10,
                     payload_bytes: 128,
@@ -13196,7 +13384,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13219,7 +13407,7 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(600), &mut task)
             .await
             .is_err());
-        let event = serde_json::json!({"type":"message", "body":"after half-close"});
+        let event = serde_json::json!({"type":"peer_up", "peer":"3".repeat(64)});
         events.send(event.clone()).unwrap();
         let received = tokio::time::timeout(
             Duration::from_secs(1),
@@ -13230,7 +13418,7 @@ mod tests {
         .unwrap();
         let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
         assert_eq!(received["type"], event["type"]);
-        assert_eq!(received["body"], event["body"]);
+        assert_eq!(received["peer"], event["peer"]);
         assert_eq!(received["schema_version"], 1);
         assert!(contracts::valid_request_id(
             received["request_id"].as_str().unwrap()
@@ -13254,7 +13442,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13278,14 +13466,16 @@ mod tests {
         let (events, receiver) = broadcast::channel(1);
         let startup = serde_json::json!({
             "type":"peers_snapshot", "schema_version":2,
-            "generated_at_ms":1, "self":{"public_key":"self", "alias":null, "online":true},
+            "generated_at_ms":1, "directory_epoch":"4".repeat(32),
+            "directory_revision":1,
+            "self":{"public_key":"2".repeat(64), "alias":null, "online":true},
             "peers":[]
         });
         let task = tokio::spawn(handle_local_client(
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             Some(startup.clone()),
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13314,13 +13504,17 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
-        events.send(serde_json::json!({"type":"first"})).unwrap();
-        events.send(serde_json::json!({"type":"second"})).unwrap();
+        events
+            .send(serde_json::json!({"type":"peer_up", "peer":"3".repeat(64)}))
+            .unwrap();
+        events
+            .send(serde_json::json!({"type":"peer_down", "peer":"3".repeat(64)}))
+            .unwrap();
         let task = tokio::spawn(handle_local_client(
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
         ));
@@ -13370,7 +13564,7 @@ mod tests {
             Ok(LocalClientSession {
                 commands: commands.clone(),
                 events: events.subscribe(),
-                connected: serde_json::json!({"type":"connected"}),
+                connected: connected_fixture(),
                 startup_peers: None,
                 benchmark_busy: Arc::new(AtomicBool::new(false)),
             })
@@ -13431,7 +13625,15 @@ mod tests {
             "saturated client unexpectedly ran per-client preparation"
         );
         let frame = read_frame(&mut rejected, MAX_IPC_EVENT_SIZE).await.unwrap();
-        let rejection: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        let mut rejection: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            rejection["protocol_version"],
+            meshmsg_protocol::PROTOCOL_VERSION
+        );
+        rejection
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
         let rejection = ErrorEnvelopeV1::from_value(&rejection).unwrap();
         assert_eq!(rejection.code, "ipc_capacity");
         assert_eq!(rejection.outcome, "not_started");
@@ -13439,25 +13641,26 @@ mod tests {
         assert!(rejection.request_id.is_none());
         assert_eq!(tasks.len(), LOCAL_IPC_CONNECTION_CAPACITY);
 
-        let operation = "11111111111111111111111111111111".to_owned();
+        let operation: meshmsg_protocol::OperationId =
+            "11111111111111111111111111111111".parse().unwrap();
         let mutations = vec![
             IpcRequest::Send {
                 operation_id: operation.clone(),
-                body: "x".into(),
+                body: meshmsg_protocol::BroadcastBody::new("x").unwrap(),
             },
             IpcRequest::PrivateSend {
                 operation_id: operation.clone(),
-                to: "2".repeat(64),
-                body: "x".into(),
+                to: "2".repeat(64).parse().unwrap(),
+                body: meshmsg_protocol::PrivateBody::new("x").unwrap(),
             },
             IpcRequest::Share {
                 operation_id: operation.clone(),
-                source_digest: "3".repeat(64),
+                source_digest: "3".repeat(64).parse().unwrap(),
                 path: PathBuf::from("x"),
             },
             IpcRequest::OffersRemove {
                 operation_id: operation.clone(),
-                offer_id: "4".repeat(32),
+                offer_id: "4".repeat(32).parse().unwrap(),
                 direction: None,
                 provider: None,
             },
@@ -13493,7 +13696,12 @@ mod tests {
             .await;
             assert!(!admitted);
             let frame = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(
+                value["protocol_version"],
+                meshmsg_protocol::PROTOCOL_VERSION
+            );
+            value.as_object_mut().unwrap().remove("protocol_version");
             let transport = ErrorEnvelopeV1::from_value(&value).unwrap();
             crate::ipc::validate_error_for_request(&transport, &mutation).unwrap();
         }
@@ -13509,7 +13717,16 @@ mod tests {
         let timeout_frame = read_frame(&mut clients[0], MAX_IPC_EVENT_SIZE)
             .await
             .unwrap();
-        let timeout_error = serde_json::from_slice::<serde_json::Value>(&timeout_frame).unwrap();
+        let mut timeout_error =
+            serde_json::from_slice::<serde_json::Value>(&timeout_frame).unwrap();
+        assert_eq!(
+            timeout_error["protocol_version"],
+            meshmsg_protocol::PROTOCOL_VERSION
+        );
+        timeout_error
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
         let timeout_error = ErrorEnvelopeV1::from_value(&timeout_error).unwrap();
         assert_eq!(timeout_error.code, "initial_frame_timeout");
         assert_eq!(timeout_error.outcome, "not_started");
@@ -13538,7 +13755,9 @@ mod tests {
         let DaemonCommand::Status { reply } = command_rx.recv().await.unwrap() else {
             panic!("expected recovered status command")
         };
-        reply.send(serde_json::json!({"type":"status"})).unwrap();
+        reply
+            .send(serde_json::json!({"type":"stopping", "outcome":"accepted"}))
+            .unwrap();
         read_frame(&mut recovered, MAX_IPC_EVENT_SIZE)
             .await
             .unwrap();
@@ -13562,7 +13781,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
@@ -13586,7 +13805,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
@@ -13612,7 +13831,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
@@ -13671,7 +13890,7 @@ mod tests {
             server,
             commands,
             receiver,
-            serde_json::json!({"type":"connected"}),
+            connected_fixture(),
             None,
             Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
@@ -13683,7 +13902,7 @@ mod tests {
         let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["code"], "command_timeout");
-        assert!(response["message"].as_str().unwrap().contains("unknown"));
+        assert!(response["message"].as_str().unwrap().contains("reconcile"));
         drop(pending);
         task.await.unwrap().unwrap();
     }
