@@ -11,4 +11,4 @@ The shared local IPC serialization boundary for the meshmsg daemon and clients.
 - Attachment names use the same portable single-component restrictions as the runtime filesystem boundary.
 - Frames are newline-delimited JSON with separate hard request and event/response limits. A buffered reader is poisoned by an oversized or incomplete frame so unread suffixes cannot be reinterpreted.
 
-Diagnostic-status and web-only commands are not part of protocol v2. The optional web bridge is an ordinary IPC client and uses typed `DownloadMode::Raw` when it needs an exported attachment. Benchmark extraction remains later scope.
+Diagnostic-status, web-only, and benchmark-only commands are not part of protocol v2. Optional web and benchmark processes are ordinary IPC clients; the web bridge uses typed `DownloadMode::Raw`, while the benchmark client uses `Send`/`PrivateSend` and `Subscribe`.

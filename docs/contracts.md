@@ -80,9 +80,8 @@ Each newline-delimited request is a strict nested envelope:
 }
 ```
 
-The typed command union is: `send`, `private_send`, `bench_send`, `subscribe`,
-`status`, `peers`, `offers`, `offers_remove`, `offers_prune`, `share`, `download`,
-and `stop`. Unknown, missing, duplicate, or wrong-typed envelope or
+The typed command union is: `send`, `private_send`, `subscribe`, `status`,
+`peers`, `offers`, `offers_remove`, `offers_prune`, `share`, `download`, and `stop`. Unknown, missing, duplicate, or wrong-typed envelope or
 command fields are rejected. Unsupported versions and malformed IDs fail closed.
 Responses are dispatched by the exact `(type, schema_version)` pair and then fully
 deserialized into a deny-unknown-fields DTO with semantic and bounded-value checks.
@@ -105,38 +104,14 @@ failures become strict, subscriber-correlated `internal_contract_error` records 
 exact `suppressed_since_last` accounting and no synchronous stderr write.
 Unknown families, unsupported versions, and unknown/missing/wrong-typed fields fail
 closed. This applies to every command response and subscription event, including
-stop, attachment share/download metadata, lifecycle/progress/loss/peer events, and
-all benchmark records. Download progress permits `0/0` only for an empty blob;
-otherwise `total_bytes` is positive and `received_bytes <= total_bytes`. A CLI
-download accepts completion only when `output` has the exact retained OS-string/byte
-representation it submitted; Path-equivalent dot components, repeated/trailing
-separators, and other lexical rewrites are rejected. Benchmark send records are
-version 2: `attempted = queued + failed + incomplete`, where the bounded `incomplete`
-count identifies the one serial in-flight submission abandoned by cancellation or a
-deadline, or for which the daemon reply was lost; no queued/failed classification was
-received.
-Fixed-payload body bytes are exact, envelope bytes are bounded by complete encoded
-envelopes, and scheduler accounting is bounded by monotonic-clock slots eligible at
-the reported elapsed milliseconds—not merely by the final plan. Finite nonnegative
-achieved rates must agree with counts, bytes, and elapsed time.
-`send_failed` requires exactly one failure and the fixed control-free `first_error`
-text `Message submission failed.`; all other completion reasons require
-`first_error:null`. Daemon diagnostics and paths are never accepted there. Receive
-metrics likewise enforce possible unique/highest/duplicate/out-of-order relationships,
-body-byte and elapsed-rate coherence, retained latency samples and overflow-safe feasible
-percentile ranks, local lag event/drop sums, and completion/validity state. Missing samples
-are either the exact complement of the unique/highest state or a feasible first-100
-prefix of that complement. Numeric range checks precede division, caps precede
-multiplication, and relevant integer arithmetic and machine-width conversions fail
-closed on overflow. A send client accepts `interrupted` only after it initiated
-cancellation. Daemon terminal summaries must set `accounting_complete:true`; once a
-benchmark started, only synthesized partial summaries may set it false, retain only the
-latest validated counters, and preserve the request ID. Every post-start daemon error
-must contain exactly that active request ID, even for codes allowed to omit it before
-admission. Strict matching errors with partial/unknown outcomes are preserved; missing
-or mismatched correlation and the temporally impossible `not_started` outcome become
-correlated `invalid_daemon_response`/`partial`.
-Listen/chat therefore never print an unrecognized daemon event. Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
+stop, attachment share/download metadata, and lifecycle/progress/loss/peer events.
+Download progress permits `0/0` only for an empty blob; otherwise `total_bytes` is
+positive and `received_bytes <= total_bytes`. A CLI download accepts completion only
+when `output` has the exact retained OS-string/byte representation it submitted;
+Path-equivalent dot components, repeated/trailing separators, and other lexical
+rewrites are rejected. Listen/chat therefore never print an unrecognized daemon event.
+Benchmark records are not IPC schemas: the optional `meshmsg-bench` process issues
+ordinary `send`/`private_send` requests and consumes ordinary subscription events. Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
 attachment-storage pressure. Clients and the daemon are one protocol-v2 component
 set, so commands are submitted directly without status capability probes.
 
@@ -152,9 +127,6 @@ IPC success/event families are:
 - attachment: `attachment_offer` v2, `attachment_shared` v3, `offers` v1,
   `offer_removed`/`offers_pruned` v3, `download_started`/`download_progress`/
   `download_complete` v2 (all lifecycle/download records carry their operation ID);
-- benchmark: send `started`, `progress`, and `summary` v2; receive `started`,
-  `progress`, and `summary` v1 (one explicit request ID is preserved across each
-  complete benchmark stream);
 - loss indication: `lagged` v1.
 
 Local filesystem paths are no longer present in status/daemon-started contracts.

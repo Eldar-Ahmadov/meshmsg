@@ -11,9 +11,8 @@ The canonical top-level commands are:
 - `invite`
 - `send [--to <recipient>]`, `listen`, `chat`, `status`, `peers`, `stop`, and `doctor`
 - `share <path>`, `offers [remove|prune]`, and `download <offer source> --output <path>`
-- `bench-send`, `bench-receive`, and interactive `bench-tui`
 
-Run `meshmsg <command> --help` for command-specific options. The optional HTTP bridge is a separate binary, not a core command; run `meshmsg-web --help` for its options.
+Run `meshmsg <command> --help` for command-specific options. Optional clients are separate binaries: `meshmsg-web` (feature `web`) and `meshmsg-bench` (feature `bench`).
 
 ## Mobile web broadcast
 
@@ -134,7 +133,7 @@ Stop the daemon cleanly:
 meshmsg stop
 ```
 
-Client commands use owner-only local IPC and never create another Iroh endpoint. IPC uses the strict protocol-v2 request envelope and exact request/response correlation documented in [Stable contracts](contracts.md); unversioned clients and replies fail closed. The daemon permits at most 64 simultaneous local connections (including listeners and benchmarks), requires an initial request frame within eight seconds, and returns `ipc_capacity` when full. Ordinary commands have a 10-second daemon-side IPC deadline; offer listing, private send, and attachment operations use longer command-appropriate bounds. A `command_timeout` releases the connection slot but can leave the outcome of an already-submitted mutating operation unknown. Clients fail with an actionable error when the daemon is unavailable.
+Client commands use owner-only local IPC and never create another Iroh endpoint. IPC uses the strict protocol-v2 request envelope and exact request/response correlation documented in [Stable contracts](contracts.md); unversioned clients and replies fail closed. The daemon permits at most 64 simultaneous local connections (including listeners), requires an initial request frame within eight seconds, and returns `ipc_capacity` when full. Ordinary commands have a 10-second daemon-side IPC deadline; offer listing, private send, and attachment operations use longer command-appropriate bounds. A `command_timeout` releases the connection slot but can leave the outcome of an already-submitted mutating operation unknown. Clients fail with an actionable error when the daemon is unavailable.
 
 A successful send reports `queued`:
 

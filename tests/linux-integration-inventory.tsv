@@ -5,7 +5,7 @@
 180	python3	tests/integration-web.py	{BIN} {WEB_BIN}
 600	python3	tests/integration-web-peer.py	{BIN} {WEB_BIN}
 600	python3	tests/integration-peer-directory.py	{BIN}
-1100	bash	tests/integration-5-peer.sh	{BIN}
+1100	bash	tests/integration-5-peer.sh	{BIN} {BENCH_BIN}
 600	bash	tests/integration-attachments.sh	{BIN}
 600	bash	tests/integration-direct-messages.sh	{BIN} {WEB_BIN}
 600	bash	tests/integration-v018-message-boundary.sh	{BIN}

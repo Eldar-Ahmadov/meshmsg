@@ -67,13 +67,14 @@ meshmsg stop
 
 See the [Usage reference](docs/usage.md) for all commands, invite behavior, input sources, status, diagnosis, and JSON automation.
 
-Run an interactive benchmark setup and live monitor against the existing daemon with:
+Benchmarking is an optional ordinary-protocol client:
 
 ```sh
-meshmsg bench-tui
+cargo build --features bench --bin meshmsg-bench
+meshmsg-bench tui
 ```
 
-See [Benchmarking](docs/benchmarking.md) for measurement semantics, coordinated multi-node runs, and NDJSON output.
+See [Benchmarking](docs/benchmarking.md) for coordinated runs, metrics, and NDJSON output.
 
 ## Mobile web broadcast
 

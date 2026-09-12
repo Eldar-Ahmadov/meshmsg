@@ -3,6 +3,8 @@ set -euo pipefail
 
 BIN=${1:-target/debug/meshmsg}
 BIN=$(realpath "$BIN")
+BENCH_BIN=${2:-$(dirname "$BIN")/meshmsg-bench}
+BENCH_BIN=$(realpath "$BENCH_BIN")
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/meshmsg-integration.XXXXXX")
 declare -A PIDS=()
 
@@ -117,13 +119,13 @@ for queued_text, log_path in [(sys.argv[1], sys.argv[3]), (sys.argv[2], sys.argv
     assert received["body"] == queued["body"]
 PY
 
-# A benchmark uses one persistent sender operation and filtered receiver subscriptions.
+# The optional benchmark client uses ordinary send requests and subscriptions.
 BENCH_RUN=0123456789abcdef0123456789abcdef
-"$BIN" --state-dir "$ROOT/c1" --json bench-receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c1.bench.log" & B1=$!
-"$BIN" --state-dir "$ROOT/c2" --json bench-receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c2.bench.log" & B2=$!
+"$BENCH_BIN" --state-dir "$ROOT/c1" --json receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c1.bench.log" & B1=$!
+"$BENCH_BIN" --state-dir "$ROOT/c2" --json receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c2.bench.log" & B2=$!
 wait_log 10 "$ROOT/c1.bench.log" '"type":"bench_receive_started"'
 wait_log 10 "$ROOT/c2.bench.log" '"type":"bench_receive_started"'
-"$BIN" --state-dir "$ROOT/s1" --json bench-send --run-id "$BENCH_RUN" --rate 5 --duration-secs 1 --payload-bytes 128 >"$ROOT/s1.bench.log" & BS=$!
+"$BENCH_BIN" --state-dir "$ROOT/s1" --json send --run-id "$BENCH_RUN" --rate 5 --duration-secs 1 --payload-bytes 128 >"$ROOT/s1.bench.log" & BS=$!
 wait_log 10 "$ROOT/s1.bench.log" '"type":"bench_send_started"'
 status_ok s1 || fail "daemon did not answer status during benchmark send"
 wait "$BS"
@@ -135,22 +137,17 @@ sender = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().spl
 assert sender[0]["type"] == "bench_send_started"
 assert sender[-1]["type"] == "bench_send_summary"
 assert all(value["type"] == "bench_send_progress" for value in sender[1:-1])
-assert all(value["schema_version"] == 2 for value in sender)
+assert all(value["schema_version"] == 1 for value in sender)
 assert sender[-1]["planned"] == sender[-1]["attempted"] == sender[-1]["queued"] == 5
-assert sender[-1]["failed"] == sender[-1]["incomplete"] == 0
+assert sender[-1]["failed"] == 0
 assert sender[-1]["accounting_complete"] is True
 assert sender[-1]["queued_body_bytes"] == sender[-1]["queued"] * sender[-1]["payload_bytes"]
-assert sender[-1]["queued_envelope_bytes"] > sender[-1]["queued_body_bytes"]
 assert sender[-1]["delivery_acknowledged"] is False
-sender_request_ids = {value["request_id"] for value in sender}
-assert len(sender_request_ids) == 1 and next(iter(sender_request_ids)) != sender[0]["run_id"]
 for path in sys.argv[2:]:
     receiver = [json.loads(line) for line in pathlib.Path(path).read_text().splitlines()]
     assert receiver[0]["type"] == "bench_receive_started"
     assert receiver[-1]["type"] == "bench_receive_summary"
     assert all(value["type"] == "bench_receive_progress" for value in receiver[1:-1])
-    receiver_request_ids = {value["request_id"] for value in receiver}
-    assert len(receiver_request_ids) == 1 and next(iter(receiver_request_ids)) != receiver[0]["run_id"]
     summary = receiver[-1]
     assert summary["run_id"] == "0123456789abcdef0123456789abcdef"
     assert summary["expected"] == summary["unique"] == 5

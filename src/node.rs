@@ -11,11 +11,10 @@ use crate::{
     },
     invite::Invite,
     ipc::{
-        read_frame, send_request_checked, subscribe, subscribe_with_id, valid_content_digest,
-        valid_operation_id, validate_success_payload, write_request_with_id,
-        AttachmentOperationKind, BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
-        LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1, SubscriptionReader,
-        MAX_IPC_REQUEST_SIZE, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
+        read_frame, send_request_checked, subscribe, valid_content_digest, valid_operation_id,
+        AttachmentOperationKind, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
+        LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1, MAX_IPC_REQUEST_SIZE,
+        MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
     },
     peers::{self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES},
 };
@@ -51,10 +50,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{BufRead as _, Read as _},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 #[cfg(windows)]
@@ -64,12 +60,16 @@ use tokio::net::windows::named_pipe::{
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
 };
 
 #[cfg(test)]
-use crate::ipc::MAX_IPC_EVENT_SIZE;
+use crate::ipc::{write_request_with_id, MAX_IPC_EVENT_SIZE};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 const BROADCAST_ALPN_V2: &[u8] = b"/meshmsg/broadcast-gossip/2";
@@ -118,7 +118,7 @@ const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADR
 const MAX_PRESENCE_GOSSIP_MESSAGE_SIZE: usize = 2048 + GOSSIP_PROTOCOL_HEADROOM;
 const IPC_EVENT_CAPACITY: usize = 256;
 /// Bounds all accepted local IPC connections, including long-lived subscriptions
-/// and benchmarks. Connections beyond this limit receive a small rejection and
+/// and subscriptions. Connections beyond this limit receive a small rejection and
 /// are closed without creating a handler task.
 const LOCAL_IPC_CONNECTION_CAPACITY: usize = 64;
 const LOCAL_IPC_INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
@@ -129,12 +129,6 @@ const LOCAL_IPC_LIST_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_IPC_TRANSFER_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60 + 10);
 const LOCAL_IPC_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const LOCAL_IPC_REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
-const BENCH_MAGIC: &str = "meshmsg-bench-v1";
-const MAX_BENCH_MESSAGES: u64 = 10_000_000;
-const MAX_LATENCY_SAMPLES: usize = 1_000_000;
-const MAX_PROGRESS_LATENCY_SAMPLES: usize = 4_096;
-const MAX_MISSING_SEQUENCE_SAMPLE: usize = 100;
-const MAX_LATENCY_MS: u64 = 24 * 60 * 60 * 1000;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Re-issue the gossip join after connectivity loss. `join_peers` only queues a
@@ -600,14 +594,6 @@ impl EnvelopeReplayCache {
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct BenchFrame<'a> {
-    run_id: &'a str,
-    sequence: u64,
-    total: u64,
-    timestamp_ms: u64,
-}
-
 fn unix_timestamp_ms() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
 }
@@ -618,143 +604,6 @@ fn unix_timestamp_ms_saturating(now: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn valid_run_id(run_id: &str) -> bool {
-    run_id.len() == 32
-        && run_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn bench_header(run_id: &str, sequence: u64, total: u64, timestamp_ms: u64) -> String {
-    format!("{BENCH_MAGIC}|{run_id}|{sequence:020}|{total:020}|{timestamp_ms:013}|")
-}
-
-fn build_bench_body(
-    run_id: &str,
-    sequence: u64,
-    total: u64,
-    timestamp_ms: u64,
-    payload_bytes: usize,
-) -> Result<String> {
-    anyhow::ensure!(valid_run_id(run_id), "invalid benchmark run ID");
-    anyhow::ensure!(
-        total > 0 && total <= MAX_BENCH_MESSAGES,
-        "invalid benchmark total"
-    );
-    anyhow::ensure!(sequence < total, "benchmark sequence is outside the run");
-    anyhow::ensure!(
-        timestamp_ms <= 9_999_999_999_999,
-        "benchmark timestamp is too large"
-    );
-    let mut body = bench_header(run_id, sequence, total, timestamp_ms);
-    anyhow::ensure!(
-        payload_bytes >= body.len(),
-        "payload size must be at least {} bytes",
-        body.len()
-    );
-    body.extend(std::iter::repeat_n('x', payload_bytes - body.len()));
-    Ok(body)
-}
-
-fn parse_bench_body(body: &str) -> Result<Option<BenchFrame<'_>>> {
-    if !body.starts_with("meshmsg-bench") {
-        return Ok(None);
-    }
-    let mut fields = body.splitn(6, '|');
-    anyhow::ensure!(
-        fields.next() == Some(BENCH_MAGIC),
-        "invalid benchmark framing"
-    );
-    let run_id = fields.next().context("invalid benchmark framing")?;
-    let sequence_text = fields.next().context("invalid benchmark framing")?;
-    let total_text = fields.next().context("invalid benchmark framing")?;
-    let timestamp_text = fields.next().context("invalid benchmark framing")?;
-    let padding = fields.next().context("invalid benchmark framing")?;
-    anyhow::ensure!(valid_run_id(run_id), "invalid benchmark run ID");
-    for (value, width, name) in [
-        (sequence_text, 20, "sequence"),
-        (total_text, 20, "total"),
-        (timestamp_text, 13, "timestamp"),
-    ] {
-        anyhow::ensure!(
-            value.len() == width && value.bytes().all(|byte| byte.is_ascii_digit()),
-            "invalid benchmark {name}"
-        );
-    }
-    anyhow::ensure!(
-        padding.bytes().all(|byte| byte == b'x'),
-        "invalid benchmark padding"
-    );
-    let sequence = sequence_text.parse::<u64>()?;
-    let total = total_text.parse::<u64>()?;
-    let timestamp_ms = timestamp_text.parse::<u64>()?;
-    anyhow::ensure!(
-        total > 0 && total <= MAX_BENCH_MESSAGES,
-        "invalid benchmark total"
-    );
-    anyhow::ensure!(sequence < total, "benchmark sequence is outside the run");
-    Ok(Some(BenchFrame {
-        run_id,
-        sequence,
-        total,
-        timestamp_ms,
-    }))
-}
-
-fn validate_bench_config(config: &BenchConfig) -> Result<u64> {
-    anyhow::ensure!(valid_run_id(&config.run_id), "invalid benchmark run ID");
-    anyhow::ensure!(
-        (1..=10_000).contains(&config.rate),
-        "rate must be between 1 and 10000 messages per second"
-    );
-    anyhow::ensure!(
-        (1..=86_400).contains(&config.duration_secs),
-        "duration must be between 1 and 86400 seconds"
-    );
-    let total = u64::from(config.rate)
-        .checked_mul(config.duration_secs)
-        .context("benchmark message count overflow")?;
-    anyhow::ensure!(
-        total <= MAX_BENCH_MESSAGES,
-        "benchmark plans {total} messages; maximum is {MAX_BENCH_MESSAGES}"
-    );
-    anyhow::ensure!(
-        config.payload_bytes <= crate::message::MAX_BROADCAST_BODY_BYTES,
-        "payload size cannot exceed {} bytes",
-        crate::message::MAX_BROADCAST_BODY_BYTES
-    );
-    let body = build_bench_body(
-        &config.run_id,
-        total - 1,
-        total,
-        9_999_999_999_999,
-        config.payload_bytes,
-    )?;
-    Envelope::encode_at(
-        &SecretKey::generate(),
-        TopicId::from_bytes([0; 32]),
-        EnvelopeKind::Message,
-        body,
-        9_999_999_999_999,
-    )
-    .context("payload does not fit the signed application envelope")?;
-    Ok(total)
-}
-
-pub(crate) fn validate_bench_sender_config(
-    run_id: &str,
-    rate: u32,
-    duration_secs: u64,
-    payload_bytes: usize,
-) -> Result<u64> {
-    validate_bench_config(&BenchConfig {
-        run_id: run_id.parse().context("invalid benchmark run ID")?,
-        rate,
-        duration_secs,
-        payload_bytes,
-    })
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct AttachmentWire {
     version: u8,
@@ -762,6 +611,7 @@ struct AttachmentWire {
 }
 
 impl Envelope {
+    #[cfg(test)]
     fn encode_at(
         secret: &SecretKey,
         topic: TopicId,
@@ -1505,12 +1355,6 @@ enum DaemonCommand {
         body: String,
         reply: oneshot::Sender<serde_json::Value>,
     },
-    BenchMessage {
-        body: String,
-        timestamp_ms: u64,
-        cancel: oneshot::Receiver<()>,
-        reply: oneshot::Sender<std::result::Result<usize, String>>,
-    },
     Status {
         reply: oneshot::Sender<serde_json::Value>,
     },
@@ -1947,323 +1791,6 @@ async fn bind_local_endpoint(
     ))
 }
 
-struct BenchmarkLease(Arc<AtomicBool>);
-
-impl Drop for BenchmarkLease {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-#[derive(Debug, Default)]
-struct BenchSendStats {
-    attempted: u64,
-    queued: u64,
-    failed: u64,
-    incomplete: u64,
-    schedule_missed: u64,
-    body_bytes: u64,
-    envelope_bytes: u64,
-    first_error: Option<String>,
-}
-
-fn benchmark_due_slots(elapsed: Duration, period: Duration, total: u64) -> u64 {
-    let Some(slots) = elapsed.as_nanos().checked_div(period.as_nanos()) else {
-        return 0;
-    };
-    u64::try_from(slots)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1)
-        .min(total)
-}
-
-fn advance_benchmark_slot(due_slots: u64, next_slot: &mut u64, schedule_missed: &mut u64) -> u64 {
-    let sequence = due_slots.saturating_sub(1).max(*next_slot);
-    *schedule_missed = schedule_missed.saturating_add(sequence.saturating_sub(*next_slot));
-    *next_slot = sequence.saturating_add(1);
-    sequence
-}
-
-fn bench_send_progress(
-    config: &BenchConfig,
-    total: u64,
-    stats: &BenchSendStats,
-    elapsed: Duration,
-) -> serde_json::Value {
-    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-    let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
-    serde_json::json!({
-        "type":"bench_send_progress", "schema_version":2,
-        "run_id":config.run_id, "rate":config.rate,
-        "duration_secs":config.duration_secs, "payload_bytes":config.payload_bytes,
-        "planned":total, "attempted":stats.attempted, "queued":stats.queued,
-        "failed":stats.failed, "incomplete":stats.incomplete,
-        "schedule_missed":stats.schedule_missed,
-        "queued_body_bytes":stats.body_bytes, "queued_envelope_bytes":stats.envelope_bytes,
-        "elapsed_ms":elapsed_ms,
-        "achieved_messages_per_second":stats.queued as f64 / elapsed_seconds,
-        "achieved_body_bytes_per_second":stats.body_bytes as f64 / elapsed_seconds,
-        "delivery_acknowledged":false
-    })
-}
-
-fn bench_send_summary(
-    config: &BenchConfig,
-    total: u64,
-    stats: &BenchSendStats,
-    reason: &str,
-    elapsed: Duration,
-) -> serde_json::Value {
-    let mut value = bench_send_progress(config, total, stats, elapsed);
-    let object = value
-        .as_object_mut()
-        .expect("benchmark progress is an object");
-    object.insert("type".into(), "bench_send_summary".into());
-    object.insert("accounting_complete".into(), true.into());
-    object.insert("completion_reason".into(), reason.into());
-    object.insert("first_error".into(), stats.first_error.clone().into());
-    value
-}
-
-async fn handle_bench_send<S>(
-    stream: &mut S,
-    commands: &mpsc::Sender<DaemonCommand>,
-    config: BenchConfig,
-    benchmark_busy: Arc<AtomicBool>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let total = match validate_bench_config(&config) {
-        Ok(total) => total,
-        Err(error) => {
-            return write_local_response(
-                stream,
-                &serde_json::json!({"type":"error", "code":"invalid_benchmark", "message":error.to_string()}),
-                LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
-            )
-            .await;
-        }
-    };
-    if benchmark_busy
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return write_local_response(
-            stream,
-            &serde_json::json!({"type":"error", "code":"benchmark_busy", "message":"another send benchmark is already active"}),
-            LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
-        )
-        .await;
-    }
-    let _lease = BenchmarkLease(benchmark_busy);
-    write_local_response(
-        stream,
-        &serde_json::json!({
-            "type":"bench_send_started", "schema_version":2,
-            "run_id":config.run_id, "rate":config.rate,
-            "duration_secs":config.duration_secs, "payload_bytes":config.payload_bytes,
-            "planned":total, "delivery_acknowledged":false
-        }),
-        LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
-    )
-    .await?;
-
-    let started = tokio::time::Instant::now();
-    let duration = Duration::from_secs(config.duration_secs);
-    let deadline = started + duration;
-    let period_ns = 1_000_000_000_u64
-        .checked_div(u64::from(config.rate))
-        .filter(|period| *period > 0)
-        .context("invalid benchmark send period")?;
-    let period = Duration::from_nanos(period_ns);
-    let mut ticks = tokio::time::interval_at(started, period);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut stats = BenchSendStats::default();
-    let mut next_slot = 0_u64;
-    let mut reason = "deadline";
-    let mut interrupt = [0_u8; 1];
-    let progress_period = Duration::from_millis(250);
-    let mut next_progress = progress_period;
-
-    'benchmark: while next_slot < total {
-        tokio::select! {
-            biased;
-            read = stream.read(&mut interrupt) => {
-                match read {
-                    Ok(0) => return Ok(()),
-                    Ok(_) => reason = "interrupted",
-                    Err(error) => return Err(error).context("read benchmark cancellation"),
-                }
-                break;
-            }
-            _ = tokio::time::sleep_until(deadline) => break,
-            _ = ticks.tick() => {}
-        }
-        let due_slots = benchmark_due_slots(started.elapsed(), period, total);
-        let sequence =
-            advance_benchmark_slot(due_slots, &mut next_slot, &mut stats.schedule_missed);
-        stats.attempted = stats
-            .attempted
-            .checked_add(1)
-            .context("benchmark attempted-count overflow")?;
-        let timestamp_ms = match unix_timestamp_ms() {
-            Ok(timestamp_ms) => timestamp_ms,
-            Err(_) => {
-                stats.failed = stats
-                    .failed
-                    .checked_add(1)
-                    .context("benchmark failure-count overflow")?;
-                stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
-                reason = "send_failed";
-                break 'benchmark;
-            }
-        };
-        let body = match build_bench_body(
-            &config.run_id,
-            sequence,
-            total,
-            timestamp_ms,
-            config.payload_bytes,
-        ) {
-            Ok(body) => body,
-            Err(_) => {
-                stats.failed = stats
-                    .failed
-                    .checked_add(1)
-                    .context("benchmark failure-count overflow")?;
-                stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
-                reason = "send_failed";
-                break 'benchmark;
-            }
-        };
-        let (reply, response) = oneshot::channel();
-        let (cancel, cancellation) = oneshot::channel();
-        let command = DaemonCommand::BenchMessage {
-            body,
-            timestamp_ms,
-            cancel: cancellation,
-            reply,
-        };
-        let sent = tokio::select! {
-            biased;
-            read = stream.read(&mut interrupt) => {
-                match read {
-                    Ok(0) => return Ok(()),
-                    Ok(_) => reason = "interrupted",
-                    Err(error) => return Err(error).context("read benchmark cancellation"),
-                }
-                false
-            }
-            _ = tokio::time::sleep_until(deadline) => false,
-            result = commands.send(command) => {
-                if result.is_err() {
-                    reason = "daemon_stopped";
-                    false
-                } else {
-                    true
-                }
-            }
-        };
-        if !sent {
-            stats.incomplete = stats
-                .incomplete
-                .checked_add(1)
-                .context("benchmark incomplete-count overflow")?;
-            break;
-        }
-        let response = tokio::select! {
-            biased;
-            read = stream.read(&mut interrupt) => {
-                let _ = cancel.send(());
-                match read {
-                    Ok(0) => return Ok(()),
-                    Ok(_) => reason = "interrupted",
-                    Err(error) => return Err(error).context("read benchmark cancellation"),
-                }
-                None
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                let _ = cancel.send(());
-                None
-            }
-            result = response => Some(result)
-        };
-        match response {
-            Some(Ok(Ok(encoded_bytes))) => {
-                stats.queued = stats
-                    .queued
-                    .checked_add(1)
-                    .context("benchmark queued-count overflow")?;
-                stats.body_bytes = stats
-                    .body_bytes
-                    .checked_add(u64::try_from(config.payload_bytes)?)
-                    .context("benchmark body-byte overflow")?;
-                stats.envelope_bytes = stats
-                    .envelope_bytes
-                    .checked_add(u64::try_from(encoded_bytes)?)
-                    .context("benchmark envelope-byte overflow")?;
-            }
-            Some(Ok(Err(_))) => {
-                stats.failed = stats
-                    .failed
-                    .checked_add(1)
-                    .context("benchmark failure-count overflow")?;
-                stats.first_error = Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into());
-                reason = "send_failed";
-                break 'benchmark;
-            }
-            Some(Err(_)) => {
-                stats.incomplete = stats
-                    .incomplete
-                    .checked_add(1)
-                    .context("benchmark incomplete-count overflow")?;
-                reason = "daemon_stopped";
-                break 'benchmark;
-            }
-            None => {
-                stats.incomplete = stats
-                    .incomplete
-                    .checked_add(1)
-                    .context("benchmark incomplete-count overflow")?;
-                break 'benchmark;
-            }
-        }
-        let elapsed = started.elapsed();
-        if elapsed >= next_progress {
-            while next_progress <= elapsed {
-                next_progress += progress_period;
-            }
-            write_local_response(
-                stream,
-                &bench_send_progress(&config, total, &stats, elapsed),
-                LOCAL_IPC_RESPONSE_WRITE_TIMEOUT,
-            )
-            .await?;
-        }
-    }
-
-    if next_slot == total && tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            read = stream.read(&mut interrupt) => match read {
-                Ok(0) => return Ok(()),
-                Ok(_) => reason = "interrupted",
-                Err(error) => return Err(error).context("read benchmark cancellation"),
-            },
-            _ = tokio::time::sleep_until(deadline) => {}
-        }
-    }
-    let elapsed = started.elapsed();
-    let observed = elapsed.min(duration);
-    let due_slots = benchmark_due_slots(observed, period, total);
-    stats.schedule_missed = stats
-        .schedule_missed
-        .checked_add(due_slots.saturating_sub(next_slot))
-        .context("benchmark missed-schedule count overflow")?;
-    let summary = bench_send_summary(&config, total, &stats, reason, elapsed);
-    write_local_response(stream, &summary, LOCAL_IPC_RESPONSE_WRITE_TIMEOUT).await
-}
-
 #[derive(Clone, Copy)]
 struct LocalIpcTimeouts {
     initial_frame: Duration,
@@ -2306,15 +1833,13 @@ fn normalize_ipc_response(value: &serde_json::Value, request_id: &str) -> serde_
             .filter(|outcome| matches!(*outcome, "not_started" | "unknown" | "partial"))
             .unwrap_or(match code {
                 "invalid_request" | "unsupported_schema" | "invalid_message"
-                | "invalid_benchmark" | "benchmark_busy" | "private_send_busy" => "not_started",
+                | "private_send_busy" => "not_started",
                 _ => "unknown",
             });
         let retryable = value
             .get("retryable")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(
-                matches!(code, "benchmark_busy" | "private_send_busy") || outcome != "not_started",
-            );
+            .unwrap_or(code == "private_send_busy" || outcome != "not_started");
         let message = value
             .get("message")
             .and_then(serde_json::Value::as_str)
@@ -2476,7 +2001,6 @@ async fn handle_local_client<S>(
     events: broadcast::Receiver<serde_json::Value>,
     connected: serde_json::Value,
     startup_peers: Option<serde_json::Value>,
-    benchmark_busy: Arc<AtomicBool>,
 ) -> Result<()>
 where
     S: SubscriptionStream,
@@ -2490,7 +2014,6 @@ where
                 events,
                 connected,
                 startup_peers,
-                benchmark_busy,
                 LocalIpcTimeouts::default(),
             ),
         )
@@ -2503,7 +2026,6 @@ async fn handle_local_client_with_timeouts<S>(
     events: broadcast::Receiver<serde_json::Value>,
     connected: serde_json::Value,
     startup_peers: Option<serde_json::Value>,
-    benchmark_busy: Arc<AtomicBool>,
     timeouts: LocalIpcTimeouts,
 ) -> Result<()>
 where
@@ -2512,15 +2034,7 @@ where
     IPC_REQUEST_ID
         .scope(
             std::cell::RefCell::new(None),
-            handle_local_client_inner(
-                stream,
-                commands,
-                events,
-                connected,
-                startup_peers,
-                benchmark_busy,
-                timeouts,
-            ),
+            handle_local_client_inner(stream, commands, events, connected, startup_peers, timeouts),
         )
         .await
 }
@@ -2531,7 +2045,6 @@ async fn handle_local_client_inner<S>(
     mut events: broadcast::Receiver<serde_json::Value>,
     connected: serde_json::Value,
     startup_peers: Option<serde_json::Value>,
-    benchmark_busy: Arc<AtomicBool>,
     timeouts: LocalIpcTimeouts,
 ) -> Result<()>
 where
@@ -2753,11 +2266,6 @@ where
             .await;
             annotate_operation_response(&mut value, &response_operation_id);
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
-        }
-        IpcRequest::BenchSend { config } => {
-            // The benchmark protocol has its own validated duration and cancellation
-            // path; progress writes are independently bounded below.
-            handle_bench_send(&mut stream, &commands, config, benchmark_busy).await?;
         }
         IpcRequest::Status => {
             let (reply, response) = oneshot::channel();
@@ -5002,7 +4510,6 @@ struct LocalClientSession {
     events: broadcast::Receiver<serde_json::Value>,
     connected: serde_json::Value,
     startup_peers: Option<serde_json::Value>,
-    benchmark_busy: Arc<AtomicBool>,
 }
 
 async fn handle_admitted_local_client<S>(
@@ -5024,7 +4531,6 @@ where
                 session.events,
                 session.connected,
                 session.startup_peers,
-                session.benchmark_busy,
                 timeouts,
             ),
         )
@@ -5192,7 +4698,6 @@ pub async fn run_daemon(
 
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
-    let benchmark_busy = Arc::new(AtomicBool::new(false));
     let transfer_limit = Arc::new(Semaphore::new(2));
     let offer_list_limit = Arc::new(Semaphore::new(1));
     let direct_limit = Arc::new(Semaphore::new(DIRECT_CONCURRENCY));
@@ -5271,7 +4776,6 @@ pub async fn run_daemon(
                             events: event_tx.subscribe(),
                             connected,
                             startup_peers: Some(startup_peers),
-                            benchmark_busy: benchmark_busy.clone(),
                         })
                     },
                 ).await?;
@@ -5412,28 +4916,6 @@ pub async fn run_daemon(
                         operation_cache.lock().expect("operation cache poisoned")
                             .complete(&operation_id, response, StdInstant::now());
                     });
-                }
-                Some(DaemonCommand::BenchMessage { body, timestamp_ms, cancel, reply }) => {
-                    match Envelope::encode_at(
-                        &node.secret, topic, EnvelopeKind::Message, body, timestamp_ms,
-                    ) {
-                        Ok(envelope) => {
-                            let encoded_bytes = envelope.len();
-                            let sender = node.sender.clone();
-                            tokio::spawn(async move {
-                                let response = tokio::select! {
-                                    result = sender.broadcast(envelope) => result
-                                        .map(|()| encoded_bytes)
-                                        .map_err(|error| error.to_string()),
-                                    _ = cancel => Err("benchmark message cancelled".to_owned()),
-                                };
-                                let _ = reply.send(response);
-                            });
-                        }
-                        Err(error) => {
-                            let _ = reply.send(Err(error.to_string()));
-                        }
-                    }
                 }
                 Some(DaemonCommand::Status { reply }) => {
                     let endpoint_online = node.endpoint.home_relay_status().get()
@@ -6099,14 +5581,6 @@ pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
     unreachable!("named pipe connection retry loop always returns")
 }
 
-fn ensure_success(value: &serde_json::Value) -> Result<()> {
-    if value["type"] == "error" {
-        let error = ErrorEnvelopeV1::from_value(value)?;
-        return Err(anyhow::Error::new(contracts::ContractFailure(error)));
-    }
-    Ok(())
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrivateAcceptedResponse {
@@ -6444,961 +5918,6 @@ pub async fn download(
     Ok(())
 }
 
-fn generated_run_id() -> String {
-    rand::random::<[u8; 16]>()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn print_bench_value(json: bool, value: &serde_json::Value) {
-    if json {
-        println!("{value}");
-        return;
-    }
-    match value["type"].as_str() {
-        Some("bench_send_started") => println!(
-            "benchmark send started\nrun id: {}\nplanned messages: {}\ndelivery acknowledged: no",
-            value["run_id"].as_str().unwrap_or(""),
-            value["planned"].as_u64().unwrap_or(0)
-        ),
-        Some("bench_send_summary") => println!(
-            "benchmark send complete ({})\nattempted: {}\nqueued locally: {}\nfailed: {}\nincomplete: {}\nschedule missed: {}\naccounting complete: {}\nachieved: {:.2} messages/s\ndelivery acknowledged: no",
-            value["completion_reason"].as_str().unwrap_or("unknown"),
-            value["attempted"].as_u64().unwrap_or(0),
-            value["queued"].as_u64().unwrap_or(0),
-            value["failed"].as_u64().unwrap_or(0),
-            value["incomplete"].as_u64().unwrap_or(0),
-            value["schedule_missed"].as_u64().unwrap_or(0),
-            if value["accounting_complete"].as_bool().unwrap_or(false) {
-                "yes"
-            } else {
-                "no"
-            },
-            value["achieved_messages_per_second"].as_f64().unwrap_or(0.0),
-        ),
-        Some("bench_send_progress" | "bench_receive_progress") => {}
-        Some("bench_receive_started") => println!(
-            "benchmark receive started\nrun id: {}\nobservation window: {}s",
-            value["run_id"].as_str().unwrap_or(""),
-            value["duration_secs"].as_u64().unwrap_or(0)
-        ),
-        Some("bench_receive_summary") => println!(
-            "benchmark receive complete ({})\nunique: {}\nmissing: {}\nduplicates: {}\nout of order: {}\nreceived: {:.2} messages/s\nmeasurement incomplete due to lag: {}",
-            value["completion_reason"].as_str().unwrap_or("unknown"),
-            value["unique"].as_u64().unwrap_or(0),
-            value["missing"].as_u64().map(|v| v.to_string()).unwrap_or_else(|| "unknown".into()),
-            value["duplicates"].as_u64().unwrap_or(0),
-            value["out_of_order"].as_u64().unwrap_or(0),
-            value["achieved_messages_per_second"].as_f64().unwrap_or(0.0),
-            value["lag"]["incomplete"].as_bool().unwrap_or(false),
-        ),
-        _ => event(json, value.clone()),
-    }
-}
-
-const BENCH_CLIENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-
-async fn await_bench_startup<T>(
-    startup: impl std::future::Future<Output = Result<T>>,
-    cancellation: &mut oneshot::Receiver<()>,
-    timeout: Duration,
-) -> Result<T> {
-    tokio::select! {
-        result = startup => result,
-        _ = cancellation => anyhow::bail!("benchmark interrupted during daemon handshake"),
-        _ = tokio::time::sleep(timeout) => anyhow::bail!("timed out waiting for daemon benchmark handshake"),
-    }
-}
-
-#[cfg(test)]
-fn benchmark_subscription_value(
-    result: Result<Option<serde_json::Value>>,
-    stopped_message: &'static str,
-    read_context: &'static str,
-) -> Result<serde_json::Value> {
-    match result {
-        Ok(Some(value)) => Ok(value),
-        Ok(None) => anyhow::bail!(stopped_message),
-        Err(error) => Err(error).context(read_context),
-    }
-}
-
-fn disconnected_send_summary(
-    config: &BenchConfig,
-    total: u64,
-    latest_progress: Option<&serde_json::Value>,
-    elapsed: Duration,
-    request_id: &str,
-    completion_reason: &str,
-) -> serde_json::Value {
-    if let Some(progress) = latest_progress {
-        let mut summary = progress.clone();
-        let object = summary
-            .as_object_mut()
-            .expect("benchmark progress is an object");
-        object.insert("type".into(), "bench_send_summary".into());
-        object.insert("accounting_complete".into(), false.into());
-        object.insert("completion_reason".into(), completion_reason.into());
-        object.insert("first_error".into(), serde_json::Value::Null);
-        summary
-    } else {
-        let mut summary = contracts::correlate(
-            bench_send_summary(
-                config,
-                total,
-                &BenchSendStats::default(),
-                completion_reason,
-                elapsed,
-            ),
-            request_id,
-        );
-        summary["accounting_complete"] = false.into();
-        summary
-    }
-}
-
-fn validate_send_record_config(
-    value: &serde_json::Value,
-    config: &BenchConfig,
-    total: u64,
-) -> Result<()> {
-    anyhow::ensure!(
-        value["run_id"].as_str() == Some(&config.run_id)
-            && value["rate"].as_u64() == Some(u64::from(config.rate))
-            && value["duration_secs"].as_u64() == Some(config.duration_secs)
-            && value["payload_bytes"].as_u64() == u64::try_from(config.payload_bytes).ok()
-            && value["planned"].as_u64() == Some(total),
-        "daemon benchmark record does not match the submitted configuration"
-    );
-    Ok(())
-}
-
-fn validate_send_record_progress(
-    previous: Option<&serde_json::Value>,
-    current: &serde_json::Value,
-) -> Result<()> {
-    if let Some(previous) = previous {
-        for field in [
-            "attempted",
-            "queued",
-            "failed",
-            "incomplete",
-            "schedule_missed",
-            "queued_body_bytes",
-            "queued_envelope_bytes",
-            "elapsed_ms",
-        ] {
-            anyhow::ensure!(
-                current[field].as_u64() >= previous[field].as_u64(),
-                "daemon benchmark counters moved backwards"
-            );
-        }
-    }
-    Ok(())
-}
-
-fn validate_started_benchmark_error(error: &ErrorEnvelopeV1, request_id: &str) -> Result<()> {
-    anyhow::ensure!(
-        error.request_id.as_deref() == Some(request_id),
-        "daemon post-start benchmark error has missing or mismatched correlation"
-    );
-    anyhow::ensure!(
-        matches!(error.outcome.as_str(), "partial" | "unknown"),
-        "daemon returned a temporally impossible post-start benchmark error"
-    );
-    Ok(())
-}
-
-fn benchmark_contract_failure(
-    request_id: &str,
-    code: &str,
-    outcome: &str,
-    retryable: bool,
-) -> contracts::ContractFailure {
-    let mut error = ErrorEnvelopeV1::new(code, "", outcome, retryable);
-    error.request_id = Some(request_id.to_owned());
-    contracts::ContractFailure(error)
-}
-
-fn emit_bench_progress(events: &mpsc::Sender<serde_json::Value>, value: serde_json::Value) {
-    // Progress is best-effort. Never let a blocked renderer or stdout pipe
-    // perturb the benchmark's scheduling or subscription consumption.
-    let _ = events.try_send(value);
-}
-
-async fn emit_bench_terminal(events: &mpsc::Sender<serde_json::Value>, value: serde_json::Value) {
-    // Started and summary records are part of the stable stream contract.
-    let _ = events.send(value).await;
-}
-
-async fn bench_send_events(
-    dir: &Path,
-    run_id: Option<String>,
-    rate: u32,
-    duration_secs: u64,
-    payload_bytes: usize,
-    events: mpsc::Sender<serde_json::Value>,
-    mut cancellation: oneshot::Receiver<()>,
-) -> Result<()> {
-    let config = BenchConfig {
-        run_id: run_id
-            .unwrap_or_else(generated_run_id)
-            .parse()
-            .context("invalid benchmark run ID")?,
-        rate,
-        duration_secs,
-        payload_bytes,
-    };
-    let total = validate_bench_config(&config)?;
-    let request_id = contracts::new_request_id();
-    let startup = async {
-        let mut stream = connect_daemon(dir).await?;
-        write_request_with_id(
-            &mut stream,
-            &IpcRequest::BenchSend {
-                config: config.clone(),
-            },
-            &request_id,
-        )
-        .await?;
-        let mut reader = SubscriptionReader::new_correlated_for_operation(
-            stream,
-            request_id.clone(),
-            contracts::ErrorOperationKind::Benchmark,
-        );
-        let started = reader
-            .read()
-            .await?
-            .context("local daemon stopped before benchmark start")?;
-        Result::<_>::Ok((reader, started))
-    };
-    let (mut reader, started) =
-        await_bench_startup(startup, &mut cancellation, BENCH_CLIENT_STARTUP_TIMEOUT).await?;
-    ensure_success(&started)?;
-    anyhow::ensure!(
-        started["type"] == "bench_send_started",
-        "unexpected benchmark response"
-    );
-    validate_send_record_config(&started, &config, total)?;
-    let client_started = StdInstant::now();
-    emit_bench_terminal(&events, started).await;
-
-    let mut latest_progress = None;
-    let mut interrupted = false;
-    let mut interrupted_deadline = None;
-    let summary = loop {
-        let value = tokio::select! {
-            value = reader.read() => match value {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    let summary = disconnected_send_summary(
-                        &config,
-                        total,
-                        latest_progress.as_ref(),
-                        client_started.elapsed(),
-                        &request_id,
-                        if interrupted { "interrupted" } else { "daemon_stopped" },
-                    );
-                    emit_bench_terminal(&events, summary).await;
-                    return Err(anyhow::Error::new(benchmark_contract_failure(
-                        &request_id, "daemon_disconnected", "partial", true,
-                    )));
-                }
-                Err(error) => {
-                    let summary = disconnected_send_summary(
-                        &config,
-                        total,
-                        latest_progress.as_ref(),
-                        client_started.elapsed(),
-                        &request_id,
-                        if interrupted { "interrupted" } else { "daemon_stopped" },
-                    );
-                    emit_bench_terminal(&events, summary).await;
-                    let code = if error
-                        .chain()
-                        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
-                    {
-                        "daemon_disconnected"
-                    } else {
-                        "invalid_daemon_response"
-                    };
-                    return Err(error.context(benchmark_contract_failure(
-                        &request_id, code, "partial", code == "daemon_disconnected",
-                    )));
-                }
-            },
-            result = &mut cancellation, if !interrupted => {
-                let _ = result;
-                interrupted = true;
-                if let Err(error) = reader.get_mut().write_all(b"\n").await {
-                    let summary = disconnected_send_summary(
-                        &config,
-                        total,
-                        latest_progress.as_ref(),
-                        client_started.elapsed(),
-                        &request_id,
-                        "interrupted",
-                    );
-                    emit_bench_terminal(&events, summary).await;
-                    return Err(anyhow::Error::new(error).context(benchmark_contract_failure(
-                        &request_id, "daemon_disconnected", "partial", true,
-                    )));
-                }
-                interrupted_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
-                continue;
-            }
-            _ = async {
-                match interrupted_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            }, if interrupted => {
-                let summary = disconnected_send_summary(
-                    &config,
-                    total,
-                    latest_progress.as_ref(),
-                    client_started.elapsed(),
-                    &request_id,
-                    "interrupted",
-                );
-                emit_bench_terminal(&events, summary).await;
-                return Err(anyhow::Error::new(benchmark_contract_failure(
-                    &request_id, "command_timeout", "partial", true,
-                )));
-            }
-        };
-        if value["type"] == "error" {
-            let error = ErrorEnvelopeV1::from_value(&value)?;
-            let summary = disconnected_send_summary(
-                &config,
-                total,
-                latest_progress.as_ref(),
-                client_started.elapsed(),
-                &request_id,
-                if interrupted {
-                    "interrupted"
-                } else {
-                    "daemon_stopped"
-                },
-            );
-            emit_bench_terminal(&events, summary).await;
-            if let Err(temporal_error) = validate_started_benchmark_error(&error, &request_id) {
-                return Err(temporal_error.context(benchmark_contract_failure(
-                    &request_id,
-                    "invalid_daemon_response",
-                    "partial",
-                    false,
-                )));
-            }
-            return Err(anyhow::Error::new(contracts::ContractFailure(error)));
-        }
-        match value["type"].as_str() {
-            Some("bench_send_progress") => {
-                if let Err(error) = validate_send_record_config(&value, &config, total)
-                    .and_then(|()| validate_send_record_progress(latest_progress.as_ref(), &value))
-                {
-                    let summary = disconnected_send_summary(
-                        &config,
-                        total,
-                        latest_progress.as_ref(),
-                        client_started.elapsed(),
-                        &request_id,
-                        if interrupted {
-                            "interrupted"
-                        } else {
-                            "daemon_stopped"
-                        },
-                    );
-                    emit_bench_terminal(&events, summary).await;
-                    return Err(error.context(benchmark_contract_failure(
-                        &request_id,
-                        "invalid_daemon_response",
-                        "partial",
-                        false,
-                    )));
-                }
-                latest_progress = Some(value.clone());
-                emit_bench_progress(&events, value);
-            }
-            Some("bench_send_summary") => {
-                if value["completion_reason"] == "interrupted" && !interrupted {
-                    let summary = disconnected_send_summary(
-                        &config,
-                        total,
-                        latest_progress.as_ref(),
-                        client_started.elapsed(),
-                        &request_id,
-                        "daemon_stopped",
-                    );
-                    emit_bench_terminal(&events, summary).await;
-                    return Err(anyhow::Error::new(benchmark_contract_failure(
-                        &request_id,
-                        "invalid_daemon_response",
-                        "partial",
-                        false,
-                    )));
-                }
-                if let Err(error) = validate_send_record_config(&value, &config, total)
-                    .and_then(|()| validate_send_record_progress(latest_progress.as_ref(), &value))
-                {
-                    let summary = disconnected_send_summary(
-                        &config,
-                        total,
-                        latest_progress.as_ref(),
-                        client_started.elapsed(),
-                        &request_id,
-                        if interrupted {
-                            "interrupted"
-                        } else {
-                            "daemon_stopped"
-                        },
-                    );
-                    emit_bench_terminal(&events, summary).await;
-                    return Err(error.context(benchmark_contract_failure(
-                        &request_id,
-                        "invalid_daemon_response",
-                        "partial",
-                        false,
-                    )));
-                }
-                break value;
-            }
-            _ => unreachable!("strict response validation rejects unknown benchmark records"),
-        }
-    };
-    emit_bench_terminal(&events, summary.clone()).await;
-    match summary["completion_reason"].as_str() {
-        Some("send_failed") => Err(anyhow::Error::new(benchmark_contract_failure(
-            &request_id,
-            "send_failed",
-            "partial",
-            false,
-        ))),
-        Some("daemon_stopped") => Err(anyhow::Error::new(benchmark_contract_failure(
-            &request_id,
-            "daemon_disconnected",
-            "partial",
-            true,
-        ))),
-        _ => Ok(()),
-    }
-}
-
-fn bench_output_worker(
-    json: bool,
-) -> (mpsc::Sender<serde_json::Value>, tokio::task::JoinHandle<()>) {
-    let (events, mut output) = mpsc::channel(16);
-    let worker = tokio::task::spawn_blocking(move || {
-        while let Some(value) = output.blocking_recv() {
-            print_bench_value(json, &value);
-        }
-    });
-    (events, worker)
-}
-
-pub async fn bench_send(
-    dir: &Path,
-    run_id: Option<String>,
-    rate: u32,
-    duration_secs: u64,
-    payload_bytes: usize,
-    json: bool,
-) -> Result<()> {
-    let (cancel_tx, cancel_rx) = oneshot::channel();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = cancel_tx.send(());
-        } else {
-            std::future::pending::<()>().await;
-        }
-    });
-    let (events, output) = bench_output_worker(json);
-    let result = bench_send_events(
-        dir,
-        run_id,
-        rate,
-        duration_secs,
-        payload_bytes,
-        events,
-        cancel_rx,
-    )
-    .await;
-    signal.abort();
-    output.await.context("benchmark output worker failed")?;
-    result
-}
-
-pub(crate) async fn bench_send_tui(
-    dir: &Path,
-    run_id: String,
-    rate: u32,
-    duration_secs: u64,
-    payload_bytes: usize,
-    events: mpsc::Sender<serde_json::Value>,
-    cancellation: oneshot::Receiver<()>,
-) -> Result<()> {
-    bench_send_events(
-        dir,
-        Some(run_id),
-        rate,
-        duration_secs,
-        payload_bytes,
-        events,
-        cancellation,
-    )
-    .await
-}
-
-#[derive(Debug)]
-struct BenchReceiveStats {
-    run_id: String,
-    expected: Option<u64>,
-    seen: Vec<u8>,
-    unique: u64,
-    duplicates: u64,
-    out_of_order: u64,
-    highest_sequence: Option<u64>,
-    body_bytes: u64,
-    latencies: Vec<u64>,
-    latency_observations: u64,
-    latency_sampled: bool,
-    latency_clock_invalid: u64,
-    local_lag_events: u64,
-    local_dropped: u64,
-    gossip_lag_events: u64,
-    peer_up: u64,
-    peer_down: u64,
-    ignored_messages: u64,
-    malformed_messages: u64,
-}
-
-impl BenchReceiveStats {
-    fn new(run_id: String, expected: Option<u64>) -> Result<Self> {
-        if let Some(expected) = expected {
-            anyhow::ensure!(
-                (1..=MAX_BENCH_MESSAGES).contains(&expected),
-                "expected count must be between 1 and {MAX_BENCH_MESSAGES}"
-            );
-        }
-        let seen = match expected {
-            Some(count) => vec![
-                0;
-                usize::try_from(count.div_ceil(8))
-                    .context("benchmark sequence bitmap is too large")?
-            ],
-            None => Vec::new(),
-        };
-        Ok(Self {
-            run_id,
-            expected,
-            seen,
-            unique: 0,
-            duplicates: 0,
-            out_of_order: 0,
-            highest_sequence: None,
-            body_bytes: 0,
-            latencies: Vec::new(),
-            latency_observations: 0,
-            latency_sampled: false,
-            latency_clock_invalid: 0,
-            local_lag_events: 0,
-            local_dropped: 0,
-            gossip_lag_events: 0,
-            peer_up: 0,
-            peer_down: 0,
-            ignored_messages: 0,
-            malformed_messages: 0,
-        })
-    }
-
-    fn reservoir_index(observation: u64, sequence: u64) -> u64 {
-        // SplitMix64 provides a deterministic pseudorandom draw for Algorithm R.
-        let mut value = observation ^ sequence.rotate_left(32);
-        value = value.wrapping_add(0x9e3779b97f4a7c15);
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-        value ^ (value >> 31)
-    }
-
-    fn record_latency_sample(&mut self, latency: u64, sequence: u64, capacity: usize) {
-        self.latency_observations = self.latency_observations.saturating_add(1);
-        if self.latencies.len() < capacity {
-            self.latencies.push(latency);
-        } else {
-            self.latency_sampled = true;
-            let candidate = Self::reservoir_index(self.latency_observations, sequence)
-                % self.latency_observations.max(1);
-            if u64::try_from(capacity).is_ok_and(|capacity| candidate < capacity) {
-                if let Ok(index) = usize::try_from(candidate) {
-                    self.latencies[index] = latency;
-                }
-            }
-        }
-    }
-
-    fn record_message_at(&mut self, value: &serde_json::Value, received_timestamp_ms: u64) {
-        let Some(body) = value["body"].as_str() else {
-            self.ignored_messages = self.ignored_messages.saturating_add(1);
-            return;
-        };
-        let frame = match parse_bench_body(body) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => {
-                self.ignored_messages = self.ignored_messages.saturating_add(1);
-                return;
-            }
-            Err(_) => {
-                if body.contains(&self.run_id) {
-                    self.malformed_messages = self.malformed_messages.saturating_add(1);
-                } else {
-                    self.ignored_messages = self.ignored_messages.saturating_add(1);
-                }
-                return;
-            }
-        };
-        if frame.run_id != self.run_id {
-            self.ignored_messages = self.ignored_messages.saturating_add(1);
-            return;
-        }
-        if self.expected.is_none() {
-            let Ok(bitmap_len) = usize::try_from(frame.total.div_ceil(8)) else {
-                self.malformed_messages = self.malformed_messages.saturating_add(1);
-                return;
-            };
-            self.expected = Some(frame.total);
-            self.seen = vec![0; bitmap_len];
-        }
-        if self.expected != Some(frame.total) {
-            self.malformed_messages = self.malformed_messages.saturating_add(1);
-            return;
-        }
-        let event_timestamp = value["timestamp_ms"].as_u64();
-        if event_timestamp != Some(frame.timestamp_ms) {
-            self.malformed_messages = self.malformed_messages.saturating_add(1);
-            return;
-        }
-        let Ok(byte) = usize::try_from(frame.sequence / 8) else {
-            self.malformed_messages = self.malformed_messages.saturating_add(1);
-            return;
-        };
-        let mask = 1_u8 << (frame.sequence % 8);
-        if self.seen[byte] & mask != 0 {
-            self.duplicates = self.duplicates.saturating_add(1);
-            return;
-        }
-        self.seen[byte] |= mask;
-        if self
-            .highest_sequence
-            .is_some_and(|highest| frame.sequence < highest)
-        {
-            self.out_of_order = self.out_of_order.saturating_add(1);
-        }
-        self.highest_sequence = Some(
-            self.highest_sequence
-                .map_or(frame.sequence, |highest| highest.max(frame.sequence)),
-        );
-        self.unique = self.unique.saturating_add(1);
-        self.body_bytes = self
-            .body_bytes
-            .saturating_add(u64::try_from(body.len()).unwrap_or(u64::MAX));
-
-        let Some(latency) = received_timestamp_ms.checked_sub(frame.timestamp_ms) else {
-            self.latency_clock_invalid = self.latency_clock_invalid.saturating_add(1);
-            return;
-        };
-        if latency > MAX_LATENCY_MS {
-            self.latency_clock_invalid = self.latency_clock_invalid.saturating_add(1);
-        } else {
-            self.record_latency_sample(latency, frame.sequence, MAX_LATENCY_SAMPLES);
-        }
-    }
-
-    fn record_event_at(&mut self, value: &serde_json::Value, received_timestamp_ms: u64) {
-        match value["type"].as_str() {
-            Some("message") => self.record_message_at(value, received_timestamp_ms),
-            Some("lagged") if value["source"] == "local" => {
-                self.local_lag_events = self.local_lag_events.saturating_add(1);
-                self.local_dropped = self
-                    .local_dropped
-                    .saturating_add(value["dropped"].as_u64().unwrap_or(0));
-            }
-            Some("lagged") if value["source"] == "gossip" => {
-                self.gossip_lag_events = self.gossip_lag_events.saturating_add(1);
-            }
-            Some("peer_up") => self.peer_up = self.peer_up.saturating_add(1),
-            Some("peer_down") => self.peer_down = self.peer_down.saturating_add(1),
-            _ => {}
-        }
-    }
-
-    fn record_event(&mut self, value: &serde_json::Value) {
-        self.record_event_at(value, unix_timestamp_ms().unwrap_or(0));
-    }
-
-    fn percentile(sorted: &[u64], percentile: usize) -> Option<u64> {
-        if sorted.is_empty() || !(1..=100).contains(&percentile) {
-            return None;
-        }
-        let rank = percentile
-            .checked_mul(sorted.len())?
-            .checked_add(99)?
-            .checked_div(100)?;
-        sorted.get(rank.checked_sub(1)?).copied()
-    }
-
-    fn missing_sequence_sample(&self) -> Vec<u64> {
-        let Some(expected) = self.expected else {
-            return Vec::new();
-        };
-        (0..expected)
-            .filter(|sequence| {
-                let Ok(byte) = usize::try_from(*sequence / 8) else {
-                    return false;
-                };
-                let mask = 1_u8 << (*sequence % 8);
-                self.seen
-                    .get(byte)
-                    .is_some_and(|observed| observed & mask == 0)
-            })
-            .take(MAX_MISSING_SEQUENCE_SAMPLE)
-            .collect()
-    }
-
-    fn progress(&self, elapsed: Duration) -> serde_json::Value {
-        // Keep live percentile work small enough that rendering cannot starve the
-        // subscription loop. The final summary still uses the full reservoir.
-        let stride = self
-            .latencies
-            .len()
-            .div_ceil(MAX_PROGRESS_LATENCY_SAMPLES)
-            .max(1);
-        let mut latencies = self
-            .latencies
-            .iter()
-            .step_by(stride)
-            .take(MAX_PROGRESS_LATENCY_SAMPLES)
-            .copied()
-            .collect::<Vec<_>>();
-        latencies.sort_unstable();
-        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
-        let missing = self
-            .expected
-            .map(|expected| expected.saturating_sub(self.unique));
-        let incomplete = self.local_lag_events > 0 || self.gossip_lag_events > 0;
-        serde_json::json!({
-            "type":"bench_receive_progress", "schema_version":1,
-            "run_id":self.run_id, "elapsed_ms":elapsed_ms, "expected":self.expected,
-            "unique":self.unique, "missing":missing,
-            "duplicates":self.duplicates, "out_of_order":self.out_of_order,
-            "highest_sequence":self.highest_sequence, "body_bytes":self.body_bytes,
-            "achieved_messages_per_second":self.unique as f64 / elapsed_seconds,
-            "achieved_body_bytes_per_second":self.body_bytes as f64 / elapsed_seconds,
-            "latency":{
-                "observations":self.latency_observations,
-                "samples":latencies.len(),
-                "sampled":self.latency_sampled || self.latencies.len() > latencies.len(),
-                "clock_invalid":self.latency_clock_invalid,
-                "p50_ms":Self::percentile(&latencies, 50),
-                "p95_ms":Self::percentile(&latencies, 95),
-                "p99_ms":Self::percentile(&latencies, 99)
-            },
-            "lag":{
-                "local_events":self.local_lag_events, "local_dropped":self.local_dropped,
-                "gossip_events":self.gossip_lag_events, "incomplete":incomplete
-            },
-            "malformed_messages":self.malformed_messages
-        })
-    }
-
-    fn summary(&mut self, completion_reason: &str, elapsed: Duration) -> serde_json::Value {
-        self.latencies.sort_unstable();
-        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        let elapsed_seconds = elapsed_ms.max(1) as f64 / 1000.0;
-        let missing = self
-            .expected
-            .map(|expected| expected.saturating_sub(self.unique));
-        let incomplete = self.local_lag_events > 0 || self.gossip_lag_events > 0;
-        let complete = self
-            .expected
-            .is_some_and(|expected| expected == self.unique);
-        let measurement_valid = complete && !incomplete && self.malformed_messages == 0;
-        let missing_sequence_sample = self.missing_sequence_sample();
-        serde_json::json!({
-            "type":"bench_receive_summary", "schema_version":1,
-            "run_id":self.run_id, "completion_reason":completion_reason,
-            "elapsed_ms":elapsed_ms, "expected":self.expected,
-            "complete":complete, "measurement_valid":measurement_valid,
-            "unique":self.unique, "missing":missing,
-            "missing_sequence_sample":missing_sequence_sample,
-            "duplicates":self.duplicates, "out_of_order":self.out_of_order,
-            "highest_sequence":self.highest_sequence,
-            "body_bytes":self.body_bytes,
-            "achieved_messages_per_second":self.unique as f64 / elapsed_seconds,
-            "achieved_body_bytes_per_second":self.body_bytes as f64 / elapsed_seconds,
-            "latency":{
-                "observations":self.latency_observations,
-                "samples":self.latencies.len(), "sampled":self.latency_sampled,
-                "clock_invalid":self.latency_clock_invalid,
-                "p50_ms":Self::percentile(&self.latencies, 50),
-                "p95_ms":Self::percentile(&self.latencies, 95),
-                "p99_ms":Self::percentile(&self.latencies, 99)
-            },
-            "lag":{
-                "local_events":self.local_lag_events, "local_dropped":self.local_dropped,
-                "gossip_events":self.gossip_lag_events, "incomplete":incomplete
-            },
-            "peer_up":self.peer_up, "peer_down":self.peer_down,
-            "ignored_messages":self.ignored_messages,
-            "malformed_messages":self.malformed_messages
-        })
-    }
-}
-
-async fn bench_receive_events(
-    dir: &Path,
-    run_id: String,
-    duration_secs: u64,
-    expected: Option<u64>,
-    events: mpsc::Sender<serde_json::Value>,
-    mut cancellation: oneshot::Receiver<()>,
-) -> Result<()> {
-    anyhow::ensure!(valid_run_id(&run_id), "invalid benchmark run ID");
-    anyhow::ensure!(
-        (1..=86_400).contains(&duration_secs),
-        "duration must be between 1 and 86400 seconds"
-    );
-    let mut stats = BenchReceiveStats::new(run_id.clone(), expected)?;
-    let request_id = contracts::new_request_id();
-    let startup = async {
-        let mut reader = subscribe_with_id(dir, &request_id).await?;
-        let connected = reader
-            .read()
-            .await?
-            .context("local daemon stopped before benchmark receiver connected")?;
-        Result::<_>::Ok((reader, connected))
-    };
-    let (mut reader, connected) =
-        await_bench_startup(startup, &mut cancellation, BENCH_CLIENT_STARTUP_TIMEOUT).await?;
-    ensure_success(&connected)?;
-    anyhow::ensure!(
-        connected["type"] == "connected",
-        "unexpected daemon subscription response"
-    );
-    let started_value = contracts::correlate(
-        serde_json::json!({
-            "type":"bench_receive_started", "schema_version":1,
-            "run_id":run_id, "duration_secs":duration_secs, "expected":expected
-        }),
-        &request_id,
-    );
-    validate_success_payload(&started_value)?;
-    emit_bench_terminal(&events, started_value).await;
-    let started = StdInstant::now();
-    let deadline = tokio::time::sleep(Duration::from_secs(duration_secs));
-    tokio::pin!(deadline);
-    let mut progress = tokio::time::interval(Duration::from_millis(250));
-    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    progress.tick().await;
-    let mut completion_reason = "deadline";
-    let mut terminal_error = None;
-    loop {
-        tokio::select! {
-            value = reader.read() => match value {
-                Ok(Some(value)) if value["type"] == "error" => {
-                    completion_reason = "daemon_stopped";
-                    let error = ErrorEnvelopeV1::from_value(&value)?;
-                    terminal_error = Some(match validate_started_benchmark_error(&error, &request_id) {
-                        Ok(()) => anyhow::Error::new(contracts::ContractFailure(error)),
-                        Err(error) => error.context(benchmark_contract_failure(
-                            &request_id, "invalid_daemon_response", "partial", false,
-                        )),
-                    });
-                    break;
-                }
-                Ok(Some(value)) => stats.record_event(&value),
-                Ok(None) => {
-                    completion_reason = "daemon_stopped";
-                    terminal_error = Some(anyhow::Error::new(benchmark_contract_failure(
-                        &request_id, "daemon_disconnected", "partial", true,
-                    )));
-                    break;
-                }
-                Err(error) => {
-                    completion_reason = "daemon_stopped";
-                    let code = if error
-                        .chain()
-                        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
-                    {
-                        "daemon_disconnected"
-                    } else {
-                        "invalid_daemon_response"
-                    };
-                    terminal_error = Some(error.context(benchmark_contract_failure(
-                        &request_id, code, "partial", code == "daemon_disconnected",
-                    )));
-                    break;
-                }
-            },
-            _ = &mut deadline => break,
-            _ = progress.tick() => {
-                let value = contracts::correlate(stats.progress(started.elapsed()), &request_id);
-                validate_success_payload(&value)?;
-                emit_bench_progress(&events, value);
-            },
-            _ = &mut cancellation => {
-                completion_reason = "interrupted";
-                break;
-            }
-        }
-    }
-    let summary = contracts::correlate(
-        stats.summary(completion_reason, started.elapsed()),
-        &request_id,
-    );
-    validate_success_payload(&summary)?;
-    emit_bench_terminal(&events, summary).await;
-    if let Some(error) = terminal_error {
-        return Err(error);
-    }
-    Ok(())
-}
-
-pub async fn bench_receive(
-    dir: &Path,
-    run_id: String,
-    duration_secs: u64,
-    expected: Option<u64>,
-    json: bool,
-) -> Result<()> {
-    let (cancel_tx, cancel_rx) = oneshot::channel();
-    let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = cancel_tx.send(());
-        } else {
-            std::future::pending::<()>().await;
-        }
-    });
-    let (events, output) = bench_output_worker(json);
-    let result =
-        bench_receive_events(dir, run_id, duration_secs, expected, events, cancel_rx).await;
-    signal.abort();
-    output.await.context("benchmark output worker failed")?;
-    result
-}
-
-pub(crate) async fn bench_receive_tui(
-    dir: &Path,
-    run_id: String,
-    duration_secs: u64,
-    expected: Option<u64>,
-    events: mpsc::Sender<serde_json::Value>,
-    cancellation: oneshot::Receiver<()>,
-) -> Result<()> {
-    bench_receive_events(dir, run_id, duration_secs, expected, events, cancellation).await
-}
-
 pub async fn listen(dir: &Path, json: bool) -> Result<()> {
     let mut reader = subscribe(dir).await?;
     loop {
@@ -7730,7 +6249,6 @@ fn event(json: bool, mut value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::write_value;
     const TEST_OPERATION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
     use iroh_blobs::protocol::ChunkRangesExt;
@@ -8489,7 +7007,6 @@ mod tests {
                 events.subscribe(),
                 connected_fixture(),
                 None,
-                Arc::new(AtomicBool::new(false)),
             ));
             client.write_all(&request).await.unwrap();
             let frame = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
@@ -8541,7 +7058,6 @@ mod tests {
                 "alias":null
             }),
             None,
-            Arc::new(AtomicBool::new(false)),
         ));
         write_request_with_id(
             &mut client,
@@ -8598,7 +7114,6 @@ mod tests {
             events.subscribe(),
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
         ));
         let second_task = tokio::spawn(handle_local_client(
             second_server,
@@ -8606,7 +7121,6 @@ mod tests {
             events.subscribe(),
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
         ));
         write_request(&mut first, &IpcRequest::Subscribe)
             .await
@@ -9557,530 +8071,6 @@ mod tests {
         );
         assert_eq!(body_128.len() - body_127.len(), 2);
         assert_eq!(crate::message::MAX_V2_MESSAGE_BODY_BYTES, 3928);
-    }
-
-    #[test]
-    fn benchmark_body_is_fixed_size_and_strictly_parsed() {
-        let run_id = "0123456789abcdef0123456789abcdef";
-        let body = build_bench_body(run_id, 9, 10, 1_700_000_000_000, 256).unwrap();
-        assert_eq!(body.len(), 256);
-        assert_eq!(
-            parse_bench_body(&body).unwrap(),
-            Some(BenchFrame {
-                run_id,
-                sequence: 9,
-                total: 10,
-                timestamp_ms: 1_700_000_000_000,
-            })
-        );
-        assert!(build_bench_body(run_id, 0, 1, 1_700_000_000_000, 105).is_err());
-        assert!(parse_bench_body("ordinary chat message").unwrap().is_none());
-        assert!(parse_bench_body(&body.replace("meshmsg-bench-v1", "meshmsg-bench-v2")).is_err());
-        assert!(
-            parse_bench_body(&body.replace("00000000000000000009", "00000000000000000010"))
-                .is_err()
-        );
-        assert!(parse_bench_body(&body.replace('x', "|")).is_err());
-    }
-
-    #[test]
-    fn benchmark_payload_preflight_uses_exact_envelope_limit() {
-        let run_id = "0123456789abcdef0123456789abcdef";
-        let secret = SecretKey::generate();
-        let largest_payload = (106..MAX_ENVELOPE_SIZE)
-            .rev()
-            .find(|payload_bytes| {
-                let body =
-                    build_bench_body(run_id, 0, 1, 9_999_999_999_999, *payload_bytes).unwrap();
-                Envelope::encode_at(
-                    &secret,
-                    test_topic(),
-                    EnvelopeKind::Message,
-                    body,
-                    9_999_999_999_999,
-                )
-                .is_ok()
-            })
-            .unwrap();
-        let config = BenchConfig {
-            run_id: run_id.parse().unwrap(),
-            rate: 1,
-            duration_secs: 1,
-            payload_bytes: largest_payload,
-        };
-        assert_eq!(validate_bench_config(&config).unwrap(), 1);
-        let mut too_small = config.clone();
-        too_small.payload_bytes = 105;
-        assert!(validate_bench_config(&too_small).is_err());
-        let mut too_large = config;
-        too_large.payload_bytes = largest_payload + 1;
-        assert!(validate_bench_config(&too_large).is_err());
-    }
-
-    #[test]
-    fn benchmark_config_boundaries_are_authoritatively_validated() {
-        let base = BenchConfig {
-            run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-            rate: 1,
-            duration_secs: 1,
-            payload_bytes: 106,
-        };
-        for invalid in [
-            BenchConfig {
-                rate: 0,
-                ..base.clone()
-            },
-            BenchConfig {
-                rate: 10_001,
-                ..base.clone()
-            },
-            BenchConfig {
-                duration_secs: 0,
-                ..base.clone()
-            },
-            BenchConfig {
-                duration_secs: 86_401,
-                ..base.clone()
-            },
-            BenchConfig {
-                rate: 10_000,
-                duration_secs: 1_001,
-                ..base.clone()
-            },
-        ] {
-            assert!(
-                validate_bench_config(&invalid).is_err(),
-                "accepted {invalid:?}"
-            );
-        }
-        assert_eq!(
-            validate_bench_config(&BenchConfig {
-                duration_secs: 86_400,
-                ..base.clone()
-            })
-            .unwrap(),
-            86_400
-        );
-        assert_eq!(
-            validate_bench_config(&BenchConfig {
-                rate: 10_000,
-                duration_secs: 1_000,
-                ..base
-            })
-            .unwrap(),
-            MAX_BENCH_MESSAGES
-        );
-    }
-
-    #[tokio::test]
-    async fn benchmark_startup_cancellation_breaks_a_stalled_handshake() {
-        let (cancel, mut cancellation) = oneshot::channel();
-        cancel.send(()).unwrap();
-        let error = await_bench_startup(
-            std::future::pending::<Result<()>>(),
-            &mut cancellation,
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("interrupted"));
-    }
-
-    #[tokio::test]
-    async fn benchmark_progress_never_waits_for_a_blocked_sink_and_summary_is_retained() {
-        let (events, mut output) = mpsc::channel(1);
-        emit_bench_terminal(&events, serde_json::json!({"type":"started"})).await;
-
-        emit_bench_progress(&events, serde_json::json!({"type":"progress"}));
-        assert_eq!(output.recv().await.unwrap()["type"], "started");
-        assert!(output.try_recv().is_err());
-
-        emit_bench_terminal(&events, serde_json::json!({"type":"occupied"})).await;
-        let terminal = tokio::spawn({
-            let events = events.clone();
-            async move {
-                emit_bench_terminal(&events, serde_json::json!({"type":"summary"})).await;
-            }
-        });
-        tokio::task::yield_now().await;
-        assert!(!terminal.is_finished());
-        assert_eq!(output.recv().await.unwrap()["type"], "occupied");
-        terminal.await.unwrap();
-        assert_eq!(output.recv().await.unwrap()["type"], "summary");
-    }
-
-    #[test]
-    fn benchmark_subscription_disconnect_classifies_eof_and_read_errors() {
-        let eof =
-            benchmark_subscription_value(Ok(None), "daemon stopped cleanly", "read daemon stream")
-                .unwrap_err();
-        assert_eq!(eof.to_string(), "daemon stopped cleanly");
-
-        let reset = benchmark_subscription_value(
-            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "scripted reset").into()),
-            "daemon stopped cleanly",
-            "read daemon stream",
-        )
-        .unwrap_err();
-        assert_eq!(reset.to_string(), "read daemon stream");
-        assert!(format!("{reset:#}").contains("scripted reset"));
-    }
-
-    #[test]
-    fn disconnected_sender_summary_preserves_latest_partial_snapshot() {
-        let config = BenchConfig {
-            run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-            rate: 10,
-            duration_secs: 1,
-            payload_bytes: 128,
-        };
-        let progress = contracts::correlate(
-            bench_send_progress(
-                &config,
-                10,
-                &BenchSendStats {
-                    attempted: 3,
-                    queued: 3,
-                    schedule_missed: 1,
-                    body_bytes: 384,
-                    envelope_bytes: 900,
-                    ..BenchSendStats::default()
-                },
-                Duration::from_millis(400),
-            ),
-            "11111111111111111111111111111111",
-        );
-        let summary = disconnected_send_summary(
-            &config,
-            10,
-            Some(&progress),
-            Duration::from_secs(1),
-            "11111111111111111111111111111111",
-            "daemon_stopped",
-        );
-        assert_eq!(summary["type"], "bench_send_summary");
-        assert_eq!(summary["completion_reason"], "daemon_stopped");
-        assert_eq!(summary["attempted"], 3);
-        assert_eq!(summary["queued"], 3);
-        assert_eq!(summary["schedule_missed"], 1);
-        assert_eq!(summary["accounting_complete"], false);
-        assert!(summary["first_error"].is_null());
-        assert!(
-            validate_success_payload(&summary).is_err(),
-            "client-only partial snapshots must not validate as daemon summaries"
-        );
-    }
-
-    #[test]
-    fn benchmark_schedule_and_sender_summary_are_deterministic() {
-        let period = Duration::from_millis(100);
-        assert_eq!(benchmark_due_slots(Duration::MAX, Duration::ZERO, 10), 0);
-        assert_eq!(
-            benchmark_due_slots(Duration::MAX, Duration::from_nanos(1), 10),
-            10
-        );
-        assert_eq!(benchmark_due_slots(Duration::ZERO, period, 10), 1);
-        assert_eq!(
-            benchmark_due_slots(Duration::from_millis(99), period, 10),
-            1
-        );
-        assert_eq!(
-            benchmark_due_slots(Duration::from_millis(100), period, 10),
-            2
-        );
-        assert_eq!(
-            benchmark_due_slots(Duration::from_millis(550), period, 10),
-            6
-        );
-        assert_eq!(benchmark_due_slots(Duration::from_secs(1), period, 10), 10);
-        let mut next_slot = 0;
-        let mut schedule_missed = 0;
-        assert_eq!(
-            advance_benchmark_slot(1, &mut next_slot, &mut schedule_missed),
-            0
-        );
-        assert_eq!(
-            advance_benchmark_slot(6, &mut next_slot, &mut schedule_missed),
-            5
-        );
-        assert_eq!(schedule_missed, 4);
-        assert_eq!(
-            advance_benchmark_slot(7, &mut next_slot, &mut schedule_missed),
-            6
-        );
-        assert_eq!(schedule_missed, 4);
-
-        let config = BenchConfig {
-            run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-            rate: 10,
-            duration_secs: 1,
-            payload_bytes: 128,
-        };
-        let stats = BenchSendStats {
-            attempted: 7,
-            queued: 6,
-            failed: 1,
-            incomplete: 0,
-            schedule_missed: 2,
-            body_bytes: 768,
-            envelope_bytes: 1_200,
-            first_error: Some(contracts::BENCHMARK_SEND_FAILED_MESSAGE.into()),
-        };
-        let progress = bench_send_progress(&config, 10, &stats, Duration::from_millis(500));
-        assert_object_keys(
-            &progress,
-            &[
-                "type",
-                "schema_version",
-                "run_id",
-                "rate",
-                "duration_secs",
-                "payload_bytes",
-                "planned",
-                "attempted",
-                "queued",
-                "failed",
-                "incomplete",
-                "schedule_missed",
-                "queued_body_bytes",
-                "queued_envelope_bytes",
-                "elapsed_ms",
-                "achieved_messages_per_second",
-                "achieved_body_bytes_per_second",
-                "delivery_acknowledged",
-            ],
-        );
-        assert_eq!(progress["type"], "bench_send_progress");
-        assert_eq!(progress["schema_version"], 2);
-        assert_eq!(progress["delivery_acknowledged"], false);
-
-        let summary = bench_send_summary(
-            &config,
-            10,
-            &stats,
-            "send_failed",
-            Duration::from_millis(500),
-        );
-        assert_object_keys(
-            &summary,
-            &[
-                "type",
-                "schema_version",
-                "run_id",
-                "rate",
-                "duration_secs",
-                "payload_bytes",
-                "planned",
-                "attempted",
-                "queued",
-                "failed",
-                "incomplete",
-                "schedule_missed",
-                "queued_body_bytes",
-                "queued_envelope_bytes",
-                "elapsed_ms",
-                "achieved_messages_per_second",
-                "achieved_body_bytes_per_second",
-                "accounting_complete",
-                "completion_reason",
-                "first_error",
-                "delivery_acknowledged",
-            ],
-        );
-        assert_eq!(summary["type"], "bench_send_summary");
-        assert_eq!(summary["schema_version"], 2);
-        assert_eq!(summary["planned"], 10);
-        assert_eq!(summary["attempted"], 7);
-        assert_eq!(summary["queued"], 6);
-        assert_eq!(summary["failed"], 1);
-        assert_eq!(summary["schedule_missed"], 2);
-        assert_eq!(summary["queued_body_bytes"], 768);
-        assert_eq!(summary["accounting_complete"], true);
-        assert_eq!(summary["completion_reason"], "send_failed");
-        assert_eq!(
-            summary["first_error"],
-            contracts::BENCHMARK_SEND_FAILED_MESSAGE
-        );
-        assert_eq!(summary["delivery_acknowledged"], false);
-        assert_eq!(summary["achieved_messages_per_second"], 12.0);
-    }
-
-    #[test]
-    fn benchmark_receiver_counts_unique_order_missing_and_lag() {
-        let run_id = "0123456789abcdef0123456789abcdef";
-        let timestamp_ms = unix_timestamp_ms().unwrap();
-        let mut stats = BenchReceiveStats::new(run_id.into(), Some(4)).unwrap();
-        for sequence in [2, 0, 2, 1] {
-            let body = build_bench_body(run_id, sequence, 4, timestamp_ms, 128).unwrap();
-            stats.record_event_at(
-                &serde_json::json!({
-                    "type":"message", "timestamp_ms":timestamp_ms, "body":body
-                }),
-                timestamp_ms + 25,
-            );
-        }
-        stats.record_event_at(
-            &serde_json::json!({
-                "type":"message", "timestamp_ms":timestamp_ms,
-                "body":build_bench_body("ffffffffffffffffffffffffffffffff", 0, 1, timestamp_ms, 128).unwrap()
-            }),
-            timestamp_ms + 25,
-        );
-        stats.record_event(&serde_json::json!({
-            "type":"lagged", "source":"local", "dropped":7
-        }));
-        stats.record_event(&serde_json::json!({
-            "type":"lagged", "source":"gossip", "dropped":null
-        }));
-        let summary = stats.summary("deadline", Duration::from_secs(1));
-        assert_object_keys(
-            &summary,
-            &[
-                "type",
-                "schema_version",
-                "run_id",
-                "completion_reason",
-                "elapsed_ms",
-                "expected",
-                "complete",
-                "measurement_valid",
-                "unique",
-                "missing",
-                "missing_sequence_sample",
-                "duplicates",
-                "out_of_order",
-                "highest_sequence",
-                "body_bytes",
-                "achieved_messages_per_second",
-                "achieved_body_bytes_per_second",
-                "latency",
-                "lag",
-                "peer_up",
-                "peer_down",
-                "ignored_messages",
-                "malformed_messages",
-            ],
-        );
-        assert_object_keys(
-            &summary["latency"],
-            &[
-                "observations",
-                "samples",
-                "sampled",
-                "clock_invalid",
-                "p50_ms",
-                "p95_ms",
-                "p99_ms",
-            ],
-        );
-        assert_object_keys(
-            &summary["lag"],
-            &[
-                "local_events",
-                "local_dropped",
-                "gossip_events",
-                "incomplete",
-            ],
-        );
-        assert_eq!(summary["unique"], 3);
-        assert_eq!(summary["missing"], 1);
-        assert_eq!(summary["missing_sequence_sample"], serde_json::json!([3]));
-        assert_eq!(summary["duplicates"], 1);
-        assert_eq!(summary["out_of_order"], 2);
-        assert_eq!(summary["ignored_messages"], 1);
-        assert_eq!(summary["lag"]["local_events"], 1);
-        assert_eq!(summary["lag"]["local_dropped"], 7);
-        assert_eq!(summary["lag"]["gossip_events"], 1);
-        assert_eq!(summary["lag"]["incomplete"], true);
-        assert_eq!(summary["measurement_valid"], false);
-        assert_eq!(summary["latency"]["observations"], 3);
-        assert_eq!(summary["latency"]["p50_ms"], 25);
-    }
-
-    #[test]
-    fn benchmark_receiver_progress_is_stable_and_does_not_reorder_samples() {
-        let mut stats =
-            BenchReceiveStats::new("0123456789abcdef0123456789abcdef".into(), None).unwrap();
-        stats.latencies = vec![30, 10, 20];
-        stats.latency_observations = 3;
-        stats.unique = 2;
-        let progress = stats.progress(Duration::from_millis(500));
-
-        assert_object_keys(
-            &progress,
-            &[
-                "type",
-                "schema_version",
-                "run_id",
-                "elapsed_ms",
-                "expected",
-                "unique",
-                "missing",
-                "duplicates",
-                "out_of_order",
-                "highest_sequence",
-                "body_bytes",
-                "achieved_messages_per_second",
-                "achieved_body_bytes_per_second",
-                "latency",
-                "lag",
-                "malformed_messages",
-            ],
-        );
-        assert_eq!(progress["type"], "bench_receive_progress");
-        assert_eq!(progress["schema_version"], 1);
-        assert!(progress["missing"].is_null());
-        assert_eq!(progress["latency"]["p50_ms"], 20);
-        assert_eq!(progress["latency"]["p95_ms"], 30);
-        assert_eq!(stats.latencies, vec![30, 10, 20]);
-    }
-
-    #[test]
-    fn benchmark_latency_reservoir_is_bounded_and_deterministic() {
-        let mut left =
-            BenchReceiveStats::new("0123456789abcdef0123456789abcdef".into(), Some(10)).unwrap();
-        let mut right =
-            BenchReceiveStats::new("0123456789abcdef0123456789abcdef".into(), Some(10)).unwrap();
-        for sequence in 0..10 {
-            left.record_latency_sample(sequence, sequence, 3);
-            right.record_latency_sample(sequence, sequence, 3);
-        }
-        assert_eq!(left.latency_observations, 10);
-        assert_eq!(left.latencies.len(), 3);
-        assert!(left.latency_sampled);
-        assert_eq!(left.latencies, right.latencies);
-        assert_ne!(left.latencies, vec![7, 8, 9]);
-    }
-
-    #[test]
-    fn benchmark_receiver_handles_clock_skew_learning_and_bounded_missing_sample() {
-        let run_id = "0123456789abcdef0123456789abcdef";
-        let timestamp_ms = 1_700_000_000_000;
-        let mut stats = BenchReceiveStats::new(run_id.into(), None).unwrap();
-        for (sequence, received_timestamp_ms) in [
-            (0, timestamp_ms - 1),
-            (150, timestamp_ms + MAX_LATENCY_MS + 1),
-        ] {
-            let body = build_bench_body(run_id, sequence, 200, timestamp_ms, 128).unwrap();
-            stats.record_event_at(
-                &serde_json::json!({
-                    "type":"message", "timestamp_ms":timestamp_ms, "body":body
-                }),
-                received_timestamp_ms,
-            );
-        }
-        let summary = stats.summary("deadline", Duration::from_secs(1));
-        assert_eq!(summary["expected"], 200);
-        assert_eq!(summary["unique"], 2);
-        assert_eq!(summary["missing"], 198);
-        assert_eq!(
-            summary["missing_sequence_sample"].as_array().unwrap().len(),
-            MAX_MISSING_SEQUENCE_SAMPLE
-        );
-        assert_eq!(summary["latency"]["observations"], 0);
-        assert_eq!(summary["latency"]["samples"], 0);
-        assert_eq!(summary["latency"]["clock_invalid"], 2);
-        assert!(summary["latency"]["p50_ms"].is_null());
     }
 
     #[test]
@@ -12344,511 +10334,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn post_start_benchmark_errors_are_normalized_or_preserved_by_outcome() {
-        for (code, outcome, correlation, expected_code, expected_outcome, retryable) in [
-            (
-                "command_timeout",
-                "not_started",
-                "matching",
-                "invalid_daemon_response",
-                "partial",
-                false,
-            ),
-            (
-                "command_timeout",
-                "partial",
-                "matching",
-                "command_timeout",
-                "partial",
-                true,
-            ),
-            (
-                "command_timeout",
-                "unknown",
-                "matching",
-                "command_timeout",
-                "unknown",
-                true,
-            ),
-            (
-                "ipc_capacity",
-                "partial",
-                "missing",
-                "invalid_daemon_response",
-                "partial",
-                false,
-            ),
-            (
-                "initial_frame_timeout",
-                "unknown",
-                "missing",
-                "invalid_daemon_response",
-                "partial",
-                false,
-            ),
-            (
-                "command_timeout",
-                "partial",
-                "missing",
-                "invalid_daemon_response",
-                "partial",
-                false,
-            ),
-            (
-                "ipc_capacity",
-                "unknown",
-                "mismatched",
-                "invalid_daemon_response",
-                "partial",
-                false,
-            ),
-            (
-                "initial_frame_timeout",
-                "partial",
-                "mismatched",
-                "invalid_daemon_response",
-                "partial",
-                false,
-            ),
-            (
-                "command_timeout",
-                "unknown",
-                "mismatched",
-                "invalid_daemon_response",
-                "partial",
-                false,
-            ),
-        ] {
-            let dir = std::env::temp_dir().join(format!(
-                "meshmsg-benchmark-error-test-{}",
-                rand::random::<u64>()
-            ));
-            let state_lock = StateLock::acquire(&dir).unwrap();
-            let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
-            let server = tokio::spawn(async move {
-                let mut stream = listener.accept().await.unwrap();
-                let frame = read_frame(&mut stream, MAX_IPC_REQUEST_SIZE).await.unwrap();
-                let request: IpcRequestFrame = serde_json::from_slice(&frame).unwrap();
-                let IpcRequest::BenchSend { config } = request.request else {
-                    panic!("expected benchmark send request")
-                };
-                write_value(
-                    &mut stream,
-                    &contracts::correlate(
-                        serde_json::json!({
-                            "protocol_version":2, "type":"bench_send_started", "schema_version":2,
-                            "run_id":config.run_id, "rate":config.rate,
-                            "duration_secs":config.duration_secs,
-                            "payload_bytes":config.payload_bytes, "planned":1,
-                            "delivery_acknowledged":false
-                        }),
-                        &request.request_id,
-                    ),
-                )
-                .await
-                .unwrap();
-                let request_id = match correlation {
-                    "matching" => Some(request.request_id),
-                    "missing" => None,
-                    "mismatched" => Some("f".repeat(32).parse().unwrap()),
-                    _ => unreachable!(),
-                };
-                let error = serde_json::json!({
-                    "protocol_version":2, "type":"error", "schema_version":1, "code":code,
-                    "message":contracts::error_code_spec(code).unwrap().message,
-                    "outcome":outcome, "retryable":true, "request_id":request_id,
-                });
-                write_value(&mut stream, &error).await.unwrap();
-            });
-
-            let (events, mut output) = mpsc::channel(8);
-            let (cancel, cancellation) = oneshot::channel();
-            let result = bench_send_events(
-                &dir,
-                Some("0123456789abcdef0123456789abcdef".into()),
-                1,
-                1,
-                128,
-                events,
-                cancellation,
-            )
-            .await;
-            drop(cancel);
-            server.await.unwrap();
-            let mut values = Vec::new();
-            while let Some(value) = output.recv().await {
-                values.push(value);
-            }
-            let error = result.unwrap_err();
-            let contract = error
-                .downcast_ref::<contracts::ContractFailure>()
-                .unwrap_or_else(|| panic!("benchmark error remains authoritative: {error:#}"));
-            assert_eq!(contract.0.code, expected_code);
-            assert_eq!(contract.0.outcome, expected_outcome);
-            assert_eq!(contract.0.retryable, retryable);
-            assert_eq!(values.len(), 2);
-            assert_eq!(
-                contract.0.request_id.as_deref(),
-                values[0]["request_id"].as_str()
-            );
-            assert_eq!(values[0]["type"], "bench_send_started");
-            assert_eq!(values[1]["type"], "bench_send_summary");
-            assert_eq!(values[1]["accounting_complete"], false);
-            assert_eq!(values[1]["completion_reason"], "daemon_stopped");
-            assert_eq!(
-                values[0]["request_id"], values[1]["request_id"],
-                "synthesized summary must retain benchmark correlation"
-            );
-
-            drop(guard);
-            drop(state_lock);
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn receive_benchmark_rejects_post_start_error_correlation_failures() {
-        for (code, outcome, correlation) in [
-            ("ipc_capacity", "partial", "missing"),
-            ("initial_frame_timeout", "unknown", "missing"),
-            ("command_timeout", "partial", "missing"),
-            ("ipc_capacity", "unknown", "mismatched"),
-            ("initial_frame_timeout", "partial", "mismatched"),
-            ("command_timeout", "unknown", "mismatched"),
-        ] {
-            let dir = std::env::temp_dir().join(format!(
-                "meshmsg-receive-error-test-{}",
-                rand::random::<u64>()
-            ));
-            let state_lock = StateLock::acquire(&dir).unwrap();
-            let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
-            let server = tokio::spawn(async move {
-                let mut stream = listener.accept().await.unwrap();
-                let frame = read_frame(&mut stream, MAX_IPC_REQUEST_SIZE).await.unwrap();
-                let request: IpcRequestFrame = serde_json::from_slice(&frame).unwrap();
-                assert!(matches!(request.request, IpcRequest::Subscribe));
-                write_value(
-                    &mut stream,
-                    &contracts::correlate(
-                        serde_json::json!({
-                            "protocol_version":2, "type":"connected", "schema_version":1,
-                            "peer":"2".repeat(64), "endpoint_online":true,
-                            "topic_joined":true, "alias":null
-                        }),
-                        &request.request_id,
-                    ),
-                )
-                .await
-                .unwrap();
-                let request_id: Option<meshmsg_protocol::RequestId> = match correlation {
-                    "missing" => None,
-                    "mismatched" => Some("f".repeat(32).parse().unwrap()),
-                    _ => unreachable!(),
-                };
-                let error = serde_json::json!({
-                    "protocol_version":2, "type":"error", "schema_version":1, "code":code,
-                    "message":contracts::error_code_spec(code).unwrap().message,
-                    "outcome":outcome, "retryable":true, "request_id":request_id,
-                });
-                write_value(&mut stream, &error).await.unwrap();
-            });
-
-            let (events, mut output) = mpsc::channel(8);
-            let (cancel, cancellation) = oneshot::channel();
-            let result = bench_receive_events(
-                &dir,
-                "0123456789abcdef0123456789abcdef".into(),
-                1,
-                Some(1),
-                events,
-                cancellation,
-            )
-            .await;
-            drop(cancel);
-            server.await.unwrap();
-            let mut values = Vec::new();
-            while let Some(value) = output.recv().await {
-                values.push(value);
-            }
-            let error = result.unwrap_err();
-            let contract = error
-                .downcast_ref::<contracts::ContractFailure>()
-                .unwrap_or_else(|| panic!("benchmark error remains authoritative: {error:#}"));
-            assert_eq!(contract.0.code, "invalid_daemon_response");
-            assert_eq!(contract.0.outcome, "partial");
-            assert!(!contract.0.retryable);
-            assert_eq!(values.len(), 2);
-            assert_eq!(values[0]["type"], "bench_receive_started");
-            assert_eq!(values[1]["type"], "bench_receive_summary");
-            assert_eq!(values[1]["completion_reason"], "daemon_stopped");
-            assert_eq!(values[0]["request_id"], values[1]["request_id"]);
-            assert_eq!(
-                contract.0.request_id.as_deref(),
-                values[0]["request_id"].as_str()
-            );
-
-            drop(guard);
-            drop(state_lock);
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn benchmark_sender_cancellation_round_trips_through_strict_ipc_client() {
-        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
-        let request_id = "11111111111111111111111111111111";
-        let (commands, mut command_rx) = mpsc::channel(1);
-        let (_events, receiver) = broadcast::channel(1);
-        let busy = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(handle_local_client(
-            server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
-            busy.clone(),
-        ));
-        write_request_with_id(
-            &mut client,
-            &IpcRequest::BenchSend {
-                config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-                    rate: 1,
-                    duration_secs: 10,
-                    payload_bytes: 128,
-                },
-            },
-            request_id,
-        )
-        .await
-        .unwrap();
-        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
-        let started = reader.read().await.unwrap().unwrap();
-        assert_eq!(started["type"], "bench_send_started");
-        assert_eq!(started["schema_version"], 2);
-        let command = tokio::time::timeout(Duration::from_secs(1), command_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let DaemonCommand::BenchMessage { cancel, reply, .. } = command else {
-            panic!("expected benchmark message")
-        };
-        reader.get_mut().write_all(b"\n").await.unwrap();
-        assert!(cancel.await.is_ok());
-        drop(reply);
-        let summary = tokio::time::timeout(Duration::from_secs(1), reader.read())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary["completion_reason"], "interrupted");
-        assert_eq!(summary["attempted"], 1);
-        assert_eq!(summary["queued"], 0);
-        assert_eq!(summary["failed"], 0);
-        assert_eq!(summary["incomplete"], 1);
-        assert_eq!(summary["accounting_complete"], true);
-        task.await.unwrap().unwrap();
-        assert!(!busy.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn benchmark_sender_deadline_round_trips_through_strict_ipc_client() {
-        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
-        let request_id = "11111111111111111111111111111111";
-        let (commands, mut command_rx) = mpsc::channel(1);
-        let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client(
-            server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
-            Arc::new(AtomicBool::new(false)),
-        ));
-        write_request_with_id(
-            &mut client,
-            &IpcRequest::BenchSend {
-                config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-                    rate: 1,
-                    duration_secs: 1,
-                    payload_bytes: 128,
-                },
-            },
-            request_id,
-        )
-        .await
-        .unwrap();
-        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
-        assert_eq!(
-            reader.read().await.unwrap().unwrap()["type"],
-            "bench_send_started"
-        );
-        let command = command_rx.recv().await.unwrap();
-        let DaemonCommand::BenchMessage { reply, .. } = command else {
-            panic!("expected benchmark message")
-        };
-        reply.send(Ok(256)).unwrap();
-        let summary = tokio::time::timeout(Duration::from_secs(2), reader.read())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary["completion_reason"], "deadline");
-        assert_eq!(summary["attempted"], 1);
-        assert_eq!(summary["queued"], 1);
-        assert_eq!(summary["incomplete"], 0);
-        assert_eq!(summary["queued_body_bytes"], 128);
-        assert_eq!(summary["queued_envelope_bytes"], 256);
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn benchmark_sender_reply_channel_loss_round_trips_as_incomplete() {
-        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
-        let request_id = "11111111111111111111111111111111";
-        let (commands, mut command_rx) = mpsc::channel(1);
-        let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client(
-            server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
-            Arc::new(AtomicBool::new(false)),
-        ));
-        write_request_with_id(
-            &mut client,
-            &IpcRequest::BenchSend {
-                config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-                    rate: 1,
-                    duration_secs: 10,
-                    payload_bytes: 128,
-                },
-            },
-            request_id,
-        )
-        .await
-        .unwrap();
-        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
-        assert_eq!(
-            reader.read().await.unwrap().unwrap()["type"],
-            "bench_send_started"
-        );
-        let command = command_rx.recv().await.unwrap();
-        let DaemonCommand::BenchMessage { reply, .. } = command else {
-            panic!("expected benchmark message")
-        };
-        drop(reply);
-        let summary = tokio::time::timeout(Duration::from_secs(1), reader.read())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary["completion_reason"], "daemon_stopped");
-        assert_eq!(summary["attempted"], 1);
-        assert_eq!(summary["queued"], 0);
-        assert_eq!(summary["failed"], 0);
-        assert_eq!(summary["incomplete"], 1);
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn benchmark_sender_command_admission_loss_round_trips_as_incomplete() {
-        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
-        let request_id = "11111111111111111111111111111111";
-        let (commands, command_rx) = mpsc::channel(1);
-        drop(command_rx);
-        let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client(
-            server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
-            Arc::new(AtomicBool::new(false)),
-        ));
-        write_request_with_id(
-            &mut client,
-            &IpcRequest::BenchSend {
-                config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-                    rate: 1,
-                    duration_secs: 10,
-                    payload_bytes: 128,
-                },
-            },
-            request_id,
-        )
-        .await
-        .unwrap();
-        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
-        assert_eq!(
-            reader.read().await.unwrap().unwrap()["type"],
-            "bench_send_started"
-        );
-        let summary = reader.read().await.unwrap().unwrap();
-        assert_eq!(summary["completion_reason"], "daemon_stopped");
-        assert_eq!(summary["attempted"], 1);
-        assert_eq!(summary["queued"], 0);
-        assert_eq!(summary["failed"], 0);
-        assert_eq!(summary["incomplete"], 1);
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn benchmark_sender_failure_round_trips_through_strict_ipc_client() {
-        let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
-        let request_id = "11111111111111111111111111111111";
-        let (commands, mut command_rx) = mpsc::channel(1);
-        let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client(
-            server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
-            Arc::new(AtomicBool::new(false)),
-        ));
-        write_request_with_id(
-            &mut client,
-            &IpcRequest::BenchSend {
-                config: BenchConfig {
-                    run_id: "0123456789abcdef0123456789abcdef".parse().unwrap(),
-                    rate: 100,
-                    duration_secs: 10,
-                    payload_bytes: 128,
-                },
-            },
-            request_id,
-        )
-        .await
-        .unwrap();
-        let mut reader = SubscriptionReader::new_correlated(client, request_id.into());
-        assert_eq!(
-            reader.read().await.unwrap().unwrap()["type"],
-            "bench_send_started"
-        );
-        let command = command_rx.recv().await.unwrap();
-        let DaemonCommand::BenchMessage { reply, .. } = command else {
-            panic!("expected benchmark message")
-        };
-        reply
-            .send(Err("scripted broadcast failure".into()))
-            .unwrap();
-        let summary = reader.read().await.unwrap().unwrap();
-        assert_eq!(summary["completion_reason"], "send_failed");
-        assert_eq!(summary["attempted"], 1);
-        assert_eq!(summary["failed"], 1);
-        assert_eq!(summary["first_error"], "Message submission failed.");
-        task.await.unwrap().unwrap();
-        assert!(command_rx.try_recv().is_err());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn unix_subscriber_receives_events_after_write_half_close() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (commands, _command_rx) = mpsc::channel(1);
@@ -12859,7 +10344,6 @@ mod tests {
             receiver,
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
         ));
         write_request(&mut client, &IpcRequest::Subscribe)
             .await
@@ -12917,7 +10401,6 @@ mod tests {
             receiver,
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
         ));
         write_request(&mut client, &IpcRequest::Subscribe)
             .await
@@ -12950,7 +10433,6 @@ mod tests {
             receiver,
             connected_fixture(),
             Some(startup.clone()),
-            Arc::new(AtomicBool::new(false)),
         ));
         write_request(&mut client, &IpcRequest::Subscribe)
             .await
@@ -12989,7 +10471,6 @@ mod tests {
             receiver,
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
         ));
         write_request(&mut client, &IpcRequest::Subscribe)
             .await
@@ -13039,7 +10520,6 @@ mod tests {
                 events: events.subscribe(),
                 connected: connected_fixture(),
                 startup_peers: None,
-                benchmark_busy: Arc::new(AtomicBool::new(false)),
             })
         })
         .await
@@ -13258,7 +10738,6 @@ mod tests {
             receiver,
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
         ));
         write_request(&mut client, &IpcRequest::Stop).await.unwrap();
@@ -13282,7 +10761,6 @@ mod tests {
             receiver,
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
         ));
         write_request(&mut client, &IpcRequest::Stop).await.unwrap();
@@ -13308,7 +10786,6 @@ mod tests {
             receiver,
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
         ));
         write_request(&mut client, &IpcRequest::Stop).await.unwrap();
@@ -13367,7 +10844,6 @@ mod tests {
             receiver,
             connected_fixture(),
             None,
-            Arc::new(AtomicBool::new(false)),
             short_ipc_timeouts(),
         ));
         write_request(&mut client, &IpcRequest::Status)

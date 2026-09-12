@@ -124,7 +124,7 @@ jobs:
         run: rustup toolchain install 1.91.0 --profile minimal
       - name: Build core and optional web integration binaries
         id: integration-build
-        run: cargo build --locked --features web
+        run: cargo build --locked --features web,bench
       - name: Run authoritative Linux static and integration inventory
         id: linux-integrations
         run: bash tests/run-linux-integrations.sh target/debug/meshmsg

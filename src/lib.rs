@@ -1,5 +1,8 @@
 mod alias;
 mod attachment;
+#[cfg(feature = "bench")]
+mod bench;
+#[cfg(feature = "bench")]
 mod bench_tui;
 mod cli;
 mod config;
@@ -93,11 +96,6 @@ pub async fn entry(arguments: Vec<std::ffi::OsString>) -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let is_bench_tui = matches!(&cli.command, Command::BenchTui);
-    anyhow::ensure!(
-        !(is_bench_tui && cli.json),
-        "--json cannot be used with bench-tui; use bench-send or bench-receive for NDJSON"
-    );
     let dir = cli.state_dir();
     match cli.command {
         Command::Init { force, no_alias } => {
@@ -297,33 +295,16 @@ async fn run(cli: Cli) -> Result<()> {
             node::download(&dir, operation_id, &offer, &output, cli.json).await?
         }
         Command::Listen => node::listen(&dir, cli.json).await?,
-        Command::BenchSend { args } => {
-            node::bench_send(
-                &dir,
-                args.run_id,
-                args.rate,
-                args.duration_secs,
-                args.payload_bytes,
-                cli.json,
-            )
-            .await?
-        }
-        Command::BenchReceive { args } => {
-            node::bench_receive(
-                &dir,
-                args.run_id,
-                args.duration_secs,
-                args.expected,
-                cli.json,
-            )
-            .await?
-        }
-        Command::BenchTui => bench_tui::run(&dir).await?,
         Command::Chat => node::chat(&dir, cli.json).await?,
         Command::Status => node::status(&dir, cli.json).await?,
         Command::Doctor => node::doctor(&dir, cli.json).await?,
     }
     Ok(())
+}
+
+#[cfg(feature = "bench")]
+pub async fn bench_entry(arguments: Vec<std::ffi::OsString>) -> ExitCode {
+    bench::entry(arguments).await
 }
 
 fn save_joined_state(

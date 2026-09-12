@@ -1,4 +1,4 @@
-use crate::node;
+use crate::bench;
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
@@ -111,11 +111,12 @@ impl App {
                     .payload_bytes
                     .parse::<usize>()
                     .context("payload size must be a number")?;
-                node::validate_bench_sender_config(
+                bench::validate_sender_config(
                     &self.run_id,
                     rate,
                     duration_secs,
                     payload_bytes,
+                    false,
                 )?;
                 Ok(Config::Sender {
                     run_id: self.run_id.clone(),
@@ -314,7 +315,7 @@ pub(crate) async fn run(dir: &Path) -> Result<()> {
                                     duration_secs,
                                     payload_bytes,
                                 } => {
-                                    node::bench_send_tui(
+                                    bench::send_tui(
                                         &path,
                                         run_id,
                                         rate,
@@ -330,7 +331,7 @@ pub(crate) async fn run(dir: &Path) -> Result<()> {
                                     duration_secs,
                                     expected,
                                 } => {
-                                    node::bench_receive_tui(
+                                    bench::receive_tui(
                                         &path,
                                         run_id,
                                         duration_secs,
@@ -675,7 +676,7 @@ mod tests {
         let maximum = (106..=4096)
             .rev()
             .find(|payload| {
-                node::validate_bench_sender_config(&app.run_id, 100, 10, *payload).is_ok()
+                bench::validate_sender_config(&app.run_id, 100, 10, *payload, false).is_ok()
             })
             .unwrap();
         app.payload_bytes = maximum.to_string();

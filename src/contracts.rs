@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const SCHEMA_VERSION: u8 = 1;
 pub(crate) const MAX_PUBLIC_MESSAGE_BYTES: usize = 1024;
-pub(crate) const BENCHMARK_SEND_FAILED_MESSAGE: &str = "Message submission failed.";
 
 pub(crate) fn new_request_id() -> String {
     meshmsg_protocol::RequestId::new_random().into_string()
@@ -36,7 +35,6 @@ pub(crate) enum ErrorOperationKind {
     Remove,
     Prune,
     Download,
-    Benchmark,
     Feed,
 }
 
@@ -71,7 +69,6 @@ const ALL_OPERATIONS: &[ErrorOperationKind] = &[
     ErrorOperationKind::Remove,
     ErrorOperationKind::Prune,
     ErrorOperationKind::Download,
-    ErrorOperationKind::Benchmark,
     ErrorOperationKind::Feed,
 ];
 const MUTATIONS: &[ErrorOperationKind] = &[
@@ -154,7 +151,7 @@ pub(crate) fn error_code_spec(code: &str) -> Option<ErrorCodeSpec> {
         "send_failed" => error_spec!(
             code,
             &[("unknown", true), ("partial", false)],
-            &[ErrorOperationKind::Send, ErrorOperationKind::Benchmark]
+            &[ErrorOperationKind::Send]
         ),
         "private_send_failed" => {
             error_spec!(code, UNKNOWN_TRUE, &[ErrorOperationKind::PrivateSend])
@@ -171,12 +168,10 @@ pub(crate) fn error_code_spec(code: &str) -> Option<ErrorCodeSpec> {
         "network_event_rejected" => {
             error_spec!(code, NS_FALSE, &[ErrorOperationKind::Feed])
         }
-        "invalid_benchmark" => error_spec!(code, NS_FALSE, &[ErrorOperationKind::Benchmark]),
         "initial_frame_timeout" => error_spec!(code, NS_TRUE, ALL_OPERATIONS),
         "private_send_busy" | "private_recipient_busy" => {
             error_spec!(code, NS_TRUE, &[ErrorOperationKind::PrivateSend])
         }
-        "benchmark_busy" => error_spec!(code, NS_TRUE, &[ErrorOperationKind::Benchmark]),
         "private_replay_unavailable" => {
             error_spec!(code, NS_TRUE, &[ErrorOperationKind::PrivateSend])
         }
@@ -275,12 +270,11 @@ fn stable_message(code: &str) -> &'static str {
         "initial_frame_timeout" => "The initial local request timed out.",
         "invalid_message" => "The message is invalid.",
         "network_event_rejected" => "A network event was rejected.",
-        "private_send_busy" | "private_recipient_busy" | "benchmark_busy" => {
+        "private_send_busy" | "private_recipient_busy" => {
             "The requested operation is currently busy."
         }
         "private_message_conflict" => "The message ID is bound to different content.",
         "private_replay_unavailable" => "Recipient replay protection is unavailable.",
-        "invalid_benchmark" => "The benchmark configuration is invalid.",
         "attachment_quota_exceeded" => "The attachment storage quota is exceeded.",
         "attachment_min_free_space" => "The attachment free-space reserve is unavailable.",
         "attachment_tag_capacity" => "The attachment pin capacity is exhausted.",
@@ -617,10 +611,7 @@ impl ErrorEnvelopeV1 {
         );
         let operation_required = !matches!(
             operation,
-            ErrorOperationKind::General
-                | ErrorOperationKind::Offers
-                | ErrorOperationKind::Feed
-                | ErrorOperationKind::Benchmark
+            ErrorOperationKind::General | ErrorOperationKind::Offers | ErrorOperationKind::Feed
         );
         anyhow::ensure!(
             operation_required == expected_operation_id.is_some(),
@@ -701,11 +692,9 @@ mod tests {
         "network_event_rejected",
         "private_send_busy",
         "private_recipient_busy",
-        "benchmark_busy",
         "private_message_conflict",
         "private_replay_unavailable",
         "private_delivery_unknown",
-        "invalid_benchmark",
         "attachment_quota_exceeded",
         "attachment_min_free_space",
         "attachment_tag_capacity",
@@ -745,7 +734,6 @@ mod tests {
             ErrorOperationKind::Remove,
             ErrorOperationKind::Prune,
             ErrorOperationKind::Download,
-            ErrorOperationKind::Benchmark,
             ErrorOperationKind::Feed,
         ];
         for code in ERROR_CODES {
@@ -783,7 +771,6 @@ mod tests {
                         operation,
                         ErrorOperationKind::General
                             | ErrorOperationKind::Offers
-                            | ErrorOperationKind::Benchmark
                             | ErrorOperationKind::Feed
                     ))
                     .then(|| "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
@@ -799,7 +786,7 @@ mod tests {
         }
         assert_eq!(
             ERROR_CODES.len(),
-            62,
+            60,
             "update the exhaustive code table when adding a code"
         );
     }

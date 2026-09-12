@@ -62,15 +62,6 @@ impl RequestFrame {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchConfig {
-    pub run_id: OperationId,
-    pub rate: u32,
-    pub duration_secs: u64,
-    pub payload_bytes: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Send {
@@ -81,9 +72,6 @@ pub enum Request {
         operation_id: OperationId,
         to: Recipient,
         body: PrivateBody,
-    },
-    BenchSend {
-        config: BenchConfig,
     },
     Subscribe,
     Status,
@@ -419,9 +407,6 @@ pub enum Response {
     OfferRemoved(LifecycleResult),
     OffersPruned(LifecycleResult),
     DownloadComplete(DownloadResult),
-    BenchSendStarted(BenchSendStarted),
-    BenchSendProgress(BenchSendProgress),
-    BenchSendSummary(BenchSendSummary),
     Stopping {
         outcome: String,
     },
@@ -476,11 +461,7 @@ impl Response {
             | Self::AttachmentShared(_)
             | Self::OfferRemoved(_)
             | Self::OffersPruned(_) => version == 3,
-            Self::PeersSnapshot(_)
-            | Self::DownloadComplete(_)
-            | Self::BenchSendStarted(_)
-            | Self::BenchSendProgress(_)
-            | Self::BenchSendSummary(_) => version == 2,
+            Self::PeersSnapshot(_) | Self::DownloadComplete(_) => version == 2,
         }
     }
 }
@@ -563,9 +544,6 @@ pub enum Event {
         dropped: u64,
         message: String,
     },
-    BenchReceiveStarted(BenchReceiveStarted),
-    BenchReceiveProgress(BenchReceiveProgress),
-    BenchReceiveSummary(BenchReceiveSummary),
     Stopping {},
     Error(ProtocolError),
 }
@@ -605,9 +583,6 @@ impl Event {
             | Self::PeerUp { .. }
             | Self::PeerDown { .. }
             | Self::Lagged { .. }
-            | Self::BenchReceiveStarted(_)
-            | Self::BenchReceiveProgress(_)
-            | Self::BenchReceiveSummary(_)
             | Self::Stopping {}
             | Self::Error(_) => version == 1,
             Self::Message(_)
@@ -939,110 +914,6 @@ pub struct DownloadResult {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchSendStarted {
-    pub run_id: OperationId,
-    pub rate: u32,
-    pub duration_secs: u64,
-    pub payload_bytes: usize,
-    pub planned: u64,
-    pub delivery_acknowledged: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchSendProgress {
-    pub run_id: OperationId,
-    pub rate: u32,
-    pub duration_secs: u64,
-    pub payload_bytes: usize,
-    pub planned: u64,
-    pub attempted: u64,
-    pub queued: u64,
-    pub failed: u64,
-    pub incomplete: u64,
-    pub schedule_missed: u64,
-    pub queued_body_bytes: u64,
-    pub queued_envelope_bytes: u64,
-    pub elapsed_ms: u64,
-    pub achieved_messages_per_second: f64,
-    pub achieved_body_bytes_per_second: f64,
-    pub delivery_acknowledged: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchSendSummary {
-    #[serde(flatten)]
-    pub progress: BenchSendProgress,
-    pub accounting_complete: bool,
-    pub completion_reason: String,
-    pub first_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchLatency {
-    pub observations: u64,
-    pub samples: usize,
-    pub sampled: bool,
-    pub clock_invalid: u64,
-    pub p50_ms: Option<u64>,
-    pub p95_ms: Option<u64>,
-    pub p99_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchLag {
-    pub local_events: u64,
-    pub local_dropped: u64,
-    pub gossip_events: u64,
-    pub incomplete: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchReceiveStarted {
-    pub run_id: OperationId,
-    pub duration_secs: u64,
-    pub expected: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchReceiveProgress {
-    pub run_id: OperationId,
-    pub elapsed_ms: u64,
-    pub expected: Option<u64>,
-    pub unique: u64,
-    pub missing: Option<u64>,
-    pub duplicates: u64,
-    pub out_of_order: u64,
-    pub highest_sequence: Option<u64>,
-    pub body_bytes: u64,
-    pub achieved_messages_per_second: f64,
-    pub achieved_body_bytes_per_second: f64,
-    pub latency: BenchLatency,
-    pub lag: BenchLag,
-    pub malformed_messages: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BenchReceiveSummary {
-    #[serde(flatten)]
-    pub progress: BenchReceiveProgress,
-    pub completion_reason: String,
-    pub complete: bool,
-    pub measurement_valid: bool,
-    pub missing_sequence_sample: Vec<u64>,
-    pub peer_up: u64,
-    pub peer_down: u64,
-    pub ignored_messages: u64,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSource {
@@ -1124,11 +995,9 @@ pub enum ErrorCode {
     UnsupportedSchema,
     InvalidMessage,
     NetworkEventRejected,
-    InvalidBenchmark,
     InitialFrameTimeout,
     PrivateSendBusy,
     PrivateRecipientBusy,
-    BenchmarkBusy,
     PrivateReplayUnavailable,
     PrivateDeliveryUnknown,
     AttachmentQuotaExceeded,
