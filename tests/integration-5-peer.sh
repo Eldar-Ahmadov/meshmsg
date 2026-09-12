@@ -158,9 +158,6 @@ for path in sys.argv[2:]:
     assert not summary["lag"]["incomplete"]
 PY
 
-for peer in s1 s2 s3; do
-  wait_for 30 "two suppressed messages at $peer" bash -c "test \$(grep -c '\"body_suppressed\":true' '$ROOT/$peer.daemon.log') -ge 2"
-done
 python3 - "$ROOT/s1/config.json" "$ROOT/s2/config.json" "$ROOT/s3/config.json" "$ROOT/c1/config.json" "$ROOT/c2/config.json" <<'PY'
 import json, pathlib, sys
 for index, name in enumerate(sys.argv[1:]):
@@ -170,6 +167,7 @@ for index, name in enumerate(sys.argv[1:]):
     assert state["advertise_self"] is (index < 3)
 PY
 for node in s1 s2 s3 c1 c2; do
+  test ! -s "$ROOT/$node.daemon.log" || fail "$node daemon mirrored events to stdout"
   for output in "$ROOT/$node.daemon.log" "$ROOT/$node.daemon.err"; do
     ! grep -Fq "$M1" "$output" || fail "$node daemon leaked message body to $output"
     ! grep -Fq "$M2" "$output" || fail "$node daemon leaked message body to $output"
@@ -252,6 +250,7 @@ wait_log 30 "$ROOT/c1-restarted.listen.log" "\"body\":\"$M4\""
 
 # Re-check both output streams after restart, failover, and rejoin traffic.
 for node in s1 s2 s3 c1 c2; do
+  test ! -s "$ROOT/$node.daemon.log" || fail "$node daemon mirrored events to stdout"
   for output in "$ROOT/$node.daemon.log" "$ROOT/$node.daemon.err"; do
     ! grep -Fq "$M3" "$output" || fail "$node daemon leaked failover message body to $output"
     ! grep -Fq "$M4" "$output" || fail "$node daemon leaked rejoin message body to $output"
@@ -260,4 +259,4 @@ for node in s1 s2 s3 c1 c2; do
 done
 
 kill "$L1" >/dev/null 2>&1 || true; wait "$L1" >/dev/null 2>&1 || true
-echo "PASS: 5 equal peers, benchmarking, selective endpoint advertising, privacy logs, restart/failover/rejoin, IPC safety, and limits"
+echo "PASS: 5 equal peers, listen-only events/no daemon stdout, benchmarking, selective endpoint advertising, restart/failover/rejoin, IPC safety, and limits"

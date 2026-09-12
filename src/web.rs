@@ -1179,20 +1179,7 @@ fn web_download_context(
 }
 
 fn compatible_download_complete(value: &Value, expected: &ipc::DownloadRequestContext) -> bool {
-    match ipc::DownloadCompleteV2::validate_for_request(value, expected) {
-        Ok(_) => true,
-        Err(_error) => {
-            let _ = crate::output::sampled_diagnostic(
-                crate::output::DiagnosticRecord::new(
-                    crate::output::Level::Warn,
-                    "web_download",
-                    "completion_validation_failed",
-                )
-                .operation_id(Some(&expected.operation_id)),
-            );
-            false
-        }
-    }
+    ipc::DownloadCompleteV2::validate_for_request(value, expected).is_ok()
 }
 
 fn operation_bound_download_http_error(
@@ -1363,7 +1350,6 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
                         &operation,
                     )
                 };
-                log_private_lifecycle_diagnostic("download", &error);
                 let remove = !daemon_error || error.outcome != "unknown";
                 (
                     DownloadJob::Failed {
@@ -1422,10 +1408,6 @@ fn public_lifecycle_error(error: ipc::LifecycleErrorV1) -> ipc::LifecycleErrorV1
     // ErrorEnvelopeV1 construction and decoding already enforce fixed public
     // text for every admitted code. Never rewrite it from an internal cause.
     error
-}
-
-fn log_private_lifecycle_diagnostic(context: &str, error: &ipc::LifecycleErrorV1) {
-    contracts::log_private_diagnostic(context, &error.code, &error.message);
 }
 
 fn download_status(state: &WebState, id: &str) -> Response<Body> {
@@ -2443,10 +2425,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
                 None,
             )
             .ok()
-            .map(|error| {
-                log_private_lifecycle_diagnostic("share", &error);
-                public_lifecycle_error(error).into_value()
-            });
+            .map(|error| public_lifecycle_error(error).into_value());
             match public_error.and_then(|value| MutationErrorDto::parse(value, &operation_id)) {
                 Some(error) => mutation_error_response(error),
                 None => mutation_error_response(local_mutation_error(
@@ -2632,14 +2611,7 @@ pub(crate) async fn run(dir: &Path, address: SocketAddr, origin: Option<String>)
         .context("bind web listener")?;
     let address = listener.local_addr()?;
     let state = Arc::new(WebState::new(dir, address, origin)?);
-    let _ = crate::output::diagnostic(
-        crate::output::DiagnosticRecord::new(
-            crate::output::Level::Info,
-            "web_startup",
-            "listening",
-        )
-        .field(crate::output::Field::new("port", address.port())),
-    );
+    eprintln!("web listening on {address}");
     serve(listener, state).await
 }
 
@@ -2907,15 +2879,6 @@ mod tests {
             assert!(!public.message.contains("/home/alice"));
             assert!(!public.message.contains("database"));
             assert!(ipc::LifecycleErrorV1::from_value(&public.into_value()).is_ok());
-            let before = contracts::diagnostic_metrics();
-            contracts::log_private_diagnostic(
-                "web_test",
-                code,
-                "open /home/alice/private/file.bin failed: database secret detail",
-            );
-            let after = contracts::diagnostic_metrics();
-            assert!(after.0 >= before.0 && after.1 >= before.1);
-            assert_eq!(after.2, 0, "private causes must not be retained");
         }
     }
 

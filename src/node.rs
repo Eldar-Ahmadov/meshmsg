@@ -2110,14 +2110,6 @@ where
         let timestamp_ms = match unix_timestamp_ms() {
             Ok(timestamp_ms) => timestamp_ms,
             Err(_) => {
-                let _ = crate::output::sampled_diagnostic(
-                    crate::output::DiagnosticRecord::new(
-                        crate::output::Level::Error,
-                        "benchmark_send",
-                        "timestamp_failed",
-                    )
-                    .run_id(Some(&config.run_id)),
-                );
                 stats.failed = stats
                     .failed
                     .checked_add(1)
@@ -2136,14 +2128,6 @@ where
         ) {
             Ok(body) => body,
             Err(_) => {
-                let _ = crate::output::sampled_diagnostic(
-                    crate::output::DiagnosticRecord::new(
-                        crate::output::Level::Error,
-                        "benchmark_send",
-                        "body_build_failed",
-                    )
-                    .run_id(Some(&config.run_id)),
-                );
                 stats.failed = stats
                     .failed
                     .checked_add(1)
@@ -2221,14 +2205,6 @@ where
                     .context("benchmark envelope-byte overflow")?;
             }
             Some(Ok(Err(_))) => {
-                let _ = crate::output::sampled_diagnostic(
-                    crate::output::DiagnosticRecord::new(
-                        crate::output::Level::Error,
-                        "benchmark_send",
-                        "submission_failed",
-                    )
-                    .run_id(Some(&config.run_id)),
-                );
                 stats.failed = stats
                     .failed
                     .checked_add(1)
@@ -2315,13 +2291,6 @@ impl Default for LocalIpcTimeouts {
 
 tokio::task_local! {
     static IPC_REQUEST_ID: std::cell::RefCell<Option<String>>;
-}
-
-pub(crate) fn current_ipc_request_id() -> Option<String> {
-    IPC_REQUEST_ID
-        .try_with(|current| current.borrow().clone())
-        .ok()
-        .flatten()
 }
 
 fn normalize_ipc_response(value: &serde_json::Value, request_id: &str) -> serde_json::Value {
@@ -3095,12 +3064,7 @@ async fn list_pinned_blobs(store: &Store) -> Result<(Vec<OfferItemV1>, bool, usi
         scanned += 1;
         let tag = match item {
             Ok(tag) => tag,
-            Err(error) => {
-                contracts::log_private_diagnostic(
-                    "offers_item",
-                    "offers_failed",
-                    &error.to_string(),
-                );
+            Err(_) => {
                 item_errors += 1;
                 continue;
             }
@@ -3111,21 +3075,11 @@ async fn list_pinned_blobs(store: &Store) -> Result<(Vec<OfferItemV1>, bool, usi
         };
         let size = match (tag.format, store.blobs().status(tag.hash).await) {
             (BlobFormat::Raw, Ok(iroh_blobs::api::proto::BlobStatus::Complete { size })) => size,
-            (format, Ok(status)) => {
-                contracts::log_private_diagnostic(
-                    "offers_item",
-                    "offers_failed",
-                    &format!("non-public pin format/status: {format:?}/{status:?}"),
-                );
+            (_, Ok(_)) => {
                 item_errors += 1;
                 continue;
             }
-            (_, Err(error)) => {
-                contracts::log_private_diagnostic(
-                    "offers_item",
-                    "offers_failed",
-                    &error.to_string(),
-                );
+            (_, Err(_)) => {
                 item_errors += 1;
                 continue;
             }
@@ -4002,7 +3956,7 @@ impl AttachmentStorage {
         if failures != 0 || sync_error.is_some() {
             // Keep every guard nonexpiring through failure reconciliation, then
             // start grace only for values whose deletion may have taken effect.
-            let reconcile_error = self.reconcile().await.err();
+            let _ = self.reconcile().await;
             protection.finish(&possibly_unpinned);
             let after = self.status().tagged_bytes;
             let mut error = LifecycleErrorV1::new(
@@ -4021,13 +3975,6 @@ impl AttachmentStorage {
             error.removed_tags = Some(removed.len());
             error.quota_bytes_released = Some(before.saturating_sub(after));
             bind_partial_lifecycle_error(&mut error, &lifecycle_context, cutoff);
-            if let Some(reconcile_error) = reconcile_error {
-                contracts::log_private_diagnostic(
-                    "attachment_removal_reconciliation",
-                    &error.code,
-                    &reconcile_error.to_string(),
-                );
-            }
             return Ok(error.into_value());
         }
         // Successful deletion is now database-durable. Start a complete grace
@@ -5135,15 +5082,7 @@ where
     };
     let session = prepare()?;
     tasks.spawn(async move {
-        if let Err(error) = handle_admitted_local_client(stream, session, timeouts, permit).await {
-            if !is_local_disconnect(&error) {
-                let _ = crate::output::sampled_diagnostic(crate::output::DiagnosticRecord::new(
-                    crate::output::Level::Warn,
-                    "local_client",
-                    "client_task_failed",
-                ));
-            }
-        }
+        let _ = handle_admitted_local_client(stream, session, timeouts, permit).await;
     });
     Ok(true)
 }
@@ -5164,7 +5103,6 @@ async fn drain_local_client_tasks(tasks: &mut tokio::task::JoinSet<()>, grace: D
 fn emit_peer_transitions(
     transitions: impl IntoIterator<Item = PeerTransition>,
     events: &broadcast::Sender<serde_json::Value>,
-    output: &crate::output::DaemonOutput,
     directory_epoch: &str,
     directory_revision: &mut u64,
 ) {
@@ -5181,22 +5119,12 @@ fn emit_peer_transitions(
         {
             *directory_revision = candidate_revision;
             let _ = events.send(value.clone());
-            let _ = output.event(value);
         }
     }
 }
 
-fn daemon_warning(event: &str, code: &str) {
-    let _ = crate::output::sampled_diagnostic(crate::output::DiagnosticRecord::new(
-        crate::output::Level::Warn,
-        event,
-        code,
-    ));
-}
-
 pub async fn run_daemon(
     dir: &Path,
-    json: bool,
     max_attachment_bytes: u64,
     max_attachment_storage_bytes: u64,
     min_attachment_free_bytes: u64,
@@ -5228,26 +5156,10 @@ pub async fn run_daemon(
     let mut node = match startup {
         Ok(Ok(node)) => node,
         Ok(Err(error)) => {
-            let _ = crate::output::diagnostic(
-                crate::output::DiagnosticRecord::new(
-                    crate::output::Level::Fatal,
-                    "startup",
-                    "topic_join_failed",
-                )
-                .field(crate::output::Field::new("phase", "topic_join")),
-            );
             return Err(error)
                 .context("start gossip topic; verify the invite and bootstrap-peer reachability");
         }
         Err(_) => {
-            let _ = crate::output::diagnostic(
-                crate::output::DiagnosticRecord::new(
-                    crate::output::Level::Fatal,
-                    "startup",
-                    "topic_join_timeout",
-                )
-                .field(crate::output::Field::new("phase", "topic_join")),
-            );
             anyhow::bail!(
                 "startup timed out after {}s while joining the gossip topic; verify that at least one configured bootstrap peer is reachable",
                 STARTUP_TIMEOUT.as_secs()
@@ -5263,14 +5175,6 @@ pub async fn run_daemon(
         }
     };
     if online.is_err() {
-        let _ = crate::output::diagnostic(
-            crate::output::DiagnosticRecord::new(
-                crate::output::Level::Fatal,
-                "startup",
-                "endpoint_online_timeout",
-            )
-            .field(crate::output::Field::new("phase", "endpoint_online")),
-        );
         node.router.shutdown().await?;
         node.direct_replay.shutdown().await?;
         anyhow::bail!(
@@ -5305,58 +5209,11 @@ pub async fn run_daemon(
     )
     .await
     .context("initialize attachment lifecycle state")?;
-    let initial_storage_status = attachment_storage.status();
-
     // Expose IPC only after networking is ready, so clients never connect to a
     // socket whose daemon is still blocked during bootstrap.
     let (mut listener, _endpoint_guard) = bind_local_endpoint(dir, &state_lock).await?;
-    // Declare the RAII output owner after network/listener resources so every
-    // `?`, early return, and unwind closes stdout admission and performs a
-    // bounded drain before those resources are dropped.
-    let daemon_output = crate::output::DaemonOutput::start(json, render_daemon_event)
-        .context("start bounded daemon output writer")?;
     let peer = node.endpoint.id().to_string();
-    let started = serde_json::json!({
-        "type":"daemon_started", "peer":peer, "topic":state.topic,
-        "advertises_self":state.advertise_self, "has_invite":has_invite,
-        "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
-        "endpoint_online":true, "topic_joined":node.receiver.is_joined(),
-        "alias":alias_config.effective(), "alias_enabled":alias_config.enabled(),
-        "max_attachment_bytes":max_attachment_bytes,
-        "attachment_storage":initial_storage_status,
-        "attachment_retention_secs":attachment_retention_secs
-    });
-    let _ = daemon_output.event(started);
-    if crate::output::test_switch("MESHMSG_TEST_REJECT_DAEMON_ERROR") {
-        let _ = daemon_output.event(serde_json::json!({
-            "type":"error", "schema_version":1,
-            "code":"network_event_rejected",
-            "message":"private noncanonical cause",
-            "outcome":"not_started", "retryable":false,
-            "private_cause":"must never be admitted"
-        }));
-    }
-    if crate::output::test_switch("MESHMSG_TEST_OUTPUT_BURST") {
-        for index in 0..64_u64 {
-            let _ = daemon_output.event(serde_json::json!({
-                "type":"logging_test_event", "index":index
-            }));
-        }
-    }
-    if crate::output::test_switch("MESHMSG_TEST_DAEMON_ERROR_AFTER_OUTPUT")
-        || crate::output::test_switch("MESHMSG_TEST_DAEMON_PANIC_AFTER_OUTPUT")
-    {
-        if let Some(path) = std::env::var_os("MESHMSG_TEST_POST_START_READY_FILE") {
-            let _ = std::fs::write(path, b"ready");
-        }
-        let _ = daemon_output.event(serde_json::json!({
-            "type":"logging_test_marker", "sequence":1
-        }));
-        if crate::output::test_switch("MESHMSG_TEST_DAEMON_PANIC_AFTER_OUTPUT") {
-            panic!("injected post-start daemon panic");
-        }
-        anyhow::bail!("injected post-start daemon error");
-    }
+    eprintln!("daemon running as {peer}");
 
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
@@ -5423,7 +5280,7 @@ pub async fn run_daemon(
                         // Expiration is authoritative in the daemon. Emit it before
                         // capturing the new subscriber's snapshot so queued events
                         // are strictly later than that snapshot.
-                        emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
+                        emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                         let generated_at_ms = unix_timestamp_ms()?;
                         let startup_peers = peer_snapshot(
                             &node, &directory, &peer, alias_config.effective(), generated_at_ms,
@@ -5494,7 +5351,7 @@ pub async fn run_daemon(
                     ) {
                         continue;
                     }
-                    emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
+                    emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                     let address = match directory.resolve(&to) {
                         Ok(address) => address,
                         Err(error) => {
@@ -5651,7 +5508,7 @@ pub async fn run_daemon(
                     ))?);
                 }
                 Some(DaemonCommand::Peers { reply }) => {
-                    emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
+                    emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                     let generated_at_ms = unix_timestamp_ms()?;
                     let _ = reply.send(peer_snapshot(
                         &node, &directory, &peer, alias_config.effective(), generated_at_ms,
@@ -5971,15 +5828,13 @@ pub async fn run_daemon(
                         now_ms,
                     );
                     for full_value in values {
-                        if publish_daemon_message_event(
+                        publish_daemon_message_event(
                             &event_tx,
-                            full_value.clone(),
+                            full_value,
                             &mut internal_contract_guard.lock().expect("contract guard poisoned"),
                             topic,
                             now_ms,
-                        ) {
-                            let _ = daemon_output.event(suppress_message_body(full_value));
-                        }
+                        );
                     }
                 }
                 None => break,
@@ -5991,9 +5846,9 @@ pub async fn run_daemon(
                     if presence_sources.allow(message.delivered_from) {
                         // Never let receive-time cleanup swallow an expiry. The
                         // explicit cleanup transition is emitted first.
-                        emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
+                        emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                         if let Ok(Some(transition)) = directory.receive(&message.content, topic) {
-                            emit_peer_transitions([transition], &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
+                            emit_peer_transitions([transition], &event_tx, &directory_epoch, &mut directory_revision);
                         }
                     }
                 }
@@ -6004,8 +5859,7 @@ pub async fn run_daemon(
             incoming = direct_incoming_rx.recv() => {
                 if let Some(message) = incoming {
                     let value = private_message_event(message);
-                    let _ = event_tx.send(value.clone());
-                    let _ = daemon_output.event(suppress_message_body(value));
+                    let _ = event_tx.send(value);
                 }
             },
             _ = presence.tick() => {
@@ -6019,25 +5873,19 @@ pub async fn run_daemon(
                 }
             },
             _ = presence_cleanup.tick() => {
-                emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
+                emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                 presence_sources.cleanup();
             },
             _ = attachment_space_refresh.tick() => {
                 let storage = attachment_storage.clone();
                 offer_list_tasks.spawn(async move {
-                    if storage.refresh_free_space().await.is_err() {
-                        daemon_warning("attachment_storage", "free_space_refresh_failed");
-                    }
+                    let _ = storage.refresh_free_space().await;
                 });
             }
             _ = retention_check.tick(), if attachment_retention_secs != 0 => {
                 let storage = attachment_storage.clone();
                 offer_list_tasks.spawn(async move {
-                    if let Err(error) = storage.automatic_retention_pass().await {
-                        if !error.to_string().starts_with("attachment_storage_busy:") {
-                            daemon_warning("attachment_storage", "automatic_prune_failed");
-                        }
-                    }
+                    let _ = storage.automatic_retention_pass().await;
                 });
             }
             _ = rejoin.tick(), if !node.bootstrap_peers.is_empty() => {
@@ -6055,19 +5903,13 @@ pub async fn run_daemon(
                 }
             },
             completed = local_client_tasks.join_next(), if !local_client_tasks.is_empty() => {
-                if let Some(Err(_)) = completed {
-                    daemon_warning("local_client", "task_join_failed");
-                }
+                let _ = completed;
             },
             completed = transfer_tasks.join_next(), if !transfer_tasks.is_empty() => {
-                if let Some(Err(_)) = completed {
-                    daemon_warning("attachment_transfer", "task_join_failed");
-                }
+                let _ = completed;
             },
             completed = offer_list_tasks.join_next(), if !offer_list_tasks.is_empty() => {
-                if let Some(Err(_)) = completed {
-                    daemon_warning("attachment_listing", "task_join_failed");
-                }
+                let _ = completed;
             },
             _ = shutdown.recv() => break,
         }
@@ -6088,9 +5930,6 @@ pub async fn run_daemon(
     while transfer_tasks.join_next().await.is_some() {}
     while offer_list_tasks.join_next().await.is_some() {}
     drain_local_client_tasks(&mut local_client_tasks, LOCAL_IPC_SHUTDOWN_GRACE).await;
-    // Terminal ordering is strict: first close event admission and drain stdout,
-    // then begin fallible network teardown. No event can be queued after this.
-    let _ = daemon_output.shutdown(crate::output::DRAIN_TIMEOUT);
     node.router.shutdown().await?;
     node.direct_replay.shutdown().await?;
     Ok(())
@@ -6103,20 +5942,6 @@ fn invite_details(state: &State, self_id: PublicKey) -> Result<(bool, usize, boo
     let invite: Invite = token.parse()?;
     let self_advertised = invite.bootstrap_peers.iter().any(|peer| peer.id == self_id);
     Ok((true, invite.bootstrap_peers.len(), self_advertised))
-}
-
-fn is_local_disconnect(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::NotConnected
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-        })
-    })
 }
 
 fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Value {
@@ -6258,33 +6083,6 @@ fn private_message_event(msg: IncomingDirect) -> serde_json::Value {
         "timestamp_ms":msg.timestamp_ms, "body":msg.body,
         "acceptance_acknowledged":true, "durable":false, "read":false
     })
-}
-
-fn suppress_message_body(value: serde_json::Value) -> serde_json::Value {
-    if value["type"] == "message" {
-        return serde_json::json!({
-            "type":"message", "from":value["from"], "message_id":value["message_id"],
-            "timestamp_ms":value["timestamp_ms"],
-            "body_bytes":value["body"].as_str().map(str::len).unwrap_or(0), "body_suppressed":true
-        });
-    }
-    if value["type"] == "private_message" {
-        return serde_json::json!({
-            "type":"private_message", "from":value["from"],
-            "message_id":value["message_id"], "timestamp_ms":value["timestamp_ms"],
-            "body_bytes":value["body"].as_str().map(str::len).unwrap_or(0),
-            "body_suppressed":true, "private":true
-        });
-    }
-    if value["type"] == "attachment_offer" {
-        return serde_json::json!({
-            "type":"attachment_offer", "from":value["from"],
-            "message_id":value["message_id"], "timestamp_ms":value["timestamp_ms"],
-            "size":value["size"],
-            "details_suppressed":true
-        });
-    }
-    value
 }
 
 #[cfg(unix)]
@@ -7742,13 +7540,6 @@ pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn startup_error_value(_phase: &str, message: &str) -> serde_json::Value {
-    let mut error = ErrorEnvelopeV1::new("startup_failed", message, "not_started", true);
-    error.request_id = Some(contracts::new_request_id());
-    error.into_value()
-}
-
 fn terminal_safe(value: &str) -> String {
     value
         .chars()
@@ -7774,50 +7565,6 @@ fn offer_listing_warnings(value: &serde_json::Value) -> Vec<String> {
         ));
     }
     warnings
-}
-
-fn daemon_started_human_output(value: &serde_json::Value) -> String {
-    format!("daemon running as {}", value["peer"].as_str().unwrap_or(""))
-}
-
-fn render_daemon_event(value: serde_json::Value) -> String {
-    match value["type"].as_str().unwrap_or("event") {
-        "daemon_started" => daemon_started_human_output(&value),
-        "message" => format!(
-            "message from {} ({} bytes; body suppressed)",
-            value["from"].as_str().unwrap_or("peer"),
-            value["body_bytes"].as_u64().unwrap_or(0)
-        ),
-        "private_message" => format!(
-            "private message from {} ({} bytes; body suppressed)",
-            value["from"].as_str().unwrap_or("peer"),
-            value["body_bytes"].as_u64().unwrap_or(0)
-        ),
-        "attachment_offer" => format!(
-            "attachment offer from {} ({} bytes; details suppressed)",
-            value["from"].as_str().unwrap_or("peer"),
-            value["size"].as_u64().unwrap_or(0)
-        ),
-        "peer_up" => format!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
-        "peer_down" => format!("peer left: {}", value["peer"].as_str().unwrap_or("")),
-        "peer_discovered" | "peer_updated" | "peer_expired" => {
-            let peer = &value["peer"];
-            format!(
-                "{}: {}{}",
-                value["type"].as_str().unwrap_or("peer").replace('_', " "),
-                peer["public_key"].as_str().unwrap_or(""),
-                peer["alias"]
-                    .as_str()
-                    .map(|alias| format!(" ({})", terminal_safe(alias)))
-                    .unwrap_or_default()
-            )
-        }
-        "lagged" => format!(
-            "warning: {}",
-            terminal_safe(value["message"].as_str().unwrap_or("receiver lagged"))
-        ),
-        _ => value.to_string(),
-    }
 }
 
 fn event(json: bool, mut value: serde_json::Value) {
@@ -7989,7 +7736,6 @@ fn event(json: bool, mut value: serde_json::Value) {
             }
             "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
             "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
-            "daemon_started" => println!("{}", daemon_started_human_output(&value)),
             "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
             "stopping" => println!("daemon stopping"),
             "lagged" => println!(
@@ -8732,35 +8478,6 @@ mod tests {
             replay.live_ids, 0,
             "invalid semantics consumed replay state"
         );
-
-        #[derive(Clone)]
-        struct Capture(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let rendered = Arc::new(Mutex::new(Vec::new()));
-        let output = crate::output::DaemonOutput::start_with_sink(
-            true,
-            render_daemon_event,
-            Box::new(Capture(rendered.clone())),
-            "network-rejection-output-test",
-        )
-        .unwrap();
-        assert!(output.event(rejected[0].clone()));
-        assert!(output.shutdown(Duration::from_secs(1)));
-        let bytes = rendered.lock().unwrap().clone();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        ErrorEnvelopeV1::from_value(&value).unwrap();
-        let encoded = String::from_utf8(bytes).unwrap();
-        assert!(!encoded.contains("message body"));
-        assert!(!encoded.contains("private"));
-        assert!(value.get("rate_limited").is_none());
 
         let accepted = network_event(
             Event::Received(iroh_gossip::api::Message {
@@ -9863,16 +9580,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_started_human_output_omits_removed_local_endpoint() {
-        let output = daemon_started_human_output(&serde_json::json!({
-            "type":"daemon_started", "peer":"test-peer"
-        }));
-        assert_eq!(output, "daemon running as test-peer");
-        assert!(!output.contains("local endpoint:"));
-        assert_eq!(output.lines().count(), 1);
-    }
-
-    #[test]
     fn benchmark_body_is_fixed_size_and_strictly_parsed() {
         let run_id = "0123456789abcdef0123456789abcdef";
         let body = build_bench_body(run_id, 9, 10, 1_700_000_000_000, 256).unwrap();
@@ -10425,32 +10132,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_log_message_event_suppresses_body_but_keeps_metadata() {
-        let secret = SecretKey::generate();
-        let value = suppress_message_body(message_event(unsigned_test_envelope(
-            secret.public(),
-            "private text".to_owned(),
-            42,
-        )));
-        assert_eq!(value["timestamp_ms"], 42);
-        assert_eq!(value["body_bytes"], 12);
-        assert_eq!(value["body_suppressed"], true);
-        assert!(value.get("body").is_none());
-
-        let direct = suppress_message_body(private_message_event(IncomingDirect {
-            from: secret.public(),
-            id: [7; 16],
-            timestamp_ms: 43,
-            body: "dm secret".to_owned(),
-        }));
-        assert_eq!(direct["type"], "private_message");
-        assert_eq!(direct["body_bytes"], 9);
-        assert_eq!(direct["private"], true);
-        assert!(direct.get("body").is_none());
-        assert!(!direct.to_string().contains("dm secret"));
-    }
-
-    #[test]
     fn queued_event_has_canonical_send_metadata_and_does_not_claim_delivery() {
         let value = queued_event("peer", [4; 16], "hello".to_owned(), 1_700_000_000_000);
 
@@ -10538,22 +10219,6 @@ mod tests {
                     .is_err()
             );
         }
-    }
-
-    #[test]
-    fn startup_errors_are_structured_and_retryable() {
-        let value = startup_error_value("topic_join", "bootstrap peer unavailable");
-
-        assert_eq!(value["type"], "error");
-        assert_eq!(value["schema_version"], 1);
-        assert_eq!(value["code"], "startup_failed");
-        assert_eq!(value["outcome"], "not_started");
-        assert_eq!(value["retryable"], true);
-        assert!(contracts::valid_request_id(
-            value["request_id"].as_str().unwrap()
-        ));
-        assert!(STARTUP_TIMEOUT <= Duration::from_secs(60));
-        assert!(ENDPOINT_ONLINE_TIMEOUT <= Duration::from_secs(60));
     }
 
     #[tokio::test]

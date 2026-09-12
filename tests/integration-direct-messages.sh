@@ -282,7 +282,7 @@ sleep 2
 ! grep -Fq "$COLLISION" "$ROOT/spy.listen.log" || fail "colliding alias delivered to another claimant"
 
 # Private contents may appear only in the explicit owner CLI subscription, not
-# daemon diagnostics, sender responses, or the broadcast-only web process/feed.
+# daemon output, sender responses, or the broadcast-only web process/feed.
 for secret in "$PINNED" "$PRIVATE" "$CANONICAL" "$COLLISION"; do
   for output in "$ROOT"/*.daemon.log "$ROOT"/*.daemon.err "$ROOT"/web.log "$ROOT"/web.err "$ROOT"/web.sse "$ROOT"/collision.out "$ROOT"/collision.err; do
     [[ -e "$output" ]] || continue

@@ -55,34 +55,17 @@ output). Operation-aware consumers additionally require the exact originating
 operation ID; offer IDs and partial-removal counts are accepted only for applicable
 codes.
 
-Public-error construction offers only typed metadata to the process diagnostic
-subsystem; arbitrary private causes are neither queued nor retained. Records contain
-a timestamp, level, stable event/code, allowlisted bounded fields, and applicable
-request/operation/run IDs. Message bodies, secrets, invite/ticket material, private
-peer routes, and filesystem paths are prohibited. Human mode offers diagnostics to
-a bounded nonblocking stderr writer; JSON mode disables diagnostic terminal output
-to preserve the empty-stderr and stdout protocol contracts.
+Public errors retain only canonical typed fields; arbitrary private causes are not
+included in responses or events. Automation must branch on stable error `code`
+values, never display text.
 
-Diagnostic writer telemetry is internal and is not exposed as an IPC status variant.
-Automation must branch on stable error `code` values, never display text.
-
-Every daemon error offered to process stdout is first decoded as the strict shared
-`ErrorEnvelopeV1` and reserialized from that DTO. Missing/noncanonical fixed text,
-outcome, retryability, or schema fields and all unsupported fields—including private
-diagnostics—are rejected before queue admission. This includes sampled rejected
-network events and generated-event guard failures.
-
-With `--json`, one-shot failures offer exactly one error object to **stdout**, write
-nothing to stderr, and exit 1. Success exits 0. Streaming commands use stdout NDJSON;
-a terminal process failure follows the same error rule. Every terminal write has a
-bounded deadline, so a permanently blocked consumer can cause the final record to be
-abandoned rather than hang shutdown. Without `--json`, diagnostics remain
-human-readable on stderr. If their bounded drain times out, that detached writer
-retains sole stderr ownership and the final human fatal is suppressed rather than
-written concurrently. A guarded top-level unwind boundary catches process panics,
-lets daemon-output RAII close and drain first, emits only a fixed bounded JSON or
-human terminal failure, and restores the previously installed panic hook before
-returning. Clap help/version still exit successfully.
+With `--json`, one-shot failures write exactly one error object to **stdout**, write
+nothing to stderr, and exit 1. Success exits 0. Streaming client commands use stdout
+NDJSON. Human one-shot failures use stderr. The daemon is different: it never mirrors
+events to stdout, even with `--json`; clients receive events through authenticated,
+bounded `subscribe` IPC (`meshmsg listen`). Daemon startup and fatal errors use
+stderr. There is no process diagnostic queue, output telemetry, bounded terminal
+writer, or custom process panic hook. Clap help/version still exit successfully.
 
 ## IPC
 
@@ -157,7 +140,7 @@ attachment-storage pressure. Clients and the daemon are one protocol-v2 componen
 set, so commands are submitted directly without status capability probes.
 
 CLI-only setup/state-file records are `initialized`, `joined`, `alias`, `invite`,
-`doctor`, and daemon-process `daemon_started`; they do not cross IPC. The exhaustive
+and `doctor`; they do not cross IPC. The exhaustive
 IPC success/event families are:
 
 - lifecycle: `stopping` v1;

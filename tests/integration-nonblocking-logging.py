@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Real daemon/IPC responsiveness with permanently blocked stdout and stderr."""
+"""Daemon stays responsive and shuts down when process output is never consumed."""
 import json
-import os
 import pathlib
 import shutil
 import subprocess
@@ -24,38 +23,25 @@ def wait_status(state):
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
         result = cli(state, "--json", "status", timeout=5)
-        if result.returncode == 0:
-            value = json.loads(result.stdout)
-            if value.get("running") is True:
-                return
+        if result.returncode == 0 and json.loads(result.stdout).get("running") is True:
+            return
         time.sleep(0.1)
     raise AssertionError("daemon did not become IPC-ready")
 
 
-def run_once(index, signal_shutdown=False, panic_stdout=False):
+def run_once(index, signal_shutdown):
     state = root / f"state-{index}"
     initialized = cli(state, "init", "--no-default-alias")
     assert initialized.returncode == 0, initialized.stderr
-    env = os.environ.copy()
-    env.update({
-        "MESHMSG_TEST_BLOCK_STDERR": "1",
-        "MESHMSG_TEST_EMIT_DIAGNOSTIC": "1",
-        "MESHMSG_TEST_REJECT_DAEMON_ERROR": "1",
-    })
-    if panic_stdout:
-        env.update({
-            "MESHMSG_TEST_PANIC_DAEMON_STDOUT": "1",
-            "MESHMSG_TEST_OUTPUT_BURST": "1",
-        })
-    else:
-        env["MESHMSG_TEST_BLOCK_DAEMON_STDOUT"] = "1"
+    # Keep both pipes unread until exit. Daemon events must use listen, so stdout
+    # cannot fill; stderr receives only the single bounded startup line.
     daemon = subprocess.Popen(
-        [str(binary), "--state-dir", str(state), "daemon"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        [str(binary), "--state-dir", str(state), "--json", "daemon"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     try:
         wait_status(state)
-        for _ in range(3):
+        for _ in range(8):
             status = cli(state, "--json", "status")
             assert status.returncode == 0 and json.loads(status.stdout)["running"] is True
         started = time.monotonic()
@@ -64,85 +50,23 @@ def run_once(index, signal_shutdown=False, panic_stdout=False):
         else:
             stopped = cli(state, "--json", "stop")
             assert stopped.returncode == 0, (stopped.stdout, stopped.stderr)
-        daemon.wait(timeout=5)
+        stdout, stderr = daemon.communicate(timeout=5)
         assert time.monotonic() - started < 5
         assert daemon.returncode == 0, daemon.returncode
-        # Both worker threads were blocked permanently. Process exit must not wait
-        # for them and no competing panic/final-error owner may write stderr.
-        assert daemon.stderr.read() == b""
+        assert stdout == b"", stdout
+        assert stderr.startswith(b"daemon running as "), stderr
+        assert len(stderr.splitlines()) == 1, stderr
+        assert not (state / "daemon.sock").exists(), "endpoint guard did not clean up"
     finally:
         if daemon.poll() is None:
             daemon.kill()
             daemon.wait()
 
 
-def post_start_terminal(index, panic, json_mode, blocked=False):
-    state = root / f"terminal-{index}"
-    initialized = cli(state, "init", "--no-default-alias")
-    assert initialized.returncode == 0, initialized.stderr
-    ready = root / f"terminal-{index}.ready"
-    env = os.environ.copy()
-    env["MESHMSG_TEST_POST_START_READY_FILE"] = str(ready)
-    env[
-        "MESHMSG_TEST_DAEMON_PANIC_AFTER_OUTPUT"
-        if panic else "MESHMSG_TEST_DAEMON_ERROR_AFTER_OUTPUT"
-    ] = "1"
-    if blocked:
-        env["MESHMSG_TEST_BLOCK_DAEMON_STDOUT"] = "1"
-    command = [str(binary), "--state-dir", str(state)]
-    if json_mode:
-        command.append("--json")
-    command.append("daemon")
-    daemon = subprocess.Popen(
-        command,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT if not json_mode else subprocess.PIPE,
-    )
-    deadline = time.monotonic() + 40
-    while not ready.exists() and daemon.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert ready.exists(), "daemon did not reach post-start injection"
-    injected = time.monotonic()
-    stdout, stderr = daemon.communicate(timeout=4)
-    assert time.monotonic() - injected < 2
-    assert daemon.returncode == 1
-    assert not (state / "daemon.sock").exists(), "endpoint guard did not clean up"
-    if blocked:
-        assert stdout == b"" and stderr == b""
-        return
-    if json_mode:
-        assert stderr == b"", stderr
-        values = [json.loads(line) for line in stdout.splitlines()]
-        assert [value["type"] for value in values] == [
-            "daemon_started", "logging_test_marker", "error"
-        ], values
-        expected_code = "internal_contract_error" if panic else "command_failed"
-        assert values[-1]["code"] == expected_code
-        expected_message = (
-            "An internal contract error occurred." if panic else "The command failed."
-        )
-        assert values[-1]["message"] == expected_message
-    else:
-        text = stdout.decode()
-        started = text.index("daemon running as")
-        marker = text.index('"type":"logging_test_marker"')
-        terminal = text.index("error: internal process panic" if panic else "error:")
-        assert started < marker < terminal, text
-
-
 try:
-    # Repetition covers command shutdown and graceful signal-triggered shutdown.
     run_once(1, False)
     run_once(2, True)
-    run_once(3, False, True)
-    # True post-start Result failure and unwind paths prove marker-before-terminal
-    # ordering. A blocked unwind proves the RAII deadline and output suppression.
-    post_start_terminal(4, False, True)
-    post_start_terminal(5, True, True)
-    post_start_terminal(6, True, False)
-    post_start_terminal(7, True, True, blocked=True)
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
-print("PASS: real daemon status/shutdown survive blocked stdout+stderr")
+print("PASS: daemon emits no stdout events and IPC/signal shutdown remains nonblocking")

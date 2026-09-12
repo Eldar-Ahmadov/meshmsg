@@ -10,7 +10,6 @@ mod invite;
 mod ipc;
 mod message;
 mod node;
-mod output;
 mod peers;
 mod persistent;
 mod web;
@@ -20,7 +19,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{AliasCommand, Cli, Command, OffersCommand};
 use config::State;
-use futures_util::FutureExt;
 use invite::Invite;
 use std::process::ExitCode;
 
@@ -38,92 +36,41 @@ fn authoritative_contract_failure(error: &anyhow::Error) -> Option<contracts::Er
         .map(|failure| failure.0.clone())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let json = json_mode_requested(std::env::args_os());
-    // Suppress hook I/O only inside this guarded process boundary. Every unwind
-    // is caught, daemon output locals drain during unwinding, terminal output is
-    // serialized afterward, and the caller's hook is restored before returning.
-    let panic_hook = output::install_panic_hook();
-    let outcome = std::panic::AssertUnwindSafe(async {
-        contracts::set_private_diagnostic_output(!json)
-            .context("start bounded diagnostic writer")?;
-        if output::test_switch("MESHMSG_TEST_PROCESS_PANIC") {
-            panic!("injected process panic");
-        }
-        if output::test_switch("MESHMSG_TEST_EMIT_DIAGNOSTIC") {
-            contracts::log_private_diagnostic("process_test", "injected", "private");
-        }
-        run().await
-    })
-    .catch_unwind()
-    .await;
-
-    // No final stderr owner is created unless the diagnostic owner exited. If it
-    // timed out, it may still hold a blocked stderr forever and the final human
-    // diagnostic is deliberately suppressed.
-    let diagnostics_drained = output::shutdown_diagnostics(output::DRAIN_TIMEOUT);
-    let result = match outcome {
-        Ok(result) => result,
-        Err(_) => {
-            let mut error = contracts::ErrorEnvelopeV1::new(
-                "internal_contract_error",
-                "process panicked",
-                "unknown",
-                false,
-            );
-            error.request_id = Some(contracts::new_request_id());
-            if json && output::stdout_available() {
-                let mut bytes = error.into_value().to_string().into_bytes();
-                bytes.push(b'\n');
-                let _ = output::write_terminal_bounded(false, bytes, output::DRAIN_TIMEOUT);
-            } else if !json && diagnostics_drained {
-                let _ = output::write_terminal_bounded(
-                    true,
-                    b"error: internal process panic\n".to_vec(),
-                    output::DRAIN_TIMEOUT,
-                );
-            }
-            drop(panic_hook);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if let Err(error) = result {
-        if json && output::stdout_available() {
-            let authoritative = authoritative_contract_failure(&error);
-            let envelope = authoritative.unwrap_or_else(|| {
-                let diagnostic = format!("{error:#}");
-                let (code, retryable, outcome) = if diagnostic.contains("connect to local daemon") {
-                    ("daemon_offline", true, "not_started")
-                } else if diagnostic.contains("timed out")
-                    || diagnostic.contains("outcome may be unknown")
-                {
-                    ("command_timeout", true, "unknown")
-                } else {
-                    ("command_failed", false, "not_started")
-                };
-                let mut envelope =
-                    contracts::ErrorEnvelopeV1::new(code, &diagnostic, outcome, retryable);
-                envelope.request_id = Some(contracts::new_request_id());
-                envelope
-            });
-            let mut bytes = envelope.into_value().to_string().into_bytes();
-            bytes.push(b'\n');
-            let _ = output::write_terminal_bounded(false, bytes, output::DRAIN_TIMEOUT);
-        } else if !json && diagnostics_drained {
-            let text = format!("error: {error:#}\n");
-            let _ = output::write_terminal_bounded(true, text.into_bytes(), output::DRAIN_TIMEOUT);
-        }
-        drop(panic_hook);
-        return ExitCode::FAILURE;
-    }
-    drop(panic_hook);
-    ExitCode::SUCCESS
+fn daemon_mode(cli: &Cli) -> bool {
+    matches!(&cli.command, Command::Daemon { .. })
 }
 
-async fn run() -> Result<()> {
-    let cli = match Cli::try_parse() {
+fn report_failure(error: anyhow::Error, json: bool, daemon: bool) -> ExitCode {
+    if json && !daemon {
+        let authoritative = authoritative_contract_failure(&error);
+        let envelope = authoritative.unwrap_or_else(|| {
+            let diagnostic = format!("{error:#}");
+            let (code, retryable, outcome) = if diagnostic.contains("connect to local daemon") {
+                ("daemon_offline", true, "not_started")
+            } else if diagnostic.contains("timed out")
+                || diagnostic.contains("outcome may be unknown")
+            {
+                ("command_timeout", true, "unknown")
+            } else {
+                ("command_failed", false, "not_started")
+            };
+            let mut envelope =
+                contracts::ErrorEnvelopeV1::new(code, &diagnostic, outcome, retryable);
+            envelope.request_id = Some(contracts::new_request_id());
+            envelope
+        });
+        println!("{}", envelope.into_value());
+    } else {
+        eprintln!("error: {error:#}");
+    }
+    ExitCode::FAILURE
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let arguments: Vec<_> = std::env::args_os().collect();
+    let requested_json = json_mode_requested(arguments.iter().cloned());
+    let cli = match Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -132,10 +79,21 @@ async fn run() -> Result<()> {
             ) =>
         {
             print!("{error}");
-            return Ok(());
+            return ExitCode::SUCCESS;
         }
-        Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+        Err(error) => {
+            return report_failure(anyhow::anyhow!(error.to_string()), requested_json, false)
+        }
     };
+    let json = cli.json;
+    let daemon = daemon_mode(&cli);
+    match run(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => report_failure(error, json, daemon),
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let is_bench_tui = matches!(&cli.command, Command::BenchTui);
     anyhow::ensure!(
         !(is_bench_tui && cli.json),
@@ -212,7 +170,6 @@ async fn run() -> Result<()> {
         } => {
             node::run_daemon(
                 &dir,
-                cli.json,
                 max_attachment_bytes,
                 max_attachment_storage_bytes,
                 min_attachment_free_bytes,
@@ -402,6 +359,16 @@ mod tests {
         let error = anyhow::anyhow!("private transport diagnostic")
             .context(contracts::ContractFailure(expected.clone()));
         assert_eq!(authoritative_contract_failure(&error), Some(expected));
+    }
+
+    #[test]
+    fn daemon_mode_comes_only_from_the_parsed_subcommand() {
+        let status =
+            Cli::try_parse_from(["meshmsg", "--state-dir", "daemon", "--json", "status"]).unwrap();
+        assert!(!daemon_mode(&status));
+
+        let daemon = Cli::try_parse_from(["meshmsg", "--state-dir", "state", "daemon"]).unwrap();
+        assert!(daemon_mode(&daemon));
     }
 
     #[test]

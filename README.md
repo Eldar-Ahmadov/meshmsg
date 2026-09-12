@@ -27,7 +27,7 @@ Create a topic and keep its daemon running:
 
 ```sh
 meshmsg init
-meshmsg --json daemon
+meshmsg daemon
 ```
 
 In another terminal, export the invite:
@@ -40,7 +40,7 @@ Join from another machine and start its daemon:
 
 ```sh
 printf '%s' '<invite>' | meshmsg join --token-stdin
-meshmsg --json daemon
+meshmsg daemon
 ```
 
 Send and receive messages through the local daemon:

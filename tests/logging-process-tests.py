@@ -1,70 +1,60 @@
 #!/usr/bin/env python3
-"""Process-level panic, stderr ownership, and startup-failure logging checks."""
+"""One-shot output contracts and daemon startup/fatal stream routing."""
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
-binary = sys.argv[1] if len(sys.argv) > 1 else "target/debug/meshmsg"
+binary = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "target/debug/meshmsg")
 base = os.environ.copy()
 
 
-def run(args, changes, timeout=4):
+def run(args, changes=None, timeout=4, cwd=None):
     env = base.copy()
-    env.update(changes)
+    env.update(changes or {})
     started = time.monotonic()
     child = subprocess.run(
         [binary, *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=timeout, check=False,
+        timeout=timeout, check=False, cwd=cwd,
     )
     assert time.monotonic() - started < timeout
     return child
 
 
-# The panic hook is deliberately I/O-free, including in JSON mode.
-panic = run(["--json", "status"], {"MESHMSG_TEST_PROCESS_PANIC": "1"})
-assert panic.returncode == 1
-assert panic.stderr == b"", panic.stderr
-panic_error = json.loads(panic.stdout)
-assert panic_error["type"] == "error" and panic_error["code"] == "internal_contract_error"
-assert panic_error["message"] == "An internal contract error occurred."
-assert panic_error["outcome"] == "unknown" and panic_error["retryable"] is False
+# One-shot JSON failures remain one normal stdout result with empty stderr.
+json_error = run(["--json", "definitely-not-a-command"])
+assert json_error.returncode == 1 and json_error.stderr == b""
+value = json.loads(json_error.stdout)
+assert value["type"] == "error" and len(json_error.stdout.splitlines()) == 1
 
-human_panic = run(["status"], {"MESHMSG_TEST_PROCESS_PANIC": "1"})
-assert human_panic.returncode == 1 and human_panic.stdout == b""
-assert human_panic.stderr == b"error: internal process panic\n"
+# A global option value equal to a subcommand is not daemon mode. The parsed
+# status command retains the one-shot JSON stdout contract.
+with tempfile.TemporaryDirectory(prefix="meshmsg-argument-collision-") as directory:
+    collision = run(["--state-dir", "daemon", "--json", "status"], cwd=directory)
+assert collision.returncode == 1 and collision.stderr == b""
+assert json.loads(collision.stdout)["type"] == "error"
+assert len(collision.stdout.splitlines()) == 1
 
-json_blocked = run(
-    ["--json", "definitely-not-a-command"], {"MESHMSG_TEST_BLOCK_STDERR": "1"}
+# Human one-shot failures use normal stderr.
+human_error = run(["definitely-not-a-command"])
+assert human_error.returncode == 1 and human_error.stdout == b""
+assert human_error.stderr.startswith(b"error: ")
+
+# Legacy output-hardening injectors have no effect after subsystem removal.
+legacy = run(
+    ["--json", "status"],
+    {"MESHMSG_TEST_BLOCK_STDERR": "1", "MESHMSG_TEST_DIAGNOSTIC_STARTUP_FAIL": "1"},
 )
-assert json_blocked.returncode == 1 and json_blocked.stderr == b""
-assert json.loads(json_blocked.stdout)["type"] == "error"
+assert legacy.returncode == 1 and legacy.stderr == b""
+assert json.loads(legacy.stdout)["type"] == "error"
 
-# A detached blocked diagnostic writer remains the sole stderr owner. The final
-# human error is suppressed after the bounded drain deadline rather than racing it.
-blocked = run(
-    ["definitely-not-a-command"],
-    {"MESHMSG_TEST_BLOCK_STDERR": "1", "MESHMSG_TEST_EMIT_DIAGNOSTIC": "1"},
-)
-assert blocked.returncode == 1, blocked.returncode
-assert blocked.stderr == b"", blocked.stderr
+# A parsed daemon's fatal output is stderr even with --json; stdout is never an
+# event/error stream.
+with tempfile.TemporaryDirectory(prefix="meshmsg-daemon-fatal-") as directory:
+    fatal = run(["--state-dir", "missing", "--json", "daemon"], cwd=directory)
+assert fatal.returncode == 1 and fatal.stdout == b""
+assert fatal.stderr.startswith(b"error: ")
 
-# Production initialization propagates writer startup failure instead of silently
-# disabling diagnostics. JSON still preserves the one-record stdout contract.
-failed = run(
-    ["--json", "status"], {"MESHMSG_TEST_DIAGNOSTIC_STARTUP_FAIL": "1"}
-)
-# JSON mode intentionally starts no stderr writer, so the failure injector is not
-# applicable there. Verify the normal offline contract remains intact.
-assert failed.returncode == 1 and failed.stderr == b""
-value = json.loads(failed.stdout)
-assert value["type"] == "error"
-
-failed_human = run(
-    ["status"], {"MESHMSG_TEST_DIAGNOSTIC_STARTUP_FAIL": "1"}
-)
-assert failed_human.returncode == 1
-assert b"start bounded diagnostic writer" in failed_human.stderr
-
-print("PASS: process panic/stderr ownership/startup-failure logging")
+print("PASS: one-shot output is normal and daemon fatal output is stderr-only")

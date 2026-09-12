@@ -26,7 +26,7 @@ Create a fresh topic and start its daemon:
 
 ```sh
 meshmsg init
-meshmsg --json daemon
+meshmsg daemon
 ```
 
 Fresh state has `advertise_self=true` but no invite. After the endpoint becomes online, the daemon atomically stores an invite containing its endpoint. Until that first successful daemon startup, `meshmsg invite` intentionally fails.
@@ -34,8 +34,8 @@ Fresh state has `advertise_self=true` but no invite. After the endpoint becomes 
 The attachment limit defaults to 4 GiB. Configure it for each daemon invocation with bytes or an environment variable:
 
 ```sh
-meshmsg --json daemon --max-attachment-bytes 8589934592
-MESHMSG_MAX_ATTACHMENT_BYTES=8589934592 meshmsg --json daemon
+meshmsg daemon --max-attachment-bytes 8589934592
+MESHMSG_MAX_ATTACHMENT_BYTES=8589934592 meshmsg daemon
 meshmsg daemon --max-attachment-storage-bytes 17179869184 \
   --min-attachment-free-bytes 1073741824 \
   --attachment-retention-secs 2592000
@@ -53,14 +53,14 @@ Join from another machine, using stdin to avoid putting the capability in shell 
 
 ```sh
 printf '%s' '<invite>' | meshmsg join --token-stdin
-meshmsg --json daemon
+meshmsg daemon
 ```
 
 `join` defaults to `advertise_self=false`: the peer uses the invite to bootstrap but does not add itself to its stored invite. To advertise the joining peer:
 
 ```sh
 meshmsg join --advertise-self '<invite>'
-meshmsg --json daemon
+meshmsg daemon
 meshmsg invite
 ```
 
@@ -229,16 +229,17 @@ Representative status:
 
 `neighbors` is the current direct broadcast-Gossip-neighbor count. `advertised_aliases` is the number of currently unexpired directory entries carrying an alias, not a trusted contact count or reachability guarantee. `topic_joined` becomes false when no direct neighbors remain, including for a lone first peer. These are local observations, not delivery guarantees.
 
-Startup and bootstrap are bounded. If joining configured peers or becoming online times out, the daemon exits nonzero so a service manager can retry. JSON mode emits one standard error envelope (`command_timeout` when the bounded outcome is unknown, otherwise `command_failed`) and never emits a second startup record.
+Startup and bootstrap are bounded. If joining configured peers or becoming online times out, the daemon exits nonzero so a service manager can retry. Daemon startup and fatal diagnostics are human-readable and stderr-only, even when `--json` is supplied. Successful startup writes one stderr line after networking and local IPC are ready. The daemon writes no stdout records: protocol events are available through authenticated local subscriptions such as `meshmsg listen`.
 
 `doctor` validates stored state, identity binding, expected public key, topic, and invite invariants offline.
 
 ## JSON automation
 
-The global `--json` option produces versioned JSON for one-shot commands and NDJSON for streams. Every success has `type`, `schema_version`, and a 32-lowercase-hex `request_id` where a request exists. Every failure uses the [stable error envelope](contracts.md#error-envelope), writes exactly one object to stdout (never stderr), and exits 1:
+The global `--json` option produces versioned JSON results for one-shot commands and NDJSON for client streams. A one-shot JSON command writes its result to stdout. On failure it writes exactly one [stable error envelope](contracts.md#error-envelope) to stdout, writes nothing to stderr, and exits 1. Success records have `type`, `schema_version`, and a 32-lowercase-hex `request_id` where a request exists.
+
+The `daemon` command is deliberately outside that JSON stdout contract: it emits no stdout event or telemetry records, and routes startup/fatal diagnostics to stderr. Use `meshmsg --json listen` for the authenticated NDJSON event stream.
 
 ```sh
-meshmsg --json daemon
 meshmsg --json status
 meshmsg --json peers
 meshmsg --json invite

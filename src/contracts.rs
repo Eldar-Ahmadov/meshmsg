@@ -379,27 +379,6 @@ fn validate_field_rule(rule: FieldRule, present: bool, name: &str) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn set_private_diagnostic_output(enabled: bool) -> std::io::Result<()> {
-    crate::output::init_diagnostics(enabled)
-}
-
-#[cfg(test)]
-pub(crate) fn diagnostic_metrics() -> (u64, u64, usize) {
-    let metrics = crate::output::diagnostic_metrics();
-    (metrics.accepted, metrics.dropped, 0)
-}
-
-/// Emit only bounded typed metadata. `diagnostic` is intentionally not retained
-/// or rendered because arbitrary causes can contain paths, secrets, message
-/// bodies, tickets, or private routes.
-pub(crate) fn log_private_diagnostic(context: &str, code: &str, _diagnostic: &str) {
-    let request_id = crate::node::current_ipc_request_id();
-    let _ = crate::output::sampled_diagnostic(
-        crate::output::DiagnosticRecord::new(crate::output::Level::Warn, context, code)
-            .request_id(request_id.as_deref()),
-    );
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ErrorEnvelopeV1 {
@@ -493,12 +472,10 @@ impl ErrorEnvelopeV1 {
 
     pub(crate) fn try_new(
         code: impl Into<String>,
-        diagnostic: impl AsRef<str>,
+        _diagnostic: impl AsRef<str>,
         outcome: impl Into<String>,
         retryable: bool,
     ) -> Result<Self> {
-        let code = code.into();
-        log_private_diagnostic("error_envelope", &code, diagnostic.as_ref());
         Self::try_new_public(code, outcome, retryable)
     }
 
@@ -513,29 +490,26 @@ impl ErrorEnvelopeV1 {
     ) -> Self {
         let code = code.into();
         let outcome = outcome.into();
-        Self::try_new(&code, diagnostic.as_ref(), &outcome, retryable).unwrap_or_else(|failure| {
-            log_private_diagnostic("invalid_error_producer", &code, &failure.to_string());
-            Self {
-                kind: "error".into(),
-                schema_version: SCHEMA_VERSION,
-                code: "internal_contract_error".into(),
-                message: stable_message("internal_contract_error").into(),
-                retryable: false,
-                outcome: "unknown".into(),
-                request_id: None,
-                operation_id: None,
-                offer_id: None,
-                selected_tags: None,
-                removed_tags: None,
-                quota_bytes_released: None,
-                suppressed_since_last: None,
-                direction: None,
-                provider: None,
-                older_than_secs: None,
-                maximum: None,
-                dry_run: None,
-                cutoff_ms: None,
-            }
+        Self::try_new(&code, diagnostic.as_ref(), &outcome, retryable).unwrap_or_else(|_| Self {
+            kind: "error".into(),
+            schema_version: SCHEMA_VERSION,
+            code: "internal_contract_error".into(),
+            message: stable_message("internal_contract_error").into(),
+            retryable: false,
+            outcome: "unknown".into(),
+            request_id: None,
+            operation_id: None,
+            offer_id: None,
+            selected_tags: None,
+            removed_tags: None,
+            quota_bytes_released: None,
+            suppressed_since_last: None,
+            direction: None,
+            provider: None,
+            older_than_secs: None,
+            maximum: None,
+            dry_run: None,
+            cutoff_ms: None,
         })
     }
 
@@ -775,23 +749,6 @@ mod tests {
         "send_outcome_unknown",
         "share_outcome_unknown",
     ];
-
-    #[test]
-    fn diagnostic_admission_is_nonblocking_and_does_not_retain_private_causes() {
-        let before = diagnostic_metrics();
-        let started = std::time::Instant::now();
-        for _ in 0..10_000 {
-            log_private_diagnostic(
-                "contention_test",
-                "internal_contract_error",
-                "open /private/path containing a secret ticket",
-            );
-        }
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        let after = diagnostic_metrics();
-        assert!(after.0 > before.0 || after.1 > before.1);
-        assert_eq!(after.2, 0);
-    }
 
     #[test]
     fn every_error_code_has_exhaustive_canonical_semantics_and_applicability() {
