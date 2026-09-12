@@ -9,6 +9,8 @@ mod config;
 mod contracts;
 mod direct;
 mod direct_replay;
+mod gossip;
+mod ids;
 mod invite;
 mod ipc;
 mod message;

@@ -1,5 +1,6 @@
 use crate::{
     direct_replay::{self, ReplayClient, ReplayDecision},
+    ids::id_string,
     presence::validate_endpoint_addr,
 };
 use anyhow::{Context, Result};
@@ -615,10 +616,6 @@ pub(crate) fn replay_status(worker: &ReplayWorker) -> ReplayStatus {
         sender_rate_per_second: direct_replay::SENDER_RATE_PER_SECOND as u64,
         sender_rate_burst: direct_replay::SENDER_RATE_BURST as u64,
     }
-}
-
-pub(crate) fn id_string(id: &[u8; 16]) -> String {
-    data_encoding::HEXLOWER.encode(id)
 }
 
 #[cfg(test)]

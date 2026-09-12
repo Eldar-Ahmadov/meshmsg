@@ -1,8 +1,8 @@
 use super::{protocol, AttachmentKind, AttachmentOffer};
 use crate::attachment;
-use crate::direct;
 use crate::{
     contracts,
+    ids::id_string,
     ipc::{
         LifecycleErrorV1, LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1,
         MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
@@ -1571,7 +1571,7 @@ pub(crate) async fn share_attachment(
         Ok(serde_json::json!({
             "type":"attachment_shared", "schema_version":3,
             "from":signed.from.to_string(),
-            "message_id":direct::id_string(&message_id), "timestamp_ms":timestamp_ms,
+            "message_id":id_string(&message_id), "timestamp_ms":timestamp_ms,
             "offer_id":offer.offer_id, "source_digest":source_digest,
             "kind":offer.kind, "name":offer.name, "size":offer.size,
             "ticket":offer.ticket, "offer":BASE64URL_NOPAD.encode(&encoded),
@@ -1592,7 +1592,7 @@ pub(crate) fn raw_ticket_offer_id(ticket: &BlobTicket) -> String {
     digest.update(b"\0");
     digest.update(ticket.hash().to_string().as_bytes());
     digest.update(b"\0raw");
-    direct::id_string(
+    id_string(
         &digest.finalize()[..16]
             .try_into()
             .expect("fixed digest prefix"),

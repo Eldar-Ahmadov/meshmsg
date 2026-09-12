@@ -4,16 +4,13 @@ use crate::{
     alias::AliasConfig,
     attachment::{
         self,
-        protocol::{
-            offer_event as attachment_offer_event, validate_offer_binding,
-            ENVELOPE_ACCEPTANCE_WINDOW,
-        },
+        protocol::{offer_event as attachment_offer_event, validate_offer_binding},
         runtime::*,
-        AttachmentOffer,
     },
     config::{prepare_state_dir, State, StateLock},
     contracts::{self, ErrorEnvelopeV1},
     direct::{self, DIRECT_ALPN},
+    gossip::{self, EventHandler as GossipEventHandler},
     invite::Invite,
     ipc::{
         read_frame, send_request_checked, subscribe, valid_content_digest, valid_operation_id,
@@ -24,6 +21,7 @@ use crate::{
     presence::{self, Directory, PresenceSourceLimiter},
 };
 use anyhow::{Context, Result};
+#[cfg(test)]
 use bytes::Bytes;
 #[cfg(test)]
 use data_encoding::BASE64URL_NOPAD;
@@ -45,10 +43,11 @@ use iroh_gossip::{
     net::Gossip,
     proto::TopicId,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(test)]
 use serde_byte_array::ByteArray;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io::BufRead as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -73,7 +72,18 @@ use crate::{
             signed_attachment_event_for_test, validate_attachment_event, AttachmentWire,
             ATTACHMENT_OFFER_VERSION, ATTACHMENT_PREFIX,
         },
-        AttachmentKind,
+        AttachmentKind, AttachmentOffer,
+    },
+    gossip::{
+        Envelope, EnvelopeKind, EnvelopeReplayCache, EnvelopeSignaturePayload, LegacyEnvelopeV1,
+        RejectionSampler, TokenBucket, TransportSourceLimiter, ENVELOPE_ACCEPTANCE_WINDOW,
+        ENVELOPE_DOMAIN, ENVELOPE_FUTURE_SKEW, ENVELOPE_VERSION, GLOBAL_REPLAY_BURST,
+        GLOBAL_TRANSPORT_BURST, MAX_ENVELOPE_REPLAY_ENTRIES, MAX_ENVELOPE_SIZE,
+        MAX_MESSAGE_SIZE as GOSSIP_MAX_MESSAGE_SIZE, MAX_REPLAY_IDS_PER_SENDER,
+        MAX_REPLAY_SENDERS_PER_SOURCE, MAX_TRANSPORT_SOURCES, PER_SENDER_REPLAY_BURST,
+        PROTOCOL_HEADROOM as GOSSIP_PROTOCOL_HEADROOM, REPLAY_BUCKET_RETENTION,
+        REPLAY_BUCKET_WIDTH, SIGNATURE_LENGTH, TRANSPORT_SOURCE_BURST,
+        TRANSPORT_SOURCE_IDLE_LIFETIME,
     },
     ipc::{
         write_request_with_id, MAX_IPC_EVENT_SIZE, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
@@ -86,49 +96,7 @@ use std::{collections::BTreeMap, sync::atomic::Ordering};
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
 
-const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
-const BROADCAST_ALPN_V2: &[u8] = b"/meshmsg/broadcast-gossip/2";
-const ENVELOPE_DOMAIN: &str = "meshmsg-broadcast";
-const ENVELOPE_VERSION: u8 = 2;
-const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
-const REPLAY_BUCKET_WIDTH: Duration = Duration::from_secs(60);
-// A bucket may receive an envelope at its last millisecond whose timestamp is
-// at the future-skew boundary. Keep that whole bucket for one width beyond the
-// five-minute past acceptance window plus the one-minute future allowance.
-const REPLAY_BUCKET_RETENTION: Duration = Duration::from_secs(7 * 60);
-const PER_SENDER_REPLAY_RATE_PER_SEC: u64 = 100;
-const PER_SENDER_REPLAY_BURST: u64 = 200;
-const TRANSPORT_SOURCE_RATE_PER_SEC: u64 = 500;
-const TRANSPORT_SOURCE_BURST: u64 = 1_000;
-const GLOBAL_TRANSPORT_RATE_PER_SEC: u64 = 1_500;
-const GLOBAL_TRANSPORT_BURST: u64 = 3_000;
-const TRANSPORT_SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(60);
-const MAX_TRANSPORT_SOURCES: usize = 128;
-const MAX_REPLAY_SENDERS_PER_SOURCE: usize = 256;
-const MAX_REPLAY_SOURCES: usize = 128;
-const GLOBAL_REPLAY_RATE_PER_SEC: u64 = 1_000;
-const GLOBAL_REPLAY_BURST: u64 = 2_000;
-const MAX_REPLAY_SENDERS: usize = 4_096;
-const MAX_REPLAY_IDS_PER_SENDER: usize = (PER_SENDER_REPLAY_BURST
-    + PER_SENDER_REPLAY_RATE_PER_SEC * REPLAY_BUCKET_RETENTION.as_secs())
-    as usize;
-const MAX_REPLAY_IDS_PER_SOURCE: usize = (TRANSPORT_SOURCE_BURST
-    + TRANSPORT_SOURCE_RATE_PER_SEC * REPLAY_BUCKET_RETENTION.as_secs())
-    as usize;
-const MAX_ENVELOPE_REPLAY_ENTRIES: usize =
-    (GLOBAL_REPLAY_BURST + GLOBAL_REPLAY_RATE_PER_SEC * REPLAY_BUCKET_RETENTION.as_secs()) as usize;
 const REJECTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
-const _: () = assert!(
-    REPLAY_BUCKET_RETENTION.as_secs()
-        >= ENVELOPE_ACCEPTANCE_WINDOW.as_secs()
-            + ENVELOPE_FUTURE_SKEW.as_secs()
-            + REPLAY_BUCKET_WIDTH.as_secs()
-);
-/// Maximum serialized application envelope accepted for broadcast.
-const MAX_ENVELOPE_SIZE: usize = 4096;
-/// Iroh's limit includes its own framing, so reserve explicit protocol headroom.
-const GOSSIP_PROTOCOL_HEADROOM: usize = 512;
-const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADROOM;
 const IPC_EVENT_CAPACITY: usize = 256;
 /// Bounds all accepted local IPC connections, including long-lived subscriptions
 /// and subscriptions. Connections beyond this limit receive a small rejection and
@@ -156,201 +124,6 @@ pub(crate) const DEFAULT_MIN_FREE_SPACE_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_ATTACHMENT_RETENTION_SECS: u64 = 0;
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
-type Signature = ByteArray<SIGNATURE_LENGTH>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum EnvelopeKind {
-    Message,
-    AttachmentOffer,
-}
-
-#[cfg(test)]
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyEnvelopeV1 {
-    from: PublicKey,
-    timestamp_ms: u64,
-    body: String,
-    signature: Signature,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Envelope {
-    domain: String,
-    version: u8,
-    topic: TopicId,
-    from: PublicKey,
-    message_id: [u8; 16],
-    timestamp_ms: u64,
-    kind: EnvelopeKind,
-    body: String,
-    signature: Signature,
-}
-
-#[derive(Debug, Serialize)]
-struct EnvelopeSignaturePayload<'a> {
-    domain: &'a str,
-    version: u8,
-    topic: TopicId,
-    from: PublicKey,
-    message_id: [u8; 16],
-    timestamp_ms: u64,
-    kind: EnvelopeKind,
-    body: &'a str,
-}
-
-type EnvelopeReplayKey = (PublicKey, [u8; 16]);
-
-struct ReplayBucket {
-    started_at_ms: u64,
-    expires_at_ms: u64,
-    entries: HashSet<EnvelopeReplayKey>,
-}
-
-#[derive(Clone)]
-struct TokenBucket {
-    milli_tokens: u64,
-    burst: u64,
-    rate_per_sec: u64,
-    last_refill_ms: u64,
-}
-
-impl TokenBucket {
-    fn new(rate_per_sec: u64, burst: u64, now_ms: u64) -> Self {
-        Self {
-            milli_tokens: burst.saturating_mul(1_000),
-            burst,
-            rate_per_sec,
-            last_refill_ms: now_ms,
-        }
-    }
-
-    fn refill(&mut self, now_ms: u64) {
-        let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms);
-        self.milli_tokens = self
-            .milli_tokens
-            .saturating_add(elapsed_ms.saturating_mul(self.rate_per_sec))
-            .min(self.burst.saturating_mul(1_000));
-        self.last_refill_ms = self.last_refill_ms.max(now_ms);
-    }
-
-    fn available(&self) -> bool {
-        self.milli_tokens >= 1_000
-    }
-
-    fn consume(&mut self) {
-        self.milli_tokens -= 1_000;
-    }
-}
-
-struct TransportSourceState {
-    verification_limiter: TokenBucket,
-    admission_limiter: TokenBucket,
-    last_seen_ms: u64,
-}
-
-struct TransportSourceLimiter {
-    sources: HashMap<PublicKey, TransportSourceState>,
-    verification_global: TokenBucket,
-    admission_global: TokenBucket,
-}
-
-impl Default for TransportSourceLimiter {
-    fn default() -> Self {
-        Self {
-            sources: HashMap::new(),
-            verification_global: TokenBucket::new(
-                GLOBAL_TRANSPORT_RATE_PER_SEC,
-                GLOBAL_TRANSPORT_BURST,
-                0,
-            ),
-            admission_global: TokenBucket::new(
-                GLOBAL_TRANSPORT_RATE_PER_SEC,
-                GLOBAL_TRANSPORT_BURST,
-                0,
-            ),
-        }
-    }
-}
-
-impl TransportSourceLimiter {
-    fn prepare_source(&mut self, source: PublicKey, now_ms: u64) -> bool {
-        let idle_ms = TRANSPORT_SOURCE_IDLE_LIFETIME.as_millis() as u64;
-        self.sources
-            .retain(|_, state| state.last_seen_ms.saturating_add(idle_ms) > now_ms);
-        if !self.sources.contains_key(&source) {
-            if self.sources.len() >= MAX_TRANSPORT_SOURCES {
-                return false;
-            }
-            self.sources.insert(
-                source,
-                TransportSourceState {
-                    verification_limiter: TokenBucket::new(
-                        TRANSPORT_SOURCE_RATE_PER_SEC,
-                        TRANSPORT_SOURCE_BURST,
-                        now_ms,
-                    ),
-                    admission_limiter: TokenBucket::new(
-                        TRANSPORT_SOURCE_RATE_PER_SEC,
-                        TRANSPORT_SOURCE_BURST,
-                        now_ms,
-                    ),
-                    last_seen_ms: now_ms,
-                },
-            );
-        }
-        true
-    }
-
-    /// Cheap authenticated-hop bound paid by every frame before postcard or
-    /// signature work. It is deliberately separate from accepted-message
-    /// accounting, so malformed/stale/replayed frames cannot consume the
-    /// transport tokens needed by later valid traffic.
-    fn allow_verification(&mut self, source: PublicKey, now_ms: u64) -> bool {
-        if !self.prepare_source(source, now_ms) {
-            return false;
-        }
-        self.verification_global.refill(now_ms);
-        if !self.verification_global.available() {
-            return false;
-        }
-        let state = self.sources.get_mut(&source).expect("source was inserted");
-        state.verification_limiter.refill(now_ms);
-        if !state.verification_limiter.available() {
-            return false;
-        }
-        self.verification_global.consume();
-        state.verification_limiter.consume();
-        state.last_seen_ms = now_ms;
-        true
-    }
-
-    fn admission_available(&mut self, source: PublicKey, now_ms: u64) -> bool {
-        if !self.prepare_source(source, now_ms) {
-            return false;
-        }
-        self.admission_global.refill(now_ms);
-        let state = self.sources.get_mut(&source).expect("source was inserted");
-        state.admission_limiter.refill(now_ms);
-        self.admission_global.available() && state.admission_limiter.available()
-    }
-
-    fn consume_admission(&mut self, source: PublicKey, now_ms: u64) {
-        debug_assert!(self.admission_available(source, now_ms));
-        self.admission_global.consume();
-        let state = self.sources.get_mut(&source).expect("source was reserved");
-        state.admission_limiter.consume();
-        state.last_seen_ms = now_ms;
-    }
-}
-
-#[derive(Default)]
-struct RejectionSampler {
-    last_emitted_ms: Option<u64>,
-    suppressed: u64,
-}
-
 #[derive(Default)]
 struct InternalContractGuard {
     last_emitted_ms: Option<u64>,
@@ -380,209 +153,6 @@ impl InternalContractGuard {
     }
 }
 
-impl RejectionSampler {
-    fn event(&mut self, now_ms: u64, _private_diagnostic: &str) -> Option<serde_json::Value> {
-        let interval_ms = REJECTION_SAMPLE_INTERVAL.as_millis() as u64;
-        if self
-            .last_emitted_ms
-            .is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms)
-        {
-            let suppressed = std::mem::take(&mut self.suppressed);
-            self.last_emitted_ms = Some(now_ms);
-            let mut error =
-                ErrorEnvelopeV1::try_new_public("network_event_rejected", "not_started", false)
-                    .ok()?;
-            error.suppressed_since_last = Some(suppressed);
-            return Some(error.into_value());
-        }
-        self.suppressed = self.suppressed.saturating_add(1);
-        None
-    }
-}
-
-struct SenderReplayState {
-    limiter: TokenBucket,
-    live_ids: usize,
-    last_seen_ms: u64,
-}
-
-struct SourceReplayState {
-    live_ids: usize,
-    senders: HashMap<PublicKey, usize>,
-}
-
-struct EnvelopeReplayCache {
-    buckets: VecDeque<ReplayBucket>,
-    senders: HashMap<PublicKey, SenderReplayState>,
-    sources: HashMap<PublicKey, SourceReplayState>,
-    ownership: HashMap<EnvelopeReplayKey, PublicKey>,
-    global_limiter: TokenBucket,
-    live_ids: usize,
-    max_live_ids: usize,
-}
-
-impl Default for EnvelopeReplayCache {
-    fn default() -> Self {
-        Self {
-            buckets: VecDeque::new(),
-            senders: HashMap::new(),
-            sources: HashMap::new(),
-            ownership: HashMap::new(),
-            global_limiter: TokenBucket::new(GLOBAL_REPLAY_RATE_PER_SEC, GLOBAL_REPLAY_BURST, 0),
-            live_ids: 0,
-            max_live_ids: MAX_ENVELOPE_REPLAY_ENTRIES,
-        }
-    }
-}
-
-impl EnvelopeReplayCache {
-    fn rotate(&mut self, now_ms: u64) {
-        while self
-            .buckets
-            .front()
-            .is_some_and(|bucket| bucket.expires_at_ms <= now_ms)
-        {
-            let expired = self.buckets.pop_front().expect("front exists");
-            self.live_ids -= expired.entries.len();
-            for key @ (sender, _) in expired.entries {
-                if let Some(state) = self.senders.get_mut(&sender) {
-                    state.live_ids -= 1;
-                }
-                if let Some(source) = self.ownership.remove(&key) {
-                    if let Some(state) = self.sources.get_mut(&source) {
-                        state.live_ids -= 1;
-                        if let Some(count) = state.senders.get_mut(&sender) {
-                            *count -= 1;
-                            if *count == 0 {
-                                state.senders.remove(&sender);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let retention_ms = REPLAY_BUCKET_RETENTION.as_millis() as u64;
-        self.senders.retain(|_, state| {
-            state.live_ids != 0 || state.last_seen_ms.saturating_add(retention_ms) > now_ms
-        });
-        self.sources.retain(|_, state| state.live_ids != 0);
-    }
-
-    fn contains(&self, key: &EnvelopeReplayKey) -> bool {
-        self.buckets
-            .iter()
-            .any(|bucket| bucket.entries.contains(key))
-    }
-
-    fn accept(&mut self, envelope: &Envelope, source: PublicKey, now_ms: u64) -> Result<()> {
-        self.rotate(now_ms);
-        let oldest = now_ms.saturating_sub(ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64);
-        let newest = now_ms.saturating_add(ENVELOPE_FUTURE_SKEW.as_millis() as u64);
-        anyhow::ensure!(
-            (oldest..=newest).contains(&envelope.timestamp_ms),
-            "message timestamp is outside the acceptance window"
-        );
-        let key = (envelope.from, envelope.message_id);
-        anyhow::ensure!(!self.contains(&key), "replayed message");
-
-        self.global_limiter.refill(now_ms);
-        anyhow::ensure!(
-            self.global_limiter.available(),
-            "global message rate limit exceeded"
-        );
-        anyhow::ensure!(
-            self.live_ids < self.max_live_ids,
-            "global replay capacity reached"
-        );
-        if !self.sources.contains_key(&source) {
-            anyhow::ensure!(
-                self.sources.len() < MAX_REPLAY_SOURCES,
-                "replay source capacity reached"
-            );
-            self.sources.insert(
-                source,
-                SourceReplayState {
-                    live_ids: 0,
-                    senders: HashMap::new(),
-                },
-            );
-        }
-        let source_state = self.sources.get(&source).expect("source was inserted");
-        anyhow::ensure!(
-            source_state.live_ids < MAX_REPLAY_IDS_PER_SOURCE,
-            "transport source replay quota reached"
-        );
-        anyhow::ensure!(
-            source_state.senders.contains_key(&envelope.from)
-                || source_state.senders.len() < MAX_REPLAY_SENDERS_PER_SOURCE,
-            "transport source sender quota reached"
-        );
-        if !self.senders.contains_key(&envelope.from) {
-            anyhow::ensure!(
-                self.senders.len() < MAX_REPLAY_SENDERS,
-                "replay sender capacity reached"
-            );
-            self.senders.insert(
-                envelope.from,
-                SenderReplayState {
-                    limiter: TokenBucket::new(
-                        PER_SENDER_REPLAY_RATE_PER_SEC,
-                        PER_SENDER_REPLAY_BURST,
-                        now_ms,
-                    ),
-                    live_ids: 0,
-                    last_seen_ms: now_ms,
-                },
-            );
-        }
-        let sender = self
-            .senders
-            .get_mut(&envelope.from)
-            .expect("sender was inserted");
-        sender.limiter.refill(now_ms);
-        anyhow::ensure!(
-            sender.limiter.available(),
-            "sender message rate limit exceeded"
-        );
-        anyhow::ensure!(
-            sender.live_ids < MAX_REPLAY_IDS_PER_SENDER,
-            "sender replay quota reached"
-        );
-
-        self.global_limiter.consume();
-        sender.limiter.consume();
-        sender.live_ids += 1;
-        sender.last_seen_ms = now_ms;
-        let source_state = self.sources.get_mut(&source).expect("source was inserted");
-        source_state.live_ids += 1;
-        *source_state.senders.entry(envelope.from).or_default() += 1;
-        self.ownership.insert(key, source);
-        self.live_ids += 1;
-
-        let width_ms = REPLAY_BUCKET_WIDTH.as_millis() as u64;
-        let started_at_ms = now_ms - now_ms % width_ms;
-        let expires_at_ms =
-            started_at_ms.saturating_add(REPLAY_BUCKET_RETENTION.as_millis() as u64);
-        if self
-            .buckets
-            .back()
-            .is_none_or(|bucket| bucket.started_at_ms != started_at_ms)
-        {
-            self.buckets.push_back(ReplayBucket {
-                started_at_ms,
-                expires_at_ms,
-                entries: HashSet::new(),
-            });
-        }
-        self.buckets
-            .back_mut()
-            .expect("current replay bucket exists")
-            .entries
-            .insert(key);
-        Ok(())
-    }
-}
-
 fn unix_timestamp_ms() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
 }
@@ -591,126 +161,6 @@ fn unix_timestamp_ms_saturating(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
-}
-
-impl Envelope {
-    #[cfg(test)]
-    fn encode_at(
-        secret: &SecretKey,
-        topic: TopicId,
-        kind: EnvelopeKind,
-        body: String,
-        timestamp_ms: u64,
-    ) -> Result<Bytes> {
-        Self::encode_with_id_at(secret, topic, kind, body, rand::random(), timestamp_ms)
-    }
-
-    fn encode_with_id_at(
-        secret: &SecretKey,
-        topic: TopicId,
-        kind: EnvelopeKind,
-        body: String,
-        message_id: [u8; 16],
-        timestamp_ms: u64,
-    ) -> Result<Bytes> {
-        if kind == EnvelopeKind::Message {
-            crate::message::validate_broadcast_body(&body)?;
-        }
-        let payload = EnvelopeSignaturePayload {
-            domain: ENVELOPE_DOMAIN,
-            version: ENVELOPE_VERSION,
-            topic,
-            from: secret.public(),
-            message_id,
-            timestamp_ms,
-            kind,
-            body: &body,
-        };
-        let signed = postcard::to_stdvec(&payload)?;
-        let value = Self {
-            domain: ENVELOPE_DOMAIN.to_owned(),
-            version: ENVELOPE_VERSION,
-            topic,
-            from: secret.public(),
-            message_id,
-            timestamp_ms,
-            kind,
-            body,
-            signature: ByteArray::new(secret.sign(&signed).to_bytes()),
-        };
-        value.validate_semantics()?;
-        let encoded = postcard::to_stdvec(&value)?;
-        anyhow::ensure!(
-            encoded.len() <= MAX_ENVELOPE_SIZE,
-            "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
-            encoded.len()
-        );
-        Ok(encoded.into())
-    }
-
-    fn decode(data: &[u8], expected_topic: TopicId) -> Result<Self> {
-        let value = Self::decode_signed(data)?;
-        anyhow::ensure!(
-            value.topic == expected_topic,
-            "message belongs to another topic"
-        );
-        Ok(value)
-    }
-
-    fn decode_signed(data: &[u8]) -> Result<Self> {
-        anyhow::ensure!(
-            data.len() <= MAX_ENVELOPE_SIZE,
-            "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
-            data.len()
-        );
-        let (value, remainder): (Self, &[u8]) =
-            postcard::take_from_bytes(data).context("decode message")?;
-        anyhow::ensure!(
-            remainder.is_empty(),
-            "encoded message contains trailing bytes"
-        );
-        anyhow::ensure!(value.domain == ENVELOPE_DOMAIN, "invalid message domain");
-        anyhow::ensure!(
-            value.version == ENVELOPE_VERSION,
-            "unsupported message version"
-        );
-        let signed = postcard::to_stdvec(&EnvelopeSignaturePayload {
-            domain: &value.domain,
-            version: value.version,
-            topic: value.topic,
-            from: value.from,
-            message_id: value.message_id,
-            timestamp_ms: value.timestamp_ms,
-            kind: value.kind,
-            body: &value.body,
-        })?;
-        value
-            .from
-            .verify(&signed, &iroh::Signature::from_bytes(&value.signature))
-            .context("verify message")?;
-        value.validate_semantics()?;
-        Ok(value)
-    }
-
-    fn validate_semantics(&self) -> Result<()> {
-        match self.kind {
-            EnvelopeKind::Message => crate::message::validate_v2_message_body(&self.body),
-            EnvelopeKind::AttachmentOffer => validate_attachment_envelope(self).map(|_| ()),
-        }
-    }
-}
-
-fn validate_attachment_envelope(envelope: &Envelope) -> Result<AttachmentOffer> {
-    anyhow::ensure!(
-        envelope.kind == EnvelopeKind::AttachmentOffer,
-        "message is not an attachment offer"
-    );
-    validate_offer_binding(
-        envelope.from,
-        envelope.message_id,
-        envelope.timestamp_ms,
-        &envelope.body,
-    )
 }
 
 struct RunningNode {
@@ -747,8 +197,8 @@ async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<Run
         .bind()
         .await?;
     let gossip = Gossip::builder()
-        .alpn(BROADCAST_ALPN_V2)
-        .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
+        .alpn(gossip::ALPN)
+        .max_message_size(gossip::MAX_MESSAGE_SIZE)
         .spawn(endpoint.clone());
     // Isolate control-plane membership from the long-standing broadcast Gossip
     // actor. Sharing one actor/connection pool across both topics can perturb
@@ -772,7 +222,7 @@ async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<Run
     let (direct, direct_replay, direct_incoming) = direct::setup(secret.clone(), topic, state_dir)
         .context("open persistent direct replay state")?;
     let router = Router::builder(endpoint.clone())
-        .accept(BROADCAST_ALPN_V2, gossip.clone())
+        .accept(gossip::ALPN, gossip.clone())
         .accept(presence::ALPN, presence_gossip.clone())
         .accept(iroh_blobs::ALPN, blobs)
         .accept(DIRECT_ALPN, direct)
@@ -2361,9 +1811,7 @@ pub async fn run_daemon(
     let mut presence_cleanup = tokio::time::interval(presence::CLEANUP_INTERVAL);
     presence_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut presence_sources = PresenceSourceLimiter::default();
-    let mut envelope_replay = EnvelopeReplayCache::default();
-    let mut broadcast_sources = TransportSourceLimiter::default();
-    let mut broadcast_rejections = RejectionSampler::default();
+    let mut gossip_events = GossipEventHandler::default();
     let internal_contract_guard = Arc::new(Mutex::new(InternalContractGuard::default()));
     let connection_limit = Arc::new(Semaphore::new(LOCAL_IPC_CONNECTION_CAPACITY));
     let mut local_client_tasks = tokio::task::JoinSet::new();
@@ -2436,12 +1884,12 @@ pub async fn run_daemon(
                         continue;
                     }
                     let response = match unix_timestamp_ms() {
-                        Ok(timestamp_ms) => match Envelope::encode_with_id_at(
-                            &node.secret, topic, EnvelopeKind::Message, body.clone(),
+                        Ok(timestamp_ms) => match gossip::Envelope::encode_message_with_id_at(
+                            &node.secret, topic, body.clone(),
                             operation_id_bytes(&operation_id), timestamp_ms,
                         ) {
                             Ok(envelope) => match node.sender.broadcast(envelope).await {
-                                Ok(()) => queued_event(
+                                Ok(()) => gossip::queued_event(
                                     &peer, operation_id_bytes(&operation_id), body, timestamp_ms
                                 ),
                                 Err(error) => serde_json::json!({"type":"error", "schema_version":1, "code":"send_failed", "message":error.to_string(), "outcome":"unknown", "retryable":true}),
@@ -2816,14 +2264,21 @@ pub async fn run_daemon(
                         ).await;
                     }
                     let now_ms = unix_timestamp_ms()?;
-                    let values = network_event(
-                        value,
-                        topic,
-                        &mut envelope_replay,
-                        &mut broadcast_sources,
-                        &mut broadcast_rejections,
-                        now_ms,
-                    );
+                    let values = gossip_events.handle(value, topic, now_ms, |envelope| {
+                        let offer = validate_offer_binding(
+                            envelope.from,
+                            envelope.message_id,
+                            envelope.timestamp_ms,
+                            envelope.body,
+                        )?;
+                        Ok(attachment_offer_event(
+                            envelope.from,
+                            envelope.message_id,
+                            envelope.timestamp_ms,
+                            envelope.encoded,
+                            offer,
+                        ))
+                    });
                     for full_value in values {
                         publish_daemon_message_event(
                             &event_tx,
@@ -2939,11 +2394,17 @@ fn invite_details(state: &State, self_id: PublicKey) -> Result<(bool, usize, boo
     Ok((true, invite.bootstrap_peers.len(), self_advertised))
 }
 
+#[cfg(test)]
 fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Value {
     if envelope.kind == EnvelopeKind::Message {
-        return message_event(envelope);
+        return gossip::message_event(&envelope);
     }
-    match validate_attachment_envelope(&envelope) {
+    match validate_offer_binding(
+        envelope.from,
+        envelope.message_id,
+        envelope.timestamp_ms,
+        &envelope.body,
+    ) {
         Ok(offer) => attachment_offer_event(
             envelope.from,
             envelope.message_id,
@@ -2958,6 +2419,7 @@ fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Va
     }
 }
 
+#[cfg(test)]
 fn network_event(
     value: Event,
     topic: TopicId,
@@ -2966,60 +2428,44 @@ fn network_event(
     rejections: &mut RejectionSampler,
     now_ms: u64,
 ) -> Vec<serde_json::Value> {
-    match value {
-        Event::Received(message) => {
-            let source = message.delivered_from;
-            if !sources.allow_verification(source, now_ms) {
-                return rejections
-                    .event(now_ms, "broadcast verification rate limit exceeded")
-                    .into_iter()
-                    .collect();
-            }
-            // Signature and complete semantics come before accepted-traffic
-            // accounting. Freshness/replay admission also comes first, so
-            // stale, future, replayed, and malformed frames pay only the
-            // separate cheap verification-attempt budget.
-            match Envelope::decode(&message.content, topic).and_then(|envelope| {
-                anyhow::ensure!(
-                    sources.admission_available(source, now_ms),
-                    "broadcast transport source rate limit exceeded"
-                );
-                replay.accept(&envelope, source, now_ms)?;
-                sources.consume_admission(source, now_ms);
-                Ok(envelope)
-            }) {
-                Ok(envelope) => {
-                    let event = received_envelope_event(envelope, &message.content);
-                    if event["type"] == "error" {
-                        return rejections
-                            .event(
-                                now_ms,
-                                event["message"]
-                                    .as_str()
-                                    .unwrap_or("invalid broadcast message"),
-                            )
-                            .into_iter()
-                            .collect();
-                    }
-                    vec![event]
-                }
-                Err(error) => rejections
-                    .event(now_ms, &error.to_string())
-                    .into_iter()
-                    .collect(),
-            }
-        }
-        Event::NeighborUp(peer) => {
-            vec![serde_json::json!({"type":"peer_up", "peer":peer.to_string()})]
-        }
-        Event::NeighborDown(peer) => {
-            vec![serde_json::json!({"type":"peer_down", "peer":peer.to_string()})]
-        }
-        Event::Lagged => vec![serde_json::json!({
-            "type":"lagged", "source":"gossip", "dropped":serde_json::Value::Null,
-            "message":"receiver fell behind; one or more events were dropped"
-        })],
-    }
+    gossip::network_event(
+        value,
+        topic,
+        replay,
+        sources,
+        rejections,
+        now_ms,
+        |envelope| {
+            let offer = validate_offer_binding(
+                envelope.from,
+                envelope.message_id,
+                envelope.timestamp_ms,
+                envelope.body,
+            )?;
+            Ok(attachment_offer_event(
+                envelope.from,
+                envelope.message_id,
+                envelope.timestamp_ms,
+                envelope.encoded,
+                offer,
+            ))
+        },
+    )
+}
+
+#[cfg(test)]
+fn queued_event(
+    peer: &str,
+    message_id: [u8; 16],
+    body: String,
+    timestamp_ms: u64,
+) -> serde_json::Value {
+    gossip::queued_event(peer, message_id, body, timestamp_ms)
+}
+
+#[cfg(test)]
+fn message_event(envelope: Envelope) -> serde_json::Value {
+    gossip::message_event(&envelope)
 }
 
 fn valid_daemon_message_event(value: &serde_json::Value, topic: TopicId, now_ms: u64) -> bool {
@@ -3052,29 +2498,6 @@ fn publish_daemon_message_event(
         let _ = events.send(error);
     }
     false
-}
-
-fn queued_event(
-    peer: &str,
-    message_id: [u8; 16],
-    body: String,
-    timestamp_ms: u64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type":"queued", "schema_version":3,
-        "from":peer, "operation_id":direct::id_string(&message_id),
-        "message_id":direct::id_string(&message_id),
-        "timestamp_ms":timestamp_ms, "body":body,
-        "delivery_acknowledged":false
-    })
-}
-
-fn message_event(msg: Envelope) -> serde_json::Value {
-    serde_json::json!({
-        "type":"message", "schema_version":2, "from":msg.from.to_string(),
-        "message_id":direct::id_string(&msg.message_id),
-        "timestamp_ms":msg.timestamp_ms, "body":msg.body
-    })
 }
 
 #[cfg(unix)]
@@ -4346,7 +3769,14 @@ mod tests {
             operation_id_bytes(&offer.offer_id),
             0,
         );
-        assert!(Envelope::decode(&zero_time, test_topic()).is_err());
+        let zero_time_envelope = Envelope::decode(&zero_time, test_topic()).unwrap();
+        assert!(validate_offer_binding(
+            zero_time_envelope.from,
+            zero_time_envelope.message_id,
+            zero_time_envelope.timestamp_ms,
+            &zero_time_envelope.body,
+        )
+        .is_err());
         assert!(
             parse_signed_offer_token(&BASE64URL_NOPAD.encode(&zero_time), test_topic()).is_err()
         );
@@ -5348,10 +4778,7 @@ mod tests {
         next.timestamp_ms += 1;
         replay.accept(&next, next.from, now_ms + 1).unwrap();
 
-        let mut capacity_limited = EnvelopeReplayCache {
-            max_live_ids: 3,
-            ..EnvelopeReplayCache::default()
-        };
+        let mut capacity_limited = EnvelopeReplayCache::with_capacity(3);
         let source = SecretKey::generate().public();
         let mut retained = unsigned_test_envelope(
             SecretKey::generate().public(),
@@ -5412,21 +4839,14 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_v2_uses_an_explicitly_new_gossip_protocol() {
-        assert_ne!(BROADCAST_ALPN_V2, iroh_gossip::net::GOSSIP_ALPN);
-    }
-
-    #[test]
     fn attachment_wire_rejects_provider_mismatch_version_and_trailing_bytes() {
         let signer = SecretKey::generate();
         let other = SecretKey::generate();
         let mismatched = sample_offer(other.public());
-        assert!(Envelope::encode_with_id_at(
+        assert!(crate::attachment::protocol::encode_signed_offer(
             &signer,
             test_topic(),
-            EnvelopeKind::AttachmentOffer,
-            attachment_body(&mismatched).unwrap(),
-            operation_id_bytes(&mismatched.offer_id),
+            mismatched,
             42,
         )
         .is_err());

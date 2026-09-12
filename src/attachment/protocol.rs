@@ -1,4 +1,8 @@
 use super::{validate_display_name, AttachmentOffer};
+use crate::{
+    gossip::{Envelope, EnvelopeKind},
+    ids::id_string,
+};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use data_encoding::BASE64URL_NOPAD;
@@ -10,8 +14,6 @@ use serde_byte_array::ByteArray;
 use std::time::Duration;
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
-const ENVELOPE_DOMAIN: &str = "meshmsg-broadcast";
-const ENVELOPE_VERSION: u8 = 2;
 pub(crate) const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 pub(crate) const ATTACHMENT_OFFER_VERSION: u8 = 1;
 const MAX_ENVELOPE_SIZE: usize = 4096;
@@ -20,45 +22,12 @@ pub(crate) const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 
 
 type Signature = ByteArray<SIGNATURE_LENGTH>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum EnvelopeKind {
-    Message,
-    AttachmentOffer,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyEnvelopeV1 {
     from: PublicKey,
     timestamp_ms: u64,
     body: String,
     signature: Signature,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SignedEnvelope {
-    domain: String,
-    version: u8,
-    topic: TopicId,
-    from: PublicKey,
-    message_id: [u8; 16],
-    timestamp_ms: u64,
-    kind: EnvelopeKind,
-    body: String,
-    signature: Signature,
-}
-
-#[derive(Debug, Serialize)]
-struct SignaturePayload<'a> {
-    domain: &'a str,
-    version: u8,
-    topic: TopicId,
-    from: PublicKey,
-    message_id: [u8; 16],
-    timestamp_ms: u64,
-    kind: EnvelopeKind,
-    body: &'a str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,7 +106,7 @@ pub(crate) fn validate_offer_binding(
     let offer = parse_attachment_body(body)?
         .context("attachment envelope does not contain a typed offer")?;
     anyhow::ensure!(
-        crate::direct::id_string(&message_id) == offer.offer_id,
+        id_string(&message_id) == offer.offer_id,
         "attachment envelope message ID does not match offer ID"
     );
     let ticket: BlobTicket = offer.ticket.parse().context("parse attachment ticket")?;
@@ -146,50 +115,6 @@ pub(crate) fn validate_offer_binding(
         "attachment provider does not match its signature"
     );
     Ok(offer)
-}
-
-fn decode_signed(data: &[u8]) -> Result<SignedEnvelope> {
-    anyhow::ensure!(
-        data.len() <= MAX_ENVELOPE_SIZE,
-        "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
-        data.len()
-    );
-    let (value, remainder): (SignedEnvelope, &[u8]) =
-        postcard::take_from_bytes(data).context("decode message")?;
-    anyhow::ensure!(
-        remainder.is_empty(),
-        "encoded message contains trailing bytes"
-    );
-    anyhow::ensure!(value.domain == ENVELOPE_DOMAIN, "invalid message domain");
-    anyhow::ensure!(
-        value.version == ENVELOPE_VERSION,
-        "unsupported message version"
-    );
-    let signed = postcard::to_stdvec(&SignaturePayload {
-        domain: &value.domain,
-        version: value.version,
-        topic: value.topic,
-        from: value.from,
-        message_id: value.message_id,
-        timestamp_ms: value.timestamp_ms,
-        kind: value.kind,
-        body: &value.body,
-    })?;
-    value
-        .from
-        .verify(&signed, &iroh::Signature::from_bytes(&value.signature))
-        .context("verify message")?;
-    anyhow::ensure!(
-        value.kind == EnvelopeKind::AttachmentOffer,
-        "token is not an attachment offer"
-    );
-    validate_offer_binding(
-        value.from,
-        value.message_id,
-        value.timestamp_ms,
-        &value.body,
-    )?;
-    Ok(value)
 }
 
 fn decode_legacy(data: &[u8]) -> Result<LegacyEnvelopeV1> {
@@ -218,7 +143,7 @@ pub(crate) fn parse_signed_offer_token(
     let bytes = BASE64URL_NOPAD
         .decode(token.as_bytes())
         .context("decode signed attachment offer")?;
-    let envelope = match decode_signed(&bytes) {
+    let envelope = match Envelope::decode(&bytes, expected_topic) {
         Ok(envelope) => envelope,
         Err(v2_error) => {
             if decode_legacy(&bytes).is_ok() {
@@ -230,8 +155,8 @@ pub(crate) fn parse_signed_offer_token(
         }
     };
     anyhow::ensure!(
-        envelope.topic == expected_topic,
-        "message belongs to another topic"
+        envelope.kind == EnvelopeKind::AttachmentOffer,
+        "token is not an attachment offer"
     );
     let offer = validate_offer_binding(
         envelope.from,
@@ -259,43 +184,18 @@ pub(crate) fn encode_signed_offer(
         .try_into()
         .expect("validated operation ID length");
     let body = attachment_body(&offer)?;
-    let payload = SignaturePayload {
-        domain: ENVELOPE_DOMAIN,
-        version: ENVELOPE_VERSION,
+    validate_offer_binding(secret.public(), message_id, timestamp_ms, &body)?;
+    let encoded = Envelope::encode_with_id_at(
+        secret,
         topic,
-        from: secret.public(),
-        message_id,
-        timestamp_ms,
-        kind: EnvelopeKind::AttachmentOffer,
-        body: &body,
-    };
-    let signed = postcard::to_stdvec(&payload)?;
-    let envelope = SignedEnvelope {
-        domain: ENVELOPE_DOMAIN.to_owned(),
-        version: ENVELOPE_VERSION,
-        topic,
-        from: secret.public(),
-        message_id,
-        timestamp_ms,
-        kind: EnvelopeKind::AttachmentOffer,
+        EnvelopeKind::AttachmentOffer,
         body,
-        signature: ByteArray::new(secret.sign(&signed).to_bytes()),
-    };
-    validate_offer_binding(
-        envelope.from,
-        envelope.message_id,
-        envelope.timestamp_ms,
-        &envelope.body,
+        message_id,
+        timestamp_ms,
     )?;
-    let encoded = postcard::to_stdvec(&envelope)?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_ENVELOPE_SIZE,
-        "encoded message is {} bytes; maximum is {MAX_ENVELOPE_SIZE} bytes",
-        encoded.len()
-    );
     Ok(EncodedOffer {
-        encoded: encoded.into(),
-        from: envelope.from,
+        encoded,
+        from: secret.public(),
         message_id,
         timestamp_ms,
         offer,
@@ -312,7 +212,7 @@ pub(crate) fn offer_event(
     serde_json::json!({
         "type":"attachment_offer", "schema_version":2,
         "from":from.to_string(),
-        "message_id":crate::direct::id_string(&message_id),
+        "message_id":id_string(&message_id),
         "timestamp_ms":timestamp_ms,
         "offer_id":offer.offer_id, "kind":offer.kind,
         "name":offer.name, "size":offer.size, "ticket":offer.ticket,
@@ -340,7 +240,7 @@ pub(crate) fn validate_attachment_event(
     let encoded = BASE64URL_NOPAD
         .decode(token.as_bytes())
         .context("decode signed attachment event")?;
-    let envelope = decode_signed(&encoded)?;
+    let envelope = Envelope::decode_signed(&encoded)?;
     if let Some(expected_topic) = expected_topic {
         anyhow::ensure!(
             envelope.topic == expected_topic,
@@ -366,7 +266,7 @@ pub(crate) fn validate_attachment_event(
         "attachment event provider does not match"
     );
     anyhow::ensure!(
-        crate::direct::id_string(&envelope.message_id) == message_id,
+        id_string(&envelope.message_id) == message_id,
         "attachment event message ID does not match"
     );
     anyhow::ensure!(
