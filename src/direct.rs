@@ -25,6 +25,8 @@ pub(crate) const DIRECT_ALPN: &[u8] = b"/meshmsg/direct/2";
 const DIRECT_VERSION: u8 = 2;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 const MAX_DIRECT_FRAME: usize = 6 * 1024;
+const INCOMING_QUEUE_CAPACITY: usize = 256;
+const SEND_CONCURRENCY: usize = 8;
 const DIRECT_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLAY_SAFETY_MARGIN: Duration = Duration::from_secs(30);
@@ -237,27 +239,36 @@ impl AckFrame {
 }
 
 #[derive(Debug)]
-pub(crate) struct IncomingDirect {
-    pub(crate) from: PublicKey,
-    pub(crate) id: [u8; 16],
-    pub(crate) timestamp_ms: u64,
-    pub(crate) body: String,
+struct IncomingDirect {
+    from: PublicKey,
+    id: [u8; 16],
+    timestamp_ms: u64,
+    body: String,
+}
+
+fn incoming_event(msg: IncomingDirect) -> serde_json::Value {
+    serde_json::json!({
+        "type":"private_message", "schema_version":1, "private":true,
+        "from":msg.from.to_string(), "message_id":id_string(&msg.id),
+        "timestamp_ms":msg.timestamp_ms, "body":msg.body,
+        "acceptance_acknowledged":true, "durable":false, "read":false
+    })
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DirectHandler {
     secret: SecretKey,
     topic: TopicId,
-    incoming: mpsc::Sender<IncomingDirect>,
+    incoming: mpsc::Sender<serde_json::Value>,
     replay: ReplayClient,
     connections: Arc<tokio::sync::Semaphore>,
 }
 
 impl DirectHandler {
-    pub(crate) fn new(
+    fn new(
         secret: SecretKey,
         topic: TopicId,
-        incoming: mpsc::Sender<IncomingDirect>,
+        incoming: mpsc::Sender<serde_json::Value>,
         state_dir: &Path,
     ) -> Result<(Self, ReplayWorker)> {
         let (replay, worker) = direct_replay::start(state_dir, secret.public(), topic)?;
@@ -302,12 +313,12 @@ impl DirectHandler {
             .map(|permit| {
                 let payload = frame.payload.clone();
                 Box::new(move || {
-                    permit.send(IncomingDirect {
+                    permit.send(incoming_event(IncomingDirect {
                         from: payload.sender,
                         id: payload.id,
                         timestamp_ms: payload.timestamp_ms,
                         body: payload.body,
-                    });
+                    }));
                 }) as Box<dyn FnOnce() + Send + 'static>
             });
         let expires_at_ms = now_ms()?.saturating_add(REPLAY_LIFETIME.as_millis() as u64);
@@ -362,17 +373,33 @@ impl ProtocolHandler for DirectHandler {
     }
 }
 
+/// Builds the protocol handler together with its persistent replay owner and
+/// bounded stream of already-validated private-message events.
+pub(crate) fn setup(
+    secret: SecretKey,
+    topic: TopicId,
+    state_dir: &Path,
+) -> Result<(
+    DirectHandler,
+    ReplayWorker,
+    mpsc::Receiver<serde_json::Value>,
+)> {
+    let (incoming, receiver) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
+    let (handler, replay) = DirectHandler::new(secret, topic, incoming, state_dir)?;
+    Ok((handler, replay, receiver))
+}
+
 #[derive(Debug)]
-pub(crate) struct AcceptedDirect {
-    pub(crate) recipient: PublicKey,
-    pub(crate) id: [u8; 16],
-    pub(crate) timestamp_ms: u64,
-    pub(crate) body_bytes: usize,
-    pub(crate) duplicate: bool,
+struct AcceptedDirect {
+    recipient: PublicKey,
+    id: [u8; 16],
+    timestamp_ms: u64,
+    body_bytes: usize,
+    duplicate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DirectRejection {
+enum DirectRejection {
     Conflict,
     Busy,
     Unavailable,
@@ -380,12 +407,12 @@ pub(crate) enum DirectRejection {
 }
 
 #[derive(Debug)]
-pub(crate) enum DirectSendOutcome {
+enum DirectSendOutcome {
     Accepted(AcceptedDirect),
     Rejected(DirectRejection),
 }
 
-pub(crate) async fn send(
+async fn send(
     endpoint: Endpoint,
     secret: SecretKey,
     topic: TopicId,
@@ -445,6 +472,151 @@ pub(crate) async fn send(
         .context("private-message operation timed out")?
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DirectSender {
+    endpoint: Endpoint,
+    secret: SecretKey,
+    topic: TopicId,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl DirectSender {
+    pub(crate) fn new(endpoint: Endpoint, secret: SecretKey, topic: TopicId) -> Self {
+        Self {
+            endpoint,
+            secret,
+            topic,
+            permits: Arc::new(tokio::sync::Semaphore::new(SEND_CONCURRENCY)),
+        }
+    }
+
+    /// Reserves one bounded send task before the caller spawns it.
+    pub(crate) fn try_reserve(&self) -> Result<DirectSendPermit, serde_json::Value> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .map(|permit| DirectSendPermit {
+                sender: self.clone(),
+                _permit: permit,
+            })
+            .map_err(|_| {
+                serde_json::json!({
+                    "type":"error", "schema_version":1,
+                    "code":"private_send_busy",
+                    "message":"private-message send capacity reached",
+                    "outcome":"not_started", "retryable":true
+                })
+            })
+    }
+
+    pub(crate) fn close(&self) {
+        self.permits.close();
+    }
+}
+
+pub(crate) struct DirectSendPermit {
+    sender: DirectSender,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl DirectSendPermit {
+    pub(crate) async fn send(
+        self,
+        address: EndpointAddr,
+        body: String,
+        operation_id: [u8; 16],
+    ) -> serde_json::Value {
+        match send(
+            self.sender.endpoint,
+            self.sender.secret,
+            self.sender.topic,
+            address,
+            body,
+            operation_id,
+        )
+        .await
+        {
+            Ok(DirectSendOutcome::Accepted(accepted)) => serde_json::json!({
+                "type":"private_accepted", "schema_version":3,
+                "to":accepted.recipient.to_string(),
+                "message_id":id_string(&accepted.id),
+                "timestamp_ms":accepted.timestamp_ms,
+                "body_bytes":accepted.body_bytes,
+                "acceptance_acknowledged":true,
+                "duplicate_accepted":accepted.duplicate,
+                "durable":false, "read":false
+            }),
+            Ok(DirectSendOutcome::Rejected(rejection)) => rejection_response(rejection),
+            Err(error) => serde_json::json!({
+                "type":"error", "schema_version":1,
+                "code":"private_send_failed", "message":format!("{error:#}"),
+                "outcome":"unknown", "retryable":true
+            }),
+        }
+    }
+}
+
+fn rejection_response(rejection: DirectRejection) -> serde_json::Value {
+    let (code, message, outcome, retryable) = match rejection {
+        DirectRejection::Conflict => (
+            "private_message_conflict",
+            "recipient has the same message ID bound to different content",
+            "not_started",
+            false,
+        ),
+        DirectRejection::Busy => (
+            "private_recipient_busy",
+            "recipient replay or delivery capacity is busy",
+            "not_started",
+            true,
+        ),
+        DirectRejection::Unavailable => (
+            "private_replay_unavailable",
+            "recipient replay persistence is unavailable",
+            "not_started",
+            true,
+        ),
+        DirectRejection::DeliveryOutcomeUnknown => (
+            "private_delivery_unknown",
+            "recipient durably recorded this message ID but cannot prove whether its volatile delivery was queued",
+            "unknown",
+            false,
+        ),
+    };
+    serde_json::json!({
+        "type":"error", "schema_version":1, "code":code, "message":message,
+        "outcome":outcome, "retryable":retryable
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayStatus {
+    pub(crate) available: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) capacity: usize,
+    pub(crate) per_sender_capacity: usize,
+    pub(crate) queue_capacity: usize,
+    pub(crate) global_rate_per_second: u64,
+    pub(crate) global_rate_burst: u64,
+    pub(crate) sender_rate_per_second: u64,
+    pub(crate) sender_rate_burst: u64,
+}
+
+pub(crate) fn replay_status(worker: &ReplayWorker) -> ReplayStatus {
+    let health = worker.health();
+    ReplayStatus {
+        available: health.available,
+        error: health.error,
+        capacity: direct_replay::MAX_REPLAY_ENTRIES,
+        per_sender_capacity: direct_replay::MAX_REPLAY_ENTRIES_PER_SENDER,
+        queue_capacity: direct_replay::REPLAY_QUEUE_CAPACITY,
+        global_rate_per_second: direct_replay::GLOBAL_RATE_PER_SECOND as u64,
+        global_rate_burst: direct_replay::GLOBAL_RATE_BURST as u64,
+        sender_rate_per_second: direct_replay::SENDER_RATE_PER_SECOND as u64,
+        sender_rate_burst: direct_replay::SENDER_RATE_BURST as u64,
+    }
+}
+
 pub(crate) fn id_string(id: &[u8; 16]) -> String {
     data_encoding::HEXLOWER.encode(id)
 }
@@ -478,7 +650,9 @@ mod tests {
             ));
             assert_eq!(ack.payload.id, frame.payload.id);
         }
-        assert_eq!(rx.try_recv().unwrap().body, "deliver once");
+        let delivered = rx.try_recv().unwrap();
+        assert_eq!(delivered["type"], "private_message");
+        assert_eq!(delivered["body"], "deliver once");
         assert!(rx.try_recv().is_err());
         let conflict = DirectFrame::new_with_id(
             &sender,
@@ -569,6 +743,41 @@ mod tests {
         let signed = postcard::to_stdvec(&(ACK_DOMAIN, &legacy_version.payload)).unwrap();
         legacy_version.signature = ByteArray::new(receiver.sign(&signed).to_bytes());
         assert!(AckFrame::decode(&legacy_version.encode().unwrap(), &frame.payload).is_err());
+    }
+
+    #[test]
+    fn send_outcomes_map_to_stable_ipc_contracts() {
+        for (rejection, code, outcome, retryable) in [
+            (
+                DirectRejection::Conflict,
+                "private_message_conflict",
+                "not_started",
+                false,
+            ),
+            (
+                DirectRejection::Busy,
+                "private_recipient_busy",
+                "not_started",
+                true,
+            ),
+            (
+                DirectRejection::Unavailable,
+                "private_replay_unavailable",
+                "not_started",
+                true,
+            ),
+            (
+                DirectRejection::DeliveryOutcomeUnknown,
+                "private_delivery_unknown",
+                "unknown",
+                false,
+            ),
+        ] {
+            let response = rejection_response(rejection);
+            assert_eq!(response["code"], code);
+            assert_eq!(response["outcome"], outcome);
+            assert_eq!(response["retryable"], retryable);
+        }
     }
 
     #[test]

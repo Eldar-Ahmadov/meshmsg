@@ -5,7 +5,7 @@ use crate::{
     attachment::{self, AttachmentKind, AttachmentOffer},
     config::{prepare_state_dir, State, StateLock},
     contracts::{self, ErrorEnvelopeV1},
-    direct::{self, DirectHandler, IncomingDirect, DIRECT_ALPN},
+    direct::{self, DIRECT_ALPN},
     invite::Invite,
     ipc::{
         read_frame, send_request_checked, subscribe, valid_content_digest, valid_operation_id,
@@ -132,7 +132,6 @@ const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection attempt, so repeating it also covers attempts made while the
 /// network interface is still unavailable.
 const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
-const DIRECT_CONCURRENCY: usize = 8;
 const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 const ATTACHMENT_OFFER_VERSION: u8 = 1;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -1020,14 +1019,10 @@ struct RunningNode {
     lookup: MemoryLookup,
     presence_lookup: MemoryLookup,
     direct_replay: direct::ReplayWorker,
+    direct_incoming: mpsc::Receiver<serde_json::Value>,
 }
 
-async fn start(
-    state: &State,
-    secret: SecretKey,
-    state_dir: &Path,
-    direct_incoming: mpsc::Sender<IncomingDirect>,
-) -> Result<RunningNode> {
+async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<RunningNode> {
     state.validate()?;
     attachment::cleanup_stale_state_staging(state_dir)
         .context("recover stale attachment share staging")?;
@@ -1065,9 +1060,8 @@ async fn start(
     let blob_store: Store = fs_store.into();
     let downloader = blob_store.downloader(&endpoint);
     let blobs = BlobsProtocol::new(&blob_store, None);
-    let (direct, direct_replay) =
-        DirectHandler::new(secret.clone(), topic, direct_incoming, state_dir)
-            .context("open persistent direct replay state")?;
+    let (direct, direct_replay, direct_incoming) = direct::setup(secret.clone(), topic, state_dir)
+        .context("open persistent direct replay state")?;
     let router = Router::builder(endpoint.clone())
         .accept(BROADCAST_ALPN_V2, gossip.clone())
         .accept(presence::ALPN, presence_gossip.clone())
@@ -1119,6 +1113,7 @@ async fn start(
         lookup,
         presence_lookup,
         direct_replay,
+        direct_incoming,
     })
 }
 
@@ -4569,12 +4564,8 @@ pub async fn run_daemon(
     let (mut state, secret) = State::load_locked(dir, &state_lock)?;
     state.validate_for_identity(secret.public())?;
     let alias_config = AliasConfig::load_for_identity(dir, secret.public())?;
-    let (direct_incoming_tx, mut direct_incoming_rx) = mpsc::channel(256);
     let startup = tokio::select! {
-        result = tokio::time::timeout(
-            STARTUP_TIMEOUT,
-            start(&state, secret, dir, direct_incoming_tx),
-        ) => result,
+        result = tokio::time::timeout(STARTUP_TIMEOUT, start(&state, secret, dir)) => result,
         _ = shutdown.recv() => return Ok(()),
     };
     let mut node = match startup {
@@ -4643,7 +4634,11 @@ pub async fn run_daemon(
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
     let transfer_limit = Arc::new(Semaphore::new(2));
     let offer_list_limit = Arc::new(Semaphore::new(1));
-    let direct_limit = Arc::new(Semaphore::new(DIRECT_CONCURRENCY));
+    let direct_sender = direct::DirectSender::new(
+        node.endpoint.clone(),
+        node.secret.clone(),
+        state.topic_id()?,
+    );
     // Deliberately daemon-lifetime scoped: status advertises the bounded TTL and
     // restart semantics so callers never infer durable command history.
     let operation_cache = Arc::new(Mutex::new(OperationCache::new(
@@ -4794,73 +4789,20 @@ pub async fn run_daemon(
                             continue;
                         }
                     };
-                    let permit = match direct_limit.clone().try_acquire_owned() {
+                    let permit = match direct_sender.try_reserve() {
                         Ok(permit) => permit,
-                        Err(_) => {
+                        Err(response) => {
                             operation_cache.lock().expect("operation cache poisoned").complete(
-                                &operation_id,
-                                serde_json::json!({
-                                    "type":"error", "schema_version":1,
-                                    "code":"private_send_busy",
-                                    "message":"private-message send capacity reached",
-                                    "outcome":"not_started", "retryable":true
-                                }),
-                                StdInstant::now(),
+                                &operation_id, response, StdInstant::now(),
                             );
                             continue;
                         }
                     };
-                    let endpoint = node.endpoint.clone();
-                    let secret = node.secret.clone();
                     let operation_cache = operation_cache.clone();
                     transfer_tasks.spawn(async move {
-                        let _permit = permit;
-                        let response = match direct::send(
-                            endpoint, secret, topic, address, body,
-                            operation_id_bytes(&operation_id),
-                        ).await {
-                            Ok(direct::DirectSendOutcome::Accepted(accepted)) => serde_json::json!({
-                                "type":"private_accepted", "schema_version":3,
-                                "to":accepted.recipient.to_string(),
-                                "message_id":direct::id_string(&accepted.id),
-                                "timestamp_ms":accepted.timestamp_ms,
-                                "body_bytes":accepted.body_bytes,
-                                "acceptance_acknowledged":true,
-                                "duplicate_accepted":accepted.duplicate,
-                                "durable":false, "read":false
-                            }),
-                            Ok(direct::DirectSendOutcome::Rejected(rejection)) => match rejection {
-                                direct::DirectRejection::Conflict => serde_json::json!({
-                                    "type":"error", "schema_version":1,
-                                    "code":"private_message_conflict",
-                                    "message":"recipient has the same message ID bound to different content",
-                                    "outcome":"not_started", "retryable":false
-                                }),
-                                direct::DirectRejection::Busy => serde_json::json!({
-                                    "type":"error", "schema_version":1,
-                                    "code":"private_recipient_busy",
-                                    "message":"recipient replay or delivery capacity is busy",
-                                    "outcome":"not_started", "retryable":true
-                                }),
-                                direct::DirectRejection::Unavailable => serde_json::json!({
-                                    "type":"error", "schema_version":1,
-                                    "code":"private_replay_unavailable",
-                                    "message":"recipient replay persistence is unavailable",
-                                    "outcome":"not_started", "retryable":true
-                                }),
-                                direct::DirectRejection::DeliveryOutcomeUnknown => serde_json::json!({
-                                    "type":"error", "schema_version":1,
-                                    "code":"private_delivery_unknown",
-                                    "message":"recipient durably recorded this message ID but cannot prove whether its volatile delivery was queued",
-                                    "outcome":"unknown", "retryable":false
-                                }),
-                            },
-                            Err(error) => serde_json::json!({
-                                "type":"error", "schema_version":1,
-                                "code":"private_send_failed", "message":format!("{error:#}"),
-                                "outcome":"unknown", "retryable":true
-                            }),
-                        };
+                        let response = permit
+                            .send(address, body, operation_id_bytes(&operation_id))
+                            .await;
                         operation_cache.lock().expect("operation cache poisoned")
                             .complete(&operation_id, response, StdInstant::now());
                     });
@@ -4869,7 +4811,7 @@ pub async fn run_daemon(
                     let endpoint_online = node.endpoint.home_relay_status().get()
                         .iter().any(|status| status.is_connected());
                     let neighbors = node.receiver.neighbors().count();
-                    let replay_status = node.direct_replay.health();
+                    let replay_status = direct::replay_status(&node.direct_replay);
                     let status = meshmsg_protocol::Status {
                         running: true,
                         peer: peer.parse()?,
@@ -4891,18 +4833,13 @@ pub async fn run_daemon(
                         operation_cache_persistent: false,
                         direct_replay_available: replay_status.available,
                         direct_replay_error: replay_status.error,
-                        direct_replay_capacity: crate::direct_replay::MAX_REPLAY_ENTRIES,
-                        direct_replay_per_sender_capacity:
-                            crate::direct_replay::MAX_REPLAY_ENTRIES_PER_SENDER,
-                        direct_replay_queue_capacity: crate::direct_replay::REPLAY_QUEUE_CAPACITY,
-                        direct_replay_global_rate_per_second:
-                            crate::direct_replay::GLOBAL_RATE_PER_SECOND as u64,
-                        direct_replay_global_rate_burst:
-                            crate::direct_replay::GLOBAL_RATE_BURST as u64,
-                        direct_replay_sender_rate_per_second:
-                            crate::direct_replay::SENDER_RATE_PER_SECOND as u64,
-                        direct_replay_sender_rate_burst:
-                            crate::direct_replay::SENDER_RATE_BURST as u64,
+                        direct_replay_capacity: replay_status.capacity,
+                        direct_replay_per_sender_capacity: replay_status.per_sender_capacity,
+                        direct_replay_queue_capacity: replay_status.queue_capacity,
+                        direct_replay_global_rate_per_second: replay_status.global_rate_per_second,
+                        direct_replay_global_rate_burst: replay_status.global_rate_burst,
+                        direct_replay_sender_rate_per_second: replay_status.sender_rate_per_second,
+                        direct_replay_sender_rate_burst: replay_status.sender_rate_burst,
                         max_attachment_bytes,
                         attachment_storage: attachment_storage.status(),
                         attachment_retention_secs,
@@ -5269,10 +5206,9 @@ pub async fn run_daemon(
                 Some(Event::NeighborUp(_) | Event::Lagged) => {}
                 None => break,
             },
-            incoming = direct_incoming_rx.recv() => {
-                if let Some(message) = incoming {
-                    let value = private_message_event(message);
-                    let _ = event_tx.send(value);
+            incoming = node.direct_incoming.recv() => {
+                if let Some(event) = incoming {
+                    let _ = event_tx.send(event);
                 }
             },
             _ = presence.tick() => {
@@ -5335,7 +5271,7 @@ pub async fn run_daemon(
     transfer_limit.close();
     attachment_storage.gate.close();
     offer_list_limit.close();
-    direct_limit.close();
+    direct_sender.close();
     drop(event_tx);
     transfer_tasks.abort_all();
     offer_list_tasks.abort_all();
@@ -5485,15 +5421,6 @@ fn message_event(msg: Envelope) -> serde_json::Value {
         "type":"message", "schema_version":2, "from":msg.from.to_string(),
         "message_id":direct::id_string(&msg.message_id),
         "timestamp_ms":msg.timestamp_ms, "body":msg.body
-    })
-}
-
-fn private_message_event(msg: IncomingDirect) -> serde_json::Value {
-    serde_json::json!({
-        "type":"private_message", "schema_version":1, "private":true,
-        "from":msg.from.to_string(), "message_id":direct::id_string(&msg.id),
-        "timestamp_ms":msg.timestamp_ms, "body":msg.body,
-        "acceptance_acknowledged":true, "durable":false, "read":false
     })
 }
 
