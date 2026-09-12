@@ -2300,7 +2300,6 @@ dependencies = [
  "sha2",
  "tar",
  "tokio",
- "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
 

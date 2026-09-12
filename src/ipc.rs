@@ -29,7 +29,7 @@ pub(crate) const IDEMPOTENT_MUTATIONS_CAPABILITY: &str = "idempotent_mutations_v
 pub(crate) const IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY: &str =
     "idempotent_attachment_operations_v1";
 pub(crate) const ATTACHMENT_LIFECYCLE_CAPABILITY: &str = "attachment_lifecycle_v3";
-pub(crate) const DIAGNOSTIC_STATUS_CAPABILITY: &str = "diagnostic_status_v1";
+pub(crate) const DIAGNOSTIC_STATUS_CAPABILITY: &str = "diagnostic_status_v2";
 pub(crate) type LifecycleErrorV1 = ErrorEnvelopeV1;
 
 pub(crate) use contracts::valid_operation_id;
@@ -1223,8 +1223,8 @@ pub(crate) fn validate_success_payload_for_context(
         ("status", 1) => {
             StatusV1::from_value(value)?;
         }
-        ("diagnostic_status", 1) => {
-            DiagnosticStatusV1::from_value(value)?;
+        ("diagnostic_status", 2) => {
+            DiagnosticStatusV2::from_value(value)?;
         }
         ("queued", 3) => {
             let dto: QueuedV3 =
@@ -1884,7 +1884,7 @@ impl StatusV1 {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DiagnosticStatusV1 {
+pub(crate) struct DiagnosticStatusV2 {
     #[serde(rename = "type")]
     pub(crate) kind: String,
     pub(crate) schema_version: u8,
@@ -1892,18 +1892,46 @@ pub(crate) struct DiagnosticStatusV1 {
     pub(crate) records_accepted: u64,
     pub(crate) records_dropped: u64,
     pub(crate) records_retained: usize,
+    pub(crate) stdout_queue_occupancy: usize,
+    pub(crate) stdout_queue_capacity: usize,
+    pub(crate) stdout_queue_high_watermark: usize,
+    pub(crate) diagnostic_queue_occupancy: usize,
+    pub(crate) diagnostic_queue_capacity: usize,
+    pub(crate) diagnostic_queue_high_watermark: usize,
+    pub(crate) records_sampled: u64,
+    pub(crate) records_suppressed: u64,
+    pub(crate) queue_drops: u64,
+    pub(crate) contention_drops: u64,
+    pub(crate) records_written: u64,
+    pub(crate) write_failures: u64,
+    pub(crate) writer_panics: u64,
+    pub(crate) writer_records_lost: u64,
+    pub(crate) writer_healthy: bool,
+    pub(crate) writer_terminal: bool,
+    pub(crate) process_panics: u64,
 }
 
-impl DiagnosticStatusV1 {
+impl DiagnosticStatusV2 {
     pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
         let status: Self = serde_json::from_value(value.clone())
             .context("daemon returned malformed diagnostic status")?;
         anyhow::ensure!(
             status.kind == "diagnostic_status"
-                && status.schema_version == 1
+                && status.schema_version == 2
                 && contracts::valid_request_id(&status.request_id)
-                && status.records_retained <= 256
-                && status.records_accepted >= status.records_retained as u64,
+                && status.records_retained == 0
+                && status.stdout_queue_capacity > 0
+                && status.stdout_queue_occupancy <= status.stdout_queue_capacity
+                && status.stdout_queue_high_watermark <= status.stdout_queue_capacity
+                && status.diagnostic_queue_occupancy <= status.diagnostic_queue_capacity
+                && status.diagnostic_queue_high_watermark <= status.diagnostic_queue_capacity
+                && status.records_accepted >= status.records_written
+                && status.records_dropped
+                    == status
+                        .queue_drops
+                        .saturating_add(status.contention_drops)
+                        .saturating_add(status.writer_records_lost)
+                && status.writer_healthy != status.writer_terminal,
             "daemon diagnostic status is invalid"
         );
         Ok(status)
@@ -2270,7 +2298,7 @@ pub(crate) async fn send_request_checked(
             StatusV1::from_value(&value)?;
         }
         "diagnostic_status" => {
-            DiagnosticStatusV1::from_value(&value)?;
+            DiagnosticStatusV2::from_value(&value)?;
         }
         "queued" => {
             let queued: QueuedV3 = serde_json::from_value(value.clone())
@@ -3415,15 +3443,24 @@ mod tests {
         v1_with_v2_metrics["diagnostic_records_accepted"] = 1.into();
         assert!(validate_success_payload(&v1_with_v2_metrics).is_err());
         let diagnostics = serde_json::json!({
-            "type":"diagnostic_status", "schema_version":1,
+            "type":"diagnostic_status", "schema_version":2,
             "request_id":"11111111111111111111111111111111",
-            "records_accepted":2, "records_dropped":1, "records_retained":2
+            "records_accepted":2, "records_dropped":1, "records_retained":0,
+            "stdout_queue_occupancy":0, "stdout_queue_capacity":256,
+            "stdout_queue_high_watermark":2,
+            "diagnostic_queue_occupancy":0, "diagnostic_queue_capacity":128,
+            "diagnostic_queue_high_watermark":1,
+            "records_sampled":1, "records_suppressed":1,
+            "queue_drops":1, "contention_drops":0,
+            "records_written":2, "write_failures":0, "writer_panics":0,
+            "writer_records_lost":0, "writer_healthy":true,
+            "writer_terminal":false, "process_panics":0
         });
-        DiagnosticStatusV1::from_value(&diagnostics).unwrap();
+        DiagnosticStatusV2::from_value(&diagnostics).unwrap();
         assert!(validate_success_payload(&diagnostics).is_ok());
         let mut malformed_diagnostics = diagnostics;
         malformed_diagnostics["records_retained"] = 257.into();
-        assert!(DiagnosticStatusV1::from_value(&malformed_diagnostics).is_err());
+        assert!(DiagnosticStatusV2::from_value(&malformed_diagnostics).is_err());
 
         for malformed in [
             {

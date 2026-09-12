@@ -55,27 +55,44 @@ output). Operation-aware consumers additionally require the exact originating
 operation ID; offer IDs and partial-removal counts are accepted only for applicable
 codes.
 
-Before public-message replacement, constructors retain the private cause (including
-useful local paths) in a bounded 256-record in-process telemetry ring. Records are
-control-sanitized and bounded to 2048 UTF-8 bytes. In human mode they are also offered
-to a 128-record nonblocking channel whose dedicated worker owns stderr, so the
-producer never waits on diagnostic output; contended evidence admission and full or
-disconnected output queues increment an in-process drop counter. Poisoned evidence
-state is cleared and recovered rather than panicking. Exact status schema v1 remains
-unchanged for released-client compatibility. Daemons advertising
-`diagnostic_status_v1` accept the separate `diagnostics` command and return strict
-`diagnostic_status` v1 with cumulative `records_accepted`, cumulative
-`records_dropped`, and current `records_retained`; accepted and dropped are
-independent stage counters, not a partition of attempts. JSON mode intentionally disables the stderr sink to
-preserve its empty-stderr contract, although the bounded telemetry ring still
-receives the cause for the process lifetime. Private causes are not present in IPC/HTTP/SSE/JSON,
-and operators must not assume every diagnostic survives queue pressure or process
-exit. Automation must branch on `code`, never diagnostic text.
+Public-error construction offers only typed metadata to the process diagnostic
+subsystem; arbitrary private causes are neither queued nor retained. Records contain
+a timestamp, level, stable event/code, allowlisted bounded fields, and applicable
+request/operation/run IDs. Message bodies, secrets, invite/ticket material, private
+peer routes, and filesystem paths are prohibited. Human mode offers diagnostics to
+a bounded nonblocking stderr writer; JSON mode disables diagnostic terminal output
+to preserve the empty-stderr and stdout protocol contracts.
 
-With `--json`, one-shot failures write exactly one error object to **stdout**, write
+Daemons advertising `diagnostic_status_v2` accept `diagnostics` and return strict
+`diagnostic_status` schema 2. It reports accepted, aggregate dropped, queue-drop,
+lock-contention-drop, sampled-admission, immediately counted suppression, written,
+write-failure, writer-panic, and current-plus-abandoned writer-loss counters;
+separately named stdout and diagnostic queue occupancy/capacity/high-water marks;
+terminal writer health; and process panic count. Separate peaks are intentional:
+adding independent maxima would invent a combined occupancy that never occurred. `records_dropped` is exactly queue drops plus contention drops plus writer
+records lost, and `records_retained` is always zero. Counters are process-lifetime
+observations, including when JSON mode disables stderr, and are not a promise that
+every diagnostic or daemon stdout event survived pressure. Correlations are emitted
+only when they satisfy the exact 32-character lowercase hexadecimal request,
+operation, or run-ID grammar. Automation must branch on `code`, never text.
+
+Every daemon error offered to process stdout is first decoded as the strict shared
+`ErrorEnvelopeV1` and reserialized from that DTO. Missing/noncanonical fixed text,
+outcome, retryability, or schema fields and all unsupported fields—including private
+diagnostics—are rejected before queue admission. This includes sampled rejected
+network events and generated-event guard failures.
+
+With `--json`, one-shot failures offer exactly one error object to **stdout**, write
 nothing to stderr, and exit 1. Success exits 0. Streaming commands use stdout NDJSON;
-a terminal process failure follows the same error rule. Without `--json`, diagnostics
-remain human-readable on stderr. Clap help/version still exit successfully.
+a terminal process failure follows the same error rule. Every terminal write has a
+bounded deadline, so a permanently blocked consumer can cause the final record to be
+abandoned rather than hang shutdown. Without `--json`, diagnostics remain
+human-readable on stderr. If their bounded drain times out, that detached writer
+retains sole stderr ownership and the final human fatal is suppressed rather than
+written concurrently. A guarded top-level unwind boundary catches process panics,
+lets daemon-output RAII close and drain first, emits only a fixed bounded JSON or
+human terminal failure, and restores the previously installed panic hook before
+returning. Clap help/version still exit successfully.
 
 ## IPC
 

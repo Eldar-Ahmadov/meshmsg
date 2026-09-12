@@ -1182,8 +1182,15 @@ fn web_download_context(
 fn compatible_download_complete(value: &Value, expected: &ipc::DownloadRequestContext) -> bool {
     match ipc::DownloadCompleteV2::validate_for_request(value, expected) {
         Ok(_) => true,
-        Err(error) => {
-            eprintln!("meshmsg web download completion validation: {error:#}");
+        Err(_error) => {
+            let _ = crate::output::sampled_diagnostic(
+                crate::output::DiagnosticRecord::new(
+                    crate::output::Level::Warn,
+                    "web_download",
+                    "completion_validation_failed",
+                )
+                .operation_id(Some(&expected.operation_id)),
+            );
             false
         }
     }
@@ -2688,7 +2695,14 @@ pub(crate) async fn run(dir: &Path, address: SocketAddr, origin: Option<String>)
         .context("bind web listener")?;
     let address = listener.local_addr()?;
     let state = Arc::new(WebState::new(dir, address, origin)?);
-    eprintln!("meshmsg web: http://{address} (no app authentication; Tailscale Serve only). Stopping web does not stop daemon.");
+    let _ = crate::output::diagnostic(
+        crate::output::DiagnosticRecord::new(
+            crate::output::Level::Info,
+            "web_startup",
+            "listening",
+        )
+        .field(crate::output::Field::new("port", address.port())),
+    );
     serve(listener, state).await
 }
 
@@ -2956,20 +2970,15 @@ mod tests {
             assert!(!public.message.contains("/home/alice"));
             assert!(!public.message.contains("database"));
             assert!(ipc::LifecycleErrorV1::from_value(&public.into_value()).is_ok());
-            for _ in 0..100 {
-                if contracts::private_diagnostic_evidence_contains("/home/alice/private/file.bin") {
-                    break;
-                }
-                contracts::log_private_diagnostic(
-                    "web-test",
-                    code,
-                    "open /home/alice/private/file.bin failed: database secret detail",
-                );
-                std::thread::yield_now();
-            }
-            assert!(contracts::private_diagnostic_evidence_contains(
-                "/home/alice/private/file.bin"
-            ));
+            let before = contracts::diagnostic_metrics();
+            contracts::log_private_diagnostic(
+                "web_test",
+                code,
+                "open /home/alice/private/file.bin failed: database secret detail",
+            );
+            let after = contracts::diagnostic_metrics();
+            assert!(after.0 >= before.0 && after.1 >= before.1);
+            assert_eq!(after.2, 0, "private causes must not be retained");
         }
     }
 
