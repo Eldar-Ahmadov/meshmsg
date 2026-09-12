@@ -71,10 +71,13 @@ def main():
             web, _ = spawn('one', 'web', '--listen', f'127.0.0.1:{port}')
             request_counter = 100000
 
-            def request_payload(value):
+            def next_request_id():
                 nonlocal request_counter
                 request_counter += 1
-                request_id = f'{request_counter:032x}'
+                return f'{request_counter:032x}'
+
+            def request_payload(value):
+                request_id = next_request_id()
                 return {'schema_version': 1, 'request_id': request_id, 'request': value}, request_id
 
             def post(value):
@@ -115,7 +118,11 @@ def main():
             def submit_without_reply(value):
                 with socket.socket(socket.AF_UNIX) as client:
                     client.connect(str(root / 'one' / 'daemon.sock'))
-                    payload, _ = request_payload(value)
+                    payload = {
+                        'protocol_version': 2,
+                        'request_id': next_request_id(),
+                        'request': value,
+                    }
                     client.sendall(json.dumps(payload).encode() + b'\n')
 
             def get(path):
