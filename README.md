@@ -67,11 +67,14 @@ meshmsg stop
 
 See the [Usage reference](docs/usage.md) for all commands, invite behavior, input sources, status, diagnosis, and JSON automation.
 
-Benchmarking is an optional ordinary-protocol client:
+Benchmarking uses optional ordinary-protocol clients. The non-interactive client has no terminal UI dependencies; the TUI is a separate binary and feature:
 
 ```sh
 cargo build --features bench --bin meshmsg-bench
-meshmsg-bench tui
+meshmsg-bench --json send --rate 100 --duration-secs 10
+
+cargo build --features bench-tui --bin meshmsg-bench-tui
+meshmsg-bench-tui
 ```
 
 See [Benchmarking](docs/benchmarking.md) for coordinated runs, metrics, and NDJSON output.
@@ -117,7 +120,11 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked
+cargo build --locked --features bench --bin meshmsg-bench
+cargo test --locked --features bench-tui --all-targets
 cargo build --locked --features web --bin meshmsg-web
+cargo check --locked --features full
+bash tests/check-optional-dependencies.sh
 node tests/web-ui.cjs
 python3 tests/integration-web.py target/debug/meshmsg
 python3 tests/integration-web-peer.py target/debug/meshmsg

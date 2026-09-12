@@ -2,13 +2,20 @@
 
 `meshmsg-bench` is an optional protocol client. It does not add a benchmark command, handler, event, capability, or error to the daemon. Every generated message is submitted with the ordinary canonical `send` or `private_send` request, and receivers consume the ordinary `subscribe` feed. This measures the same local IPC and messaging path used by normal clients.
 
-Build it explicitly:
+Build the non-interactive client explicitly:
 
 ```sh
 cargo build --features bench --bin meshmsg-bench
 ```
 
-The default `meshmsg` build does not compile the benchmark client or its Ratatui/Crossterm dependencies.
+The `bench` feature contains no Ratatui/Crossterm dependency. The interactive dashboard is a separate binary behind the additive `bench-tui` feature:
+
+```sh
+cargo build --features bench-tui --bin meshmsg-bench-tui
+meshmsg-bench-tui --state-dir /path/to/node-state
+```
+
+The default `meshmsg` build compiles neither benchmark client. `full` enables `web` and `bench-tui` (which in turn enables `bench`).
 
 ## Running a coordinated test
 
@@ -28,7 +35,7 @@ meshmsg-bench --json send \
 
 Use `send --to <recipient>` to benchmark ordinary private sends. Broadcast benchmark bodies are readable by topic participants, so prefer an isolated topic.
 
-The interactive UI remains available as `meshmsg-bench tui`. Its deeper extraction is deferred to Chunk 5B.
+Use `meshmsg-bench-tui` for an interactive sender/receiver setup and live dashboard. `meshmsg-bench` intentionally accepts only `send` and `receive`; this keeps automation and benchmark integrations independent of terminal UI libraries.
 
 ## Semantics and limits
 

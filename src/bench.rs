@@ -38,8 +38,6 @@ enum Command {
     Send(SendArgs),
     /// Consume the ordinary subscription feed and measure one run
     Receive(ReceiveArgs),
-    /// Configure and monitor a benchmark interactively
-    Tui,
 }
 
 #[derive(Args, Debug)]
@@ -130,8 +128,6 @@ pub async fn entry(arguments: Vec<std::ffi::OsString>) -> std::process::ExitCode
             )
             .await
         }
-        Command::Tui if cli.json => Err(anyhow::anyhow!("--json cannot be used with tui")),
-        Command::Tui => crate::bench_tui::run(&dir).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -715,6 +711,7 @@ async fn receive(
     result
 }
 
+#[cfg(feature = "bench-tui")]
 pub(crate) async fn send_tui(
     dir: &std::path::Path,
     run_id: String,
@@ -736,6 +733,7 @@ pub(crate) async fn send_tui(
     )
     .await
 }
+#[cfg(feature = "bench-tui")]
 pub(crate) async fn receive_tui(
     dir: &std::path::Path,
     run_id: String,
@@ -764,6 +762,19 @@ mod tests {
         assert!(validate_sender_config(id, 100, 1, 256, false).is_ok());
         assert!(validate_sender_config(id, 0, 1, 256, false).is_err());
         assert!(validate_sender_config(id, 100, 1, 32, false).is_err());
+    }
+
+    #[test]
+    fn non_tui_cli_has_only_send_and_receive() {
+        assert!(Cli::try_parse_from(["meshmsg-bench", "send"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "meshmsg-bench",
+            "receive",
+            "--run-id",
+            "0123456789abcdef0123456789abcdef"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["meshmsg-bench", "tui"]).is_err());
     }
 
     #[test]

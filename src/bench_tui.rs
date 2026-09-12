@@ -1,5 +1,6 @@
 use crate::bench;
 use anyhow::{Context, Result};
+use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -15,8 +16,57 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde_json::Value;
-use std::{io, io::IsTerminal, path::Path, time::Duration};
+use std::{
+    io,
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 use tokio::{sync::oneshot, task::JoinHandle};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "meshmsg-bench-tui",
+    version,
+    about = "Configure and monitor a meshmsg benchmark interactively"
+)]
+struct Cli {
+    /// State directory (defaults to $XDG_DATA_HOME/meshmsg)
+    #[arg(long, env = "MESHMSG_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+}
+
+pub(crate) async fn entry(arguments: Vec<std::ffi::OsString>) -> ExitCode {
+    let cli = match Cli::try_parse_from(arguments) {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            print!("{error}");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dir = cli.state_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("meshmsg")
+    });
+    match run(&dir).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Role {
@@ -652,6 +702,14 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn tui_cli_owns_only_tui_arguments() {
+        let cli = Cli::try_parse_from(["meshmsg-bench-tui", "--state-dir", "state"]).unwrap();
+        assert_eq!(cli.state_dir, Some(PathBuf::from("state")));
+        assert!(Cli::try_parse_from(["meshmsg-bench-tui", "send"]).is_err());
+        assert!(Cli::try_parse_from(["meshmsg-bench-tui", "--json"]).is_err());
     }
 
     #[test]

@@ -52,6 +52,20 @@ jobs:
       - name: Build locked debug binary
         id: rust-build
         run: cargo build --locked
+      - name: Verify optional feature isolation and feature-specific targets
+        id: optional-features
+        run: |
+          bash tests/check-optional-dependencies.sh
+          cargo check --locked --features bench --bin meshmsg-bench
+          cargo clippy --locked --features bench --all-targets -- -D warnings
+          cargo test --locked --features bench --all-targets
+          cargo check --locked --features bench-tui --bin meshmsg-bench-tui
+          cargo clippy --locked --features bench-tui --all-targets -- -D warnings
+          cargo test --locked --features bench-tui --all-targets
+          cargo check --locked --features web --bin meshmsg-web
+          cargo check --locked --features full --all-targets
+          cargo clippy --locked --features full --all-targets -- -D warnings
+          cargo test --locked --features full --all-targets
 
   windows-rust:
     runs-on: windows-2022

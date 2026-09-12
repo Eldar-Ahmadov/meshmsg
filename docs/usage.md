@@ -12,7 +12,7 @@ The canonical top-level commands are:
 - `send [--to <recipient>]`, `listen`, `chat`, `status`, `peers`, `stop`, and `doctor`
 - `share <path>`, `offers [remove|prune]`, and `download <offer source> --output <path>`
 
-Run `meshmsg <command> --help` for command-specific options. Optional clients are separate binaries: `meshmsg-web` (feature `web`) and `meshmsg-bench` (feature `bench`).
+Run `meshmsg <command> --help` for command-specific options. Optional clients are separate binaries: `meshmsg-web` (feature `web`), the non-interactive `meshmsg-bench` (feature `bench`), and `meshmsg-bench-tui` (feature `bench-tui`). The TUI feature includes `bench`; only it (and the aggregate `full` feature) enables Ratatui/Crossterm.
 
 ## Mobile web broadcast
 

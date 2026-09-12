@@ -24,7 +24,15 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked
-cargo build --locked --features web --bin meshmsg-web
+cargo check --locked --features bench --bin meshmsg-bench
+cargo clippy --locked --features bench --all-targets -- -D warnings
+cargo test --locked --features bench --all-targets
+cargo check --locked --features bench-tui --bin meshmsg-bench-tui
+cargo clippy --locked --features bench-tui --all-targets -- -D warnings
+cargo test --locked --features bench-tui --all-targets
+cargo check --locked --features web --bin meshmsg-web
+cargo check --locked --features full --all-targets
+bash tests/check-optional-dependencies.sh
 bash -n install.sh tests/*.sh scripts/*.sh
 python3 -m py_compile tests/*.py
 node --check src/web/app.js
@@ -47,10 +55,12 @@ The complete Linux integration inventory is parsed from
 bash tests/run-linux-integrations.sh target/debug/meshmsg
 ```
 
-The driver requires both `target/debug/meshmsg` and the sibling feature-built
-`target/debug/meshmsg-web`; its `{BIN}` and `{WEB_BIN}` inventory placeholders keep
-the two executable roles explicit. It includes CLI errors, fake/real web, peer directory, five-peer, attachments,
-direct messages, idempotency, checksum-pinned v0.1.18 wire boundaries,
+The driver requires `target/debug/meshmsg` and the sibling feature-built
+`target/debug/meshmsg-web` and `target/debug/meshmsg-bench`; its `{BIN}`, `{WEB_BIN}`,
+and `{BENCH_BIN}` inventory placeholders keep the executable roles explicit. The
+five-peer benchmark uses only the non-TUI binary and `bench` feature. It includes
+CLI errors, fake/real web, peer directory, five-peer, attachments, direct messages,
+idempotency, checksum-pinned v0.1.18 wire boundaries,
 persistent-state migration/restart, and a generated-archive/mock-download installer
 test. The per-command budgets total under 96 minutes.
 The workflow allows 130 minutes,

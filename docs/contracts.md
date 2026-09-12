@@ -110,8 +110,7 @@ positive and `received_bytes <= total_bytes`. A CLI download accepts completion 
 when `output` has the exact retained OS-string/byte representation it submitted;
 Path-equivalent dot components, repeated/trailing separators, and other lexical
 rewrites are rejected. Listen/chat therefore never print an unrecognized daemon event.
-Benchmark records are not IPC schemas: the optional `meshmsg-bench` process issues
-ordinary `send`/`private_send` requests and consumes ordinary subscription events. Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
+Benchmark records are not IPC schemas: the optional non-TUI `meshmsg-bench` process and separate `meshmsg-bench-tui` process issue ordinary `send`/`private_send` requests and consume ordinary subscription events. Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
 attachment-storage pressure. Clients and the daemon are one protocol-v2 component
 set, so commands are submitted directly without status capability probes.
 

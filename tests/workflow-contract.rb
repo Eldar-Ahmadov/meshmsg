@@ -110,7 +110,8 @@ def validate(ci, verification, release, inventory)
   assert_run(linux, "clippy", "cargo clippy --locked --all-targets -- -D warnings")
   assert_run(linux, "rust-tests", "cargo test --locked --all-targets")
   assert_run(linux, "rust-build", "cargo build --locked")
-  assert_order(linux, %w[rustfmt clippy rust-tests rust-build])
+  assert_run(linux, "optional-features", "bash tests/check-optional-dependencies.sh\ncargo check --locked --features bench --bin meshmsg-bench\ncargo clippy --locked --features bench --all-targets -- -D warnings\ncargo test --locked --features bench --all-targets\ncargo check --locked --features bench-tui --bin meshmsg-bench-tui\ncargo clippy --locked --features bench-tui --all-targets -- -D warnings\ncargo test --locked --features bench-tui --all-targets\ncargo check --locked --features web --bin meshmsg-web\ncargo check --locked --features full --all-targets\ncargo clippy --locked --features full --all-targets -- -D warnings\ncargo test --locked --features full --all-targets")
+  assert_order(linux, %w[rustfmt clippy rust-tests rust-build optional-features])
   windows = jobs["windows-rust"]
   assert_run(windows, "windows-tests", "cargo test --locked --all-targets")
   assert_run(windows, "windows-clippy", "cargo clippy --locked --all-targets -- -D warnings")
@@ -127,7 +128,7 @@ def validate(ci, verification, release, inventory)
     "cargo install cargo-audit --version 0.22.2 --locked",
     "cargo install cargo-deny --version 0.20.2 --locked"
   ], "policy tool installation must remain exact and pinned")
-  assert_run(jobs["linux-integration"], "integration-build", "cargo build --locked --features web")
+  assert_run(jobs["linux-integration"], "integration-build", "cargo build --locked --features web,bench")
   assert_run(jobs["linux-integration"], "linux-integrations",
              "bash tests/run-linux-integrations.sh target/debug/meshmsg")
   assert(jobs.dig("linux-integration", "timeout-minutes") == 130, "integration job timeout must cover inventory")
@@ -140,7 +141,7 @@ def validate(ci, verification, release, inventory)
     [180, "python3", "tests/integration-web.py", "{BIN} {WEB_BIN}"],
     [600, "python3", "tests/integration-web-peer.py", "{BIN} {WEB_BIN}"],
     [600, "python3", "tests/integration-peer-directory.py", "{BIN}"],
-    [1100, "bash", "tests/integration-5-peer.sh", "{BIN}"],
+    [1100, "bash", "tests/integration-5-peer.sh", "{BIN} {BENCH_BIN}"],
     [600, "bash", "tests/integration-attachments.sh", "{BIN}"],
     [600, "bash", "tests/integration-direct-messages.sh", "{BIN} {WEB_BIN}"],
     [600, "bash", "tests/integration-v018-message-boundary.sh", "{BIN}"],
