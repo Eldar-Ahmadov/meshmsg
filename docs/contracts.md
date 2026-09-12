@@ -64,13 +64,17 @@ a bounded nonblocking stderr writer; JSON mode disables diagnostic terminal outp
 to preserve the empty-stderr and stdout protocol contracts.
 
 Daemons advertising `diagnostic_status_v2` accept `diagnostics` and return strict
-`diagnostic_status` schema 2. It reports accepted, aggregate dropped, queue-drop,
-lock-contention-drop, sampled-admission, immediately counted suppression, written,
-write-failure, writer-panic, and current-plus-abandoned writer-loss counters;
+`diagnostic_status` schema 2. It reports accepted, aggregate dropped, strict
+output-admission rejection, queue-drop, lock-contention-drop, sampled-admission,
+immediately counted suppression, written, write-failure, writer-panic, and
+current-plus-abandoned writer-loss counters;
 separately named stdout and diagnostic queue occupancy/capacity/high-water marks;
 terminal writer health; and process panic count. Separate peaks are intentional:
-adding independent maxima would invent a combined occupancy that never occurred. `records_dropped` is exactly queue drops plus contention drops plus writer
-records lost, and `records_retained` is always zero. Counters are process-lifetime
+adding independent maxima would invent a combined occupancy that never occurred.
+`admission_rejections` counts malformed, noncanonical, or unsupported daemon error
+objects rejected before queue admission; it is not a queue drop. `records_dropped`
+is exactly queue drops plus contention drops plus writer records lost, and
+`records_retained` is always zero. Counters are process-lifetime
 observations, including when JSON mode disables stderr, and are not a promise that
 every diagnostic or daemon stdout event survived pressure. Correlations are emitted
 only when they satisfy the exact 32-character lowercase hexadecimal request,

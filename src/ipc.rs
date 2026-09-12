@@ -1900,6 +1900,7 @@ pub(crate) struct DiagnosticStatusV2 {
     pub(crate) diagnostic_queue_high_watermark: usize,
     pub(crate) records_sampled: u64,
     pub(crate) records_suppressed: u64,
+    pub(crate) admission_rejections: u64,
     pub(crate) queue_drops: u64,
     pub(crate) contention_drops: u64,
     pub(crate) records_written: u64,
@@ -3451,6 +3452,7 @@ mod tests {
             "diagnostic_queue_occupancy":0, "diagnostic_queue_capacity":128,
             "diagnostic_queue_high_watermark":1,
             "records_sampled":1, "records_suppressed":1,
+            "admission_rejections":3,
             "queue_drops":1, "contention_drops":0,
             "records_written":2, "write_failures":0, "writer_panics":0,
             "writer_records_lost":0, "writer_healthy":true,
@@ -3458,6 +3460,12 @@ mod tests {
         });
         DiagnosticStatusV2::from_value(&diagnostics).unwrap();
         assert!(validate_success_payload(&diagnostics).is_ok());
+        let mut missing_admission_rejections = diagnostics.clone();
+        missing_admission_rejections
+            .as_object_mut()
+            .unwrap()
+            .remove("admission_rejections");
+        assert!(DiagnosticStatusV2::from_value(&missing_admission_rejections).is_err());
         let mut malformed_diagnostics = diagnostics;
         malformed_diagnostics["records_retained"] = 257.into();
         assert!(DiagnosticStatusV2::from_value(&malformed_diagnostics).is_err());

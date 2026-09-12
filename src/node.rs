@@ -5632,6 +5632,7 @@ pub async fn run_daemon(
                         "diagnostic_queue_high_watermark":diagnostics.high_watermark,
                         "records_sampled":diagnostics.sampled,
                         "records_suppressed":diagnostics.suppressed,
+                        "admission_rejections":diagnostics.admission_rejected.saturating_add(output.admission_rejected),
                         "queue_drops":diagnostics.queue_dropped.saturating_add(output.queue_dropped),
                         "contention_drops":diagnostics.contention_dropped.saturating_add(output.contention_dropped),
                         "records_written":diagnostics.written.saturating_add(output.written),

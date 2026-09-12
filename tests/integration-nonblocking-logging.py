@@ -83,6 +83,12 @@ def run_once(index, signal_shutdown=False, panic_stdout=False):
             assert health["schema_version"] == 2
             assert health["stdout_queue_occupancy"] <= health["stdout_queue_capacity"]
             assert health["diagnostic_queue_occupancy"] <= health["diagnostic_queue_capacity"]
+            assert health["admission_rejections"] >= 0
+            assert health["records_dropped"] == (
+                health["queue_drops"]
+                + health["contention_drops"]
+                + health["writer_records_lost"]
+            )
             assert health["records_suppressed"] >= 0
             if panic_stdout:
                 if health["writer_terminal"]:
