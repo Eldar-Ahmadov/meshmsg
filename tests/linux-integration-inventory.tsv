@@ -2,6 +2,7 @@
 60	python3	tests/integration-cli-errors.py	{BIN}
 30	python3	tests/logging-process-tests.py	{BIN}
 120	python3	tests/integration-nonblocking-logging.py	{BIN}
+240	python3	tests/integration-diagnostic-status-compat.py	{BIN}
 180	python3	tests/integration-web.py	{BIN}
 600	python3	tests/integration-web-peer.py	{BIN}
 600	python3	tests/integration-peer-directory.py	{BIN}

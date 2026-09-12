@@ -11,11 +11,12 @@ use crate::{
     },
     invite::Invite,
     ipc::{
-        read_frame, send_request_checked, subscribe, subscribe_with_id, valid_content_digest,
-        valid_operation_id, validate_success_payload, write_request_with_id, write_value,
-        AttachmentOperationKind, BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
-        LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1, SubscriptionReader,
-        ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_CAPABILITY,
+        negotiated_diagnostic_request, read_frame, send_request_checked, subscribe,
+        subscribe_with_id, valid_content_digest, valid_operation_id, validate_success_payload,
+        write_request_with_id, write_value, AttachmentOperationKind, BenchConfig, IpcRequest,
+        IpcRequestFrame, LifecycleErrorV1, LifecycleRequestContext, LifecycleSuccessV3,
+        OfferItemV1, OffersV1, StatusV1, SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY,
+        DIAGNOSTIC_STATUS_V2_CAPABILITY, DIAGNOSTIC_STATUS_V3_CAPABILITY,
         IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY,
         MAX_IPC_REQUEST_SIZE, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
         PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY,
@@ -1520,6 +1521,7 @@ enum DaemonCommand {
         reply: oneshot::Sender<serde_json::Value>,
     },
     Diagnostics {
+        schema_version: u8,
         reply: oneshot::Sender<serde_json::Value>,
     },
     Peers {
@@ -2758,7 +2760,30 @@ where
         IpcRequest::Diagnostics => {
             let (reply, response) = oneshot::channel();
             let value = command_response(
-                send_command(&commands, DaemonCommand::Diagnostics { reply }, response),
+                send_command(
+                    &commands,
+                    DaemonCommand::Diagnostics {
+                        schema_version: 2,
+                        reply,
+                    },
+                    response,
+                ),
+                timeouts.ordinary_command,
+            )
+            .await;
+            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+        }
+        IpcRequest::DiagnosticsV3 => {
+            let (reply, response) = oneshot::channel();
+            let value = command_response(
+                send_command(
+                    &commands,
+                    DaemonCommand::Diagnostics {
+                        schema_version: 3,
+                        reply,
+                    },
+                    response,
+                ),
                 timeouts.ordinary_command,
             )
             .await;
@@ -5313,6 +5338,15 @@ pub async fn run_daemon(
         "attachment_retention_secs":attachment_retention_secs
     });
     let _ = daemon_output.event(started);
+    if crate::output::test_switch("MESHMSG_TEST_REJECT_DAEMON_ERROR") {
+        let _ = daemon_output.event(serde_json::json!({
+            "type":"error", "schema_version":1,
+            "code":"network_event_rejected",
+            "message":"private noncanonical cause",
+            "outcome":"not_started", "retryable":false,
+            "private_cause":"must never be admitted"
+        }));
+    }
     if crate::output::test_switch("MESHMSG_TEST_OUTPUT_BURST") {
         for index in 0..64_u64 {
             let _ = daemon_output.event(serde_json::json!({
@@ -5410,7 +5444,7 @@ pub async fn run_daemon(
                             "type":"connected", "peer":peer, "endpoint_online":true,
                             "topic_joined":node.receiver.is_joined(),
                             "alias":alias_config.effective(),
-                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_CAPABILITY]
+                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_V2_CAPABILITY, DIAGNOSTIC_STATUS_V3_CAPABILITY]
                         });
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
@@ -5598,7 +5632,7 @@ pub async fn run_daemon(
                         "captured_hostname":alias_config.hostname(),
                         "custom_alias":alias_config.custom(),
                         "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_CAPABILITY],
+                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_V2_CAPABILITY, DIAGNOSTIC_STATUS_V3_CAPABILITY],
                         "operation_cache_capacity":OPERATION_CACHE_CAPACITY,
                         "operation_cache_ttl_ms":OPERATION_CACHE_TTL.as_millis() as u64,
                         "operation_cache_persistent":false,
@@ -5616,11 +5650,11 @@ pub async fn run_daemon(
                         "attachment_retention_secs":attachment_retention_secs
                     }));
                 }
-                Some(DaemonCommand::Diagnostics { reply }) => {
+                Some(DaemonCommand::Diagnostics { schema_version, reply }) => {
                     let diagnostics = crate::output::diagnostic_metrics();
                     let output = daemon_output.metrics();
-                    let _ = reply.send(serde_json::json!({
-                        "type":"diagnostic_status", "schema_version":2,
+                    let mut status = serde_json::json!({
+                        "type":"diagnostic_status", "schema_version":schema_version,
                         "records_accepted":diagnostics.accepted.saturating_add(output.accepted),
                         "records_dropped":diagnostics.dropped.saturating_add(output.dropped),
                         "records_retained":0,
@@ -5632,7 +5666,6 @@ pub async fn run_daemon(
                         "diagnostic_queue_high_watermark":diagnostics.high_watermark,
                         "records_sampled":diagnostics.sampled,
                         "records_suppressed":diagnostics.suppressed,
-                        "admission_rejections":diagnostics.admission_rejected.saturating_add(output.admission_rejected),
                         "queue_drops":diagnostics.queue_dropped.saturating_add(output.queue_dropped),
                         "contention_drops":diagnostics.contention_dropped.saturating_add(output.contention_dropped),
                         "records_written":diagnostics.written.saturating_add(output.written),
@@ -5642,7 +5675,14 @@ pub async fn run_daemon(
                         "writer_healthy":output.writer_healthy && (crate::output::diagnostic_capacity() == 0 || diagnostics.writer_healthy),
                         "writer_terminal":output.writer_terminal || diagnostics.writer_terminal,
                         "process_panics":diagnostics.process_panics.max(output.process_panics)
-                    }));
+                    });
+                    if schema_version == 3 {
+                        status["admission_rejections"] = diagnostics
+                            .admission_rejected
+                            .saturating_add(output.admission_rejected)
+                            .into();
+                    }
+                    let _ = reply.send(status);
                 }
                 Some(DaemonCommand::Peers { reply }) => {
                     emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
@@ -7720,6 +7760,18 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    Ok(())
+}
+
+async fn diagnostic_status(dir: &Path) -> Result<serde_json::Value> {
+    let status_value = send_request_checked(dir, &IpcRequest::Status, "status", Some(1)).await?;
+    let status = StatusV1::from_value(&status_value)?;
+    let (request, schema_version) = negotiated_diagnostic_request(&status)?;
+    send_request_checked(dir, &request, "diagnostic_status", Some(schema_version)).await
+}
+
+pub async fn diagnostics(dir: &Path) -> Result<()> {
+    println!("{}", diagnostic_status(dir).await?);
     Ok(())
 }
 
