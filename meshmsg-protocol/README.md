@@ -11,4 +11,4 @@ The shared local IPC serialization boundary for the meshmsg daemon and clients.
 - Attachment names use the same portable single-component restrictions as the runtime filesystem boundary.
 - Frames are newline-delimited JSON with separate hard request and event/response limits. A buffered reader is poisoned by an oversized or incomplete frame so unread suffixes cannot be reinterpreted.
 
-Diagnostic, web, and benchmark commands remain represented during this chunk so existing features continue to work. Their later removal or extraction is deliberately outside this revision.
+Diagnostic-status commands and responses are not part of protocol v2. Web and benchmark commands remain represented for now; their extraction is later scope.

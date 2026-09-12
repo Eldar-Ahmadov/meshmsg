@@ -4,26 +4,20 @@ use crate::{
     alias::AliasConfig,
     attachment::{self, AttachmentKind, AttachmentOffer},
     config::{prepare_state_dir, State, StateLock},
-    contracts::{self, ErrorEnvelopeV1, API_CONTRACT_CAPABILITY},
+    contracts::{self, ErrorEnvelopeV1},
     direct::{
         self, DirectHandler, Directory, IncomingDirect, PresenceSourceLimiter, DIRECT_ALPN,
         PRESENCE_ALPN,
     },
     invite::Invite,
     ipc::{
-        negotiated_diagnostic_request, read_frame, send_request_checked, subscribe,
-        subscribe_with_id, valid_content_digest, valid_operation_id, validate_success_payload,
-        write_request_with_id, AttachmentOperationKind, BenchConfig, IpcRequest, IpcRequestFrame,
-        LifecycleErrorV1, LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1,
-        StatusV1, SubscriptionReader, ATTACHMENT_LIFECYCLE_CAPABILITY,
-        DIAGNOSTIC_STATUS_V2_CAPABILITY, DIAGNOSTIC_STATUS_V3_CAPABILITY,
-        IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY,
+        read_frame, send_request_checked, subscribe, subscribe_with_id, valid_content_digest,
+        valid_operation_id, validate_success_payload, write_request_with_id,
+        AttachmentOperationKind, BenchConfig, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
+        LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1, SubscriptionReader,
         MAX_IPC_REQUEST_SIZE, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
-        PRIVATE_SEND_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY,
     },
-    peers::{
-        self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES, PEER_DIRECTORY_CAPABILITY,
-    },
+    peers::{self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES},
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -1520,10 +1514,6 @@ enum DaemonCommand {
     Status {
         reply: oneshot::Sender<serde_json::Value>,
     },
-    Diagnostics {
-        schema_version: u8,
-        reply: oneshot::Sender<serde_json::Value>,
-    },
     Peers {
         reply: oneshot::Sender<serde_json::Value>,
     },
@@ -2810,38 +2800,6 @@ where
             .await;
             write_local_response(&mut stream, &value, timeouts.response_write).await?;
         }
-        IpcRequest::Diagnostics => {
-            let (reply, response) = oneshot::channel();
-            let value = command_response(
-                send_command(
-                    &commands,
-                    DaemonCommand::Diagnostics {
-                        schema_version: 2,
-                        reply,
-                    },
-                    response,
-                ),
-                timeouts.ordinary_command,
-            )
-            .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
-        }
-        IpcRequest::DiagnosticsV3 => {
-            let (reply, response) = oneshot::channel();
-            let value = command_response(
-                send_command(
-                    &commands,
-                    DaemonCommand::Diagnostics {
-                        schema_version: 3,
-                        reply,
-                    },
-                    response,
-                ),
-                timeouts.ordinary_command,
-            )
-            .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
-        }
         IpcRequest::Peers => {
             let (reply, response) = oneshot::channel();
             let value = command_response(
@@ -3276,7 +3234,7 @@ struct AttachmentStorageState {
     reservations: HashSet<String>,
     gc_protections: HashMap<iroh_blobs::HashAndFormat, GcProtection>,
     accounting_healthy: bool,
-    status: AttachmentStorageStatus,
+    status: meshmsg_protocol::AttachmentStorageStatus,
 }
 
 struct GcProtection {
@@ -3372,21 +3330,6 @@ struct StorageTag {
     size: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct AttachmentStorageStatus {
-    tagged_bytes: u64,
-    tagged_blobs: usize,
-    tags: usize,
-    tag_capacity: usize,
-    quota_bytes: u64,
-    available_bytes: u64,
-    min_free_bytes: u64,
-    pressure: bool,
-    over_quota: bool,
-    below_min_free: bool,
-    sampled_at_ms: u64,
-}
-
 struct RemovalSpec<'a> {
     operation_id: &'a str,
     offer_id: Option<&'a str>,
@@ -3460,7 +3403,7 @@ impl AttachmentStorage {
         })
     }
 
-    fn status(&self) -> AttachmentStorageStatus {
+    fn status(&self) -> meshmsg_protocol::AttachmentStorageStatus {
         self.state
             .lock()
             .expect("attachment storage state poisoned")
@@ -4328,12 +4271,12 @@ fn storage_status<'a>(
     available_bytes: u64,
     min_free_bytes: u64,
     sampled_at_ms: u64,
-) -> AttachmentStorageStatus {
+) -> meshmsg_protocol::AttachmentStorageStatus {
     let tags = tags.into_iter().collect::<Vec<_>>();
     let (tagged_bytes, tagged_blobs) = unique_storage_usage(tags.iter().copied());
     let over_quota = tagged_bytes > quota_bytes;
     let below_min_free = available_bytes < min_free_bytes;
-    AttachmentStorageStatus {
+    meshmsg_protocol::AttachmentStorageStatus {
         tagged_bytes,
         tagged_blobs,
         tags: tags.len(),
@@ -5251,13 +5194,6 @@ fn daemon_warning(event: &str, code: &str) {
     ));
 }
 
-fn direct_replay_status(health: crate::direct_replay::ReplayHealth) -> serde_json::Value {
-    serde_json::json!({
-        "available":health.available,
-        "error":health.error,
-    })
-}
-
 pub async fn run_daemon(
     dir: &Path,
     json: bool,
@@ -5497,7 +5433,6 @@ pub async fn run_daemon(
                             "type":"connected", "peer":peer, "endpoint_online":true,
                             "topic_joined":node.receiver.is_joined(),
                             "alias":alias_config.effective(),
-                            "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_V2_CAPABILITY, DIAGNOSTIC_STATUS_V3_CAPABILITY]
                         });
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
@@ -5672,70 +5607,48 @@ pub async fn run_daemon(
                     let endpoint_online = node.endpoint.home_relay_status().get()
                         .iter().any(|status| status.is_connected());
                     let neighbors = node.receiver.neighbors().count();
-                    let replay_status = direct_replay_status(node.direct_replay.health());
-                    let attachment_status = attachment_storage.status();
-                    let _ = reply.send(serde_json::json!({
-                        "type":"status", "running":true, "peer":peer, "topic":state.topic,
-                        "advertises_self":state.advertise_self, "has_invite":has_invite,
-                        "bootstrap_peer_count":bootstrap_peer_count,
-                        "self_advertised":self_advertised, "neighbors":neighbors,
-                        "endpoint_online":endpoint_online, "topic_joined":node.receiver.is_joined(),
-                        "alias":alias_config.effective(),
-                        "alias_enabled":alias_config.enabled(),
-                        "captured_hostname":alias_config.hostname(),
-                        "custom_alias":alias_config.custom(),
-                        "advertised_aliases":directory.advertised_aliases(),
-                        "ipc_capabilities":[API_CONTRACT_CAPABILITY, PRIVATE_SEND_CAPABILITY, PEER_DIRECTORY_CAPABILITY, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY, IDEMPOTENT_MUTATIONS_CAPABILITY, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY, ATTACHMENT_LIFECYCLE_CAPABILITY, DIAGNOSTIC_STATUS_V2_CAPABILITY, DIAGNOSTIC_STATUS_V3_CAPABILITY],
-                        "operation_cache_capacity":OPERATION_CACHE_CAPACITY,
-                        "operation_cache_ttl_ms":OPERATION_CACHE_TTL.as_millis() as u64,
-                        "operation_cache_persistent":false,
-                        "direct_replay_available":replay_status["available"],
-                        "direct_replay_error":replay_status["error"],
-                        "direct_replay_capacity":crate::direct_replay::MAX_REPLAY_ENTRIES,
-                        "direct_replay_per_sender_capacity":crate::direct_replay::MAX_REPLAY_ENTRIES_PER_SENDER,
-                        "direct_replay_queue_capacity":crate::direct_replay::REPLAY_QUEUE_CAPACITY,
-                        "direct_replay_global_rate_per_second":crate::direct_replay::GLOBAL_RATE_PER_SECOND as u64,
-                        "direct_replay_global_rate_burst":crate::direct_replay::GLOBAL_RATE_BURST as u64,
-                        "direct_replay_sender_rate_per_second":crate::direct_replay::SENDER_RATE_PER_SECOND as u64,
-                        "direct_replay_sender_rate_burst":crate::direct_replay::SENDER_RATE_BURST as u64,
-                        "max_attachment_bytes":max_attachment_bytes,
-                        "attachment_storage":attachment_status,
-                        "attachment_retention_secs":attachment_retention_secs
-                    }));
-                }
-                Some(DaemonCommand::Diagnostics { schema_version, reply }) => {
-                    let diagnostics = crate::output::diagnostic_metrics();
-                    let output = daemon_output.metrics();
-                    let mut status = serde_json::json!({
-                        "type":"diagnostic_status", "schema_version":schema_version,
-                        "records_accepted":diagnostics.accepted.saturating_add(output.accepted),
-                        "records_dropped":diagnostics.dropped.saturating_add(output.dropped),
-                        "records_retained":0,
-                        "stdout_queue_occupancy":output.occupancy,
-                        "stdout_queue_capacity":crate::output::OUTPUT_QUEUE_CAPACITY,
-                        "stdout_queue_high_watermark":output.high_watermark,
-                        "diagnostic_queue_occupancy":diagnostics.occupancy,
-                        "diagnostic_queue_capacity":crate::output::diagnostic_capacity(),
-                        "diagnostic_queue_high_watermark":diagnostics.high_watermark,
-                        "records_sampled":diagnostics.sampled,
-                        "records_suppressed":diagnostics.suppressed,
-                        "queue_drops":diagnostics.queue_dropped.saturating_add(output.queue_dropped),
-                        "contention_drops":diagnostics.contention_dropped.saturating_add(output.contention_dropped),
-                        "records_written":diagnostics.written.saturating_add(output.written),
-                        "write_failures":diagnostics.write_failed.saturating_add(output.write_failed),
-                        "writer_panics":diagnostics.writer_panicked.saturating_add(output.writer_panicked),
-                        "writer_records_lost":diagnostics.writer_lost.saturating_add(output.writer_lost),
-                        "writer_healthy":output.writer_healthy && (crate::output::diagnostic_capacity() == 0 || diagnostics.writer_healthy),
-                        "writer_terminal":output.writer_terminal || diagnostics.writer_terminal,
-                        "process_panics":diagnostics.process_panics.max(output.process_panics)
-                    });
-                    if schema_version == 3 {
-                        status["admission_rejections"] = diagnostics
-                            .admission_rejected
-                            .saturating_add(output.admission_rejected)
-                            .into();
-                    }
-                    let _ = reply.send(status);
+                    let replay_status = node.direct_replay.health();
+                    let status = meshmsg_protocol::Status {
+                        running: true,
+                        peer: peer.parse()?,
+                        topic: state.topic.parse()?,
+                        advertises_self: state.advertise_self,
+                        has_invite,
+                        bootstrap_peer_count,
+                        self_advertised,
+                        neighbors,
+                        endpoint_online,
+                        topic_joined: node.receiver.is_joined(),
+                        alias: alias_config.effective().map(str::parse).transpose()?,
+                        alias_enabled: alias_config.enabled(),
+                        captured_hostname: alias_config.hostname().map(str::to_owned),
+                        custom_alias: alias_config.custom().map(str::to_owned),
+                        advertised_aliases: directory.advertised_aliases(),
+                        operation_cache_capacity: OPERATION_CACHE_CAPACITY,
+                        operation_cache_ttl_ms: OPERATION_CACHE_TTL.as_millis() as u64,
+                        operation_cache_persistent: false,
+                        direct_replay_available: replay_status.available,
+                        direct_replay_error: replay_status.error,
+                        direct_replay_capacity: crate::direct_replay::MAX_REPLAY_ENTRIES,
+                        direct_replay_per_sender_capacity:
+                            crate::direct_replay::MAX_REPLAY_ENTRIES_PER_SENDER,
+                        direct_replay_queue_capacity: crate::direct_replay::REPLAY_QUEUE_CAPACITY,
+                        direct_replay_global_rate_per_second:
+                            crate::direct_replay::GLOBAL_RATE_PER_SECOND as u64,
+                        direct_replay_global_rate_burst:
+                            crate::direct_replay::GLOBAL_RATE_BURST as u64,
+                        direct_replay_sender_rate_per_second:
+                            crate::direct_replay::SENDER_RATE_PER_SECOND as u64,
+                        direct_replay_sender_rate_burst:
+                            crate::direct_replay::SENDER_RATE_BURST as u64,
+                        max_attachment_bytes,
+                        attachment_storage: attachment_storage.status(),
+                        attachment_retention_secs,
+                    };
+                    status.validate().map_err(anyhow::Error::msg)?;
+                    let _ = reply.send(serde_json::to_value(meshmsg_protocol::Response::Status(
+                        status,
+                    ))?);
                 }
                 Some(DaemonCommand::Peers { reply }) => {
                     emit_peer_transitions(directory.cleanup(), &event_tx, &daemon_output, &directory_epoch, &mut directory_revision);
@@ -6482,21 +6395,6 @@ fn validate_private_acceptance(
     Ok(())
 }
 
-fn advertises_capability(status: &serde_json::Value, expected: &str) -> bool {
-    status["type"] == "status"
-        && status["ipc_capabilities"]
-            .as_array()
-            .is_some_and(|capabilities| {
-                capabilities
-                    .iter()
-                    .any(|capability| capability.as_str() == Some(expected))
-            })
-}
-
-fn advertises_private_send(status: &serde_json::Value) -> bool {
-    advertises_capability(status, PRIVATE_SEND_CAPABILITY)
-}
-
 pub async fn send_once(
     dir: &Path,
     operation_id: Option<String>,
@@ -6505,18 +6403,7 @@ pub async fn send_once(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
-    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
-    anyhow::ensure!(
-        advertises_capability(&status, IDEMPOTENT_MUTATIONS_CAPABILITY),
-        "daemon does not advertise retry-safe operation IDs; upgrade and restart the daemon (operation was not submitted)"
-    );
     let value = if let Some(to) = to {
-        // Negotiate without the body first. A daemon swap after this check is
-        // still safe because private_send is never interpreted as broadcast.
-        anyhow::ensure!(
-            advertises_private_send(&status),
-            "daemon does not advertise safe private-send IPC; upgrade and restart the daemon (message was not submitted)"
-        );
         let value = send_request_checked(
             dir,
             &IpcRequest::PrivateSend {
@@ -6572,10 +6459,6 @@ pub async fn share(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
-    anyhow::ensure!(
-        advertises_capability(&status, IDEMPOTENT_MUTATIONS_CAPABILITY),
-        "daemon does not advertise retry-safe operation IDs; upgrade and restart the daemon (operation was not submitted)"
-    );
     let path = caller_path(path)?;
     let maximum = status["max_attachment_bytes"]
         .as_u64()
@@ -6612,14 +6495,6 @@ pub async fn share(
 }
 
 pub async fn peers(dir: &Path, json: bool) -> Result<()> {
-    // Negotiate before sending a command that legacy daemons do not know. A
-    // daemon swap remains safe because `peers` is a distinct, fieldless command
-    // and all IPC enums reject unknown fields.
-    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
-    anyhow::ensure!(
-        advertises_capability(&status, PEER_DIRECTORY_CAPABILITY),
-        "daemon does not advertise peer-directory IPC; upgrade and restart the daemon"
-    );
     let value = send_request_checked(
         dir,
         &IpcRequest::Peers,
@@ -6674,12 +6549,6 @@ pub async fn offers_remove(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
-    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
-    anyhow::ensure!(
-        advertises_capability(&status, ATTACHMENT_LIFECYCLE_CAPABILITY)
-            && advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
-        "daemon does not advertise retry-safe attachment lifecycle IPC; upgrade and restart the daemon (operation was not submitted)"
-    );
     let lifecycle_context = LifecycleRequestContext::Remove {
         operation_id: &operation_id,
         offer_id,
@@ -6718,11 +6587,6 @@ pub async fn offers_prune(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
-    anyhow::ensure!(
-        advertises_capability(&status, ATTACHMENT_LIFECYCLE_CAPABILITY)
-            && advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
-        "daemon does not advertise retry-safe attachment lifecycle IPC; upgrade and restart the daemon (operation was not submitted)"
-    );
     let effective_age = older_than_secs
         .unwrap_or_else(|| status["attachment_retention_secs"].as_u64().unwrap_or(0));
     let lifecycle_context = LifecycleRequestContext::Prune {
@@ -6763,10 +6627,6 @@ pub async fn download(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
-    anyhow::ensure!(
-        advertises_capability(&status, IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY),
-        "daemon does not advertise retry-safe downloads; upgrade and restart the daemon (operation was not submitted)"
-    );
     // Retain the exact absolute representation submitted to the daemon. Do not
     // canonicalize through symlinks or require the not-yet-created destination.
     let requested_output = caller_path(output)?;
@@ -7819,18 +7679,6 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn diagnostic_status(dir: &Path) -> Result<serde_json::Value> {
-    let status_value = send_request_checked(dir, &IpcRequest::Status, "status", Some(1)).await?;
-    let status = StatusV1::from_value(&status_value)?;
-    let (request, schema_version) = negotiated_diagnostic_request(&status)?;
-    send_request_checked(dir, &request, "diagnostic_status", Some(schema_version)).await
-}
-
-pub async fn diagnostics(dir: &Path) -> Result<()> {
-    println!("{}", diagnostic_status(dir).await?);
-    Ok(())
-}
-
 pub async fn status(dir: &Path, json: bool) -> Result<()> {
     let value = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
     if json {
@@ -8176,7 +8024,7 @@ mod tests {
         serde_json::json!({
             "type":"connected", "peer":"2".repeat(64),
             "endpoint_online":true, "topic_joined":true,
-            "alias":null, "ipc_capabilities":[]
+            "alias":null
         })
     }
 
@@ -8993,7 +8841,7 @@ mod tests {
             serde_json::json!({
                 "type":"connected", "peer":"2".repeat(64),
                 "endpoint_online":true, "topic_joined":true,
-                "alias":null, "ipc_capabilities":[]
+                "alias":null
             }),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -10630,17 +10478,7 @@ mod tests {
     }
 
     #[test]
-    fn private_send_capability_and_acceptance_are_validated_strictly() {
-        assert!(!advertises_private_send(
-            &serde_json::json!({"type":"status"})
-        ));
-        assert!(!advertises_private_send(&serde_json::json!({
-            "type":"connected", "ipc_capabilities":[PRIVATE_SEND_CAPABILITY]
-        })));
-        assert!(advertises_private_send(&serde_json::json!({
-            "type":"status", "ipc_capabilities":[PRIVATE_SEND_CAPABILITY]
-        })));
-
+    fn private_send_acceptance_is_validated_strictly() {
         let recipient = SecretKey::generate().public().to_string();
         let accepted = serde_json::json!({
             "type":"private_accepted", "schema_version":3,
@@ -10738,16 +10576,6 @@ mod tests {
 
         assert!(error.to_string().contains("cannot advertise self"));
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn direct_replay_terminal_health_has_stable_status_fields() {
-        let status = direct_replay_status(crate::direct_replay::ReplayHealth {
-            available: false,
-            error: Some("direct replay persistence worker failed".into()),
-        });
-        assert_eq!(status["available"], false);
-        assert_eq!(status["error"], "direct replay persistence worker failed");
     }
 
     #[test]
@@ -13061,7 +12889,7 @@ mod tests {
                         serde_json::json!({
                             "protocol_version":2, "type":"connected", "schema_version":1,
                             "peer":"2".repeat(64), "endpoint_online":true,
-                            "topic_joined":true, "alias":null, "ipc_capabilities":[]
+                            "topic_joined":true, "alias":null
                         }),
                         &request.request_id,
                     ),

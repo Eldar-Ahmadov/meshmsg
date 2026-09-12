@@ -6,7 +6,7 @@ use crate::{
     config::prepare_state_dir,
     contracts::{self, ErrorEnvelopeV1},
     direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
-    ipc::{self, IpcRequest, WEB_DOWNLOAD_CAPABILITY, WEB_SHARE_CAPABILITY},
+    ipc::{self, IpcRequest},
     message::{validate_broadcast_body, validate_v2_message_body},
     peers::PEER_LEASE_MS,
 };
@@ -654,7 +654,6 @@ struct ConnectedEventDto {
     endpoint_online: bool,
     topic_joined: bool,
     alias: Option<String>,
-    ipc_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1484,17 +1483,6 @@ fn local_mutation_error(
     }
 }
 
-fn daemon_supports_idempotent_mutations(status: &Value) -> bool {
-    status["type"] == "status"
-        && status["ipc_capabilities"]
-            .as_array()
-            .is_some_and(|capabilities| {
-                capabilities.iter().any(|capability| {
-                    capability.as_str() == Some(ipc::IDEMPOTENT_MUTATIONS_CAPABILITY)
-                })
-            })
-}
-
 async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
     let request = match parse_request(bytes) {
         Ok(request) => request,
@@ -1528,34 +1516,6 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
     let is_send = matches!(&request, WebRequest::Send { .. });
     let is_peers = matches!(&request, WebRequest::Peers {});
     if let WebRequest::Send { operation_id, .. } = &request {
-        let negotiated = timeout(
-            IPC_TIMEOUT,
-            web_ipc_request(&state.dir, &IpcRequest::Status),
-        )
-        .await;
-        match negotiated {
-            Ok(Ok(status))
-                if ipc::StatusV1::from_value(&status).is_ok()
-                    && daemon_supports_idempotent_mutations(&status) => {}
-            Ok(Ok(_)) => {
-                return mutation_error_response(local_mutation_error(
-                    operation_id,
-                    "idempotency_unsupported",
-                    "Daemon does not advertise retry-safe mutations. Upgrade and restart it; the message was not submitted.",
-                    false,
-                    "not_started",
-                ));
-            }
-            _ => {
-                return mutation_error_response(local_mutation_error(
-                    operation_id,
-                    "daemon_unavailable",
-                    "Daemon unavailable during capability negotiation; the message was not submitted.",
-                    true,
-                    "not_started",
-                ));
-            }
-        }
         if !state.take_send(operation_id, Instant::now()) {
             let mut response = mutation_error_response(local_mutation_error(
                 operation_id,
@@ -1631,7 +1591,7 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
                 )),
             }
         }
-        Ok(Ok(value)) if !is_send && !is_peers && ipc::StatusV1::from_value(&value).is_ok() => {
+        Ok(Ok(value)) if !is_send && !is_peers && ipc::status_from_value(&value).is_ok() => {
             json_response(StatusCode::OK, public_status(&value))
         }
         Ok(Ok(value)) if is_peers => match public_peers_snapshot(&value) {
@@ -1711,7 +1671,6 @@ fn public_event(
                 || decoded.schema_version != 1
                 || !contracts::valid_request_id(&decoded.request_id)
                 || !decoded.endpoint_online
-                || decoded.ipc_capabilities.len() > 64
             {
                 return None;
             }
@@ -1972,20 +1931,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
                 return;
             }
         };
-        let download_supported = first["ipc_capabilities"]
-            .as_array()
-            .is_some_and(|capabilities| {
-                [
-                    WEB_DOWNLOAD_CAPABILITY,
-                    ipc::IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY,
-                ]
-                .iter()
-                .all(|expected| {
-                    capabilities
-                        .iter()
-                        .any(|value| value.as_str() == Some(*expected))
-                })
-            });
+        let download_supported = true;
         let Some(connected) = public_event(&state, subscription_topic, first, download_supported) else {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
             return;
@@ -2256,19 +2202,7 @@ fn decode_upload_name(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-fn daemon_supports_web_share(status: &Value) -> Option<u64> {
-    let supported = status["type"] == "status"
-        && status["ipc_capabilities"].as_array().is_some_and(|values| {
-            values
-                .iter()
-                .any(|value| value.as_str() == Some(WEB_SHARE_CAPABILITY))
-                && values
-                    .iter()
-                    .any(|value| value.as_str() == Some(ipc::IDEMPOTENT_MUTATIONS_CAPABILITY))
-        });
-    if !supported {
-        return None;
-    }
+fn daemon_attachment_limit(status: &Value) -> Option<u64> {
     status["max_attachment_bytes"]
         .as_u64()
         .filter(|limit| *limit > 0)
@@ -2339,7 +2273,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     )
     .await
     {
-        Ok(Ok(status)) if ipc::StatusV1::from_value(&status).is_ok() => status,
+        Ok(Ok(status)) if ipc::status_from_value(&status).is_ok() => status,
         _ => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2348,11 +2282,11 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             )
         }
     };
-    let Some(maximum) = daemon_supports_web_share(&status) else {
+    let Some(maximum) = daemon_attachment_limit(&status) else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "not_shared",
-            "The daemon does not support web attachment sharing. Upgrade and restart it.",
+            "The daemon returned an invalid attachment size limit.",
         );
     };
     if declared_size.is_some_and(|size| size > maximum) {
@@ -3695,7 +3629,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_names_and_share_capability_are_strict() {
+    fn upload_names_and_attachment_limit_are_strict() {
         assert_eq!(
             decode_upload_name("r%C3%A9sum%C3%A9.txt").as_deref(),
             Some("résumé.txt")
@@ -3704,19 +3638,15 @@ mod tests {
             assert!(decode_upload_name(invalid).is_none(), "{invalid}");
         }
         assert_eq!(
-            daemon_supports_web_share(&json!({
-                "type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY, ipc::IDEMPOTENT_MUTATIONS_CAPABILITY],
-                "max_attachment_bytes":123
-            })),
+            daemon_attachment_limit(&json!({"max_attachment_bytes":123})),
             Some(123)
         );
         for status in [
-            json!({"type":"status", "ipc_capabilities":[], "max_attachment_bytes":123}),
-            json!({"type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY]}),
-            json!({"type":"status", "ipc_capabilities":[WEB_SHARE_CAPABILITY], "max_attachment_bytes":0}),
-            json!({"type":"connected", "ipc_capabilities":[WEB_SHARE_CAPABILITY], "max_attachment_bytes":123}),
+            json!({}),
+            json!({"max_attachment_bytes":0}),
+            json!({"max_attachment_bytes":"123"}),
         ] {
-            assert_eq!(daemon_supports_web_share(&status), None);
+            assert_eq!(daemon_attachment_limit(&status), None);
         }
     }
 
@@ -3913,8 +3843,7 @@ mod tests {
         .is_none());
         let connected_source = ipc_event(json!({
             "type":"connected", "schema_version":1, "peer":iroh::SecretKey::generate().public().to_string(),
-            "endpoint_online":true, "topic_joined":true, "alias":null,
-            "ipc_capabilities":[WEB_DOWNLOAD_CAPABILITY]
+            "endpoint_online":true, "topic_joined":true, "alias":null
         }));
         let connected = public_event(connected_source.clone()).unwrap();
         assert!(connected["download_supported"].as_bool().unwrap());

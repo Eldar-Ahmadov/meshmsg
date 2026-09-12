@@ -6,7 +6,6 @@ use std::str::FromStr;
 /// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
 /// locally derived and never extends beyond this bound.
 pub(crate) const PEER_LEASE_MS: u64 = 150_000;
-pub(crate) const PEER_DIRECTORY_CAPABILITY: &str = "peer_directory_v2";
 pub(crate) const PEER_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
 

@@ -215,6 +215,7 @@ struct Metrics {
     terminal: AtomicBool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MetricsSnapshot {
     pub(crate) accepted: u64,
@@ -224,7 +225,6 @@ pub(crate) struct MetricsSnapshot {
     pub(crate) contention_dropped: u64,
     pub(crate) sampled: u64,
     pub(crate) suppressed: u64,
-    pub(crate) written: u64,
     pub(crate) write_failed: u64,
     pub(crate) writer_panicked: u64,
     pub(crate) writer_lost: u64,
@@ -236,6 +236,7 @@ pub(crate) struct MetricsSnapshot {
 }
 
 impl Metrics {
+    #[cfg(test)]
     fn snapshot(&self) -> MetricsSnapshot {
         let queue_dropped = self.queue_dropped.load(Ordering::Relaxed);
         let contention_dropped = self.contention_dropped.load(Ordering::Relaxed);
@@ -251,7 +252,6 @@ impl Metrics {
             contention_dropped,
             sampled: self.sampled.load(Ordering::Relaxed),
             suppressed: self.suppressed.load(Ordering::Relaxed),
-            written: self.written.load(Ordering::Relaxed),
             write_failed: self.write_failed.load(Ordering::Relaxed),
             writer_panicked: self.writer_panicked.load(Ordering::Relaxed),
             writer_lost,
@@ -377,6 +377,7 @@ impl Dispatcher {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> MetricsSnapshot {
         let snapshot = self.metrics.snapshot();
         debug_assert!(snapshot.occupancy <= self.capacity);
@@ -558,6 +559,7 @@ impl DaemonOutput {
         self.0.offer(Item::Event(value))
     }
 
+    #[cfg(test)]
     pub(crate) fn metrics(&self) -> MetricsSnapshot {
         self.0.snapshot()
     }
@@ -690,14 +692,6 @@ pub(crate) fn sampled_diagnostic(mut record: DiagnosticRecord) -> bool {
     diagnostic(record)
 }
 
-pub(crate) fn diagnostic_capacity() -> usize {
-    if DIAGNOSTICS.get().and_then(Option::as_ref).is_some() {
-        DIAGNOSTIC_QUEUE_CAPACITY
-    } else {
-        0
-    }
-}
-
 pub(crate) fn shutdown_diagnostics(timeout: Duration) -> bool {
     DIAGNOSTICS
         .get()
@@ -705,6 +699,7 @@ pub(crate) fn shutdown_diagnostics(timeout: Duration) -> bool {
         .is_none_or(|dispatcher| dispatcher.close_and_wait(timeout))
 }
 
+#[cfg(test)]
 pub(crate) fn diagnostic_metrics() -> MetricsSnapshot {
     let mut snapshot = DIAGNOSTICS
         .get()

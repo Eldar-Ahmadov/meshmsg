@@ -156,7 +156,7 @@ wait_for 40 "sender presence at receiver" status_aliases receiver 2
 
 SENDER_STATUS=$("$BIN" --state-dir "$ROOT/sender" --json status)
 SENDER_PEER=$(python3 -c \
-  'import json,sys; v=json.load(sys.stdin); assert "private_send_v2" in v["ipc_capabilities"]; print(v["peer"])' \
+  'import json,sys; print(json.load(sys.stdin)["peer"])' \
   <<<"$SENDER_STATUS") || fail "current daemon did not advertise safe private-send IPC"
 
 # Private positional/file/stdin inputs retain their independent 4096-byte

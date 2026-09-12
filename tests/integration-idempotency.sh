@@ -194,7 +194,7 @@ for BAD_CUTOFF in 0 18446744073709551615; do
 done
 
 # Put a transparent Unix-socket proxy in front of the daemon. It forwards the
-# real CLI's status negotiation and prune request, waits for the daemon's terminal
+# real CLI's status context lookup and prune request, waits for the daemon's terminal
 # prune result, then discards that response. The identical CLI retry must replay.
 PRUNE_ID=55555555555555555555555555555555
 SOCKET="$ROOT/sender/daemon.sock"

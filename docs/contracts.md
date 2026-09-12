@@ -1,7 +1,7 @@
 # Stable JSON, IPC, HTTP, and SSE contracts
 
-The stable application contract is `typed_contracts_v1`. JSON objects use a numeric
-`schema_version`; version 1 is the common envelope version. A family may have a
+Local IPC uses exactly protocol version 2. JSON payload objects use a numeric
+`schema_version`; version 1 is the common family version. A family may have a
 higher version where its payload evolved (for example `message`/peer-directory v2
 and mutation results v3). Family versions are exact, not minimum versions.
 
@@ -63,26 +63,8 @@ peer routes, and filesystem paths are prohibited. Human mode offers diagnostics 
 a bounded nonblocking stderr writer; JSON mode disables diagnostic terminal output
 to preserve the empty-stderr and stdout protocol contracts.
 
-Daemons advertising `diagnostic_status_v2` accept `diagnostics` and return the
-exact strict `diagnostic_status` schema 2 released in v0.1.19. Daemons advertising
-`diagnostic_status_v3` additionally accept `diagnostics_v3`; current clients prefer
-schema 3 and intentionally fall back to schema 2 when only the v2 capability is
-advertised. Current daemons advertise and serve both capabilities, preserving v2
-interoperation with v0.1.19 clients and daemons. Both schemas report accepted,
-aggregate dropped, queue-drop, lock-contention-drop, sampled-admission, immediately
-counted suppression, written, write-failure, writer-panic, and
-current-plus-abandoned writer-loss counters; separately named stdout and diagnostic
-queue occupancy/capacity/high-water marks; terminal writer health; and process panic
-count. Schema 3 alone adds `admission_rejections`, counting malformed, noncanonical,
-or unsupported daemon error objects rejected before queue admission; it is not a
-queue drop. Separate peaks are intentional: adding independent maxima would invent a
-combined occupancy that never occurred. `records_dropped` is exactly queue drops plus
-contention drops plus writer records lost, and `records_retained` is always zero.
-Counters are process-lifetime
-observations, including when JSON mode disables stderr, and are not a promise that
-every diagnostic or daemon stdout event survived pressure. Correlations are emitted
-only when they satisfy the exact 32-character lowercase hexadecimal request,
-operation, or run-ID grammar. Automation must branch on `code`, never text.
+Diagnostic writer telemetry is internal and is not exposed as an IPC status variant.
+Automation must branch on stable error `code` values, never display text.
 
 Every daemon error offered to process stdout is first decoded as the strict shared
 `ErrorEnvelopeV1` and reserialized from that DTO. Missing/noncanonical fixed text,
@@ -108,7 +90,7 @@ Each newline-delimited request is a strict nested envelope:
 
 ```json
 {
-  "schema_version": 1,
+  "protocol_version": 2,
   "request_id": "0123456789abcdef0123456789abcdef",
   "request": { "command": "status" }
 }
@@ -170,16 +152,16 @@ must contain exactly that active request ID, even for codes allowed to omit it b
 admission. Strict matching errors with partial/unknown outcomes are preserved; missing
 or mismatched correlation and the temporally impossible `not_started` outcome become
 correlated `invalid_daemon_response`/`partial`.
-Listen/chat therefore never print an unrecognized daemon event. Error objects are strictly decoded against the closed error contract. Status
-includes capabilities, replay limits, mutation-cache semantics, attachment limits,
-and attachment-storage pressure.
+Listen/chat therefore never print an unrecognized daemon event. Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
+attachment-storage pressure. Clients and the daemon are one protocol-v2 component
+set, so commands are submitted directly without status capability probes.
 
 CLI-only setup/state-file records are `initialized`, `joined`, `alias`, `invite`,
 `doctor`, and daemon-process `daemon_started`; they do not cross IPC. The exhaustive
 IPC success/event families are:
 
 - lifecycle: `stopping` v1;
-- state/capabilities: `status` v1, `connected` v1, `peers_snapshot` v2,
+- state/directory: `status` v1, `connected` v1, `peers_snapshot` v2,
   `peer_discovered`/`peer_updated`/`peer_expired` v2 and `peer_up`/`peer_down` v1;
 - messaging: `queued` v3, `private_accepted` v3, `message` v2,
   `private_message` v1;
@@ -234,15 +216,12 @@ not event cursors.
 
 ## Compatibility and migration
 
-This is an intentional local-API compatibility boundary. New daemons advertise
-`typed_contracts_v1`. New clients send only nested IPC/HTTP schema-1 envelopes and
-require exact correlated replies. Old unversioned clients are rejected; new clients
-reject old uncorrelated replies before any payload is consumed. There is no
-permissive downgrade or field defaulting. Operators must upgrade and restart the
-CLI, web bridge, and daemon together. Attachment lifecycle/download clients also
-require `idempotent_attachment_operations_v1` before submission; an older daemon
-therefore cannot silently interpret an operation without its identity. Network
-gossip/direct protocol compatibility is unchanged.
+This is an intentional local-API compatibility boundary. Clients send only strict
+protocol-v2 IPC envelopes and require exact correlated replies. Older clients and
+daemons are rejected before any payload is consumed. There is no permissive
+downgrade, capability probe, or field defaulting; operators must upgrade and restart
+the CLI, web bridge, and daemon together. Network gossip/direct protocol
+compatibility is unchanged.
 
 The shared daemon cache admits at most 1,024 completed plus in-flight operations.
 Matching concurrent requests join one execution. A terminal success, failure, or
@@ -299,9 +278,8 @@ successful non-dry-run removal has equal selected and removed counts; dry-run re
 zero; and an empty selection releases zero bytes. The same request-aware DTO
 validator is used by production, generic IPC dispatch, and CLI consumption;
 caller-side validation accepts one required daemon-authoritative cutoff while
-producer/generic validation binds its exact value. `attachment_lifecycle_v3` is
-negotiated before submission, so a daemon that only supports lifecycle-v2 or earlier
-fails closed before mutation.
+producer/generic validation binds its exact value. The protocol-v2 lifecycle command is submitted directly and its strict response is
+validated before consumption.
 
 Attachment operation errors are additionally request-kind-aware. Share, remove,
 prune, download, and web-download each admit only their documented code set with
@@ -310,5 +288,5 @@ and partial-removal accounting. A structurally valid error from another operatio
 kind is rejected as an invalid daemon response.
 
 Adding optional fields still requires a new family version because DTOs deny unknown
-fields. A future transport version must use a new capability token, negotiate before
-mutations, and define an explicit migration; unsupported versions always fail closed.
+fields. A future transport version requires an explicit breaking migration;
+unsupported versions always fail closed.

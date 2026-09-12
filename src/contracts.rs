@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SCHEMA_VERSION: u8 = 1;
-pub(crate) const API_CONTRACT_CAPABILITY: &str = "typed_contracts_v1";
 pub(crate) const MAX_PUBLIC_MESSAGE_BYTES: usize = 1024;
 pub(crate) const BENCHMARK_SEND_FAILED_MESSAGE: &str = "Message submission failed.";
 

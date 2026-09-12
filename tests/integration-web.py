@@ -61,9 +61,7 @@ class Daemon(socketserver.ThreadingUnixStreamServer):
         self.requests = []
         self.operations = {}
         self.share_operations = {}
-        self.idempotency_capability = True
         self.web_download_attempts = {}
-        self.web_download_capability = True
         self.malformed_handshake = False
         self.clients = set()
         self.subscribers = {}
@@ -165,18 +163,12 @@ class Handler(socketserver.StreamRequestHandler):
                 self.wfile.flush()
 
             if value['command'] == 'status':
-                capabilities = ['peer_directory_v2', 'web_share_v1',
-                                'idempotent_attachment_operations_v1']
-                if self.server.idempotency_capability:
-                    capabilities.append('idempotent_mutations_v1')
-                capabilities.append('typed_contracts_v1')
                 emit({'type': 'status', 'running': True, 'peer': SELF_KEY,
                       'topic': '00' * 32, 'advertises_self': False, 'has_invite': True,
                       'bootstrap_peer_count': 1, 'self_advertised': False, 'neighbors': 1,
                       'endpoint_online': True, 'topic_joined': True, 'alias': 'local-node',
                       'alias_enabled': True, 'captured_hostname': 'local-node',
                       'custom_alias': None, 'advertised_aliases': 1,
-                      'ipc_capabilities': capabilities,
                       'operation_cache_capacity': 1024, 'operation_cache_ttl_ms': 600000,
                       'operation_cache_persistent': False, 'direct_replay_available': True,
                       'direct_replay_error': None, 'direct_replay_capacity': 8192,
@@ -301,14 +293,9 @@ class Handler(socketserver.StreamRequestHandler):
                     return  # The terminal outcome is cached but this reply is lost.
                 emit(outcome)
             elif value['command'] == 'subscribe':
-                capabilities = (
-                    ['web_download_v1', 'idempotent_attachment_operations_v1']
-                    if self.server.web_download_capability else []
-                )
                 emit({'type': 'connected', 'peer': SELF_KEY,
                       'endpoint_online': not self.server.malformed_handshake,
-                      'topic_joined': True, 'alias': 'local-node',
-                      'ipc_capabilities': capabilities})
+                      'topic_joined': True, 'alias': 'local-node'})
                 emit(malicious_peers_snapshot())
                 emit(dict(self.server.initial_offer))
                 emit({'type': 'message', 'from': REMOTE_KEY,
@@ -442,17 +429,6 @@ def main():
                     'Origin': origin, 'Content-Type': 'text/plain',
                     'X-Meshmsg-File-Name': 'file.txt',
                     'X-Meshmsg-Operation-Id': '20000000000000000000000000000000'})[0] == 415
-                daemon.web_download_capability = False
-                legacy_feed = open_feed()
-                legacy_connected = next_event(legacy_feed)
-                assert legacy_connected['type'] == 'connected' and legacy_connected['download_supported'] is False
-                assert next_event(legacy_feed)['type'] == 'peers_snapshot'
-                legacy_attachment = next_event(legacy_feed)
-                assert legacy_attachment['type'] == 'attachment_offer' and 'download_id' not in legacy_attachment
-                legacy_feed.close()
-                streams.pop()[1].close()
-                daemon.web_download_capability = True
-
                 # A structurally valid handshake that cannot represent a public
                 # connected state must become one correlated sanitized error,
                 # not panic the bridge or claim connection success.
@@ -472,7 +448,7 @@ def main():
 
                 code, status = api({'command': 'status'})
                 assert code == 200 and status['peer'] == SELF_KEY
-                assert all(key not in status for key in ['socket', 'invite', 'ipc_capabilities'])
+                assert all(key not in status for key in ['socket', 'invite'])
                 code, peers = api({'command': 'peers'})
                 assert code == 200 and peers == {
                     'type': 'peers_snapshot', 'schema_version': 2, 'generated_at_ms': 1000,
@@ -552,21 +528,6 @@ def main():
                               'operation_id': reused_http_id,
                               'message_id': reused_http_id,
                               'delivery_acknowledged': False})
-
-                daemon.idempotency_capability = False
-                sends_before = sum(r.get('command') == 'send' for r in daemon.requests)
-                code, unsupported = api({
-                    'command': 'send',
-                    'operation_id': '10000000000000000000000000000000',
-                    'body': 'must-not-submit'})
-                assert code == 422 and unsupported == {
-                    'type': 'error', 'schema_version': 1,
-                    'code': 'idempotency_unsupported',
-                    'operation_id': '10000000000000000000000000000000',
-                    'message': 'Retry-safe mutations are unsupported by the daemon.',
-                    'outcome': 'not_started', 'retryable': False}
-                assert sum(r.get('command') == 'send' for r in daemon.requests) == sends_before
-                daemon.idempotency_capability = True
                 time.sleep(1.05)
 
                 assert api({'command': 'send', 'operation_id': '10000000000000000000000000000001', 'body': 'hello\n<script>test</script>'}) == (200, {'type': 'queued', 'schema_version': 3, 'operation_id': '10000000000000000000000000000001', 'message_id': '10000000000000000000000000000001', 'delivery_acknowledged': False})
@@ -1154,7 +1115,7 @@ def main():
                     client.connect(str(root / 'daemon.sock'))
                     client.sendall(b'{"protocol_version":2,"request_id":"66666666666666666666666666666666","request":{"command":"status"}}\n')
                     assert json.loads(client.recv(4096))['running'] is True
-                print('PASS: isolated offline signed fixtures, HTTP security/allowlist/assets, bounded browser attachment uploads and negotiated opaque retryable/ranged downloads with safe staging/headers, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, live web-process daemon topic replacement with old-topic rejection and correlated new-topic offer/share delivery, offline/restart, independent web shutdown')
+                print('PASS: isolated offline signed fixtures, HTTP security/allowlist/assets, bounded browser attachment uploads and opaque retryable/ranged downloads with safe staging/headers, UTF-8/body bounds/timeouts, throttle, queued/rejected/unknown outcomes, local CLI/chat/web sends, reconstructed peer snapshots/lifecycle without endpoints or private bodies, safe attachment metadata synchronized to simultaneous SSE feeds, SSE framing/capacity/cleanup, live web-process daemon topic replacement with old-topic rejection and correlated new-topic offer/share delivery, offline/restart, independent web shutdown')
             finally:
                 for response, conn in streams:
                     response.close()

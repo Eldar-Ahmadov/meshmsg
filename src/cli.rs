@@ -342,8 +342,6 @@ pub enum Command {
     Chat,
     /// Show live daemon configuration and connectivity
     Status,
-    /// Show bounded daemon output and diagnostic telemetry
-    Diagnostics,
     /// Validate local state, including the expected public identity
     Doctor,
 }

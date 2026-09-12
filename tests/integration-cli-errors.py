@@ -29,10 +29,10 @@ def run_case(command, response, expected_code="command_failed",
 
         def daemon():
             try:
-                negotiated = command[0] == "download" or (
+                needs_status_context = command[0] == "download" or (
                     command[0] == "offers" and len(command) > 1
-                    and command[1] in ("remove", "prune"))
-                request_count = 2 if negotiated else 1
+                    and command[1] == "prune")
+                request_count = 2 if needs_status_context else 1
                 for _ in range(request_count):
                     connection, _ = listener.accept()
                     with connection:
@@ -93,7 +93,6 @@ def download_status():
         "self_advertised": False, "neighbors": 1, "endpoint_online": True,
         "topic_joined": True, "alias": None, "alias_enabled": False,
         "captured_hostname": None, "custom_alias": None, "advertised_aliases": 0,
-        "ipc_capabilities": ["idempotent_attachment_operations_v1", "attachment_lifecycle_v3"],
         "operation_cache_capacity": 1024, "operation_cache_ttl_ms": 600000,
         "operation_cache_persistent": False, "direct_replay_available": True,
         "direct_replay_error": None, "direct_replay_capacity": 8192,

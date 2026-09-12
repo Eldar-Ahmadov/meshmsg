@@ -23,15 +23,6 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader}
 pub(crate) use meshmsg_protocol::framing::{
     MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT_SIZE, MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE,
 };
-pub(crate) const PRIVATE_SEND_CAPABILITY: &str = "private_send_v2";
-pub(crate) const WEB_DOWNLOAD_CAPABILITY: &str = "web_download_v1";
-pub(crate) const WEB_SHARE_CAPABILITY: &str = "web_share_v1";
-pub(crate) const IDEMPOTENT_MUTATIONS_CAPABILITY: &str = "idempotent_mutations_v1";
-pub(crate) const IDEMPOTENT_ATTACHMENT_OPERATIONS_CAPABILITY: &str =
-    "idempotent_attachment_operations_v1";
-pub(crate) const ATTACHMENT_LIFECYCLE_CAPABILITY: &str = "attachment_lifecycle_v3";
-pub(crate) const DIAGNOSTIC_STATUS_V2_CAPABILITY: &str = "diagnostic_status_v2";
-pub(crate) const DIAGNOSTIC_STATUS_V3_CAPABILITY: &str = "diagnostic_status_v3";
 pub(crate) type LifecycleErrorV1 = ErrorEnvelopeV1;
 
 pub(crate) use contracts::valid_operation_id;
@@ -188,63 +179,7 @@ pub(crate) fn new_operation_id() -> String {
     meshmsg_protocol::OperationId::new_random().into_string()
 }
 
-pub(crate) use meshmsg_protocol::BenchConfig;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AttachmentStorageStatusV1 {
-    pub(crate) tagged_bytes: u64,
-    pub(crate) tagged_blobs: usize,
-    pub(crate) tags: usize,
-    pub(crate) tag_capacity: usize,
-    pub(crate) quota_bytes: u64,
-    pub(crate) available_bytes: u64,
-    pub(crate) min_free_bytes: u64,
-    pub(crate) pressure: bool,
-    pub(crate) over_quota: bool,
-    pub(crate) below_min_free: bool,
-    pub(crate) sampled_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StatusV1 {
-    #[serde(rename = "type")]
-    pub(crate) kind: String,
-    pub(crate) schema_version: u8,
-    pub(crate) request_id: String,
-    pub(crate) running: bool,
-    pub(crate) peer: String,
-    pub(crate) topic: String,
-    pub(crate) advertises_self: bool,
-    pub(crate) has_invite: bool,
-    pub(crate) bootstrap_peer_count: usize,
-    pub(crate) self_advertised: bool,
-    pub(crate) neighbors: usize,
-    pub(crate) endpoint_online: bool,
-    pub(crate) topic_joined: bool,
-    pub(crate) alias: Option<String>,
-    pub(crate) alias_enabled: bool,
-    pub(crate) captured_hostname: Option<String>,
-    pub(crate) custom_alias: Option<String>,
-    pub(crate) advertised_aliases: usize,
-    pub(crate) ipc_capabilities: Vec<String>,
-    pub(crate) operation_cache_capacity: usize,
-    pub(crate) operation_cache_ttl_ms: u64,
-    pub(crate) operation_cache_persistent: bool,
-    pub(crate) direct_replay_available: bool,
-    pub(crate) direct_replay_error: Option<String>,
-    pub(crate) direct_replay_capacity: usize,
-    pub(crate) direct_replay_per_sender_capacity: usize,
-    pub(crate) direct_replay_queue_capacity: usize,
-    pub(crate) direct_replay_global_rate_per_second: u64,
-    pub(crate) direct_replay_global_rate_burst: u64,
-    pub(crate) direct_replay_sender_rate_per_second: u64,
-    pub(crate) direct_replay_sender_rate_burst: u64,
-    pub(crate) max_attachment_bytes: u64,
-    pub(crate) attachment_storage: AttachmentStorageStatusV1,
-    pub(crate) attachment_retention_secs: u64,
-}
+pub(crate) use meshmsg_protocol::{BenchConfig, Status};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -272,7 +207,6 @@ struct ConnectedV1 {
     endpoint_online: bool,
     topic_joined: bool,
     alias: Option<String>,
-    ipc_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1216,13 +1150,7 @@ pub(crate) fn validate_success_payload_for_context(
         .context("response schema version is missing")?;
     match (family, version) {
         ("status", 1) => {
-            StatusV1::from_value(value)?;
-        }
-        ("diagnostic_status", 2) => {
-            DiagnosticStatusV2::from_value(value)?;
-        }
-        ("diagnostic_status", 3) => {
-            DiagnosticStatusV3::from_value(value)?;
+            status_from_value(value)?;
         }
         ("queued", 3) => {
             let dto: QueuedV3 =
@@ -1234,12 +1162,7 @@ pub(crate) fn validate_success_payload_for_context(
                 serde_json::from_value(value.clone()).context("malformed connected event")?;
             anyhow::ensure!(
                 valid_family(&dto.kind, family, dto.schema_version, &dto.request_id)
-                    && valid_peer_id(&dto.peer)
-                    && dto.ipc_capabilities.len() <= 64
-                    && dto
-                        .ipc_capabilities
-                        .iter()
-                        .all(|item| valid_public_text(item, 64)),
+                    && valid_peer_id(&dto.peer),
                 "invalid connected event"
             );
             anyhow::ensure!(
@@ -1816,160 +1739,30 @@ impl OffersV1 {
     }
 }
 
-impl StatusV1 {
-    pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let status: Self =
-            serde_json::from_value(value.clone()).context("daemon returned malformed status")?;
-        anyhow::ensure!(
-            status.kind == "status" && status.schema_version == contracts::SCHEMA_VERSION,
-            "daemon returned unsupported status"
-        );
-        anyhow::ensure!(
-            contracts::valid_request_id(&status.request_id),
-            "daemon status request ID is invalid"
-        );
-        anyhow::ensure!(
-            status.running
-                && valid_peer_id(&status.peer)
-                && valid_content_digest(&status.topic)
-                && status.max_attachment_bytes > 0
-                && status
-                    .alias
-                    .as_deref()
-                    .is_none_or(|value| valid_public_text(value, 63))
-                && status
-                    .captured_hostname
-                    .as_deref()
-                    .is_none_or(|value| valid_public_text(value, 253))
-                && status
-                    .custom_alias
-                    .as_deref()
-                    .is_none_or(|value| valid_public_text(value, 63))
-                && status
-                    .direct_replay_error
-                    .as_deref()
-                    .is_none_or(|value| valid_public_text(
-                        value,
-                        contracts::MAX_PUBLIC_MESSAGE_BYTES
-                    )),
-            "daemon status values are invalid"
-        );
-        anyhow::ensure!(
-            status.attachment_storage.tags <= status.attachment_storage.tag_capacity
-                && status.attachment_storage.tagged_blobs <= status.attachment_storage.tags
-                && status.attachment_storage.over_quota
-                    == (status.attachment_storage.tagged_bytes
-                        > status.attachment_storage.quota_bytes)
-                && status.attachment_storage.below_min_free
-                    == (status.attachment_storage.available_bytes
-                        < status.attachment_storage.min_free_bytes)
-                && status.attachment_storage.pressure
-                    == (status.attachment_storage.over_quota
-                        || status.attachment_storage.below_min_free),
-            "daemon attachment status is invalid"
-        );
-        anyhow::ensure!(
-            status.ipc_capabilities.len() <= 64
-                && status
-                    .ipc_capabilities
-                    .iter()
-                    .all(|capability| capability.len() <= 64),
-            "daemon capabilities are invalid"
-        );
-        Ok(status)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DiagnosticStatusV2 {
-    #[serde(rename = "type")]
-    pub(crate) kind: String,
-    pub(crate) schema_version: u8,
-    pub(crate) request_id: String,
-    pub(crate) records_accepted: u64,
-    pub(crate) records_dropped: u64,
-    pub(crate) records_retained: usize,
-    pub(crate) stdout_queue_occupancy: usize,
-    pub(crate) stdout_queue_capacity: usize,
-    pub(crate) stdout_queue_high_watermark: usize,
-    pub(crate) diagnostic_queue_occupancy: usize,
-    pub(crate) diagnostic_queue_capacity: usize,
-    pub(crate) diagnostic_queue_high_watermark: usize,
-    pub(crate) records_sampled: u64,
-    pub(crate) records_suppressed: u64,
-    pub(crate) queue_drops: u64,
-    pub(crate) contention_drops: u64,
-    pub(crate) records_written: u64,
-    pub(crate) write_failures: u64,
-    pub(crate) writer_panics: u64,
-    pub(crate) writer_records_lost: u64,
-    pub(crate) writer_healthy: bool,
-    pub(crate) writer_terminal: bool,
-    pub(crate) process_panics: u64,
-}
-
-impl DiagnosticStatusV2 {
-    pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let status: Self = serde_json::from_value(value.clone())
-            .context("daemon returned malformed diagnostic status")?;
-        anyhow::ensure!(status.valid(2), "daemon diagnostic status is invalid");
-        Ok(status)
-    }
-
-    fn valid(&self, schema_version: u8) -> bool {
-        self.kind == "diagnostic_status"
-            && self.schema_version == schema_version
-            && contracts::valid_request_id(&self.request_id)
-            && self.records_retained == 0
-            && self.stdout_queue_capacity > 0
-            && self.stdout_queue_occupancy <= self.stdout_queue_capacity
-            && self.stdout_queue_high_watermark <= self.stdout_queue_capacity
-            && self.diagnostic_queue_occupancy <= self.diagnostic_queue_capacity
-            && self.diagnostic_queue_high_watermark <= self.diagnostic_queue_capacity
-            && self.records_accepted >= self.records_written
-            && self.records_dropped
-                == self
-                    .queue_drops
-                    .saturating_add(self.contention_drops)
-                    .saturating_add(self.writer_records_lost)
-            && self.writer_healthy != self.writer_terminal
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DiagnosticStatusV3 {
-    #[serde(flatten)]
-    pub(crate) v2: DiagnosticStatusV2,
-    pub(crate) admission_rejections: u64,
-}
-
-impl DiagnosticStatusV3 {
-    pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let status: Self = serde_json::from_value(value.clone())
-            .context("daemon returned malformed diagnostic status")?;
-        anyhow::ensure!(status.v2.valid(3), "daemon diagnostic status is invalid");
-        Ok(status)
-    }
-}
-
-pub(crate) fn negotiated_diagnostic_request(status: &StatusV1) -> Result<(IpcRequest, u64)> {
-    if status
-        .ipc_capabilities
-        .iter()
-        .any(|capability| capability == DIAGNOSTIC_STATUS_V3_CAPABILITY)
-    {
-        Ok((IpcRequest::DiagnosticsV3, 3))
-    } else if status
-        .ipc_capabilities
-        .iter()
-        .any(|capability| capability == DIAGNOSTIC_STATUS_V2_CAPABILITY)
-    {
-        Ok((IpcRequest::Diagnostics, 2))
-    } else {
-        anyhow::bail!("daemon does not advertise a compatible diagnostic status capability")
-    }
+pub(crate) fn status_from_value(value: &serde_json::Value) -> Result<Status> {
+    anyhow::ensure!(
+        value.get("type").and_then(serde_json::Value::as_str) == Some("status")
+            && value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(u64::from(contracts::SCHEMA_VERSION))
+            && value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(contracts::valid_request_id),
+        "daemon returned unsupported status metadata"
+    );
+    let mut payload = value.clone();
+    let object = payload
+        .as_object_mut()
+        .context("daemon returned malformed status")?;
+    object.remove("type");
+    object.remove("schema_version");
+    object.remove("request_id");
+    let status: Status =
+        serde_json::from_value(payload).context("daemon returned malformed status")?;
+    status.validate().map_err(anyhow::Error::msg)?;
+    Ok(status)
 }
 
 pub(crate) use meshmsg_protocol::{Request as IpcRequest, RequestFrame as IpcRequestFrame};
@@ -2002,11 +1795,9 @@ fn error_expectation(request: &IpcRequest) -> (contracts::ErrorOperationKind, Op
             contracts::ErrorOperationKind::WebDownload,
             Some(operation_id),
         ),
-        IpcRequest::Status
-        | IpcRequest::Diagnostics
-        | IpcRequest::DiagnosticsV3
-        | IpcRequest::Peers
-        | IpcRequest::Stop => (contracts::ErrorOperationKind::General, None),
+        IpcRequest::Status | IpcRequest::Peers | IpcRequest::Stop => {
+            (contracts::ErrorOperationKind::General, None)
+        }
     }
 }
 
@@ -2217,17 +2008,8 @@ pub(crate) async fn send_request_checked(
     validate_response(&value, expected_type, expected_schema_version)?;
     match expected_type {
         "status" => {
-            StatusV1::from_value(&value)?;
+            status_from_value(&value)?;
         }
-        "diagnostic_status" => match expected_schema_version {
-            Some(2) => {
-                DiagnosticStatusV2::from_value(&value)?;
-            }
-            Some(3) => {
-                DiagnosticStatusV3::from_value(&value)?;
-            }
-            _ => anyhow::bail!("diagnostic status validation requires schema version 2 or 3"),
-        },
         "queued" => {
             let queued: QueuedV3 = serde_json::from_value(value.clone())
                 .context("daemon returned malformed queued response")?;
@@ -3309,13 +3091,10 @@ mod tests {
 
     #[test]
     fn status_dto_is_exact_and_rejects_unknown_missing_and_wrong_version() {
-        let mut status = StatusV1 {
-            kind: "status".into(),
-            schema_version: 1,
-            request_id: "11111111111111111111111111111111".into(),
+        let status = Status {
             running: true,
-            peer: "2".repeat(64),
-            topic: "3".repeat(64),
+            peer: "2".repeat(64).parse().unwrap(),
+            topic: "3".repeat(64).parse().unwrap(),
             advertises_self: true,
             has_invite: true,
             bootstrap_peer_count: 1,
@@ -3323,12 +3102,11 @@ mod tests {
             neighbors: 1,
             endpoint_online: true,
             topic_joined: true,
-            alias: Some("node".into()),
+            alias: Some("node".parse().unwrap()),
             alias_enabled: true,
             captured_hostname: Some("node".into()),
             custom_alias: None,
             advertised_aliases: 1,
-            ipc_capabilities: vec!["typed_contracts_v1".into()],
             operation_cache_capacity: 1024,
             operation_cache_ttl_ms: 600_000,
             operation_cache_persistent: false,
@@ -3342,7 +3120,7 @@ mod tests {
             direct_replay_sender_rate_per_second: 100,
             direct_replay_sender_rate_burst: 200,
             max_attachment_bytes: 1024,
-            attachment_storage: AttachmentStorageStatusV1 {
+            attachment_storage: meshmsg_protocol::AttachmentStorageStatus {
                 tagged_bytes: 0,
                 tagged_blobs: 0,
                 tags: 0,
@@ -3357,63 +3135,14 @@ mod tests {
             },
             attachment_retention_secs: 0,
         };
-        let value = serde_json::to_value(&status).unwrap();
+        let mut value = serde_json::to_value(&status).unwrap();
+        value["type"] = "status".into();
+        value["schema_version"] = 1.into();
+        value["request_id"] = "11111111111111111111111111111111".into();
         validate_success_payload(&value).unwrap();
-        let mut v1_with_v2_metrics = value.clone();
-        v1_with_v2_metrics["diagnostic_records_accepted"] = 1.into();
-        assert!(validate_success_payload(&v1_with_v2_metrics).is_err());
-        // This is the exact strict diagnostic_status_v2 shape released in v0.1.19.
-        let diagnostics_v2 = serde_json::json!({
-            "type":"diagnostic_status", "schema_version":2,
-            "request_id":"11111111111111111111111111111111",
-            "records_accepted":2, "records_dropped":1, "records_retained":0,
-            "stdout_queue_occupancy":0, "stdout_queue_capacity":256,
-            "stdout_queue_high_watermark":2,
-            "diagnostic_queue_occupancy":0, "diagnostic_queue_capacity":128,
-            "diagnostic_queue_high_watermark":1,
-            "records_sampled":1, "records_suppressed":1,
-            "queue_drops":1, "contention_drops":0,
-            "records_written":2, "write_failures":0, "writer_panics":0,
-            "writer_records_lost":0, "writer_healthy":true,
-            "writer_terminal":false, "process_panics":0
-        });
-        DiagnosticStatusV2::from_value(&diagnostics_v2).unwrap();
-        assert!(validate_success_payload(&diagnostics_v2).is_ok());
-        let mut v2_with_v3_metric = diagnostics_v2.clone();
-        v2_with_v3_metric["admission_rejections"] = 3.into();
-        assert!(DiagnosticStatusV2::from_value(&v2_with_v3_metric).is_err());
-
-        let mut diagnostics_v3 = diagnostics_v2.clone();
-        diagnostics_v3["schema_version"] = 3.into();
-        diagnostics_v3["admission_rejections"] = 3.into();
-        DiagnosticStatusV3::from_value(&diagnostics_v3).unwrap();
-        assert!(validate_success_payload(&diagnostics_v3).is_ok());
-        let mut v3_missing_metric = diagnostics_v3.clone();
-        v3_missing_metric
-            .as_object_mut()
-            .unwrap()
-            .remove("admission_rejections");
-        assert!(DiagnosticStatusV3::from_value(&v3_missing_metric).is_err());
-        let mut v3_unknown = diagnostics_v3.clone();
-        v3_unknown["private_cause"] = "secret".into();
-        assert!(DiagnosticStatusV3::from_value(&v3_unknown).is_err());
-
-        let mut malformed_diagnostics = diagnostics_v2;
-        malformed_diagnostics["records_retained"] = 257.into();
-        assert!(DiagnosticStatusV2::from_value(&malformed_diagnostics).is_err());
-
-        status.ipc_capabilities = vec![DIAGNOSTIC_STATUS_V2_CAPABILITY.into()];
-        let (request, version) = negotiated_diagnostic_request(&status).unwrap();
-        assert!(matches!(request, IpcRequest::Diagnostics));
-        assert_eq!(version, 2);
-        status
-            .ipc_capabilities
-            .push(DIAGNOSTIC_STATUS_V3_CAPABILITY.into());
-        let (request, version) = negotiated_diagnostic_request(&status).unwrap();
-        assert!(matches!(request, IpcRequest::DiagnosticsV3));
-        assert_eq!(version, 3);
-        status.ipc_capabilities.clear();
-        assert!(negotiated_diagnostic_request(&status).is_err());
+        let mut status_with_diagnostics = value.clone();
+        status_with_diagnostics["diagnostic_records_accepted"] = 1.into();
+        assert!(validate_success_payload(&status_with_diagnostics).is_err());
 
         for malformed in [
             {
@@ -3486,7 +3215,7 @@ mod tests {
             .as_millis() as u64
             - 1_000;
         let fixtures = vec![
-            serde_json::json!({"type":"connected","schema_version":1,"request_id":request_id,"peer":peer,"endpoint_online":true,"topic_joined":true,"alias":"node","ipc_capabilities":["typed_contracts_v1"]}),
+            serde_json::json!({"type":"connected","schema_version":1,"request_id":request_id,"peer":peer,"endpoint_online":true,"topic_joined":true,"alias":"node"}),
             serde_json::json!({"type":"message","schema_version":2,"request_id":request_id,"from":peer,"message_id":operation_id,"timestamp_ms":1,"body":"hello"}),
             serde_json::json!({"type":"private_message","schema_version":1,"request_id":request_id,"private":true,"from":peer,"message_id":operation_id,"timestamp_ms":1,"body":"secret","acceptance_acknowledged":true,"durable":false,"read":false}),
             serde_json::json!({"type":"queued","schema_version":3,"request_id":request_id,"operation_id":operation_id,"from":peer,"message_id":operation_id,"timestamp_ms":1,"body":"hello","delivery_acknowledged":false}),

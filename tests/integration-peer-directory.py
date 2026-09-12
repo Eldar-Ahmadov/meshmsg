@@ -18,7 +18,7 @@ EVENT_KEYS = {
 FORBIDDEN_KEYS = {
     "endpoint", "endpoints", "address", "addresses", "addrs", "relay", "socket",
     "local_endpoint", "invite", "token", "ticket", "offer", "path", "record",
-    "signature", "capabilities", "ipc_capabilities", "body",
+    "signature", "capabilities", "body",
 }
 
 
@@ -171,7 +171,6 @@ def main():
             start_daemon("one")
             one_status = cli("one", "status")
             one_peer = one_status["peer"]
-            assert "peer_directory_v2" in one_status["ipc_capabilities"]
 
             listener_path = root / "one.listen.log"
             listener_log = listener_path

@@ -79,7 +79,7 @@ pub enum Request {
     },
     PrivateSend {
         operation_id: OperationId,
-        to: PeerId,
+        to: Recipient,
         body: PrivateBody,
     },
     BenchSend {
@@ -87,8 +87,6 @@ pub enum Request {
     },
     Subscribe,
     Status,
-    Diagnostics,
-    DiagnosticsV3,
     Peers,
     Offers,
     OffersRemove {
@@ -176,6 +174,14 @@ macro_rules! bounded_text {
                 Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = TextError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
     };
 }
 
@@ -258,6 +264,7 @@ message_body!(PrivateBody, 4096, "private message body");
 message_body!(MessageBody, 4096, "message body");
 bounded_text!(AttachmentToken, 16_384, "attachment token");
 bounded_text!(Alias, 63, "alias");
+bounded_text!(Recipient, 64, "private message recipient");
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AttachmentName(String);
@@ -416,7 +423,6 @@ pub enum Response {
     OfferRemoved(LifecycleResult),
     OffersPruned(LifecycleResult),
     DownloadComplete(DownloadResult),
-    DiagnosticStatus(DiagnosticStatus),
     BenchSendStarted(BenchSendStarted),
     BenchSendProgress(BenchSendProgress),
     BenchSendSummary(BenchSendSummary),
@@ -446,6 +452,7 @@ impl<'de> Deserialize<'de> for ResponseFrame {
                 "unsupported response family schema version",
             ));
         }
+        wire.response.validate().map_err(de::Error::custom)?;
         Ok(Self {
             protocol_version: wire.protocol_version,
             schema_version: wire.schema_version,
@@ -456,6 +463,13 @@ impl<'de> Deserialize<'de> for ResponseFrame {
 }
 
 impl Response {
+    fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Status(status) => status.validate(),
+            _ => Ok(()),
+        }
+    }
+
     fn supports_schema(&self, version: u8) -> bool {
         match self {
             Self::Status(_) | Self::Offers(_) | Self::Stopping { .. } | Self::Error(_) => {
@@ -471,11 +485,6 @@ impl Response {
             | Self::BenchSendStarted(_)
             | Self::BenchSendProgress(_)
             | Self::BenchSendSummary(_) => version == 2,
-            Self::DiagnosticStatus(status) => match version {
-                2 => status.admission_rejections.is_none(),
-                3 => status.admission_rejections.is_some(),
-                _ => false,
-            },
         }
     }
 }
@@ -635,6 +644,20 @@ pub struct AttachmentStorageStatus {
     pub sampled_at_ms: u64,
 }
 
+impl AttachmentStorageStatus {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.tags > self.tag_capacity
+            || self.tagged_blobs > self.tags
+            || self.over_quota != (self.tagged_bytes > self.quota_bytes)
+            || self.below_min_free != (self.available_bytes < self.min_free_bytes)
+            || self.pressure != (self.over_quota || self.below_min_free)
+        {
+            return Err("invalid attachment storage status");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Status {
@@ -653,7 +676,6 @@ pub struct Status {
     pub captured_hostname: Option<String>,
     pub custom_alias: Option<String>,
     pub advertised_aliases: usize,
-    pub ipc_capabilities: Vec<String>,
     pub operation_cache_capacity: usize,
     pub operation_cache_ttl_ms: u64,
     pub operation_cache_persistent: bool,
@@ -671,6 +693,33 @@ pub struct Status {
     pub attachment_retention_secs: u64,
 }
 
+impl Status {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        fn valid_public_text(value: &str, maximum: usize) -> bool {
+            !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+        }
+
+        if !self.running
+            || self.max_attachment_bytes == 0
+            || self
+                .captured_hostname
+                .as_deref()
+                .is_some_and(|value| !valid_public_text(value, 253))
+            || self
+                .custom_alias
+                .as_deref()
+                .is_some_and(|value| !valid_public_text(value, 63))
+            || self
+                .direct_replay_error
+                .as_deref()
+                .is_some_and(|value| !valid_public_text(value, 1024))
+        {
+            return Err("invalid status values");
+        }
+        self.attachment_storage.validate()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connected {
@@ -678,7 +727,6 @@ pub struct Connected {
     pub endpoint_online: bool,
     pub topic_joined: bool,
     pub alias: Option<Alias>,
-    pub ipc_capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -893,33 +941,6 @@ pub struct DownloadResult {
     pub destination_synced: bool,
     pub cleanup_complete: bool,
     pub warnings: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DiagnosticStatus {
-    pub records_accepted: u64,
-    pub records_dropped: u64,
-    pub records_retained: usize,
-    pub stdout_queue_occupancy: usize,
-    pub stdout_queue_capacity: usize,
-    pub stdout_queue_high_watermark: usize,
-    pub diagnostic_queue_occupancy: usize,
-    pub diagnostic_queue_capacity: usize,
-    pub diagnostic_queue_high_watermark: usize,
-    pub records_sampled: u64,
-    pub records_suppressed: u64,
-    pub queue_drops: u64,
-    pub contention_drops: u64,
-    pub records_written: u64,
-    pub write_failures: u64,
-    pub writer_panics: u64,
-    pub writer_records_lost: u64,
-    pub writer_healthy: bool,
-    pub writer_terminal: bool,
-    pub process_panics: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub admission_rejections: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1178,16 +1199,13 @@ mod tests {
         }
 
         let event = format!(
-            r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null,"ipc_capabilities":[]}}"#,
+            r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
             "2".repeat(64)
         );
         assert!(serde_json::from_str::<EventFrame>(&event).is_ok());
         for malformed in [
             event.replace("\"schema_version\":1", "\"schema_version\":2"),
-            event.replace(
-                "\"ipc_capabilities\":[]",
-                "\"ipc_capabilities\":[],\"extra\":true",
-            ),
+            event.replace("\"alias\":null", "\"alias\":null,\"extra\":true"),
         ] {
             assert!(serde_json::from_str::<EventFrame>(&malformed).is_err());
         }

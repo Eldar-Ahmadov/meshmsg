@@ -4,7 +4,6 @@ import json
 import os
 import pathlib
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -33,26 +32,6 @@ def wait_status(state):
     raise AssertionError("daemon did not become IPC-ready")
 
 
-def diagnostics(state, command="diagnostics_v3"):
-    request_id = "1" * 32
-    frame = json.dumps({
-        "protocol_version": 2,
-        "request_id": request_id,
-        "request": {"command": command},
-    }).encode() + b"\n"
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(5)
-    client.connect(str(state / "daemon.sock"))
-    client.sendall(frame)
-    response = b""
-    while not response.endswith(b"\n"):
-        part = client.recv(65536)
-        assert part
-        response += part
-    client.close()
-    return json.loads(response)
-
-
 def run_once(index, signal_shutdown=False, panic_stdout=False):
     state = root / f"state-{index}"
     initialized = cli(state, "init", "--no-default-alias")
@@ -79,39 +58,6 @@ def run_once(index, signal_shutdown=False, panic_stdout=False):
         for _ in range(3):
             status = cli(state, "--json", "status")
             assert status.returncode == 0 and json.loads(status.stdout)["running"] is True
-            health = diagnostics(state)
-            assert health["type"] == "diagnostic_status"
-            assert health["schema_version"] == 3
-            assert health["stdout_queue_occupancy"] <= health["stdout_queue_capacity"]
-            assert health["diagnostic_queue_occupancy"] <= health["diagnostic_queue_capacity"]
-            assert health["admission_rejections"] >= 1
-            assert health["records_dropped"] == (
-                health["queue_drops"]
-                + health["contention_drops"]
-                + health["writer_records_lost"]
-            )
-            assert health["records_suppressed"] >= 0
-            legacy_health = diagnostics(state, "diagnostics")
-            assert legacy_health["schema_version"] == 2
-            assert "admission_rejections" not in legacy_health
-            if panic_stdout:
-                if health["writer_terminal"]:
-                    assert health["writer_healthy"] is False
-                    assert health["writer_panics"] == 1
-                    assert health["writer_records_lost"] >= 1
-                    assert health["stdout_queue_occupancy"] == 0
-                    assert health["diagnostic_queue_occupancy"] == 1
-            else:
-                assert health["writer_healthy"] is True
-        if panic_stdout:
-            deadline = time.monotonic() + 2
-            while not health["writer_terminal"] and time.monotonic() < deadline:
-                time.sleep(0.02)
-                health = diagnostics(state)
-            assert health["writer_terminal"] is True
-            assert health["writer_records_lost"] >= 1
-            assert health["stdout_queue_occupancy"] == 0
-            assert health["diagnostic_queue_occupancy"] == 1
         started = time.monotonic()
         if signal_shutdown:
             daemon.terminate()
@@ -199,4 +145,4 @@ try:
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
-print("PASS: real daemon status/diagnostics/shutdown survive blocked stdout+stderr")
+print("PASS: real daemon status/shutdown survive blocked stdout+stderr")
