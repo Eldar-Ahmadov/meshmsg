@@ -15,6 +15,7 @@ mod message;
 mod node;
 mod peers;
 mod persistent;
+mod presence;
 #[cfg(feature = "web")]
 pub mod web;
 

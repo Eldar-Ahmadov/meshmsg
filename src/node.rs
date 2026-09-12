@@ -5,10 +5,7 @@ use crate::{
     attachment::{self, AttachmentKind, AttachmentOffer},
     config::{prepare_state_dir, State, StateLock},
     contracts::{self, ErrorEnvelopeV1},
-    direct::{
-        self, DirectHandler, Directory, IncomingDirect, PresenceSourceLimiter, DIRECT_ALPN,
-        PRESENCE_ALPN,
-    },
+    direct::{self, DirectHandler, IncomingDirect, DIRECT_ALPN},
     invite::Invite,
     ipc::{
         read_frame, send_request_checked, subscribe, valid_content_digest, valid_operation_id,
@@ -16,7 +13,8 @@ use crate::{
         LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1, MAX_IPC_REQUEST_SIZE,
         MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
     },
-    peers::{self as peer_api, PeerTransition, MAX_PEER_LIFECYCLE_EVENT_BYTES},
+    peers as peer_api,
+    presence::{self, Directory, PresenceSourceLimiter},
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -115,7 +113,6 @@ const MAX_ENVELOPE_SIZE: usize = 4096;
 /// Iroh's limit includes its own framing, so reserve explicit protocol headroom.
 const GOSSIP_PROTOCOL_HEADROOM: usize = 512;
 const GOSSIP_MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + GOSSIP_PROTOCOL_HEADROOM;
-const MAX_PRESENCE_GOSSIP_MESSAGE_SIZE: usize = 2048 + GOSSIP_PROTOCOL_HEADROOM;
 const IPC_EVENT_CAPACITY: usize = 256;
 /// Bounds all accepted local IPC connections, including long-lived subscriptions
 /// and subscriptions. Connections beyond this limit receive a small rejection and
@@ -135,8 +132,6 @@ const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection attempt, so repeating it also covers attempts made while the
 /// network interface is still unavailable.
 const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
-const PRESENCE_INTERVAL: Duration = Duration::from_secs(30);
-const PRESENCE_CLEANUP_INTERVAL: Duration = Duration::from_secs(15);
 const DIRECT_CONCURRENCY: usize = 8;
 const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 const ATTACHMENT_OFFER_VERSION: u8 = 1;
@@ -1055,8 +1050,8 @@ async fn start(
     // actor. Sharing one actor/connection pool across both topics can perturb
     // broadcast neighbor liveness during failover and rejoin.
     let presence_gossip = Gossip::builder()
-        .alpn(PRESENCE_ALPN)
-        .max_message_size(MAX_PRESENCE_GOSSIP_MESSAGE_SIZE)
+        .alpn(presence::ALPN)
+        .max_message_size(presence::MAX_GOSSIP_MESSAGE_SIZE)
         .spawn(endpoint.clone());
     let blob_root = state_dir.join("blobs-v1").join(secret.public().to_string());
     let mut blob_options = FsStoreOptions::new(&blob_root);
@@ -1075,7 +1070,7 @@ async fn start(
             .context("open persistent direct replay state")?;
     let router = Router::builder(endpoint.clone())
         .accept(BROADCAST_ALPN_V2, gossip.clone())
-        .accept(PRESENCE_ALPN, presence_gossip.clone())
+        .accept(presence::ALPN, presence_gossip.clone())
         .accept(iroh_blobs::ALPN, blobs)
         .accept(DIRECT_ALPN, direct)
         .spawn();
@@ -1085,7 +1080,7 @@ async fn start(
         let invite: Invite = token.parse()?;
         for peer in invite.bootstrap_peers {
             if peer.id != endpoint.id() {
-                direct::validate_endpoint_addr(&peer, peer.id)
+                presence::validate_endpoint_addr(&peer, peer.id)
                     .context("invalid bootstrap endpoint address")?;
                 bootstrap.push(peer.id);
                 bootstrap_addrs.push(peer.clone());
@@ -1101,11 +1096,11 @@ async fn start(
     let (sender, receiver) = subscription.split();
     let presence_subscription = if bootstrap.is_empty() {
         presence_gossip
-            .subscribe(direct::presence_topic(topic), vec![])
+            .subscribe(presence::presence_topic(topic), vec![])
             .await?
     } else {
         presence_gossip
-            .subscribe_and_join(direct::presence_topic(topic), bootstrap.clone())
+            .subscribe_and_join(presence::presence_topic(topic), bootstrap.clone())
             .await?
     };
     let (presence_sender, presence_receiver) = presence_subscription.split();
@@ -4463,35 +4458,6 @@ fn shutdown_signals() -> Result<mpsc::Receiver<()>> {
     Ok(receiver)
 }
 
-fn local_peer_online(node: &RunningNode) -> bool {
-    node.endpoint
-        .home_relay_status()
-        .get()
-        .iter()
-        .any(|status| status.is_connected())
-        && node.receiver.is_joined()
-}
-
-fn peer_snapshot(
-    node: &RunningNode,
-    directory: &Directory,
-    self_peer: &str,
-    self_alias: Option<&str>,
-    generated_at_ms: u64,
-    directory_epoch: &str,
-    directory_revision: u64,
-) -> serde_json::Value {
-    peer_api::snapshot_value(
-        self_peer,
-        self_alias,
-        local_peer_online(node),
-        generated_at_ms,
-        directory_epoch,
-        directory_revision,
-        directory.peers(),
-    )
-}
-
 async fn reject_local_client_at_capacity<S>(mut stream: S, write_timeout: Duration)
 where
     S: AsyncWrite + Unpin,
@@ -4579,29 +4545,6 @@ async fn drain_local_client_tasks(tasks: &mut tokio::task::JoinSet<()>, grace: D
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-}
-
-fn emit_peer_transitions(
-    transitions: impl IntoIterator<Item = PeerTransition>,
-    events: &broadcast::Sender<serde_json::Value>,
-    directory_epoch: &str,
-    directory_revision: &mut u64,
-) {
-    for transition in transitions {
-        let candidate_revision = directory_revision
-            .checked_add(1)
-            .expect("directory revision overflow");
-        let value = peer_api::transition_value(transition, directory_epoch, candidate_revision);
-        // The type-level field bounds make this unreachable; keep an explicit
-        // final guard so future schema changes fail closed instead of creating
-        // unexpectedly large subscription events.
-        if serde_json::to_vec(&value)
-            .is_ok_and(|encoded| encoded.len() <= MAX_PEER_LIFECYCLE_EVENT_BYTES)
-        {
-            *directory_revision = candidate_revision;
-            let _ = events.send(value.clone());
-        }
-    }
 }
 
 pub async fn run_daemon(
@@ -4717,12 +4660,12 @@ pub async fn run_daemon(
             // addresses simply remain unavailable for private messaging.
         }
     }
-    if direct::validate_endpoint_addr(&node.endpoint.addr(), node.endpoint.id()).is_ok() {
+    if presence::validate_endpoint_addr(&node.endpoint.addr(), node.endpoint.id()).is_ok() {
         directory.pin(node.endpoint.addr())?;
     }
-    let mut presence = tokio::time::interval(PRESENCE_INTERVAL);
+    let mut presence = tokio::time::interval(presence::ANNOUNCE_INTERVAL);
     presence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut presence_cleanup = tokio::time::interval(PRESENCE_CLEANUP_INTERVAL);
+    let mut presence_cleanup = tokio::time::interval(presence::CLEANUP_INTERVAL);
     presence_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut presence_sources = PresenceSourceLimiter::default();
     let mut envelope_replay = EnvelopeReplayCache::default();
@@ -4760,11 +4703,16 @@ pub async fn run_daemon(
                         // Expiration is authoritative in the daemon. Emit it before
                         // capturing the new subscriber's snapshot so queued events
                         // are strictly later than that snapshot.
-                        emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                        presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                         let generated_at_ms = unix_timestamp_ms()?;
-                        let startup_peers = peer_snapshot(
-                            &node, &directory, &peer, alias_config.effective(), generated_at_ms,
-                            &directory_epoch, directory_revision,
+                        let startup_peers = presence::snapshot(
+                            (&node.endpoint, &node.receiver),
+                            &directory,
+                            &peer,
+                            alias_config.effective(),
+                            generated_at_ms,
+                            &directory_epoch,
+                            directory_revision,
                         );
                         let connected = serde_json::json!({
                             "type":"connected", "peer":peer, "endpoint_online":true,
@@ -4830,7 +4778,7 @@ pub async fn run_daemon(
                     ) {
                         continue;
                     }
-                    emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                    presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                     let address = match directory.resolve(&to) {
                         Ok(address) => address,
                         Err(error) => {
@@ -4965,11 +4913,16 @@ pub async fn run_daemon(
                     ))?);
                 }
                 Some(DaemonCommand::Peers { reply }) => {
-                    emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                    presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                     let generated_at_ms = unix_timestamp_ms()?;
-                    let _ = reply.send(peer_snapshot(
-                        &node, &directory, &peer, alias_config.effective(), generated_at_ms,
-                        &directory_epoch, directory_revision,
+                    let _ = reply.send(presence::snapshot(
+                        (&node.endpoint, &node.receiver),
+                        &directory,
+                        &peer,
+                        alias_config.effective(),
+                        generated_at_ms,
+                        &directory_epoch,
+                        directory_revision,
                     ));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
@@ -5270,14 +5223,13 @@ pub async fn run_daemon(
                         // A new client may have bootstrapped through an older node that does
                         // not know the derived presence topic. Join it directly as well.
                         let _ = node.presence_sender.join_peers(vec![*remote]).await;
-                        if let Ok(record) = direct::encode_presence(
+                        presence::announce(
+                            &node.presence_sender,
                             &node.secret,
                             topic,
                             alias_config.effective(),
                             node.endpoint.addr(),
-                        ) {
-                            let _ = node.presence_sender.broadcast(record).await;
-                        }
+                        ).await;
                     }
                     let now_ms = unix_timestamp_ms()?;
                     let values = network_event(
@@ -5307,9 +5259,9 @@ pub async fn run_daemon(
                     if presence_sources.allow(message.delivered_from) {
                         // Never let receive-time cleanup swallow an expiry. The
                         // explicit cleanup transition is emitted first.
-                        emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                        presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                         if let Ok(Some(transition)) = directory.receive(&message.content, topic) {
-                            emit_peer_transitions([transition], &event_tx, &directory_epoch, &mut directory_revision);
+                            presence::emit_transitions([transition], &event_tx, &directory_epoch, &mut directory_revision);
                         }
                     }
                 }
@@ -5324,17 +5276,16 @@ pub async fn run_daemon(
                 }
             },
             _ = presence.tick() => {
-                if let Ok(record) = direct::encode_presence(
+                presence::announce(
+                    &node.presence_sender,
                     &node.secret,
                     topic,
                     alias_config.effective(),
                     node.endpoint.addr(),
-                ) {
-                    let _ = node.presence_sender.broadcast(record).await;
-                }
+                ).await;
             },
             _ = presence_cleanup.tick() => {
-                emit_peer_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                 presence_sources.cleanup();
             },
             _ = attachment_space_refresh.tick() => {

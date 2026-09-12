@@ -8,6 +8,7 @@ use std::str::FromStr;
 pub(crate) const PEER_LEASE_MS: u64 = 150_000;
 pub(crate) const PEER_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
+pub(crate) const MAX_DYNAMIC_IDENTITIES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +156,7 @@ pub(crate) fn validate_snapshot(value: &serde_json::Value) -> Result<()> {
         crate::alias::validate_alias(alias)?;
     }
     anyhow::ensure!(
-        snapshot.peers.len() <= crate::direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
+        snapshot.peers.len() <= MAX_DYNAMIC_IDENTITIES,
         "peer snapshot is too large"
     );
     let mut previous: Option<&str> = None;
@@ -270,7 +271,7 @@ mod tests {
 
     #[test]
     fn maximum_complete_snapshot_fits_the_bounded_ipc_frame() {
-        let peers = (0..crate::direct::MAX_DYNAMIC_PRESENCE_IDENTITIES)
+        let peers = (0..MAX_DYNAMIC_IDENTITIES)
             .map(|index| RemotePeer {
                 public_key: format!("{index:064x}"),
                 alias: Some("a".repeat(crate::alias::MAX_ALIAS_BYTES)),

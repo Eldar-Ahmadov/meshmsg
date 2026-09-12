@@ -5,10 +5,9 @@ use crate::{
     attachment::{validate_display_name, AttachmentKind, AttachmentOffer},
     config::prepare_state_dir,
     contracts::{self, ErrorEnvelopeV1},
-    direct::MAX_DYNAMIC_PRESENCE_IDENTITIES,
     ipc::{self, IpcRequest},
     message::{validate_broadcast_body, validate_v2_message_body},
-    peers::PEER_LEASE_MS,
+    peers::{MAX_DYNAMIC_IDENTITIES, PEER_LEASE_MS},
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -1090,7 +1089,7 @@ fn public_peers_snapshot(value: &Value) -> Option<Value> {
     let self_alias = public_alias(&self_value["alias"])?;
     let self_online = self_value["online"].as_bool()?;
     let source = value["peers"].as_array()?;
-    if source.len() > MAX_DYNAMIC_PRESENCE_IDENTITIES {
+    if source.len() > MAX_DYNAMIC_IDENTITIES {
         return None;
     }
     let mut remotes = Vec::with_capacity(source.len());
