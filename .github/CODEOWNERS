@@ -1,5 +1,5 @@
-# Release authority and verification policy. Enforcement is intentionally not
-# enabled until an eligible second reviewer is configured; see docs/development.md.
+# Advisory ownership for release and verification policy. Main is intentionally
+# unprotected; immutable release-tag authority is configured separately.
 /.github/ @Eldar-Ahmadov
 /install.sh @Eldar-Ahmadov
 /rust-toolchain.toml @Eldar-Ahmadov

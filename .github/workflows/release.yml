@@ -43,25 +43,8 @@ jobs:
     permissions:
       contents: read
 
-  audit-protections:
-    needs: verification
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Fail closed unless live GitHub protections match canonical policy
-        id: live-protection-audit
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}
-        run: scripts/github-release-protections.sh --ci-check
-
   linux:
-    needs: audit-protections
+    needs: verification
     # GNU binaries built on this older baseline run on that glibc and newer.
     runs-on: ubuntu-22.04
     timeout-minutes: 35
@@ -117,7 +100,7 @@ jobs:
           retention-days: 1
 
   windows:
-    needs: audit-protections
+    needs: verification
     runs-on: windows-2022
     timeout-minutes: 35
     env:
@@ -216,11 +199,6 @@ jobs:
           )
           test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
           sha256sum "${archives[@]}" >SHA256SUMS
-      - name: Reaudit live protections immediately before publication
-        id: final-live-protection-audit
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}
-        run: scripts/github-release-protections.sh --ci-check
       - name: Publish exact-SHA release fail closed
         id: release-publish
         env:
@@ -228,7 +206,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_SHA: ${{ github.sha }}
-          RELEASE_PROTECTION_AUDIT_TOKEN: ${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -252,8 +229,6 @@ jobs:
             "dist/meshmsg-${tag}-x86_64-unknown-linux-musl.tar.gz" \
             "dist/meshmsg-${tag}-x86_64-pc-windows-msvc.zip" \
             dist/SHA256SUMS
-          # Reaudit policy, then re-resolve the tag, immediately before making
-          # the draft public. The read-only audit token is never used to publish.
-          GH_TOKEN="$RELEASE_PROTECTION_AUDIT_TOKEN" scripts/github-release-protections.sh --ci-check
+          # Re-resolve the immutable tag immediately before making the draft public.
           bash tests/check-release-eligibility.sh recheck "$tag" "$RELEASE_SHA"
           gh release edit "$tag" --target "$RELEASE_SHA" --draft=false

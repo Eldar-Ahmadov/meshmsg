@@ -39,13 +39,13 @@ git diff --quiet "$expected_commit" -- Cargo.toml Cargo.lock ".github/release-no
 main_tip=$(git rev-parse "origin/main^{commit}")
 if [[ $PHASE == admission ]]; then
   test "$expected_commit" = "$main_tip" || {
-    echo "initial tag admission requires current protected origin/main tip $main_tip, got $expected_commit" >&2
+    echo "initial tag admission requires current origin/main tip $main_tip, got $expected_commit" >&2
     exit 1
   }
 else
   first_parent_matches=$(git rev-list --first-parent origin/main | awk -v wanted="$expected_commit" '$0 == wanted { count++ } END { print count + 0 }')
   test "$first_parent_matches" -eq 1 || {
-    echo "release commit $expected_commit is no longer on protected origin/main first-parent history" >&2
+    echo "release commit $expected_commit is no longer on origin/main first-parent history" >&2
     exit 1
   }
 fi

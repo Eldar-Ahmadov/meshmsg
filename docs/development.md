@@ -94,8 +94,7 @@ API-backed audit below, and reviewers must treat changes to workflows, scripts,
 
 A release tag must be exactly `vMAJOR.MINOR.PATCH`. Initial admission fetches
 `origin/main` and the remote tag afresh and requires the remote tag, checked-out
-`HEAD`, full `github.sha`, and current protected `origin/main` tip to be the same
-commit. A workflow rerun may use historical-main semantics only after the
+`HEAD`, full `github.sha`, and current `origin/main` tip to be the same commit. A workflow rerun may use historical-main semantics only after the
 read-only Actions API proves that this same run ID/SHA had a successful
 **Initial release admission** in an earlier attempt.
 
@@ -104,7 +103,7 @@ public, eligibility is fetched again and requires:
 
 - the unchanged remote tag, checked-out `HEAD`, and full event SHA to resolve to
   the originally admitted commit;
-- that commit to remain on current protected `origin/main` first-parent history,
+- that commit to remain on current `origin/main` first-parent history,
   allowing normal main advancement without bricking an admitted run or proved
   rerun while rejecting rewritten/divergent history;
 - no worktree differences in package/lock/release-note metadata;
@@ -134,91 +133,41 @@ binaries equal the final runner builds. It then generates the unchanged three-
 archive `SHA256SUMS` layout. Published releases are never overwritten; reruns may
 replace only a draft.
 
-## GitHub release and main protections
+## GitHub release-tag protections
 
 GitHub settings are external state, so `scripts/github-release-protections.sh`
-is the auditable setup and drift check. It uses GitHub's documented
-[repository rulesets](https://docs.github.com/rest/repos/rules) and
-[branch-protection](https://docs.github.com/rest/branches/branch-protection)
-REST APIs, never invokes interactive login, and never widens credentials:
+provides an auditable setup and drift check for the release-tag rulesets. It uses
+GitHub's documented [repository rulesets](https://docs.github.com/rest/repos/rules)
+API, never invokes interactive login, and never widens credentials:
 
 ```sh
-# Read-only verification (recommended before every release):
+# Read-only verification (recommended before creating a release tag):
 scripts/github-release-protections.sh --check
 
-# Intentional idempotent administration change. This refuses to modify settings
-# unless canonical CODEOWNERS is already on main and a non-authority collaborator
-# with push permission exists:
+# Intentional idempotent administration change for the tag rulesets:
 scripts/github-release-protections.sh --apply
 ```
 
-Tag releases also run `--ci-check` after exact-SHA verification but before any
-artifact build, before draft creation, and again immediately before publication.
-All workflow, script, and documentation references use the single secret name
-`RELEASE_PROTECTION_AUDIT_TOKEN`; absence fails before any audit API call.
-Configure the Actions secret **`RELEASE_PROTECTION_AUDIT_TOKEN`** as a fine-grained
-repository token with only **Metadata: read**, **Contents: read** (to compare the
-canonical CODEOWNERS on `main`), and **Administration: read** (to inspect branch
-protection and full ruleset/bypass details). It needs no contents write, workflow,
-release, or administration-write permission and is exposed only to the trusted
-tag-triggered release workflow—not the reusable PR workflow. A missing, expired,
-or under-scoped secret, inaccessible API, absent CODEOWNERS, duplicate/missing
-ruleset, or any policy difference fails closed before builds/publication.
-
-The complete canonical policy is:
+The canonical release-tag policy is:
 
 - `meshmsg-immutable-v-tags`: no bypass actors; update and deletion of
   `refs/tags/v*` are prohibited;
 - `meshmsg-release-tag-authority`: creation of `refs/tags/v*` is prohibited
-  except for the configured release authority (`Eldar-Ahmadov` by default);
-- `main`: force-push/deletion prohibited, administrators included, resolved
-  conversations, one stale-review-dismissing code-owner approval, approval after
-  the last push, and strict **`Required verification`** specifically from GitHub
-  Actions app ID `15368`. Unlocked branches normalize `allow_fork_syncing` to
-  `false`; the audit requires that returned value and all other documented fields.
+  except for the configured release authority (`Eldar-Ahmadov` by default).
 
-`tests/validate-github-protections.py` compares one normalized complete policy;
-its mutation fixtures change every relevant field. The tag rulesets remain
-layered: creation authority cannot bypass immutability.
+The rules remain layered: creation authority cannot bypass immutability.
+`tests/validate-github-protections.py` compares the normalized tag policy and its
+mutation fixtures change every relevant field. The release workflow relies on
+GitHub enforcing these rules at tag creation and independently binds admission,
+verification, artifacts, notes, and publication to the exact immutable tag SHA.
+It does not require main branch protection, a pull request, CODEOWNERS approval,
+or an additional protection-audit secret.
 
-### Bootstrap, required-check proof, and recovery
-
-The immutable/authority tag rules and the older main essentials were configured
-and read back previously. The complete code-owner policy is **not yet active**:
-there is currently no eligible non-authority collaborator, so enabling one
-required approval would lock out the owner. `--apply` deliberately refuses this
-state, and release live audits deliberately fail until bootstrap is completed.
-
-An administrator must add a trusted non-authority collaborator with push access,
-add that collaborator explicitly as an owner on **every canonical protected
-CODEOWNERS pattern**, and merge the CODEOWNERS revision through existing
-protections. `--apply` parses the canonical pattern inventory and live direct
-collaborators; it rejects a push-capable collaborator who is absent from even one
-applicable CODEOWNERS entry, a listed owner without push access, duplicate/missing
-patterns, or authority-only ownership before changing settings. Only then run
-`--apply` and `--check`. Do not weaken administrator enforcement or reduce the
-approval count for bootstrap/recovery. Recovery requires another administrator
-or repository-owner settings access to restore the canonical policy; document
-and test that access before enabling it.
-
-No temporary PR was created here because that requires pushing a remote probe
-commit outside this uncommitted revision. After the workflow and complete policy
-are on protected `main`, create an isolated branch at the then-current main tip,
-make exactly one commit that only adds `.github/required-check-probe.txt`, open
-an unmerged PR to `main`, wait for checks, and run before main advances:
-
-```sh
-scripts/confirm-required-check.sh Eldar-Ahmadov/meshmsg PR_NUMBER
-```
-
-The read-only script proves the PR has one commit directly on current main,
-contains only that probe file, and has a successful `Required verification`
-check for its exact head; every check with that name must come from app ID
-`15368`. Then close the unmerged probe and delete its branch. This remains an
-explicit external prerequisite; documentation must not mark finding #5 complete
-until the proof and live-policy read-back are recorded.
+`main` is intentionally unprotected and may be updated directly. Pull-request CI
+still exposes `Required verification` as a useful aggregate, but it is not a
+branch-protection prerequisite.
 
 Override repository/authority only for an intentional fork administration
 operation with `GITHUB_REPOSITORY` and `MESHMSG_RELEASE_AUTHORITY`. If auth or API
-scope fails, stop and have an authorized administrator apply the canonical
-policy; never log in interactively in CI or weaken the rules.
+scope fails, stop and have an authorized administrator apply the canonical tag
+policy; never log in interactively in CI or weaken the immutable tag rules.

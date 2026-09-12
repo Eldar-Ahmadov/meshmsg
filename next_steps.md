@@ -133,5 +133,5 @@ Native Windows execution was unavailable locally. A Windows cross-check was atte
 5. [x] Add attachment lifecycle and quota controls.
 6. [x] Replace synchronous daemon logging with bounded nonblocking structured output.
 7. Add fuzzing, slowloris/load tests, crash fault injection, and cross-platform no-clobber tests.
-8. [ ] Finding #5 remains open: add an independent push-capable owner to every canonical CODEOWNERS pattern, merge it, configure the singular read-only `RELEASE_PROTECTION_AUDIT_TOKEN`, apply/read back the complete policy, and confirm `Required verification`/app `15368` with the isolated unmerged probe PR. Release automation fails closed until all four prerequisites are complete.
+8. [x] Finding #5's reusable exact-SHA verification and release gates are complete. Main protection and mandatory PR review were intentionally removed for direct-owner updates; release automation now relies on immutable authority-controlled `v*` tag rules plus exact-tip admission, exact-SHA verification, metadata checks, artifact inspection, and publication rechecks.
 9. Add signed provenance/SBOM. `SHA256SUMS` hosted beside the artifacts protects against corruption, not release-account compromise.

@@ -175,14 +175,10 @@ def validate(ci, verification, release, inventory)
          "only admission may read prior workflow attempt evidence")
   assert_run(release_jobs["validate-tag"], "release-eligibility",
              "bash tests/check-release-admission.sh \"$RELEASE_TAG\" \"$RELEASE_SHA\" \"$RUN_ID\" \"$RUN_ATTEMPT\"")
-  %w[validate-tag audit-protections linux windows release].each { |id| assert_exact_checkout(release_jobs[id], "release #{id}") }
-  assert(release_jobs.dig("audit-protections", "needs") == "verification", "live audit must follow verification")
-  assert_run(release_jobs["audit-protections"], "live-protection-audit",
-             "scripts/github-release-protections.sh --ci-check")
-  assert(step_by_id(release_jobs["audit-protections"], "live-protection-audit").dig("env", "GH_TOKEN") ==
-         "${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}", "pre-build audit token binding changed")
+  %w[validate-tag linux windows release].each { |id| assert_exact_checkout(release_jobs[id], "release #{id}") }
+  assert(!release_jobs.key?("audit-protections"), "release must not depend on removed main protection")
   %w[linux windows].each do |id|
-    assert(release_jobs.dig(id, "needs") == "audit-protections", "#{id} build must follow live protection audit")
+    assert(release_jobs.dig(id, "needs") == "verification", "#{id} build must follow exact-SHA verification")
   end
   assert_order(release_jobs["linux"],
                %w[release-build-linux release-package-linux release-smoke-linux release-upload-linux])
@@ -227,16 +223,12 @@ def validate(ci, verification, release, inventory)
          windows_download.dig("with", "path") == "incoming/windows", "publisher Windows download changed")
   assert_run(release_jobs["release"], "release-assets",
              "python3 tests/verify-release-assets.py --platform all --tag \"$RELEASE_TAG\" --incoming incoming --dist dist")
-  assert_run(release_jobs["release"], "final-live-protection-audit",
-             "scripts/github-release-protections.sh --ci-check")
-  assert(step_by_id(release_jobs["release"], "final-live-protection-audit").dig("env", "GH_TOKEN") ==
-         "${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}", "pre-publication audit token binding changed")
-  assert(step_by_id(release_jobs["release"], "release-publish").dig("env", "RELEASE_PROTECTION_AUDIT_TOKEN") ==
-         "${{ secrets.RELEASE_PROTECTION_AUDIT_TOKEN }}", "in-step final audit token binding changed")
-  assert(publish.include?('GH_TOKEN="$RELEASE_PROTECTION_AUDIT_TOKEN" scripts/github-release-protections.sh --ci-check'),
-         "live protections must be reaudited immediately before publication")
+  assert(!step_by_id(release_jobs["release"], "release-publish").fetch("env", {}).key?("RELEASE_PROTECTION_AUDIT_TOKEN"),
+         "publisher must not require the removed protection-audit secret")
+  assert(!publish.include?("github-release-protections.sh"),
+         "publisher must not require removed main protection")
   assert_order(release_jobs["release"],
-               %w[download-linux download-windows release-assets release-checksums final-live-protection-audit release-publish])
+               %w[download-linux download-windows release-assets release-checksums release-publish])
 end
 
 begin

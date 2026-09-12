@@ -143,7 +143,7 @@ else:
     run("git", "push", "--force", "origin", TAG, cwd=repo)
     run("bash", str(ELIGIBILITY), "recheck", TAG, release_sha, cwd=repo, ok=False)
 
-    # Restoring the tag is insufficient if protected main history was rewritten.
+    # Restoring the tag is insufficient if main history was rewritten.
     run("git", "tag", "--force", TAG, release_sha, cwd=repo)
     run("git", "push", "--force", "origin", TAG, cwd=repo)
     tree = run("git", "rev-parse", f"{release_sha}^{{tree}}", cwd=repo).stdout.strip()
