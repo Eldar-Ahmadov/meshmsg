@@ -246,7 +246,13 @@ async fn run(cli: Cli) -> Result<()> {
             );
             println!(
                 "{}",
-                node::signed_attachment_fixture(&dir, &operation_id, &kind, &name, size)?
+                attachment::protocol::signed_attachment_fixture(
+                    &dir,
+                    &operation_id,
+                    &kind,
+                    &name,
+                    size
+                )?
             );
         }
         Command::Offers { command } => match command {

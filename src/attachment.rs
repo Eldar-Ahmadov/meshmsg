@@ -1,3 +1,6 @@
+pub(crate) mod protocol;
+pub(crate) mod runtime;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

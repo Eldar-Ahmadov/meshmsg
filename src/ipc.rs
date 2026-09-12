@@ -689,7 +689,7 @@ pub(crate) fn validate_attachment_event_fields(
     offer: &AttachmentOffer,
     offer_token: &str,
 ) -> bool {
-    crate::node::validate_attachment_event(
+    crate::attachment::protocol::validate_attachment_event(
         expected_topic,
         live_now_ms,
         from,
@@ -2300,7 +2300,7 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef";
         let request_id = "11111111111111111111111111111111";
         let valid = contracts::correlate(
-            crate::node::signed_attachment_event_for_test(
+            crate::attachment::protocol::signed_attachment_event_for_test(
                 &signer,
                 id,
                 AttachmentKind::File,
@@ -2322,7 +2322,9 @@ mod tests {
         assert!(validate_success_payload_for_context(
             &valid,
             Some(TopicId::from_bytes([7; 32])),
-            Some(42 + crate::node::ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 + 1),
+            Some(
+                42 + crate::attachment::protocol::ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 + 1
+            ),
         )
         .is_err());
         for (field, replacement) in [
@@ -2511,7 +2513,7 @@ mod tests {
         let attachment_signer = iroh::SecretKey::generate();
         let peer = attachment_signer.public().to_string();
         let attachment_offer = contracts::correlate(
-            crate::node::signed_attachment_event_for_test(
+            crate::attachment::protocol::signed_attachment_event_for_test(
                 &attachment_signer,
                 operation_id,
                 AttachmentKind::File,

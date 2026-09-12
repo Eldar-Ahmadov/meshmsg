@@ -3618,7 +3618,7 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef";
         let digest = "01".repeat(32);
         let signer = iroh::SecretKey::generate();
-        let mut valid = crate::node::signed_attachment_event_for_test(
+        let mut valid = crate::attachment::protocol::signed_attachment_event_for_test(
             &signer,
             id,
             AttachmentKind::File,
@@ -3693,14 +3693,16 @@ mod tests {
             .as_millis() as u64;
         let incoming_signer = iroh::SecretKey::generate();
         let incoming_peer = incoming_signer.public().to_string();
-        let incoming = public_event(ipc_event(crate::node::signed_attachment_event_for_test(
-            &incoming_signer,
-            "01010101010101010101010101010101",
-            AttachmentKind::File,
-            "report.pdf",
-            1234,
-            now_ms,
-        )))
+        let incoming = public_event(ipc_event(
+            crate::attachment::protocol::signed_attachment_event_for_test(
+                &incoming_signer,
+                "01010101010101010101010101010101",
+                AttachmentKind::File,
+                "report.pdf",
+                1234,
+                now_ms,
+            ),
+        ))
         .unwrap();
         assert!(valid_id(incoming["download_id"].as_str().unwrap()));
         let legacy = super::public_event(
@@ -3730,7 +3732,7 @@ mod tests {
         );
         let outgoing_signer = iroh::SecretKey::generate();
         let outgoing_peer = outgoing_signer.public().to_string();
-        let mut outgoing_event = crate::node::signed_attachment_event_for_test(
+        let mut outgoing_event = crate::attachment::protocol::signed_attachment_event_for_test(
             &outgoing_signer,
             "02020202020202020202020202020202",
             AttachmentKind::DirectoryTarV1,
@@ -3757,7 +3759,7 @@ mod tests {
         assert!(!incoming.to_string().contains("secret"));
         assert!(!outgoing.to_string().contains("secret"));
         let remembered_before = state.offers.lock().unwrap().len();
-        let mut malformed_offer = crate::node::signed_attachment_event_for_test(
+        let mut malformed_offer = crate::attachment::protocol::signed_attachment_event_for_test(
             &incoming_signer,
             "03030303030303030303030303030303",
             AttachmentKind::File,
@@ -3767,7 +3769,7 @@ mod tests {
         );
         malformed_offer["offer_id"] = "0303030303030303030303030303030A".into();
         assert!(public_event(ipc_event(malformed_offer)).is_none());
-        let cross_topic = crate::node::signed_attachment_event_for_topic_for_test(
+        let cross_topic = crate::attachment::protocol::signed_attachment_event_for_topic_for_test(
             &incoming_signer,
             TopicId::from_bytes([8; 32]),
             "04040404040404040404040404040404",
@@ -3777,13 +3779,13 @@ mod tests {
             now_ms,
         );
         assert!(public_event(ipc_event(cross_topic)).is_none());
-        let stale = crate::node::signed_attachment_event_for_test(
+        let stale = crate::attachment::protocol::signed_attachment_event_for_test(
             &incoming_signer,
             "05050505050505050505050505050505",
             AttachmentKind::File,
             "safe.txt",
             4,
-            now_ms - crate::node::ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 - 1,
+            now_ms - crate::attachment::protocol::ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 - 1,
         );
         assert!(public_event(ipc_event(stale)).is_none());
         assert_eq!(state.offers.lock().unwrap().len(), remembered_before);
