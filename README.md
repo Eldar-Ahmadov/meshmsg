@@ -124,7 +124,7 @@ cargo build --locked --features bench --bin meshmsg-bench
 cargo test --locked --features bench-tui --all-targets
 cargo build --locked --features web --bin meshmsg-web
 cargo check --locked --features full
-bash tests/check-optional-dependencies.sh
+scripts/verify-lean-release.sh
 node tests/web-ui.cjs
 python3 tests/integration-web.py target/debug/meshmsg
 python3 tests/integration-web-peer.py target/debug/meshmsg

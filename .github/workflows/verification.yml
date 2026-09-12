@@ -52,10 +52,10 @@ jobs:
       - name: Build locked debug binary
         id: rust-build
         run: cargo build --locked
-      - name: Verify optional feature isolation and feature-specific targets
+      - name: Verify lean stripped release and feature-specific targets
         id: optional-features
         run: |
-          bash tests/check-optional-dependencies.sh
+          scripts/verify-lean-release.sh
           cargo check --locked --features bench --bin meshmsg-bench
           cargo clippy --locked --features bench --all-targets -- -D warnings
           cargo test --locked --features bench --all-targets

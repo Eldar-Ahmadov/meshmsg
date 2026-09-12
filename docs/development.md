@@ -32,7 +32,7 @@ cargo clippy --locked --features bench-tui --all-targets -- -D warnings
 cargo test --locked --features bench-tui --all-targets
 cargo check --locked --features web --bin meshmsg-web
 cargo check --locked --features full --all-targets
-bash tests/check-optional-dependencies.sh
+scripts/verify-lean-release.sh
 bash -n install.sh tests/*.sh scripts/*.sh
 python3 -m py_compile tests/*.py
 node --check src/web/app.js
@@ -60,7 +60,7 @@ The driver requires `target/debug/meshmsg` and the sibling feature-built
 and `{BENCH_BIN}` inventory placeholders keep the executable roles explicit. The
 five-peer benchmark uses only the non-TUI binary and `bench` feature. It includes
 CLI errors, fake/real web, peer directory, five-peer, attachments, direct messages,
-idempotency, checksum-pinned v0.1.18 wire boundaries,
+idempotency, checksum-pinned v0.1.18 on-wire EnvelopeV2 boundaries,
 persistent-state migration/restart, and a generated-archive/mock-download installer
 test. The per-command budgets total under 96 minutes.
 The workflow allows 130 minutes,
@@ -71,6 +71,19 @@ The networking harnesses require working Iroh networking and download
 checksum-pinned historical artifacts. The Node UI check uses a DOM mock, not a
 mobile browser. No harness changes Tailscale configuration. See
 [web validation limits](web.md#tests-and-validation-limits).
+
+### Lean release verification
+
+`scripts/verify-lean-release.sh` resolves locked default and full metadata, proves
+that the default root activates no optional feature or direct web/TUI dependency,
+checks Ratatui/Crossterm graph isolation, and builds the default binary alone in a
+clean target directory. It then verifies release stripping and reports the exact
+binary byte count plus default/full normal-package counts. Hyper and http-body
+remain in the default transitive graph because Iroh uses them for relay/discovery
+transport; the script reports that explicitly while proving meshmsg's optional
+web-server dependency edges and binary are absent. Run it on the release target
+platform for a reproducible platform-specific measurement; override its clean
+artifact directory with `MESHMSG_LEAN_TARGET_DIR` if needed.
 
 Dependency policy uses pinned tool versions:
 

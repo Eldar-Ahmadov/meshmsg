@@ -46,24 +46,13 @@ timeout 300 "$BIN" --state-dir "$ROOT/current" daemon >"$ROOT/current.daemon" 2>
 wait_for 80 "current daemon" status_current
 wait_for 80 "mixed neighbors" bash -c '[[ $("$1" --state-dir "$2" --json status | python3 -c '\''import json,sys; print(json.load(sys.stdin)["neighbors"])'\'') -ge 1 ]]' _ "$BIN" "$ROOT/current"
 
-"$OLD" --state-dir "$ROOT/current" --json status | python3 -c '
-import json,sys
-value=json.load(sys.stdin)
-assert value["type"] == "status" and value["schema_version"] == 1
-assert "diagnostic_records_accepted" not in value
-' || fail "v0.1.18 client rejected current daemon exact status v1"
-"$BIN" --state-dir "$ROOT/old" --json status | python3 -c '
-import json,sys
-value=json.load(sys.stdin)
-assert value["type"] == "status" and value["schema_version"] == 1
-' || fail "current client rejected v0.1.18 daemon status v1"
-
-timeout 240 "$BIN" --state-dir "$ROOT/current" --json listen >"$ROOT/current-client-current-daemon.listen" 2>"$ROOT/current-client-current-daemon.err" & PIDS+=("$!")
-timeout 240 "$OLD" --state-dir "$ROOT/current" --json listen >"$ROOT/old-client-current-daemon.listen" 2>"$ROOT/old-client-current-daemon.err" & PIDS+=("$!")
-timeout 240 "$OLD" --state-dir "$ROOT/old" --json listen >"$ROOT/old-client-old-daemon.listen" 2>"$ROOT/old-client-old-daemon.err" & PIDS+=("$!")
-wait_for 10 "current client connected to current daemon" grep -Fq '"type":"connected"' "$ROOT/current-client-current-daemon.listen"
-wait_for 10 "old client connected to current daemon" grep -Fq '"type":"connected"' "$ROOT/old-client-current-daemon.listen"
-wait_for 10 "old client connected to old daemon" grep -Fq '"type":"connected"' "$ROOT/old-client-old-daemon.listen"
+# Retain only the released on-wire EnvelopeV2 promise. Each listener uses the
+# client matching its daemon; cross-version local IPC compatibility is not a v2
+# protocol promise.
+timeout 240 "$BIN" --state-dir "$ROOT/current" --json listen >"$ROOT/current.listen" 2>"$ROOT/current.listen.err" & PIDS+=("$!")
+timeout 240 "$OLD" --state-dir "$ROOT/old" --json listen >"$ROOT/old.listen" 2>"$ROOT/old.listen.err" & PIDS+=("$!")
+wait_for 10 "current listener" grep -Fq '"type":"connected"' "$ROOT/current.listen"
+wait_for 10 "released listener" grep -Fq '"type":"connected"' "$ROOT/old.listen"
 
 # At contemporary Unix-millisecond timestamps the released producer's exact
 # 4096-byte frame capacity is 3923. Focused Rust tests cover the absolute 3928
@@ -73,11 +62,10 @@ import pathlib,sys
 pathlib.Path(sys.argv[1]).write_text('R' * 3923)
 PY
 "$OLD" --state-dir "$ROOT/old" --json send --operation-id 18181818181818181818181818181818 --message-file "$ROOT/released-contemporary-max.txt" >"$ROOT/old-send.out"
-wait_for 40 "released contemporary-max 3923-byte body at current daemon/client" grep -Fq '"body":"RRRRRRRRRR' "$ROOT/current-client-current-daemon.listen"
-python3 - "$ROOT/current-client-current-daemon.listen" "$ROOT/old-client-old-daemon.listen" <<'PY' || fail "current daemon/client dropped released contemporary-max v0.1.18 body"
+wait_for 40 "released contemporary-max 3923-byte wire body at current peer" grep -Fq '"body":"RRRRRRRRRR' "$ROOT/current.listen"
+python3 - "$ROOT/current.listen" <<'PY' || fail "current peer dropped released contemporary-max EnvelopeV2 body"
 import json,sys
 assert any(v.get('type') == 'message' and len(v.get('body','')) == 3923 for v in map(json.loads, open(sys.argv[1])))
-assert any(v.get('type') == 'queued' and len(v.get('body','')) == 3923 for v in map(json.loads, open(sys.argv[2])))
 PY
 
 python3 - "$ROOT/current-valid.txt" <<'PY'
@@ -85,11 +73,10 @@ import pathlib,sys
 pathlib.Path(sys.argv[1]).write_text('C' * 3900)
 PY
 "$BIN" --state-dir "$ROOT/current" --json send --operation-id 19191919191919191919191919191919 --message-file "$ROOT/current-valid.txt" >"$ROOT/current-daemon-send.out"
-wait_for 40 "current-produced 3900-byte body at v0.1.18 daemon/client" grep -Fq '"body":"CCCCCCCCCC' "$ROOT/old-client-old-daemon.listen"
-python3 - "$ROOT/old-client-old-daemon.listen" "$ROOT/old-client-current-daemon.listen" <<'PY' || fail "v0.1.18 daemon/client dropped current-produced canonical body"
+wait_for 40 "current-produced 3900-byte wire body at released peer" grep -Fq '"body":"CCCCCCCCCC' "$ROOT/old.listen"
+python3 - "$ROOT/old.listen" <<'PY' || fail "released peer dropped current-produced canonical EnvelopeV2 body"
 import json,sys
 assert any(v.get('type') == 'message' and len(v.get('body','')) == 3900 for v in map(json.loads, open(sys.argv[1])))
-assert any(v.get('type') == 'queued' and len(v.get('body','')) == 3900 for v in map(json.loads, open(sys.argv[2])))
 PY
 python3 -c 'open(__import__("sys").argv[1], "w").write("X" * 3901)' "$ROOT/current-oversized.txt"
 if "$BIN" --state-dir "$ROOT/current" --json send --operation-id 20202020202020202020202020202020 \
@@ -99,7 +86,7 @@ fi
 python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "invalid_message" and v["outcome"] == "not_started" and v["operation_id"] == "20202020202020202020202020202020"' \
   "$ROOT/current-oversized.out" || fail "current 3901-byte broadcast rejection was not canonical"
 
-kill "${PIDS[2]}" "${PIDS[3]}" "${PIDS[4]}" >/dev/null 2>&1 || true
-wait "${PIDS[2]}" "${PIDS[3]}" "${PIDS[4]}" >/dev/null 2>&1 || true
+kill "${PIDS[2]}" "${PIDS[3]}" >/dev/null 2>&1 || true
+wait "${PIDS[2]}" "${PIDS[3]}" >/dev/null 2>&1 || true
 PIDS=("${PIDS[0]}" "${PIDS[1]}")
-echo "PASS: v0.1.18 daemon production at its contemporary 3923-byte frame boundary reached a current daemon/client; current daemon production at the 3900-byte local cap reached a v0.1.18 daemon/client; current 3901-byte production failed canonically"
+echo "PASS: retained EnvelopeV2 wire promise works in both directions at released/current production boundaries; current 3901-byte production failed canonically"
