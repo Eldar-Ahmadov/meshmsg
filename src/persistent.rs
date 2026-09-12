@@ -226,37 +226,44 @@ pub(crate) fn opened_file_is_current_path(
     label: &'static str,
 ) -> Result<bool, PersistentError> {
     let current = open_existing(path, label, true, false, false)?;
-    let original_metadata = file
-        .metadata()
-        .map_err(|error| PersistentError::new(PersistentErrorKind::Io, label).with_source(error))?;
-    let current_metadata = current
-        .metadata()
-        .map_err(|error| PersistentError::new(PersistentErrorKind::Io, label).with_source(error))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let original_metadata = file.metadata().map_err(|error| {
+            PersistentError::new(PersistentErrorKind::Io, label).with_source(error)
+        })?;
+        let current_metadata = current.metadata().map_err(|error| {
+            PersistentError::new(PersistentErrorKind::Io, label).with_source(error)
+        })?;
         Ok(original_metadata.dev() == current_metadata.dev()
             && original_metadata.ino() == current_metadata.ino())
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        Ok(
-            match (
-                original_metadata.volume_serial_number(),
-                original_metadata.file_index(),
-                current_metadata.volume_serial_number(),
-                current_metadata.file_index(),
-            ) {
-                (
-                    Some(original_volume),
-                    Some(original_index),
-                    Some(current_volume),
-                    Some(current_index),
-                ) => original_volume == current_volume && original_index == current_index,
-                _ => false,
-            },
-        )
+        fn identity(file: &fs::File, label: &'static str) -> Result<(u32, u64), PersistentError> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{
+                Foundation::HANDLE,
+                Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+            };
+
+            let mut information = BY_HANDLE_FILE_INFORMATION::default();
+            let succeeded = unsafe {
+                GetFileInformationByHandle(
+                    file.as_raw_handle() as HANDLE,
+                    std::ptr::addr_of_mut!(information),
+                )
+            };
+            if succeeded == 0 {
+                return Err(PersistentError::new(PersistentErrorKind::Io, label)
+                    .with_source(io::Error::last_os_error()));
+            }
+            let index = (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow);
+            Ok((information.dwVolumeSerialNumber, index))
+        }
+
+        Ok(identity(file, label)? == identity(&current, label)?)
     }
 }
 

@@ -135,6 +135,8 @@ def validate(ci, verification, release, inventory)
   expected_inventory = [
     [60, "node", "tests/web-ui.cjs"],
     [60, "python3", "tests/integration-cli-errors.py", "{BIN}"],
+    [30, "python3", "tests/logging-process-tests.py", "{BIN}"],
+    [120, "python3", "tests/integration-nonblocking-logging.py", "{BIN}"],
     [180, "python3", "tests/integration-web.py", "{BIN}"],
     [600, "python3", "tests/integration-web-peer.py", "{BIN}"],
     [600, "python3", "tests/integration-peer-directory.py", "{BIN}"],
