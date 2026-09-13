@@ -1,5 +1,9 @@
 mod alias;
 mod attachment;
+#[cfg(feature = "bench")]
+mod bench;
+#[cfg(feature = "bench-tui")]
+mod bench_tui;
 mod cli;
 mod config;
 mod contracts;
@@ -311,6 +315,16 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor => node::doctor(&dir, cli.json).await?,
     }
     Ok(())
+}
+
+#[cfg(feature = "bench")]
+pub async fn bench_entry(arguments: Vec<std::ffi::OsString>) -> ExitCode {
+    bench::entry(arguments).await
+}
+
+#[cfg(feature = "bench-tui")]
+pub async fn bench_tui_entry(arguments: Vec<std::ffi::OsString>) -> ExitCode {
+    bench_tui::entry(arguments).await
 }
 
 fn save_joined_state(

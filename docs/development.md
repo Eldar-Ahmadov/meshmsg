@@ -23,16 +23,23 @@ python3 tests/github-protection-contract-tests.py
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
-cargo check --locked --workspace --all-targets
 cargo build --locked
+cargo check --locked --workspace --all-targets --features bench
+cargo clippy --locked --workspace --all-targets --features bench -- -D warnings
+cargo test --locked --workspace --all-targets --features bench
+cargo check --locked --workspace --all-targets --features bench-tui
+cargo clippy --locked --workspace --all-targets --features bench-tui -- -D warnings
+cargo test --locked --workspace --all-targets --features bench-tui
 scripts/verify-lean-release.sh
 bash -n install.sh tests/*.sh scripts/*.sh
 python3 -m py_compile tests/*.py
 bash tests/integration-installer.sh target/debug/meshmsg
 ```
 
-The explicit workspace scope makes both `meshmsg` and `meshmsg-protocol` tests,
-checks, and lint authoritative.
+The explicit workspace scope makes both `meshmsg` and `meshmsg-protocol` tests and
+lint authoritative. Default commands skip binaries whose `required-features` are
+unavailable; the feature-matrix commands enable and validate those targets
+without weakening protocol coverage.
 
 Authoritative verification installs actionlint v1.7.12 from immutable upstream
 commit `914e7df21a07ef503a81201c76d2b11c789d3fca` and runs it over all workflows.
@@ -47,10 +54,10 @@ The complete Linux integration inventory is parsed from
 bash tests/run-linux-integrations.sh target/debug/meshmsg
 ```
 
-The driver requires `target/debug/meshmsg` and substitutes its `{BIN}` inventory
-placeholder. The five-peer test retains equal-peer messaging, selective endpoint
-advertising, restart/failover/rejoin, and owner-only IPC hardening coverage. The
-inventory also includes CLI errors, peer directory, attachments, direct messages,
+The driver requires `target/debug/meshmsg` and the sibling feature-built
+`target/debug/meshmsg-bench`; its `{BIN}` and `{BENCH_BIN}` inventory placeholders keep the executable roles explicit. The
+five-peer benchmark uses only the non-TUI binary and `bench` feature. It includes
+CLI errors, peer directory, five-peer, attachments, direct messages,
 idempotency, checksum-pinned v0.1.18 on-wire EnvelopeV2 boundaries, and a
 generated-archive/mock-download installer test. The current per-command budgets
 total 4,220 seconds (70 minutes 20 seconds).
@@ -63,13 +70,13 @@ checksum-pinned historical artifacts.
 
 ### Lean release verification
 
-`scripts/verify-lean-release.sh` resolves locked all-feature metadata, proves that
-the root has no feature or secondary binary wiring, and checks that the removed
-terminal dependencies are absent from both the lockfile and dependency graph. It
-builds the sole binary in a clean target directory, verifies release stripping, and
-reports the exact binary byte count and normal-package count. Hyper and http-body
-remain transitive because Iroh uses them for relay/discovery transport; the script
-reports that explicitly. Run it on the release target
+`scripts/verify-lean-release.sh` resolves locked default and all-feature metadata, proves
+that the default root activates no optional feature or direct TUI dependency,
+checks Ratatui/Crossterm graph isolation, verifies the removed web binary and feature are
+absent, and builds the default binary alone in a clean target directory. It then verifies
+release stripping and reports the exact binary byte count plus default/all-feature
+normal-package counts. Hyper and http-body remain in the default transitive graph because
+Iroh uses them for relay/discovery transport; the script reports that explicitly. Run it on the release target
 platform for a reproducible platform-specific measurement; override its clean
 artifact directory with `MESHMSG_LEAN_TARGET_DIR` if needed.
 

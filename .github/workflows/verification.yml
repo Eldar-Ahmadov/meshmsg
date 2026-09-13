@@ -43,9 +43,6 @@ jobs:
       - name: Check formatting
         id: rustfmt
         run: cargo fmt --all -- --check
-      - name: Check all workspace targets
-        id: rust-check
-        run: cargo check --locked --workspace --all-targets
       - name: Run Clippy with warnings denied
         id: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -55,9 +52,16 @@ jobs:
       - name: Build locked debug binary
         id: rust-build
         run: cargo build --locked
-      - name: Verify lean stripped release
-        id: lean-release
-        run: scripts/verify-lean-release.sh
+      - name: Verify lean stripped release and feature-specific targets
+        id: optional-features
+        run: |
+          scripts/verify-lean-release.sh
+          cargo check --locked --workspace --all-targets --features bench
+          cargo clippy --locked --workspace --all-targets --features bench -- -D warnings
+          cargo test --locked --workspace --all-targets --features bench
+          cargo check --locked --workspace --all-targets --features bench-tui
+          cargo clippy --locked --workspace --all-targets --features bench-tui -- -D warnings
+          cargo test --locked --workspace --all-targets --features bench-tui
 
   windows-rust:
     runs-on: windows-2022
@@ -128,9 +132,9 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.91.0 --profile minimal
-      - name: Build integration binary
+      - name: Build core and benchmark integration binaries
         id: integration-build
-        run: cargo build --locked
+        run: cargo build --locked --features bench
       - name: Run authoritative Linux static and integration inventory
         id: linux-integrations
         run: bash tests/run-linux-integrations.sh target/debug/meshmsg

@@ -42,7 +42,7 @@ Daemon logs suppress incoming broadcast and private message bodies, recording me
 
 ## Interfaces
 
-meshmsg has no built-in web UI or HTTP bridge. Owner-only local IPC remains available to the CLI.
+meshmsg has no built-in web UI or HTTP bridge. Owner-only local IPC remains available to the CLI and benchmark clients.
 
 ## Daemon behavior
 
