@@ -116,8 +116,10 @@ This is an intentional local-API compatibility boundary. Clients send only stric
 protocol-v2 IPC envelopes and require exact correlated replies. Older clients and
 daemons are rejected before any payload is consumed. There is no permissive
 downgrade, capability probe, or field defaulting; operators must upgrade and restart
-the CLI and daemon together. Network gossip/direct protocol
-compatibility is unchanged.
+the CLI and daemon together. The EnvelopeV2 wire shape and ALPN remain
+unchanged, but receive compatibility with v0.1.18 bodies of 3901–3928 bytes
+was intentionally removed. Current broadcasts are uniformly limited to 3900
+bytes.
 
 The shared daemon cache admits at most 1,024 completed plus in-flight operations.
 Matching concurrent requests join one execution. A terminal success, failure, or
