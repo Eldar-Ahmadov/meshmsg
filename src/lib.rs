@@ -18,8 +18,6 @@ mod node;
 mod peers;
 mod persistent;
 mod presence;
-#[cfg(feature = "web")]
-pub mod web;
 
 use alias::AliasConfig;
 use anyhow::{Context, Result};

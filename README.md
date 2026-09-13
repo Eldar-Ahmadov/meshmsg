@@ -79,11 +79,9 @@ meshmsg-bench-tui
 
 See [Benchmarking](docs/benchmarking.md) for coordinated runs, metrics, and NDJSON output.
 
-## Mobile web broadcast
+## Interfaces
 
-Run `meshmsg-web` alongside the existing daemon, then open `http://127.0.0.1:8787/`. For phone access, use **Tailscale Serve, never Funnel**, with an explicitly configured HTTPS `--origin`. There is no app authentication: tailnet access rules are the remote access boundary. The UI queues text broadcasts locally (not delivery acknowledgements) and shows a bounded live feed without history. Incoming attachment cards support explicit, verified browser downloads (directories as `.tar`) without exposing raw offer capabilities or server filesystem paths.
-
-See [Mobile web UI](docs/web.md) for setup, security boundaries, reconnect behavior, and operations.
+meshmsg has no built-in web UI or HTTP bridge. Use the CLI or the owner-only local IPC protocol; benchmark clients also use that generic IPC interface.
 
 ## Attachments
 
@@ -106,8 +104,7 @@ Downloads are explicit, size-limited, content-verified, persistent across provid
 
 - [Installation](docs/installation.md)
 - [Usage reference](docs/usage.md)
-- [Stable JSON, IPC, HTTP, and SSE contracts](docs/contracts.md)
-- [Mobile web UI](docs/web.md)
+- [Stable JSON and IPC contracts](docs/contracts.md)
 - [Attachments](docs/attachments.md)
 - [Operations and security](docs/operations.md)
 - [Benchmarking](docs/benchmarking.md)
@@ -122,12 +119,7 @@ cargo test --locked --workspace --all-targets
 cargo build --locked
 cargo build --locked --features bench --bin meshmsg-bench
 cargo test --locked --workspace --all-targets --features bench-tui
-cargo build --locked --features web --bin meshmsg-web
-cargo check --locked --workspace --all-targets --features full
 scripts/verify-lean-release.sh
-node tests/web-ui.cjs
-python3 tests/integration-web.py target/debug/meshmsg
-python3 tests/integration-web-peer.py target/debug/meshmsg
 bash tests/integration-5-peer.sh target/debug/meshmsg
 bash tests/integration-attachments.sh target/debug/meshmsg
 bash tests/integration-direct-messages.sh target/debug/meshmsg

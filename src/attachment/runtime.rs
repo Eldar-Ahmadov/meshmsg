@@ -1762,7 +1762,6 @@ pub(crate) struct DownloadCommit<'a> {
     pub(crate) staging: attachment::StagedFile,
     pub(crate) output: &'a Path,
     pub(crate) kind: AttachmentKind,
-    pub(crate) raw_export: bool,
     pub(crate) max_attachment_bytes: u64,
     pub(crate) pin_already_committed: bool,
 }
@@ -1782,7 +1781,6 @@ pub(crate) async fn commit_download(
         staging,
         output,
         kind,
-        raw_export,
         max_attachment_bytes,
         pin_already_committed,
     } = commit;
@@ -1796,7 +1794,7 @@ pub(crate) async fn commit_download(
     }
 
     fault("destination_install")?;
-    let directory = !raw_export && kind == AttachmentKind::DirectoryTarV1;
+    let directory = kind == AttachmentKind::DirectoryTarV1;
     let output_for_task = output.to_owned();
     let staging = tokio::task::spawn_blocking(move || {
         if directory {
@@ -1915,7 +1913,6 @@ pub(crate) async fn download_attachment(
     offer_token: String,
     output: PathBuf,
     max_attachment_bytes: u64,
-    raw_export: bool,
 ) -> Result<meshmsg_protocol::Response> {
     let DownloadResources {
         store,
@@ -2107,7 +2104,6 @@ pub(crate) async fn download_attachment(
             staging,
             output: &output,
             kind: offer.kind,
-            raw_export,
             max_attachment_bytes,
             pin_already_committed: true,
         },
@@ -2140,11 +2136,7 @@ pub(crate) async fn download_attachment(
                 .parse()
                 .expect("public key is canonical"),
             output,
-            mode: if raw_export {
-                meshmsg_protocol::DownloadMode::Raw
-            } else {
-                meshmsg_protocol::DownloadMode::Install
-            },
+            mode: meshmsg_protocol::DownloadMode::Install,
             installed: true,
             pinned: true,
             destination_synced: commit.destination_synced,
@@ -2304,7 +2296,7 @@ pub(crate) async fn download_request(
     offer: String,
     output: PathBuf,
     max_attachment_bytes: u64,
-    mode: meshmsg_protocol::DownloadMode,
+    _mode: meshmsg_protocol::DownloadMode,
 ) -> meshmsg_protocol::Response {
     let gate = resources.storage.gate.clone();
     match gate.acquire_owned().await {
@@ -2320,7 +2312,6 @@ pub(crate) async fn download_request(
                 offer,
                 output,
                 max_attachment_bytes,
-                mode == meshmsg_protocol::DownloadMode::Raw,
             )
             .await
             {

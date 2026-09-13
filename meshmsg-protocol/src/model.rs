@@ -388,7 +388,6 @@ impl<'de> Deserialize<'de> for AttachmentName {
 #[serde(rename_all = "snake_case")]
 pub enum DownloadMode {
     Install,
-    Raw,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

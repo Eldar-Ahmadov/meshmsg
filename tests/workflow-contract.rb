@@ -110,7 +110,7 @@ def validate(ci, verification, release, inventory)
   assert_run(linux, "clippy", "cargo clippy --locked --workspace --all-targets -- -D warnings")
   assert_run(linux, "rust-tests", "cargo test --locked --workspace --all-targets")
   assert_run(linux, "rust-build", "cargo build --locked")
-  assert_run(linux, "optional-features", "scripts/verify-lean-release.sh\ncargo check --locked --workspace --all-targets --features bench\ncargo clippy --locked --workspace --all-targets --features bench -- -D warnings\ncargo test --locked --workspace --all-targets --features bench\ncargo check --locked --workspace --all-targets --features bench-tui\ncargo clippy --locked --workspace --all-targets --features bench-tui -- -D warnings\ncargo test --locked --workspace --all-targets --features bench-tui\ncargo check --locked --workspace --all-targets --features web\ncargo check --locked --workspace --all-targets --features full\ncargo clippy --locked --workspace --all-targets --features full -- -D warnings\ncargo test --locked --workspace --all-targets --features full")
+  assert_run(linux, "optional-features", "scripts/verify-lean-release.sh\ncargo check --locked --workspace --all-targets --features bench\ncargo clippy --locked --workspace --all-targets --features bench -- -D warnings\ncargo test --locked --workspace --all-targets --features bench\ncargo check --locked --workspace --all-targets --features bench-tui\ncargo clippy --locked --workspace --all-targets --features bench-tui -- -D warnings\ncargo test --locked --workspace --all-targets --features bench-tui")
   assert_order(linux, %w[rustfmt clippy rust-tests rust-build optional-features])
   windows = jobs["windows-rust"]
   assert_run(windows, "windows-tests", "cargo test --locked --workspace --all-targets")
@@ -128,20 +128,17 @@ def validate(ci, verification, release, inventory)
     "cargo install cargo-audit --version 0.22.2 --locked",
     "cargo install cargo-deny --version 0.20.2 --locked"
   ], "policy tool installation must remain exact and pinned")
-  assert_run(jobs["linux-integration"], "integration-build", "cargo build --locked --features web,bench")
+  assert_run(jobs["linux-integration"], "integration-build", "cargo build --locked --features bench")
   assert_run(jobs["linux-integration"], "linux-integrations",
              "bash tests/run-linux-integrations.sh target/debug/meshmsg")
   assert(jobs.dig("linux-integration", "timeout-minutes") == 130, "integration job timeout must cover inventory")
 
   expected_inventory = [
-    [60, "node", "tests/web-ui.cjs"],
     [60, "python3", "tests/integration-cli-errors.py", "{BIN}"],
-    [180, "python3", "tests/integration-web.py", "{BIN} {WEB_BIN}"],
-    [600, "python3", "tests/integration-web-peer.py", "{BIN} {WEB_BIN}"],
     [600, "python3", "tests/integration-peer-directory.py", "{BIN}"],
     [1100, "bash", "tests/integration-5-peer.sh", "{BIN} {BENCH_BIN}"],
     [600, "bash", "tests/integration-attachments.sh", "{BIN}"],
-    [600, "bash", "tests/integration-direct-messages.sh", "{BIN} {WEB_BIN}"],
+    [600, "bash", "tests/integration-direct-messages.sh", "{BIN}"],
     [600, "bash", "tests/integration-v018-message-boundary.sh", "{BIN}"],
     [600, "bash", "tests/integration-idempotency.sh", "{BIN}"],
     [120, "bash", "tests/integration-state-migration.sh", "{BIN}"],
@@ -251,7 +248,7 @@ begin
       c["jobs"]["required"]["name"] = "Old CI gate"
     end,
     "omitted integration" => lambda do |c, v, r, i|
-      i.delete_at(10)
+      i.delete_at(-1)
     end,
     "reordered smoke after upload" => lambda do |c, v, r, i|
       steps = r["jobs"]["linux"]["steps"]

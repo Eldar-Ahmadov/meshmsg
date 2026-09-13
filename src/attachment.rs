@@ -755,9 +755,7 @@ fn rename_directory_no_replace(staging: &Path, destination: &Path) -> Result<()>
     #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
     {
         let _ = staging;
-        anyhow::bail!(
-            "atomic no-replace directory installation is unsupported on this target; download the raw tar instead"
-        )
+        anyhow::bail!("atomic no-replace directory installation is unsupported on this target")
     }
 }
 

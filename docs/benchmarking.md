@@ -15,7 +15,7 @@ cargo build --features bench-tui --bin meshmsg-bench-tui
 meshmsg-bench-tui --state-dir /path/to/node-state
 ```
 
-The default `meshmsg` build compiles neither benchmark client. `full` enables `web` and `bench-tui` (which in turn enables `bench`).
+The default `meshmsg` build compiles neither benchmark client. `bench-tui` enables `bench` as well as its Ratatui/Crossterm dependencies.
 
 ## Running a coordinated test
 

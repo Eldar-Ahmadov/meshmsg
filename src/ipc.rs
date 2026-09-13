@@ -1,5 +1,5 @@
 //! Shared bounded newline-delimited local daemon protocol. Platform connection
-//! ownership checks remain in node::connect_daemon for both CLI and web clients.
+//! ownership checks remain in node::connect_daemon for CLI and benchmark clients.
 use crate::{
     config::State,
     contracts::{self, ProtocolErrorAdapter},
@@ -333,11 +333,6 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
                 .expect("validated subscription request ID"),
             expected_topic,
         }
-    }
-
-    #[cfg(feature = "web")]
-    pub(crate) fn expected_topic(&self) -> Option<TopicId> {
-        self.expected_topic
     }
 
     /// Reads one event while retaining any bytes consumed if this future is

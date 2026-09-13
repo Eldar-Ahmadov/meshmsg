@@ -3,22 +3,14 @@ set -euo pipefail
 
 BIN=${1:-target/debug/meshmsg}
 BIN=$(realpath "$BIN")
-WEB_BIN=$(dirname "$BIN")/meshmsg-web
 BENCH_BIN=$(dirname "$BIN")/meshmsg-bench
 [[ -x $BENCH_BIN ]] || { echo "missing meshmsg-bench integration artifact: build with --features bench" >&2; exit 1; }
-[[ -x $WEB_BIN ]] || {
-  echo "missing meshmsg-web integration artifact: build with --features web" >&2
-  exit 1
-}
 INVENTORY=tests/linux-integration-inventory.tsv
 
 # Syntax/static checks live beside the parsed integration inventory so local and
 # CI verification cannot silently acquire different command lists.
 bash -n install.sh tests/*.sh scripts/*.sh
 python3 -m py_compile tests/*.py
-node --check src/web/app.js
-node --check src/web/settings.js
-node --check tests/web-ui.cjs
 
 total_timeout=0
 while IFS=$'\t' read -r seconds command arguments; do
@@ -31,7 +23,6 @@ while IFS=$'\t' read -r seconds command arguments; do
   for index in "${!args[@]}"; do
     case ${args[$index]} in
       "{BIN}") args[$index]=$BIN ;;
-      "{WEB_BIN}") args[$index]=$WEB_BIN ;;
       "{BENCH_BIN}") args[$index]=$BENCH_BIN ;;
     esac
   done

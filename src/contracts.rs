@@ -118,19 +118,6 @@ impl ProtocolErrorAdapter {
         result.validate()?;
         Ok(result)
     }
-    #[cfg(feature = "web")]
-    pub(crate) fn into_value(self) -> serde_json::Value {
-        let typed = self.typed().expect("typed protocol error producer");
-        let request_id = self
-            .request_id
-            .map(|id| id.parse().expect("validated protocol request ID"));
-        meshmsg_protocol::DaemonFrame::Response(meshmsg_protocol::ResponseFrame::new(
-            request_id,
-            meshmsg_protocol::Response::Error(typed),
-        ))
-        .into_payload_value()
-        .expect("canonical protocol error serialization")
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,11 +140,6 @@ impl std::fmt::Display for ContractFailure {
     }
 }
 impl std::error::Error for ContractFailure {}
-
-#[cfg(feature = "web")]
-pub(crate) fn known_error_code(name: &str) -> bool {
-    error_code(name).is_ok()
-}
 
 pub(crate) fn error_code(name: &str) -> Result<ErrorCode> {
     serde_json::from_value(serde_json::Value::String(name.to_owned()))
@@ -197,7 +179,7 @@ pub(crate) fn protocol_error(
     ))
 }
 
-/// Produce the historical JSON presentation shape for CLI/HTTP adapters. The
+/// Produce the historical JSON presentation shape for CLI adapters. The
 /// daemon wire boundary removes `message` and `retryable`; those values are
 /// always derived locally from the typed enums.
 pub(crate) fn present_error(request_id: Option<&str>, error: &ProtocolError) -> serde_json::Value {

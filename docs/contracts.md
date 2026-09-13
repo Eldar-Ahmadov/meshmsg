@@ -1,4 +1,4 @@
-# Stable JSON, IPC, HTTP, and SSE contracts
+# Stable JSON and IPC contracts
 
 Local IPC uses exactly protocol version 2. JSON payload objects use a numeric
 `schema_version`; version 1 is the common family version. A family may have a
@@ -7,23 +7,14 @@ and mutation results v3). Family versions are exact, not minimum versions.
 
 ## Correlation and mutation identity
 
-A `request_id` is exactly 32 lowercase hexadecimal characters. It identifies one
-CLI result, one HTTP exchange/SSE connection, or one IPC request. `POST
-/api/request` requires exactly one valid `X-Meshmsg-Request-Id` header and requires
-that the strict JSON outer envelope repeat the same ID. A missing, duplicated,
-malformed, or body/header-mismatched ID is rejected before IPC. Other routes may
-omit the header; the bridge then generates an ID for the exchange. Every response
-returns its exchange ID in `X-Meshmsg-Request-Id` and every JSON body. The HTTP
-bridge passes the same ID to IPC. IPC responses and every event on an IPC subscription echo that
-request's ID.
+A `request_id` is exactly 32 lowercase hexadecimal characters. It identifies one CLI result or IPC request. IPC responses and every event on an IPC subscription echo that request's ID.
 
 An `operation_id` has the same lexical representation but a different meaning: it
 identifies a retry-safe mutation and may be reused only for an identical mutation.
 It is never generated from, compared with, or substituted for `request_id`.
 Different retries have different request IDs and the same operation ID. `send`,
 `private_send`, `share`, `offers_remove`, `offers_prune`, and `download` all
-require an operation ID. Downloads also require a typed `mode` of `install` or `raw`;
-the web bridge uses the ordinary download request in `raw` mode. Attachment `offer_id` and signed
+require an operation ID. Downloads require the sole typed mode `install`; the removed raw export mode is rejected. Attachment `offer_id` and signed
 message IDs retain their separate documented operation identity; a download's
 operation ID is not its offer ID.
 
@@ -46,7 +37,7 @@ Daemon IPC errors are compact typed frames:
 also carry the exact typed `operation_id`. Unknown enum values, versions, fields,
 or malformed IDs fail closed at that crate boundary. Errors never transmit a
 display message, retryable flag, offer selector, generic lifecycle accounting, or
-suppression counter. CLI and web adapters derive stable user-facing text and retry
+suppression counter. CLI adapters derive stable user-facing text and retry
 guidance from `ErrorCode` and `Outcome`; automation branches on those enums rather
 than display text. Lifecycle counts remain only on typed lifecycle success records.
 
@@ -86,7 +77,7 @@ or replay/rate admission and fanout, while every frame still pays a separate bou
 pre-verification attempt budget. Attachment validation binds one canonical lowercase
 operation/offer ID plus the configured signed topic, kind, provider, ticket hash/format,
 name, size, and nonzero timestamp before download registration or transfer work. Live
-IPC/HTTP attachment events must remain inside the wire freshness window. Saved signed
+IPC attachment events must remain inside the wire freshness window. Saved signed
 download tokens deliberately do not expire by timestamp, but revalidate the nonzero time,
 signature, configured topic, identity, and complete metadata before any network work.
 Daemon-created message, queued, and attachment events cross the same typed event
@@ -121,45 +112,7 @@ IPC success/event families are:
 
 Local filesystem paths are no longer present in status/daemon-started contracts.
 Attachment commands that inherently select a caller-owned input/output path keep it
-only on owner-authenticated IPC; HTTP never accepts or returns such paths.
-
-## HTTP and SSE
-
-`POST /api/request` uses the same strict outer shape as IPC, with its `request`
-restricted to `send`, `status`, `peers`, `download`, and `download_status`.
-A download start carries a client-generated operation ID; its returned polling ID
-is that same ID, so response-loss retries and every poll retain one identity.
-`download_started`, `download_pending`, and `download_ready` repeat that exact ID;
-a ready URL is exactly `/api/download/<operation-id>` without alternate encoding,
-query, or fragment. Web admission atomically binds that ID to one immutable offer, owner task, and output;
-concurrent exact starts join and changed offers conflict. Unknown polled outcomes
-stop polling but retain the ID for at most three total same-ID preparation attempts;
-strict `not_started` polling errors rotate the next user attempt to a new ID. If a
-retained unknown operation cannot enter reconciliation because local download
-capacity or staging is unavailable, the bridge replays the retained unknown state
-rather than manufacturing a definite rejection; a later same-ID attempt can still
-recover daemon-cached success. Unknown fields and duplicate keys fail closed. `POST /api/attachment` carries request and
-operation IDs in separate headers. Every JSON response has `type`, exact
-`schema_version`, and `request_id`; every HTTP response also has
-`X-Meshmsg-Request-Id`. Binary downloads carry the header but no synthetic JSON.
-
-SSE `data` records are JSON DTOs with the SSE connection's request ID. Connected,
-message, queued, attachment, lag, peer snapshot, and peer transition source DTOs are
-strictly deserialized before reconstruction from a public allowlist. Any malformed,
-noncanonical, semantically invalid, or unsupported daemon event—including an attachment
-offer/share—fails closed: the bridge terminates that IPC subscription and emits a
-sanitized SSE disconnect error before closing the feed. It does not synthesize an
-`internal_contract_error`, suppress or skip the bad event, or consume later frames from
-the failed subscription; reconnecting creates a new subscription with no replay.
-Invalid attachment events never create a web download handle. A connected handshake
-that cannot be reconstructed as a valid public connected event,
-including `endpoint_online:false`, yields a correlated `invalid_daemon_response`
-error and closes the feed cleanly. IPC connection establishment and reading this
-first frame share one eight-second startup deadline; the read receives only the
-remaining budget. Offline/disconnect notices use the standard error
-envelope (`daemon_offline` or `daemon_disconnected`) rather than an ad-hoc
-event shape. SSE has no replay IDs because request IDs are correlation identifiers,
-not event cursors.
+only on owner-authenticated IPC.
 
 ## Compatibility and migration
 
@@ -167,7 +120,7 @@ This is an intentional local-API compatibility boundary. Clients send only stric
 protocol-v2 IPC envelopes and require exact correlated replies. Older clients and
 daemons are rejected before any payload is consumed. There is no permissive
 downgrade, capability probe, or field defaulting; operators must upgrade and restart
-the CLI, web bridge, and daemon together. Network gossip/direct protocol
+the CLI and daemon together. Network gossip/direct protocol
 compatibility is unchanged.
 
 The shared daemon cache admits at most 1,024 completed plus in-flight operations.
@@ -176,17 +129,14 @@ post-install partial success is replayed exactly for ten minutes from completion
 oldest terminal entries can be evicted under pressure, while in-flight entries are
 never evicted. IDs are global across operation kinds. Fingerprints bind kind and
 exact inputs: message/recipient/body, share path/content digest, lifecycle selectors,
-age/dry-run/limit, and download token, typed `DownloadMode::{Install, Raw}`, plus exact
-output OS representation. The CLI submits `Install`; `meshmsg-web` submits `Raw` on
-the same ordinary `download` request. Changed
+age/dry-run/limit, and download token, `DownloadMode::Install`, plus exact output OS representation. Changed
 input returns `operation_id_conflict` without work. For prune, the cached terminal
 record is the authoritative original selected set/result, so a retry cannot consume
 the next batch and `max_delete` bounds one operation. For remove, an exact retry
 replays the original counts rather than recomputing the already-achieved end state.
 For download, replay occurs before the no-clobber check and prevents duplicate
 network/export/install work. `download_complete` v2 includes a domain-separated
-SHA-256 digest of the exact submitted token; one shared CLI/web request-aware
-validator binds operation ID, token identity, offer ID, provider, kind, name,
+SHA-256 digest of the exact submitted token; the shared request-aware validator binds operation ID, token identity, offer ID, provider, kind, name,
 signed declared size when present, and exact output representation. A cached partial-success `download_complete` remains a
 success; callers inspect durability warnings rather than retrying the installed
 path. Once the memory-only entry expires, is evicted, or the daemon restarts, the

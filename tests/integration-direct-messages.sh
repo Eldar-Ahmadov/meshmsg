@@ -3,19 +3,13 @@ set -euo pipefail
 
 BIN=${1:-target/debug/meshmsg}
 BIN=$(realpath "$BIN")
-WEB_BIN=${2:-${MESHMSG_WEB_BIN:-$(dirname "$BIN")/meshmsg-web}}
-WEB_BIN=$(realpath "$WEB_BIN")
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/meshmsg-direct-integration.XXXXXX")
 declare -A PIDS=()
 declare -a LISTENER_PIDS=()
 LISTENER_PID=
-WEB_PID=
-SSE_PID=
 
 cleanup() {
   set +e
-  [[ -n "$SSE_PID" ]] && kill "$SSE_PID" >/dev/null 2>&1
-  [[ -n "$WEB_PID" ]] && kill "$WEB_PID" >/dev/null 2>&1
   for pid in "${LISTENER_PIDS[@]}"; do kill "$pid" >/dev/null 2>&1; done
   for node in "${!PIDS[@]}"; do
     "$BIN" --state-dir "$ROOT/$node" stop >/dev/null 2>&1
@@ -207,19 +201,6 @@ python3 -c \
 wait_for 30 "invite-pinned private delivery" grep -Fq "\"body\":\"$PINNED\"" "$ROOT/sender.listen.log"
 ! grep -Fq "$PINNED" "$ROOT/spy.listen.log" || fail "invite-pinned private body reached a third peer"
 
-# Attach the broadcast-only web bridge to the receiver before delivering a DM.
-WEB_PORT=$(python3 - <<'PY'
-import socket
-s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()
-PY
-)
-timeout 300 "$WEB_BIN" --state-dir "$ROOT/receiver" --listen "127.0.0.1:$WEB_PORT" \
-  >"$ROOT/web.log" 2>"$ROOT/web.err" & WEB_PID=$!
-wait_for 10 "web listener" curl -fsS "http://127.0.0.1:$WEB_PORT/"
-timeout 60 curl --no-buffer --silent --show-error "http://127.0.0.1:$WEB_PORT/api/events" \
-  >"$ROOT/web.sse" 2>"$ROOT/web.sse.err" & SSE_PID=$!
-wait_for 10 "web SSE subscription" grep -Fq '"type":"connected"' "$ROOT/web.sse"
-
 PRIVATE="private-alias-$(date +%s%N)"
 PRIVATE_RESULT=$("$BIN" --state-dir "$ROOT/sender" --json send --to target-node "$PRIVATE")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["schema_version"] == 3; assert v["operation_id"] == v["message_id"]; assert v["acceptance_acknowledged"] is True and v["duplicate_accepted"] is False and v["durable"] is False and v["read"] is False; assert v["body_bytes"] == int(sys.argv[1]) and "body" not in v; assert len(v["message_id"]) == 32' "${#PRIVATE}" \
@@ -228,7 +209,6 @@ wait_for 30 "private alias delivery" grep -Fq "\"body\":\"$PRIVATE\"" "$ROOT/rec
 sleep 1
 ! grep -Fq "$PRIVATE" "$ROOT/sender.listen.log" || fail "sender subscription received its outgoing private body"
 ! grep -Fq "$PRIVATE" "$ROOT/spy.listen.log" || fail "third topic peer received private body"
-! grep -Fq "$PRIVATE" "$ROOT/web.sse" || fail "web SSE exposed private body"
 
 RECEIVER_PEER=$("$BIN" --state-dir "$ROOT/receiver" --json status | python3 -c 'import json,sys; print(json.load(sys.stdin)["peer"])')
 CANONICAL="private-key-$(date +%s%N)"
@@ -250,12 +230,6 @@ wait_for 30 "spy broadcast" grep -Fq "\"body\":\"$BROADCAST\"" "$ROOT/spy.listen
 # same alias. The sender must forget the superseded claim and fail closed.
 kill "$RECEIVER_LISTEN" >/dev/null 2>&1 || true
 wait "$RECEIVER_LISTEN" >/dev/null 2>&1 || true
-[[ -n "$SSE_PID" ]] && kill "$SSE_PID" >/dev/null 2>&1 || true
-[[ -n "$SSE_PID" ]] && wait "$SSE_PID" >/dev/null 2>&1 || true
-SSE_PID=
-[[ -n "$WEB_PID" ]] && kill "$WEB_PID" >/dev/null 2>&1 || true
-[[ -n "$WEB_PID" ]] && wait "$WEB_PID" >/dev/null 2>&1 || true
-WEB_PID=
 stop_node receiver
 "$BIN" --state-dir "$ROOT/receiver" alias set collision-node >/dev/null
 start_node receiver
@@ -282,9 +256,9 @@ sleep 2
 ! grep -Fq "$COLLISION" "$ROOT/spy.listen.log" || fail "colliding alias delivered to another claimant"
 
 # Private contents may appear only in the explicit owner CLI subscription, not
-# daemon output, sender responses, or the broadcast-only web process/feed.
+# daemon output or sender responses.
 for secret in "$PINNED" "$PRIVATE" "$CANONICAL" "$COLLISION"; do
-  for output in "$ROOT"/*.daemon.log "$ROOT"/*.daemon.err "$ROOT"/web.log "$ROOT"/web.err "$ROOT"/web.sse "$ROOT"/collision.out "$ROOT"/collision.err; do
+  for output in "$ROOT"/*.daemon.log "$ROOT"/*.daemon.err "$ROOT"/collision.out "$ROOT"/collision.err; do
     [[ -e "$output" ]] || continue
     ! grep -Fq "$secret" "$output" || fail "private body leaked to $output"
   done
@@ -297,4 +271,4 @@ done
 
 kill "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
 wait "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
-echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/4096/4097 boundaries, authenticated private acknowledgements, broadcast compatibility, and DM log/web privacy"
+echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/4096/4097 boundaries, authenticated private acknowledgements, broadcast compatibility, and DM log privacy"

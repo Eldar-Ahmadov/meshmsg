@@ -1134,7 +1134,7 @@ where
                         }
                     }
                     // EOF stays readable forever. Avoid a busy loop while still
-                    // reclaiming quiet web subscriptions after a full close.
+                    // reclaiming quiet subscriptions after a full close.
                     _ = tokio::time::sleep(Duration::from_millis(250)), if read_closed => {
                         if stream.subscription_closed_after_eof()? {
                             break;
@@ -2044,7 +2044,6 @@ pub async fn run_daemon(
                 Some(DaemonCommand::Download { operation_id, offer, output, mode, reply }) => {
                     let mode_name = match mode {
                         meshmsg_protocol::DownloadMode::Install => "install",
-                        meshmsg_protocol::DownloadMode::Raw => "raw",
                     };
                     let fingerprint = operation_fingerprint(
                         "download",
@@ -4694,7 +4693,6 @@ mod tests {
                 staging: attachment::StagedFile::new(staging),
                 output: &output,
                 kind: AttachmentKind::File,
-                raw_export: true,
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                 pin_already_committed: false,
             },
@@ -4775,7 +4773,6 @@ mod tests {
                         staging: attachment::StagedFile::new(staging.clone()),
                         output: &output,
                         kind: AttachmentKind::File,
-                        raw_export: true,
                         max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                         pin_already_committed: false,
                     },
@@ -4850,7 +4847,6 @@ mod tests {
                     staging: attachment::StagedFile::new(staging.clone()),
                     output: &output,
                     kind: AttachmentKind::File,
-                    raw_export: false,
                     max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                     pin_already_committed: false,
                 },
@@ -4886,7 +4882,6 @@ mod tests {
                     staging: attachment::StagedFile::new(retry_staging),
                     output: &output,
                     kind: AttachmentKind::File,
-                    raw_export: false,
                     max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                     pin_already_committed: false,
                 },
@@ -4961,7 +4956,6 @@ mod tests {
                     staging: attachment::StagedFile::new(staging.clone()),
                     output: &output,
                     kind: AttachmentKind::File,
-                    raw_export: false,
                     max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                     pin_already_committed: false,
                 },
@@ -5031,7 +5025,6 @@ mod tests {
                 staging: attachment::StagedFile::new(archive),
                 output: &output,
                 kind: AttachmentKind::DirectoryTarV1,
-                raw_export: false,
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                 pin_already_committed: false,
             },
@@ -6428,7 +6421,6 @@ mod tests {
                 staging: attachment::StagedFile::new(staging),
                 output: &output,
                 kind: AttachmentKind::File,
-                raw_export: true,
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                 pin_already_committed: true,
             },
@@ -7092,16 +7084,10 @@ mod tests {
                 max_delete: 1,
             },
             IpcRequest::Download {
-                operation_id: operation.clone(),
-                offer: "x".into(),
-                output: PathBuf::from("x"),
-                mode: meshmsg_protocol::DownloadMode::Install,
-            },
-            IpcRequest::Download {
                 operation_id: operation,
                 offer: "x".into(),
                 output: PathBuf::from("x"),
-                mode: meshmsg_protocol::DownloadMode::Raw,
+                mode: meshmsg_protocol::DownloadMode::Install,
             },
         ];
         for mutation in mutations {
