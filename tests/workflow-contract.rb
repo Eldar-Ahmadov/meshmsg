@@ -107,14 +107,14 @@ def validate(ci, verification, release, inventory)
 
   linux = jobs["rust-linux"]
   assert_run(linux, "rustfmt", "cargo fmt --all -- --check")
-  assert_run(linux, "clippy", "cargo clippy --locked --all-targets -- -D warnings")
-  assert_run(linux, "rust-tests", "cargo test --locked --all-targets")
+  assert_run(linux, "clippy", "cargo clippy --locked --workspace --all-targets -- -D warnings")
+  assert_run(linux, "rust-tests", "cargo test --locked --workspace --all-targets")
   assert_run(linux, "rust-build", "cargo build --locked")
-  assert_run(linux, "optional-features", "scripts/verify-lean-release.sh\ncargo check --locked --features bench --bin meshmsg-bench\ncargo clippy --locked --features bench --all-targets -- -D warnings\ncargo test --locked --features bench --all-targets\ncargo check --locked --features bench-tui --bin meshmsg-bench-tui\ncargo clippy --locked --features bench-tui --all-targets -- -D warnings\ncargo test --locked --features bench-tui --all-targets\ncargo check --locked --features web --bin meshmsg-web\ncargo check --locked --features full --all-targets\ncargo clippy --locked --features full --all-targets -- -D warnings\ncargo test --locked --features full --all-targets")
+  assert_run(linux, "optional-features", "scripts/verify-lean-release.sh\ncargo check --locked --workspace --all-targets --features bench\ncargo clippy --locked --workspace --all-targets --features bench -- -D warnings\ncargo test --locked --workspace --all-targets --features bench\ncargo check --locked --workspace --all-targets --features bench-tui\ncargo clippy --locked --workspace --all-targets --features bench-tui -- -D warnings\ncargo test --locked --workspace --all-targets --features bench-tui\ncargo check --locked --workspace --all-targets --features web\ncargo check --locked --workspace --all-targets --features full\ncargo clippy --locked --workspace --all-targets --features full -- -D warnings\ncargo test --locked --workspace --all-targets --features full")
   assert_order(linux, %w[rustfmt clippy rust-tests rust-build optional-features])
   windows = jobs["windows-rust"]
-  assert_run(windows, "windows-tests", "cargo test --locked --all-targets")
-  assert_run(windows, "windows-clippy", "cargo clippy --locked --all-targets -- -D warnings")
+  assert_run(windows, "windows-tests", "cargo test --locked --workspace --all-targets")
+  assert_run(windows, "windows-clippy", "cargo clippy --locked --workspace --all-targets -- -D warnings")
   assert_run(windows, "windows-build", "cargo build --locked")
   assert_run(windows, "windows-resolve-dumpbin", "./tests/resolve-dumpbin.ps1")
   assert(step_by_id(windows, "windows-exercise-dumpbin").fetch("run").include?("/headers target/debug/meshmsg.exe"),
@@ -242,6 +242,10 @@ begin
     end,
     "disabled Clippy gate" => lambda do |c, v, r, i|
       step_by_id(v["jobs"]["rust-linux"], "clippy")["if"] = false
+    end,
+    "root-package-only Rust tests" => lambda do |c, v, r, i|
+      step = step_by_id(v["jobs"]["rust-linux"], "rust-tests")
+      step["run"] = step.fetch("run").sub(" --workspace", "")
     end,
     "renamed aggregate" => lambda do |c, v, r, i|
       c["jobs"]["required"]["name"] = "Old CI gate"

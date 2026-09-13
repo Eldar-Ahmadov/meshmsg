@@ -117,13 +117,13 @@ Downloads are explicit, size-limited, content-verified, persistent across provid
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 cargo build --locked
 cargo build --locked --features bench --bin meshmsg-bench
-cargo test --locked --features bench-tui --all-targets
+cargo test --locked --workspace --all-targets --features bench-tui
 cargo build --locked --features web --bin meshmsg-web
-cargo check --locked --features full
+cargo check --locked --workspace --all-targets --features full
 scripts/verify-lean-release.sh
 node tests/web-ui.cjs
 python3 tests/integration-web.py target/debug/meshmsg

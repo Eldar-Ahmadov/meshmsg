@@ -45,10 +45,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy with warnings denied
         id: clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Run locked all-target tests
         id: rust-tests
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets
       - name: Build locked debug binary
         id: rust-build
         run: cargo build --locked
@@ -56,16 +56,16 @@ jobs:
         id: optional-features
         run: |
           scripts/verify-lean-release.sh
-          cargo check --locked --features bench --bin meshmsg-bench
-          cargo clippy --locked --features bench --all-targets -- -D warnings
-          cargo test --locked --features bench --all-targets
-          cargo check --locked --features bench-tui --bin meshmsg-bench-tui
-          cargo clippy --locked --features bench-tui --all-targets -- -D warnings
-          cargo test --locked --features bench-tui --all-targets
-          cargo check --locked --features web --bin meshmsg-web
-          cargo check --locked --features full --all-targets
-          cargo clippy --locked --features full --all-targets -- -D warnings
-          cargo test --locked --features full --all-targets
+          cargo check --locked --workspace --all-targets --features bench
+          cargo clippy --locked --workspace --all-targets --features bench -- -D warnings
+          cargo test --locked --workspace --all-targets --features bench
+          cargo check --locked --workspace --all-targets --features bench-tui
+          cargo clippy --locked --workspace --all-targets --features bench-tui -- -D warnings
+          cargo test --locked --workspace --all-targets --features bench-tui
+          cargo check --locked --workspace --all-targets --features web
+          cargo check --locked --workspace --all-targets --features full
+          cargo clippy --locked --workspace --all-targets --features full -- -D warnings
+          cargo test --locked --workspace --all-targets --features full
 
   windows-rust:
     runs-on: windows-2022
@@ -81,11 +81,11 @@ jobs:
       - name: Test native Windows named-pipe IPC and all Rust targets
         id: windows-tests
         shell: pwsh
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets
       - name: Clippy native Windows targets
         id: windows-clippy
         shell: pwsh
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build native Windows binary
         id: windows-build
         shell: pwsh

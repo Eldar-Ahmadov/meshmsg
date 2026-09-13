@@ -21,17 +21,17 @@ python3 tests/release-contract-tests.py
 python3 tests/release-assets-tests.py --bin target/debug/meshmsg
 python3 tests/github-protection-contract-tests.py
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 cargo build --locked
-cargo check --locked --features bench --bin meshmsg-bench
-cargo clippy --locked --features bench --all-targets -- -D warnings
-cargo test --locked --features bench --all-targets
-cargo check --locked --features bench-tui --bin meshmsg-bench-tui
-cargo clippy --locked --features bench-tui --all-targets -- -D warnings
-cargo test --locked --features bench-tui --all-targets
-cargo check --locked --features web --bin meshmsg-web
-cargo check --locked --features full --all-targets
+cargo check --locked --workspace --all-targets --features bench
+cargo clippy --locked --workspace --all-targets --features bench -- -D warnings
+cargo test --locked --workspace --all-targets --features bench
+cargo check --locked --workspace --all-targets --features bench-tui
+cargo clippy --locked --workspace --all-targets --features bench-tui -- -D warnings
+cargo test --locked --workspace --all-targets --features bench-tui
+cargo check --locked --workspace --all-targets --features web
+cargo check --locked --workspace --all-targets --features full
 scripts/verify-lean-release.sh
 bash -n install.sh tests/*.sh scripts/*.sh
 python3 -m py_compile tests/*.py
@@ -41,6 +41,11 @@ node --check tests/web-ui.cjs
 node tests/web-ui.cjs
 bash tests/integration-installer.sh target/debug/meshmsg
 ```
+
+The explicit workspace scope makes both `meshmsg` and `meshmsg-protocol` tests and
+lint authoritative. Default commands skip binaries whose `required-features` are
+unavailable; the feature-matrix commands enable and validate those targets
+without weakening protocol coverage.
 
 Authoritative verification installs actionlint v1.7.12 from immutable upstream
 commit `914e7df21a07ef503a81201c76d2b11c789d3fca` and runs it over all workflows.

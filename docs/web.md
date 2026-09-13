@@ -104,8 +104,8 @@ Resource limits can cause feed gaps. A hostile authorized/local client can still
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 cargo build --locked --features web --bin meshmsg-web
 node --check src/web/app.js
 node tests/web-ui.cjs

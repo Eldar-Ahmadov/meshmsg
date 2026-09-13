@@ -1,5 +1,6 @@
 [workspace]
 members = ["meshmsg-protocol"]
+default-members = [".", "meshmsg-protocol"]
 resolver = "2"
 
 [package]
