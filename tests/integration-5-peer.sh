@@ -3,8 +3,6 @@ set -euo pipefail
 
 BIN=${1:-target/debug/meshmsg}
 BIN=$(realpath "$BIN")
-BENCH_BIN=${2:-$(dirname "$BIN")/meshmsg-bench}
-BENCH_BIN=$(realpath "$BENCH_BIN")
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/meshmsg-integration.XXXXXX")
 declare -A PIDS=()
 
@@ -119,42 +117,6 @@ for queued_text, log_path in [(sys.argv[1], sys.argv[3]), (sys.argv[2], sys.argv
     assert received["body"] == queued["body"]
 PY
 
-# The optional benchmark client uses ordinary send requests and subscriptions.
-BENCH_RUN=0123456789abcdef0123456789abcdef
-"$BENCH_BIN" --state-dir "$ROOT/c1" --json receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c1.bench.log" & B1=$!
-"$BENCH_BIN" --state-dir "$ROOT/c2" --json receive --run-id "$BENCH_RUN" --duration-secs 5 --expected 5 >"$ROOT/c2.bench.log" & B2=$!
-wait_log 10 "$ROOT/c1.bench.log" '"type":"bench_receive_started"'
-wait_log 10 "$ROOT/c2.bench.log" '"type":"bench_receive_started"'
-"$BENCH_BIN" --state-dir "$ROOT/s1" --json send --run-id "$BENCH_RUN" --rate 5 --duration-secs 1 --payload-bytes 128 >"$ROOT/s1.bench.log" & BS=$!
-wait_log 10 "$ROOT/s1.bench.log" '"type":"bench_send_started"'
-status_ok s1 || fail "daemon did not answer status during benchmark send"
-wait "$BS"
-wait "$B1"
-wait "$B2"
-python3 - "$ROOT/s1.bench.log" "$ROOT/c1.bench.log" "$ROOT/c2.bench.log" <<'PY'
-import json, pathlib, sys
-sender = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
-assert sender[0]["type"] == "bench_send_started"
-assert sender[-1]["type"] == "bench_send_summary"
-assert all(value["type"] == "bench_send_progress" for value in sender[1:-1])
-assert all(value["schema_version"] == 1 for value in sender)
-assert sender[-1]["planned"] == sender[-1]["attempted"] == sender[-1]["queued"] == 5
-assert sender[-1]["failed"] == 0
-assert sender[-1]["accounting_complete"] is True
-assert sender[-1]["queued_body_bytes"] == sender[-1]["queued"] * sender[-1]["payload_bytes"]
-assert sender[-1]["delivery_acknowledged"] is False
-for path in sys.argv[2:]:
-    receiver = [json.loads(line) for line in pathlib.Path(path).read_text().splitlines()]
-    assert receiver[0]["type"] == "bench_receive_started"
-    assert receiver[-1]["type"] == "bench_receive_summary"
-    assert all(value["type"] == "bench_receive_progress" for value in receiver[1:-1])
-    summary = receiver[-1]
-    assert summary["run_id"] == "0123456789abcdef0123456789abcdef"
-    assert summary["expected"] == summary["unique"] == 5
-    assert summary["missing"] == 0 and summary["complete"]
-    assert not summary["lag"]["incomplete"]
-PY
-
 python3 - "$ROOT/s1/config.json" "$ROOT/s2/config.json" "$ROOT/s3/config.json" "$ROOT/c1/config.json" "$ROOT/c2/config.json" <<'PY'
 import json, pathlib, sys
 for index, name in enumerate(sys.argv[1:]):
@@ -168,7 +130,6 @@ for node in s1 s2 s3 c1 c2; do
   for output in "$ROOT/$node.daemon.log" "$ROOT/$node.daemon.err"; do
     ! grep -Fq "$M1" "$output" || fail "$node daemon leaked message body to $output"
     ! grep -Fq "$M2" "$output" || fail "$node daemon leaked message body to $output"
-    ! grep -Fq "$BENCH_RUN" "$output" || fail "$node daemon leaked benchmark body to $output"
   done
   "$BIN" --state-dir "$ROOT/$node" --json doctor | grep -q '"ok":true'
 done
@@ -256,4 +217,4 @@ for node in s1 s2 s3 c1 c2; do
 done
 
 kill "$L1" >/dev/null 2>&1 || true; wait "$L1" >/dev/null 2>&1 || true
-echo "PASS: 5 equal peers, listen-only events/no daemon stdout, benchmarking, selective endpoint advertising, restart/failover/rejoin, IPC safety, and limits"
+echo "PASS: 5 equal peers, listen-only events/no daemon stdout, selective endpoint advertising, restart/failover/rejoin, IPC safety, and limits"

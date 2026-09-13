@@ -1,5 +1,5 @@
 //! Shared bounded newline-delimited local daemon protocol. Platform connection
-//! ownership checks remain in node::connect_daemon for CLI and benchmark clients.
+//! ownership checks remain in node::connect_daemon for local clients.
 use crate::{
     config::State,
     contracts::{self, ProtocolErrorAdapter},
