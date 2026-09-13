@@ -18,8 +18,7 @@ REQUEST_ID = "1" * 32
 
 
 def run_case(command, response, expected_code="command_failed",
-             expected_outcome="not_started", expected_retryable=False,
-             expected_fields=None, absent_fields=()):
+             expected_outcome="not_started", expected_fields=None, absent_fields=()):
     with tempfile.TemporaryDirectory(prefix="meshmsg-cli-errors-") as temporary:
         state = pathlib.Path(temporary)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -42,7 +41,6 @@ def run_case(command, response, expected_code="command_failed",
                         assert "command" in request["request"]
                         reply = dict(response(request) if callable(response) else response)
                         if reply.pop("_correlate", True):
-                            reply.setdefault("schema_version", 1)
                             reply["request_id"] = request["request_id"]
                         reply.setdefault("protocol_version", 2)
                         connection.sendall(json.dumps(reply).encode() + b"\n")
@@ -64,10 +62,11 @@ def run_case(command, response, expected_code="command_failed",
         lines = child.stdout.splitlines()
         assert len(lines) == 1, (command, child.stdout)
         error = json.loads(lines[0])
-        assert error["type"] == "error" and error["schema_version"] == 1
+        assert error["protocol_version"] == 2 and error["type"] == "error"
         assert error["code"] == expected_code
         assert error["outcome"] == expected_outcome
-        assert error["retryable"] is expected_retryable
+        assert "schema_version" not in error
+        assert "message" not in error and "retryable" not in error
         assert len(error["request_id"]) == 32
         for key, expected in (expected_fields or {}).items():
             assert error.get(key) == expected, (key, error)
@@ -117,7 +116,7 @@ def mismatched_download(transform):
         different = transform(requested)
         assert different != requested
         return {
-            "type": "download_complete", "schema_version": 2,
+            "type": "download_complete",
             "operation_id": request["request"]["operation_id"],
             "offer_id": "2" * 32,
             "kind": "file",
@@ -156,16 +155,15 @@ for transform in [
         mismatched_download(transform),
     )
 
-def lifecycle_error(code, outcome, retryable, include_offer=False, partial=False):
+def lifecycle_error(code, outcome, include_offer=False, partial=False):
     def response(request):
         if request["request"]["command"] == "status":
             return download_status()
         operation_id = request["request"]["operation_id"]
-        # Retry guidance and display text are derived by the CLI adapter, not IPC.
-        assert retryable in (True, False)
+        # Retry guidance and display text are derived for human output, not IPC or JSON.
         assert include_offer in (True, False) and partial in (True, False)
         return {
-            "type": "error", "schema_version": 1, "code": code,
+            "type": "error", "code": code,
             "operation_id": operation_id, "outcome": outcome,
         }
     return response
@@ -176,27 +174,24 @@ def lifecycle_error(code, outcome, retryable, include_offer=False, partial=False
 for code in ["operation_id_conflict", "operation_capacity"]:
     run_case(
         ["offers", "remove", "--operation-id", "a" * 32, "b" * 32],
-        lifecycle_error(code, "not_started", code == "operation_capacity"),
+        lifecycle_error(code, "not_started"),
         expected_code=code,
-        expected_retryable=code == "operation_capacity",
         expected_fields={"operation_id": "a" * 32},
         absent_fields=("offer_id",),
     )
 run_case(
     ["offers", "remove", "--operation-id", "c" * 32, "d" * 32],
-    lifecycle_error("attachment_removal_partial", "partial", True,
+    lifecycle_error("attachment_removal_partial", "partial",
                     include_offer=True, partial=True),
     expected_code="attachment_removal_partial", expected_outcome="partial",
-    expected_retryable=True,
     expected_fields={"operation_id": "c" * 32},
     absent_fields=("offer_id", "selected_tags", "removed_tags", "quota_bytes_released"),
 )
 run_case(
     ["offers", "prune", "--operation-id", "e" * 32,
      "--older-than-secs", "1", "--direction", "outgoing", "--max-delete", "2"],
-    lifecycle_error("attachment_removal_partial", "partial", True, partial=True),
+    lifecycle_error("attachment_removal_partial", "partial", partial=True),
     expected_code="attachment_removal_partial", expected_outcome="partial",
-    expected_retryable=True,
     expected_fields={"operation_id": "e" * 32},
     absent_fields=("offer_id", "provider", "direction", "older_than_secs",
                    "maximum", "dry_run", "selected_tags", "removed_tags",
@@ -208,7 +203,7 @@ run_case(
 run_case(
     ["offers"],
     {"type": "error", "code": "offers_busy", "outcome": "not_started"},
-    expected_code="offers_busy", expected_retryable=True,
+    expected_code="offers_busy",
 )
 
 # Genuine global JSON parse errors remain machine-readable, but a positional
@@ -227,7 +222,7 @@ with tempfile.TemporaryDirectory(prefix="meshmsg-cli-literal-json-") as temporar
     assert literal.returncode == 1 and literal.stdout == ""
     assert "error:" in literal.stderr and not literal.stderr.lstrip().startswith("{")
 
-# Offline is stable, retryable, and also uses stdout only in JSON mode.
+# Offline is stable and also uses stdout only in JSON mode.
 with tempfile.TemporaryDirectory(prefix="meshmsg-cli-offline-") as temporary:
     child = subprocess.run(
         [BINARY, "--json", "--state-dir", temporary, "status"],
@@ -235,7 +230,8 @@ with tempfile.TemporaryDirectory(prefix="meshmsg-cli-offline-") as temporary:
     )
     assert child.returncode == 1 and child.stderr == ""
     error = json.loads(child.stdout)
-    assert error["code"] == "daemon_offline"
-    assert error["retryable"] is True and error["outcome"] == "not_started"
+    assert error["protocol_version"] == 2 and len(error["request_id"]) == 32
+    assert error["code"] == "daemon_offline" and error["outcome"] == "not_started"
+    assert "message" not in error and "retryable" not in error
 
-print("PASS: CLI JSON failures are one bounded versioned stdout record")
+print("PASS: CLI JSON failures are one canonical protocol-v2 stdout frame")

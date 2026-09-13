@@ -8,7 +8,7 @@ use crate::{
         runtime::*,
     },
     config::{prepare_state_dir, State, StateLock},
-    contracts::{self, ProtocolErrorAdapter},
+    contracts::{self},
     direct::{self, DIRECT_ALPN},
     gossip::{self, EventHandler as GossipEventHandler},
     invite::Invite,
@@ -16,7 +16,6 @@ use crate::{
         read_frame, send_request_checked, subscribe, IpcRequest, IpcRequestFrame,
         MAX_IPC_REQUEST_SIZE,
     },
-    peers as peer_api,
     presence::{self, Directory, PresenceSourceLimiter},
 };
 use anyhow::{Context, Result};
@@ -2305,16 +2304,17 @@ fn queued_event(
     body: String,
     timestamp_ms: u64,
 ) -> serde_json::Value {
-    meshmsg_protocol::DaemonFrame::Response(meshmsg_protocol::ResponseFrame::new(
-        None,
-        meshmsg_protocol::Response::Queued(gossip::queued_event(
-            peer,
-            message_id,
-            body,
-            timestamp_ms,
-        )),
+    serde_json::to_value(meshmsg_protocol::DaemonFrame::Response(
+        meshmsg_protocol::ResponseFrame::new(
+            Some(meshmsg_protocol::RequestId::new_random()),
+            meshmsg_protocol::Response::Queued(gossip::queued_event(
+                peer,
+                message_id,
+                body,
+                timestamp_ms,
+            )),
+        ),
     ))
-    .into_payload_value()
     .expect("test queued serialization")
 }
 
@@ -2375,7 +2375,6 @@ pub async fn send_once(
                 body: meshmsg_protocol::PrivateBody::new(body)?,
             },
             "private_accepted",
-            Some(3),
         )
         .await
         .with_context(|| format!("operation {operation_id}"))?;
@@ -2388,7 +2387,7 @@ pub async fn send_once(
             ),
             _ => unreachable!("checked response family"),
         }
-        crate::ipc::response_payload(value)?
+        value
     } else {
         let value = send_request_checked(
             dir,
@@ -2397,7 +2396,6 @@ pub async fn send_once(
                 body: meshmsg_protocol::BroadcastBody::new(body)?,
             },
             "queued",
-            Some(3),
         )
         .await
         .with_context(|| format!("operation {operation_id}"))?;
@@ -2409,9 +2407,9 @@ pub async fn send_once(
             ),
             _ => unreachable!("checked response family"),
         }
-        crate::ipc::response_payload(value)?
+        value
     };
-    event(json, value);
+    output_response(json, &value)?;
     Ok(())
 }
 
@@ -2432,7 +2430,7 @@ pub async fn share(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
-    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let status = send_request_checked(dir, &IpcRequest::Status, "status").await?;
     let maximum = match &status.response {
         meshmsg_protocol::Response::Status(status) => status.max_attachment_bytes,
         _ => unreachable!("checked response family"),
@@ -2451,7 +2449,6 @@ pub async fn share(
             path,
         },
         "attachment_shared",
-        3,
         &operation_id,
     )
     .await
@@ -2464,26 +2461,21 @@ pub async fn share(
             && shared.source_digest.to_string() == source_digest,
         "daemon returned mismatched share operation metadata"
     );
-    event(json, crate::ipc::response_payload(frame)?);
+    output_response(json, &frame)?;
     Ok(())
 }
 
 pub async fn peers(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request_checked(
-        dir,
-        &IpcRequest::Peers,
-        "peers_snapshot",
-        Some(peer_api::PEER_SCHEMA_VERSION.into()),
-    )
-    .await
-    .context("request peer directory; the daemon may need to be upgraded and restarted")?;
-    event(json, crate::ipc::response_payload(value)?);
+    let value = send_request_checked(dir, &IpcRequest::Peers, "peers_snapshot")
+        .await
+        .context("request peer directory; the daemon may need to be upgraded and restarted")?;
+    output_response(json, &value)?;
     Ok(())
 }
 
 pub async fn offers(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request_checked(dir, &IpcRequest::Offers, "offers", Some(1)).await?;
-    event(json, crate::ipc::response_payload(value)?);
+    let value = send_request_checked(dir, &IpcRequest::Offers, "offers").await?;
+    output_response(json, &value)?;
     Ok(())
 }
 
@@ -2491,16 +2483,9 @@ async fn send_lifecycle_request(
     dir: &Path,
     request: &IpcRequest,
     expected_type: &str,
-    expected_schema_version: u64,
     expected_operation_id: &str,
 ) -> Result<meshmsg_protocol::ResponseFrame> {
-    let frame = crate::ipc::send_request_checked(
-        dir,
-        request,
-        expected_type,
-        Some(expected_schema_version),
-    )
-    .await?;
+    let frame = crate::ipc::send_request_checked(dir, request, expected_type).await?;
     let actual_operation_id = match &frame.response {
         meshmsg_protocol::Response::AttachmentShared(value) => &value.operation_id,
         meshmsg_protocol::Response::OfferRemoved(value)
@@ -2533,7 +2518,6 @@ pub async fn offers_remove(
             provider: provider.map(str::parse).transpose()?,
         },
         "offer_removed",
-        3,
         &operation_id,
     )
     .await?;
@@ -2552,7 +2536,7 @@ pub async fn offers_remove(
             && result.maximum == MAX_PRUNE_TAGS,
         "lifecycle response does not match its request"
     );
-    event(json, crate::ipc::response_payload(frame)?);
+    output_response(json, &frame)?;
     Ok(())
 }
 
@@ -2566,7 +2550,7 @@ pub async fn offers_prune(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
-    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let status = send_request_checked(dir, &IpcRequest::Status, "status").await?;
     let retention = match &status.response {
         meshmsg_protocol::Response::Status(status) => status.attachment_retention_secs,
         _ => unreachable!("checked response family"),
@@ -2582,7 +2566,6 @@ pub async fn offers_prune(
             max_delete,
         },
         "offers_pruned",
-        3,
         &operation_id,
     )
     .await?;
@@ -2601,7 +2584,7 @@ pub async fn offers_prune(
             && result.maximum == max_delete,
         "lifecycle response does not match its request"
     );
-    event(json, crate::ipc::response_payload(frame)?);
+    output_response(json, &frame)?;
     Ok(())
 }
 
@@ -2613,7 +2596,7 @@ pub async fn download(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
-    let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let status = send_request_checked(dir, &IpcRequest::Status, "status").await?;
     let status = match &status.response {
         meshmsg_protocol::Response::Status(status) => status,
         _ => unreachable!("checked response family"),
@@ -2642,7 +2625,6 @@ pub async fn download(
             mode: meshmsg_protocol::DownloadMode::Install,
         },
         "download_complete",
-        2,
         &operation_id,
     )
     .await?;
@@ -2652,7 +2634,7 @@ pub async fn download(
     result
         .validate_for_request(&expected)
         .map_err(anyhow::Error::msg)?;
-    event(json, crate::ipc::response_payload(frame)?);
+    output_response(json, &frame)?;
     Ok(())
 }
 
@@ -2661,7 +2643,7 @@ pub async fn listen(dir: &Path, json: bool) -> Result<()> {
     loop {
         tokio::select! {
             value = reader.read() => match value? {
-                Some(frame) => event(json, crate::ipc::event_payload(frame)?),
+                Some(frame) => output_event(json, &frame)?,
                 None => anyhow::bail!("local daemon stopped; restart it with `meshmsg daemon`"),
             },
             _ = tokio::signal::ctrl_c() => break,
@@ -2698,14 +2680,13 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
                             body: meshmsg_protocol::BroadcastBody::new(body)?,
                         },
                         "queued",
-                        Some(3),
                     )
                     .await?;
                 }
                 None => break,
             },
             value = reader.read() => match value? {
-                Some(frame) => event(json, crate::ipc::event_payload(frame)?),
+                Some(frame) => output_event(json, &frame)?,
                 None => anyhow::bail!("local daemon stopped; restart it with `meshmsg daemon`"),
             },
             _ = tokio::signal::ctrl_c() => break,
@@ -2715,13 +2696,13 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub async fn status(dir: &Path, json: bool) -> Result<()> {
-    let frame = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let frame = send_request_checked(dir, &IpcRequest::Status, "status").await?;
     let value = match &frame.response {
         meshmsg_protocol::Response::Status(value) => value,
         _ => unreachable!("checked response family"),
     };
     if json {
-        println!("{}", crate::ipc::response_payload(frame.clone())?);
+        println!("{}", serde_json::to_string(&frame)?);
     } else {
         println!(
             "daemon: running\npeer: {}\ntopic: {}\nalias: {}\nalias enabled: {}\nadvertised aliases: {}\nadvertises self: {}\nhas invite: {}\nbootstrap peers: {}\nself advertised: {}\nendpoint online: {}\ntopic joined: {}\nneighbors: {}\nattachment storage: {} / {} bytes ({} unique blobs, {} / {} pins)\nattachment filesystem available: {} bytes (minimum {})\nattachment storage pressure: {}\nattachment retention: {} seconds",
@@ -2752,8 +2733,8 @@ pub async fn status(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub async fn stop(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request_checked(dir, &IpcRequest::Stop, "stopping", None).await?;
-    event(json, crate::ipc::response_payload(value)?);
+    let value = send_request_checked(dir, &IpcRequest::Stop, "stopping").await?;
+    output_response(json, &value)?;
     Ok(())
 }
 
@@ -2792,187 +2773,231 @@ fn terminal_safe(value: &str) -> String {
         .collect()
 }
 
-fn offer_listing_warnings(value: &serde_json::Value) -> Vec<String> {
+fn attachment_kind_name(kind: meshmsg_protocol::AttachmentKind) -> &'static str {
+    match kind {
+        meshmsg_protocol::AttachmentKind::File => "file",
+        meshmsg_protocol::AttachmentKind::DirectoryTarV1 => "directory_tar_v1",
+    }
+}
+
+fn print_peer_snapshot(value: &meshmsg_protocol::PeerSnapshot) {
+    println!(
+        "self: {}{} ({})",
+        value.self_peer.public_key,
+        value
+            .self_peer
+            .alias
+            .as_ref()
+            .map(|alias| format!(" ({})", alias.as_str()))
+            .unwrap_or_default(),
+        if value.self_peer.online {
+            "online"
+        } else {
+            "offline"
+        }
+    );
+    for peer in &value.peers {
+        println!(
+            "peer: {}{} ({})",
+            peer.public_key,
+            peer.alias
+                .as_ref()
+                .map(|alias| format!(" ({})", alias.as_str()))
+                .unwrap_or_default(),
+            if peer.online { "online" } else { "offline" }
+        );
+    }
+}
+
+fn print_peer_transition(action: &str, value: &meshmsg_protocol::PeerTransition) {
+    println!(
+        "{action}: {}{}",
+        value.peer.public_key,
+        value
+            .peer
+            .alias
+            .as_ref()
+            .map(|alias| format!(" ({})", alias.as_str()))
+            .unwrap_or_default()
+    );
+}
+
+fn offer_listing_warnings(truncated: bool, item_errors: usize) -> Vec<String> {
     let mut warnings = Vec::new();
-    if value["truncated"].as_bool() == Some(true) {
+    if truncated {
         warnings
             .push("WARNING: attachment listing truncated; more pinned blobs may exist".to_owned());
     }
-    if let Some(errors) = value["item_errors"].as_u64() {
+    if item_errors != 0 {
         warnings.push(format!(
-            "WARNING: {errors} attachment tag(s) could not be read"
+            "WARNING: {item_errors} attachment tag(s) could not be read"
         ));
     }
     warnings
 }
 
-fn event(json: bool, mut value: serde_json::Value) {
-    if json {
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
-            if let Ok(error) = ProtocolErrorAdapter::from_value(&value) {
-                value = contracts::present_error(
-                    error.request_id.as_deref(),
-                    &error.typed().expect("validated protocol error"),
-                );
-            }
-        }
-        println!("{value}");
+fn print_offers(value: &meshmsg_protocol::OffersList) {
+    if value.blobs.is_empty() {
+        println!("no pinned attachment blobs");
     } else {
-        match value["type"].as_str().unwrap_or("event") {
-            "message" if value["body_suppressed"].as_bool() == Some(true) => println!(
-                "message from {} ({} bytes; body suppressed)",
-                value["from"].as_str().unwrap_or("peer"),
-                value["body_bytes"].as_u64().unwrap_or(0)
-            ),
-            "message" => println!(
-                "{}: {}",
-                value["from"].as_str().unwrap_or("peer"),
-                terminal_safe(value["body"].as_str().unwrap_or(""))
-            ),
-            "private_message" if value["body_suppressed"].as_bool() == Some(true) => println!(
-                "private message from {} ({} bytes; body suppressed)",
-                value["from"].as_str().unwrap_or("peer"),
-                value["body_bytes"].as_u64().unwrap_or(0)
-            ),
-            "private_message" => println!(
-                "private from {}: {}",
-                value["from"].as_str().unwrap_or("peer"),
-                terminal_safe(value["body"].as_str().unwrap_or(""))
-            ),
-            "private_accepted" if value["duplicate_accepted"].as_bool() == Some(true) => println!(
-                "private message was previously accepted by {} (not redelivered; not durable or read)",
-                value["to"].as_str().unwrap_or("peer")
-            ),
-            "private_accepted" => println!(
-                "private message accepted by {} (acceptance only; not durable or read)",
-                value["to"].as_str().unwrap_or("peer")
-            ),
-            "queued" => println!(
-                "queued locally (delivery not acknowledged): {}",
-                terminal_safe(value["body"].as_str().unwrap_or(""))
-            ),
-            "offer_removed" => println!(
-                "removed {} attachment pin(s); {} quota bytes released",
-                value["removed_tags"].as_u64().unwrap_or(0),
-                value["released_bytes"].as_u64().unwrap_or(0)
-            ),
-            "offers_pruned" => println!(
-                "{} {} attachment pin(s); {} quota bytes released{}",
-                if value["dry_run"].as_bool() == Some(true) { "would remove" } else { "removed" },
-                if value["dry_run"].as_bool() == Some(true) { value["selected_tags"].as_u64().unwrap_or(0) } else { value["removed_tags"].as_u64().unwrap_or(0) },
-                value["released_bytes"].as_u64().unwrap_or(0),
-                if value["limited"].as_bool() == Some(true) { " (more eligible pins remain)" } else { "" }
-            ),
-            "offers" => {
-                let blobs = value["blobs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-                if blobs.is_empty() {
-                    println!("no pinned attachment blobs");
-                } else {
-                    for blob in blobs {
-                        let size = blob["size"]
-                            .as_u64()
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "?".to_owned());
-                        println!(
-                            "{}  {}  {}  {}  {}  {}  {}  {} bytes  {}",
-                            terminal_safe(blob["direction"].as_str().unwrap_or("unknown")),
-                            terminal_safe(blob["name"].as_str().unwrap_or("?")),
-                            terminal_safe(blob["kind"].as_str().unwrap_or("?")),
-                            terminal_safe(blob["offer_id"].as_str().unwrap_or("")),
-                            terminal_safe(blob["provider"].as_str().unwrap_or("-")),
-                            terminal_safe(blob["format"].as_str().unwrap_or("unknown")),
-                            terminal_safe(blob["status"].as_str().unwrap_or("unknown")),
-                            size,
-                            terminal_safe(blob["hash"].as_str().unwrap_or(""))
-                        );
-                    }
-                }
-                for warning in offer_listing_warnings(&value) {
-                    println!("{warning}");
-                }
-            }
-            "attachment_shared" => println!(
-                "shared {} ({} bytes)\noffer: {}\ndelivery acknowledged: no",
-                terminal_safe(value["name"].as_str().unwrap_or("attachment")),
-                value["size"].as_u64().unwrap_or(0),
-                value["offer"].as_str().unwrap_or("")
-            ),
-            "attachment_offer" if value["details_suppressed"].as_bool() == Some(true) => println!(
-                "attachment offer from {} ({} bytes; details suppressed)",
-                value["from"].as_str().unwrap_or("peer"),
-                value["size"].as_u64().unwrap_or(0)
-            ),
-            "attachment_offer" => println!(
-                "{} shared {} ({} bytes)\ndownload with: meshmsg download '{}' --output PATH",
-                value["from"].as_str().unwrap_or("peer"),
-                terminal_safe(value["name"].as_str().unwrap_or("attachment")),
-                value["size"].as_u64().unwrap_or(0),
-                value["offer"].as_str().unwrap_or("")
-            ),
-            "download_started" => println!("attachment download started"),
-            "download_progress" => println!(
-                "attachment download: {} / {} bytes",
-                value["received_bytes"].as_u64().unwrap_or(0),
-                value["total_bytes"].as_u64().unwrap_or(0)
-            ),
-            "download_complete" => println!(
-                "downloaded {} bytes to {}",
-                value["size"].as_u64().unwrap_or(0),
-                value["output"].as_str().unwrap_or("")
-            ),
-            "peers_snapshot" => {
-                let self_peer = &value["self"];
-                println!(
-                    "self: {}{} ({})",
-                    self_peer["public_key"].as_str().unwrap_or(""),
-                    self_peer["alias"]
-                        .as_str()
-                        .map(|alias| format!(" ({alias})"))
-                        .unwrap_or_default(),
-                    if self_peer["online"].as_bool() == Some(true) {
-                        "online"
-                    } else {
-                        "offline"
-                    }
-                );
-                for peer in value["peers"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                    println!(
-                        "peer: {}{} ({})",
-                        peer["public_key"].as_str().unwrap_or(""),
-                        peer["alias"]
-                            .as_str()
-                            .map(|alias| format!(" ({alias})"))
-                            .unwrap_or_default(),
-                        if peer["online"].as_bool() == Some(true) {
-                            "online"
-                        } else {
-                            "offline"
-                        }
-                    );
-                }
-            }
-            "peer_discovered" | "peer_updated" | "peer_expired" => {
-                let peer = &value["peer"];
-                let action = value["type"].as_str().unwrap_or("peer");
-                println!(
-                    "{}: {}{}",
-                    action.replace('_', " "),
-                    peer["public_key"].as_str().unwrap_or(""),
-                    peer["alias"]
-                        .as_str()
-                        .map(|alias| format!(" ({alias})"))
-                        .unwrap_or_default()
-                );
-            }
-            "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
-            "stopping" => println!("daemon stopping"),
-            "lagged" => println!(
-                "warning: {}",
-                value["message"].as_str().unwrap_or("receiver lagged")
-            ),
-            _ => println!("{value}"),
+        for blob in &value.blobs {
+            println!(
+                "{}  {}  {}  {}  {}  {}  {}  {} bytes  {}",
+                blob.direction,
+                terminal_safe(blob.name.as_str()),
+                attachment_kind_name(blob.kind),
+                blob.offer_id,
+                blob.provider
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref()
+                    .unwrap_or("-"),
+                terminal_safe(&blob.format),
+                terminal_safe(&blob.status),
+                blob.size
+                    .map(|size| size.to_string())
+                    .as_deref()
+                    .unwrap_or("?"),
+                blob.hash
+            );
         }
     }
+    for warning in offer_listing_warnings(value.truncated, value.item_errors) {
+        println!("{warning}");
+    }
+}
+
+fn print_lifecycle(value: &meshmsg_protocol::LifecycleResult, prune: bool) {
+    if prune {
+        println!(
+            "{} {} attachment pin(s); {} quota bytes released{}",
+            if value.dry_run {
+                "would remove"
+            } else {
+                "removed"
+            },
+            if value.dry_run {
+                value.selected_tags
+            } else {
+                value.removed_tags
+            },
+            value.released_bytes,
+            if value.limited {
+                " (more eligible pins remain)"
+            } else {
+                ""
+            }
+        );
+    } else {
+        println!(
+            "removed {} attachment pin(s); {} quota bytes released",
+            value.removed_tags, value.released_bytes
+        );
+    }
+}
+
+fn print_protocol_error(error: &meshmsg_protocol::ProtocolError) {
+    println!("error: {}", error.message());
+}
+
+fn output_response(json: bool, frame: &meshmsg_protocol::ResponseFrame) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(frame)?);
+        return Ok(());
+    }
+    match &frame.response {
+        meshmsg_protocol::Response::Status(_) => println!("daemon running"),
+        meshmsg_protocol::Response::Queued(value) => println!(
+            "queued locally (delivery not acknowledged): {}",
+            terminal_safe(value.body.as_ref())
+        ),
+        meshmsg_protocol::Response::PrivateAccepted(value) if value.duplicate_accepted => println!(
+            "private message was previously accepted by {} (not redelivered; not durable or read)",
+            value.to
+        ),
+        meshmsg_protocol::Response::PrivateAccepted(value) => println!(
+            "private message accepted by {} (acceptance only; not durable or read)",
+            value.to
+        ),
+        meshmsg_protocol::Response::PeersSnapshot(value) => print_peer_snapshot(value),
+        meshmsg_protocol::Response::Offers(value) => print_offers(value),
+        meshmsg_protocol::Response::AttachmentShared(value) => println!(
+            "shared {} ({} bytes)\noffer: {}\ndelivery acknowledged: no",
+            terminal_safe(value.name.as_str()),
+            value.size,
+            value.offer.as_str()
+        ),
+        meshmsg_protocol::Response::OfferRemoved(value) => print_lifecycle(value, false),
+        meshmsg_protocol::Response::OffersPruned(value) => print_lifecycle(value, true),
+        meshmsg_protocol::Response::DownloadComplete(value) => println!(
+            "downloaded {} bytes to {}",
+            value.size,
+            value.output.display()
+        ),
+        meshmsg_protocol::Response::Stopping { .. } => println!("daemon stopping"),
+        meshmsg_protocol::Response::Error(error) => print_protocol_error(error),
+    }
+    Ok(())
+}
+
+fn output_event(json: bool, frame: &meshmsg_protocol::EventFrame) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(frame)?);
+        return Ok(());
+    }
+    match &frame.event {
+        meshmsg_protocol::Event::Connected(value) => println!("connected as {}", value.peer),
+        meshmsg_protocol::Event::Message(value) => {
+            println!("{}: {}", value.from, terminal_safe(value.body.as_ref()))
+        }
+        meshmsg_protocol::Event::PrivateMessage(value) => println!(
+            "private from {}: {}",
+            value.from,
+            terminal_safe(value.body.as_ref())
+        ),
+        meshmsg_protocol::Event::Queued(value) => println!(
+            "queued locally (delivery not acknowledged): {}",
+            terminal_safe(value.body.as_ref())
+        ),
+        meshmsg_protocol::Event::AttachmentOffer(value) => println!(
+            "{} shared {} ({} bytes)\ndownload with: meshmsg download '{}' --output PATH",
+            value.from,
+            terminal_safe(value.name.as_str()),
+            value.size,
+            value.offer.as_str()
+        ),
+        meshmsg_protocol::Event::AttachmentShared(value) => println!(
+            "shared {} ({} bytes)\noffer: {}\ndelivery acknowledged: no",
+            terminal_safe(value.name.as_str()),
+            value.size,
+            value.offer.as_str()
+        ),
+        meshmsg_protocol::Event::PeersSnapshot(value) => print_peer_snapshot(value),
+        meshmsg_protocol::Event::PeerDiscovered(value) => {
+            print_peer_transition("peer discovered", value)
+        }
+        meshmsg_protocol::Event::PeerUpdated(value) => print_peer_transition("peer updated", value),
+        meshmsg_protocol::Event::PeerExpired(value) => print_peer_transition("peer expired", value),
+        meshmsg_protocol::Event::DownloadStarted { .. } => {
+            println!("attachment download started")
+        }
+        meshmsg_protocol::Event::DownloadProgress {
+            received_bytes,
+            total_bytes,
+            ..
+        } => println!("attachment download: {received_bytes} / {total_bytes} bytes"),
+        meshmsg_protocol::Event::DownloadComplete(value) => println!(
+            "downloaded {} bytes to {}",
+            value.size,
+            value.output.display()
+        ),
+        meshmsg_protocol::Event::Lagged { message, .. } => {
+            println!("warning: {}", terminal_safe(message))
+        }
+        meshmsg_protocol::Event::Stopping {} => println!("daemon stopping"),
+        meshmsg_protocol::Event::Error(error) => print_protocol_error(error),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3216,8 +3241,12 @@ mod tests {
         let removal_fp = operation_fingerprint("offers_remove", &[b"selector"]);
         let (removal_reply, removal_response) = oneshot::channel();
         assert!(partial_cache.admit(removal_id.into(), removal_fp, removal_reply, now));
-        let removal_error =
-            ProtocolErrorAdapter::new("attachment_removal_partial", "private", "partial", true);
+        let removal_error = contracts::ProtocolErrorAdapter::new(
+            "attachment_removal_partial",
+            "private",
+            "partial",
+            true,
+        );
         let removal = partial_cache.complete(
             removal_id,
             meshmsg_protocol::Response::Error(removal_error.typed().unwrap()),
@@ -3274,7 +3303,7 @@ mod tests {
     #[test]
     fn lifecycle_partial_errors_are_compact_across_operation_cache() {
         let operation = "11111111111111111111111111111111";
-        let mut producer = ProtocolErrorAdapter::new(
+        let mut producer = contracts::ProtocolErrorAdapter::new(
             "attachment_removal_partial",
             "private store failure",
             "partial",
@@ -3715,7 +3744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_daemon_interoperates_with_v2_and_rejects_legacy_versions() {
+    async fn local_daemon_interoperates_with_v2_and_rejects_other_protocol_versions() {
         let exercise = |request: Vec<u8>| async move {
             let (mut client, server) = tokio::io::duplex(4096);
             let (commands, mut command_rx) = mpsc::channel(1);
@@ -3763,7 +3792,7 @@ mod tests {
         );
 
         // Decode a frame produced by the real subscription path directly through
-        // the public event DTO, not through an in-crate compatibility shape.
+        // the public typed event frame.
         let (mut client, server) = tokio::io::duplex(4096);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, _) = broadcast::channel(1);
@@ -4601,7 +4630,10 @@ mod tests {
         );
 
         assert_eq!(value["type"], "queued");
-        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["protocol_version"], 2);
+        assert!(contracts::valid_request_id(
+            value["request_id"].as_str().unwrap()
+        ));
         assert_eq!(value["operation_id"], "04040404040404040404040404040404");
         assert_eq!(value["message_id"], "04040404040404040404040404040404");
         assert_eq!(value["from"], "1".repeat(64));
@@ -4611,8 +4643,9 @@ mod tests {
         assert_object_keys(
             &value,
             &[
+                "protocol_version",
+                "request_id",
                 "type",
-                "schema_version",
                 "from",
                 "operation_id",
                 "message_id",
@@ -5086,23 +5119,27 @@ mod tests {
             .await
             .unwrap();
 
-        let (blobs, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+        let (blobs, truncated, item_errors) = list_pinned_blobs(&store).await.unwrap();
         assert_eq!(blobs.len(), MAX_OFFER_LIST_ENTRIES);
-        assert!(has_more);
+        assert!(truncated);
         assert_eq!(item_errors, 1);
         assert_eq!(blobs[0].offer_id.to_string(), format!("{:032x}", 0));
         assert_eq!(
             blobs.last().unwrap().offer_id.to_string(),
             format!("{:032x}", MAX_OFFER_LIST_ENTRIES - 1)
         );
+        let frame = meshmsg_protocol::ResponseFrame::new(
+            Some(meshmsg_protocol::RequestId::new_random()),
+            meshmsg_protocol::Response::Offers(meshmsg_protocol::OffersList {
+                blobs,
+                truncated,
+                item_errors,
+            }),
+        );
+        let encoded = serde_json::to_vec(&frame).unwrap();
         assert!(
-            serde_json::to_vec(&serde_json::json!({
-                "type":"offers", "schema_version":1, "blobs":blobs,
-                "truncated":true, "has_more":true
-            }))
-            .unwrap()
-            .len()
-                <= MAX_IPC_EVENT_SIZE
+            encoded.len() <= MAX_IPC_EVENT_SIZE,
+            "maximum canonical offer-list response exceeds IPC frame"
         );
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
@@ -5210,9 +5247,9 @@ mod tests {
                     .unwrap();
             }
             store.sync_db().await.unwrap();
-            let (listed, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+            let (listed, truncated, item_errors) = list_pinned_blobs(&store).await.unwrap();
             assert!(listed.is_empty());
-            assert!(has_more);
+            assert!(truncated);
             assert_eq!(item_errors, count.min(MAX_OFFER_LIST_SCANNED));
             drop(store);
             let _ = std::fs::remove_dir_all(dir);
@@ -5245,9 +5282,9 @@ mod tests {
             .await
             .unwrap();
         store.sync_db().await.unwrap();
-        let (listed, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+        let (listed, truncated, item_errors) = list_pinned_blobs(&store).await.unwrap();
         assert!(listed.is_empty());
-        assert!(has_more);
+        assert!(truncated);
         assert_eq!(item_errors, 1, "partial blob must be an item error");
         let error = AttachmentStorage::open(
             store.clone(),
@@ -6102,9 +6139,9 @@ mod tests {
             .await
             .unwrap();
         store.sync_db().await.unwrap();
-        let (listed, has_more, item_errors) = list_pinned_blobs(&store).await.unwrap();
+        let (listed, truncated, item_errors) = list_pinned_blobs(&store).await.unwrap();
         assert!(listed.is_empty());
-        assert!(has_more);
+        assert!(truncated);
         assert_eq!(item_errors, 1);
         drop(storage);
         let error = AttachmentStorage::open(store.clone(), root.join("blobs"), &state, 100, 0, 0)
@@ -6597,9 +6634,7 @@ mod tests {
     #[test]
     fn human_offer_warnings_announce_truncation_and_item_errors() {
         assert_eq!(
-            offer_listing_warnings(&serde_json::json!({
-                "type":"offers", "truncated":true, "item_errors":2
-            })),
+            offer_listing_warnings(true, 2),
             vec![
                 "WARNING: attachment listing truncated; more pinned blobs may exist",
                 "WARNING: 2 attachment tag(s) could not be read",
@@ -6624,12 +6659,16 @@ mod tests {
                 .is_ok()
             })
             .unwrap();
-        let value = message_event(unsigned_test_envelope(
-            secret.public(),
-            "\0".repeat(largest_body),
-            timestamp_ms,
-        ));
-        assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_IPC_EVENT_SIZE);
+        let envelope =
+            unsigned_test_envelope(secret.public(), "\0".repeat(largest_body), timestamp_ms);
+        let frame = meshmsg_protocol::EventFrame::new(
+            meshmsg_protocol::RequestId::new_random(),
+            gossip::message_event(&envelope),
+        );
+        assert!(
+            serde_json::to_vec(&frame).unwrap().len() <= MAX_IPC_EVENT_SIZE,
+            "maximum canonical message event exceeds IPC frame"
+        );
     }
 
     #[cfg(unix)]
@@ -6860,7 +6899,7 @@ mod tests {
         let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
         assert_eq!(received["type"], "peer_discovered");
         assert_eq!(received["peer"]["public_key"], "3".repeat(64));
-        assert_eq!(received["schema_version"], 2);
+        assert_eq!(received["protocol_version"], 2);
         assert!(contracts::valid_request_id(
             received["request_id"].as_str().unwrap()
         ));
@@ -7062,19 +7101,17 @@ mod tests {
             "saturated client unexpectedly ran per-client preparation"
         );
         let frame = read_frame(&mut rejected, MAX_IPC_EVENT_SIZE).await.unwrap();
-        let mut rejection: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        let rejection: meshmsg_protocol::ResponseFrame = serde_json::from_slice(&frame).unwrap();
         assert_eq!(
-            rejection["protocol_version"],
-            meshmsg_protocol::PROTOCOL_VERSION
+            rejection.protocol_version,
+            meshmsg_protocol::ProtocolVersion
         );
-        rejection
-            .as_object_mut()
-            .unwrap()
-            .remove("protocol_version");
-        let rejection = ProtocolErrorAdapter::from_value(&rejection).unwrap();
-        assert_eq!(rejection.code, "ipc_capacity");
-        assert_eq!(rejection.outcome, "not_started");
-        assert!(rejection.retryable);
+        let meshmsg_protocol::Response::Error(error) = rejection.response else {
+            panic!("expected capacity error")
+        };
+        assert_eq!(error.code, meshmsg_protocol::ErrorCode::IpcCapacity);
+        assert_eq!(error.outcome, meshmsg_protocol::Outcome::NotStarted);
+        assert!(error.retryable());
         assert!(rejection.request_id.is_none());
         assert_eq!(tasks.len(), LOCAL_IPC_CONNECTION_CAPACITY);
 
@@ -7147,20 +7184,14 @@ mod tests {
         let timeout_frame = read_frame(&mut clients[0], MAX_IPC_EVENT_SIZE)
             .await
             .unwrap();
-        let mut timeout_error =
-            serde_json::from_slice::<serde_json::Value>(&timeout_frame).unwrap();
-        assert_eq!(
-            timeout_error["protocol_version"],
-            meshmsg_protocol::PROTOCOL_VERSION
-        );
-        timeout_error
-            .as_object_mut()
-            .unwrap()
-            .remove("protocol_version");
-        let timeout_error = ProtocolErrorAdapter::from_value(&timeout_error).unwrap();
-        assert_eq!(timeout_error.code, "initial_frame_timeout");
-        assert_eq!(timeout_error.outcome, "not_started");
-        assert!(timeout_error.retryable);
+        let timeout_error: meshmsg_protocol::ResponseFrame =
+            serde_json::from_slice(&timeout_frame).unwrap();
+        let meshmsg_protocol::Response::Error(error) = timeout_error.response else {
+            panic!("expected initial-frame timeout error")
+        };
+        assert_eq!(error.code, meshmsg_protocol::ErrorCode::InitialFrameTimeout);
+        assert_eq!(error.outcome, meshmsg_protocol::Outcome::NotStarted);
+        assert!(error.retryable());
         assert!(timeout_error.request_id.is_none());
 
         let (mut recovered, admitted) = accept_and_admit_test_client(

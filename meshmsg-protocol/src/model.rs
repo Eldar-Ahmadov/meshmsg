@@ -451,7 +451,6 @@ impl std::str::FromStr for AttachmentKind {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ResponseFrame {
     pub protocol_version: ProtocolVersion,
-    pub schema_version: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<RequestId>,
     #[serde(flatten)]
@@ -465,7 +464,6 @@ impl ResponseFrame {
             .expect("invalid protocol response construction");
         Self {
             protocol_version: ProtocolVersion,
-            schema_version: response.schema_version(),
             request_id,
             response,
         }
@@ -495,7 +493,6 @@ pub enum Response {
 #[derive(Deserialize)]
 struct ResponseFrameWire {
     protocol_version: ProtocolVersion,
-    schema_version: u8,
     request_id: Option<RequestId>,
     #[serde(flatten)]
     response: Response,
@@ -507,17 +504,11 @@ impl<'de> Deserialize<'de> for ResponseFrame {
         D: Deserializer<'de>,
     {
         let wire = ResponseFrameWire::deserialize(deserializer)?;
-        if !wire.response.supports_schema(wire.schema_version) {
-            return Err(de::Error::custom(
-                "unsupported response family schema version",
-            ));
-        }
         wire.response.validate().map_err(de::Error::custom)?;
         valid_response_correlation(wire.request_id.as_ref(), &wire.response)
             .map_err(de::Error::custom)?;
         Ok(Self {
             protocol_version: wire.protocol_version,
-            schema_version: wire.schema_version,
             request_id: wire.request_id,
             response: wire.response,
         })
@@ -560,32 +551,6 @@ impl Response {
             Self::Error(value) => value.validate(),
         }
     }
-
-    pub fn schema_version(&self) -> u8 {
-        match self {
-            Self::Status(_) | Self::Offers(_) | Self::Stopping { .. } | Self::Error(_) => 1,
-            Self::Queued(_)
-            | Self::PrivateAccepted(_)
-            | Self::AttachmentShared(_)
-            | Self::OfferRemoved(_)
-            | Self::OffersPruned(_) => 3,
-            Self::PeersSnapshot(_) | Self::DownloadComplete(_) => 2,
-        }
-    }
-
-    fn supports_schema(&self, version: u8) -> bool {
-        match self {
-            Self::Status(_) | Self::Offers(_) | Self::Stopping { .. } | Self::Error(_) => {
-                version == 1
-            }
-            Self::Queued(_)
-            | Self::PrivateAccepted(_)
-            | Self::AttachmentShared(_)
-            | Self::OfferRemoved(_)
-            | Self::OffersPruned(_) => version == 3,
-            Self::PeersSnapshot(_) | Self::DownloadComplete(_) => version == 2,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -609,23 +574,11 @@ impl DaemonFrame {
             Self::Event(frame) => Some(&frame.request_id),
         }
     }
-
-    /// Convert an already admitted frame to its family payload for adapters
-    /// that still render the historical command JSON shape.
-    pub fn into_payload_value(self) -> Result<serde_json::Value, serde_json::Error> {
-        let mut value = serde_json::to_value(self)?;
-        value
-            .as_object_mut()
-            .expect("daemon frames serialize as objects")
-            .remove("protocol_version");
-        Ok(value)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EventFrame {
     pub protocol_version: ProtocolVersion,
-    pub schema_version: u8,
     pub request_id: RequestId,
     #[serde(flatten)]
     pub event: Event,
@@ -638,7 +591,6 @@ impl EventFrame {
             .expect("invalid protocol event construction");
         Self {
             protocol_version: ProtocolVersion,
-            schema_version: event.schema_version(),
             request_id,
             event,
         }
@@ -681,7 +633,6 @@ pub enum Event {
 #[derive(Deserialize)]
 struct EventFrameWire {
     protocol_version: ProtocolVersion,
-    schema_version: u8,
     request_id: RequestId,
     #[serde(flatten)]
     event: Event,
@@ -693,13 +644,9 @@ impl<'de> Deserialize<'de> for EventFrame {
         D: Deserializer<'de>,
     {
         let wire = EventFrameWire::deserialize(deserializer)?;
-        if !wire.event.supports_schema(wire.schema_version) {
-            return Err(de::Error::custom("unsupported event family schema version"));
-        }
         wire.event.validate().map_err(de::Error::custom)?;
         Ok(Self {
             protocol_version: wire.protocol_version,
-            schema_version: wire.schema_version,
             request_id: wire.request_id,
             event: wire.event,
         })
@@ -733,46 +680,6 @@ impl Event {
             }
             Self::Lagged { .. } => Err("invalid lag event"),
             Self::Error(value) => value.validate(),
-        }
-    }
-
-    pub fn schema_version(&self) -> u8 {
-        match self {
-            Self::Connected(_)
-            | Self::PrivateMessage(_)
-            | Self::Lagged { .. }
-            | Self::Stopping {}
-            | Self::Error(_) => 1,
-            Self::Message(_)
-            | Self::AttachmentOffer(_)
-            | Self::PeersSnapshot(_)
-            | Self::PeerDiscovered(_)
-            | Self::PeerUpdated(_)
-            | Self::PeerExpired(_)
-            | Self::DownloadStarted { .. }
-            | Self::DownloadProgress { .. }
-            | Self::DownloadComplete(_) => 2,
-            Self::Queued(_) | Self::AttachmentShared(_) => 3,
-        }
-    }
-
-    fn supports_schema(&self, version: u8) -> bool {
-        match self {
-            Self::Connected(_)
-            | Self::PrivateMessage(_)
-            | Self::Lagged { .. }
-            | Self::Stopping {}
-            | Self::Error(_) => version == 1,
-            Self::Message(_)
-            | Self::AttachmentOffer(_)
-            | Self::PeersSnapshot(_)
-            | Self::PeerDiscovered(_)
-            | Self::PeerUpdated(_)
-            | Self::PeerExpired(_)
-            | Self::DownloadStarted { .. }
-            | Self::DownloadProgress { .. }
-            | Self::DownloadComplete(_) => version == 2,
-            Self::Queued(_) | Self::AttachmentShared(_) => version == 3,
         }
     }
 }
@@ -995,7 +902,6 @@ pub struct OfferListItem {
 pub struct OffersList {
     pub blobs: Vec<OfferListItem>,
     pub truncated: bool,
-    pub has_more: bool,
     pub item_errors: usize,
 }
 
@@ -1206,7 +1112,6 @@ impl OffersList {
     fn validate(&self) -> Result<(), &'static str> {
         if self.blobs.len() > MAX_OFFERS
             || self.item_errors > MAX_OFFER_SCAN
-            || self.has_more && !self.truncated
             || self.item_errors != 0 && !self.truncated
         {
             return Err("invalid offer listing bounds");
@@ -1294,7 +1199,7 @@ pub enum EventSource {
 /// Compact protocol-v2 error payload. Correlation and versioning are carried by
 /// the containing [`ResponseFrame`] or [`EventFrame`]; the flattened wire frame
 /// therefore contains exactly protocol version, request ID, optional operation
-/// ID, typed code, and typed outcome (plus the `type`/schema discriminators).
+/// ID, typed code, and typed outcome (plus the `type` discriminator).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolError {
@@ -1547,7 +1452,6 @@ mod tests {
         let operation_id = OperationId::new_random();
         let frame = ResponseFrame {
             protocol_version: ProtocolVersion,
-            schema_version: 1,
             request_id: Some(request_id.clone()),
             response: Response::Error(ProtocolError::new(
                 Some(operation_id.clone()),
@@ -1557,7 +1461,7 @@ mod tests {
         };
         let value = serde_json::to_value(&frame).unwrap();
         let keys = value.as_object().unwrap();
-        assert_eq!(keys.len(), 7);
+        assert_eq!(keys.len(), 6);
         for forbidden in ["message", "retryable", "selected_tags", "removed_tags"] {
             assert!(!keys.contains_key(forbidden));
         }
@@ -1573,14 +1477,14 @@ mod tests {
     }
 
     #[test]
-    fn response_and_event_families_reject_wrong_schemas_and_unknown_fields() {
+    fn response_and_event_families_reject_schema_versions_and_unknown_fields() {
         let request_id = RequestId::new_random();
         let response = format!(
-            r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request_id}","type":"stopping","outcome":"accepted"}}"#
+            r#"{{"protocol_version":2,"request_id":"{request_id}","type":"stopping","outcome":"accepted"}}"#
         );
         assert!(serde_json::from_str::<ResponseFrame>(&response).is_ok());
         for malformed in [
-            response.replace("\"schema_version\":1", "\"schema_version\":2"),
+            response.replace("\"type\":", "\"schema_version\":1,\"type\":"),
             response.replace(
                 "\"outcome\":\"accepted\"",
                 "\"outcome\":\"accepted\",\"extra\":true",
@@ -1590,12 +1494,12 @@ mod tests {
         }
 
         let event = format!(
-            r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
+            r#"{{"protocol_version":2,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
             "2".repeat(64)
         );
         assert!(serde_json::from_str::<EventFrame>(&event).is_ok());
         for malformed in [
-            event.replace("\"schema_version\":1", "\"schema_version\":2"),
+            event.replace("\"type\":", "\"schema_version\":1,\"type\":"),
             event.replace("\"alias\":null", "\"alias\":null,\"extra\":true"),
         ] {
             assert!(serde_json::from_str::<EventFrame>(&malformed).is_err());
@@ -1645,25 +1549,25 @@ mod tests {
 
         let invalid_responses = [
             format!(
-                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"older_than_secs":null,"maximum":1,"dry_run":false,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false,"cutoff_ms":null}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"older_than_secs":null,"maximum":1,"dry_run":false,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false,"cutoff_ms":null}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","offer_id":null,"direction":null,"provider":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","offer_id":null,"direction":null,"provider":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"has_more":true,"item_errors":0}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
             ),
         ];
         for frame in invalid_responses {
@@ -1675,19 +1579,19 @@ mod tests {
 
         let invalid_events = [
             format!(
-                r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
+                r#"{{"protocol_version":2,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
             ),
         ];
         for frame in invalid_events {

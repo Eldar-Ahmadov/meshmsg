@@ -62,12 +62,20 @@ fn report_failure(error: anyhow::Error, json: bool, daemon: bool) -> ExitCode {
             envelope.request_id = Some(contracts::new_request_id());
             envelope
         });
+        let request_id = envelope
+            .request_id
+            .as_deref()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(meshmsg_protocol::RequestId::new_random);
+        let frame = meshmsg_protocol::ResponseFrame::new(
+            Some(request_id),
+            meshmsg_protocol::Response::Error(
+                envelope.typed().expect("validated CLI protocol error"),
+            ),
+        );
         println!(
             "{}",
-            contracts::present_error(
-                envelope.request_id.as_deref(),
-                &envelope.typed().expect("validated CLI protocol error")
-            )
+            serde_json::to_string(&frame).expect("protocol error serialization")
         );
     } else {
         eprintln!("error: {error:#}");

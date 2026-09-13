@@ -256,11 +256,9 @@ pub(crate) fn validate_attachment_event(
 
 #[cfg(debug_assertions)]
 fn fixture_event_value(event: meshmsg_protocol::Event) -> serde_json::Value {
-    meshmsg_protocol::DaemonFrame::Event(meshmsg_protocol::EventFrame::new(
-        meshmsg_protocol::RequestId::new_random(),
-        event,
+    serde_json::to_value(meshmsg_protocol::DaemonFrame::Event(
+        meshmsg_protocol::EventFrame::new(meshmsg_protocol::RequestId::new_random(), event),
     ))
-    .into_payload_value()
     .expect("attachment fixture serialization")
 }
 

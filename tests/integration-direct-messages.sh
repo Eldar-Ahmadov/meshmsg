@@ -200,7 +200,7 @@ wait_for 30 "invite-pinned private delivery" grep -Fq "\"body\":\"$PINNED\"" "$R
 
 PRIVATE="private-alias-$(date +%s%N)"
 PRIVATE_RESULT=$("$BIN" --state-dir "$ROOT/sender" --json send --to target-node "$PRIVATE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["schema_version"] == 3; assert v["operation_id"] == v["message_id"]; assert v["acceptance_acknowledged"] is True and v["duplicate_accepted"] is False and v["durable"] is False and v["read"] is False; assert v["body_bytes"] == int(sys.argv[1]) and "body" not in v; assert len(v["message_id"]) == 32' "${#PRIVATE}" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["protocol_version"] == 2 and len(v["request_id"]) == 32; assert v["operation_id"] == v["message_id"]; assert v["acceptance_acknowledged"] is True and v["duplicate_accepted"] is False and v["durable"] is False and v["read"] is False; assert v["body_bytes"] == int(sys.argv[1]) and "body" not in v; assert len(v["message_id"]) == 32' "${#PRIVATE}" \
   <<<"$PRIVATE_RESULT" || fail "private alias send did not return the bounded acceptance acknowledgement"
 wait_for 30 "private alias delivery" grep -Fq "\"body\":\"$PRIVATE\"" "$ROOT/receiver.listen.log"
 sleep 1

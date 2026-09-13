@@ -180,7 +180,7 @@ pub(crate) async fn list_pinned_blobs(
     let mut blobs = Vec::new();
     let mut scanned = 0_usize;
     let mut item_errors = 0_usize;
-    let mut has_more = false;
+    let mut truncated = false;
     while scanned < MAX_OFFER_LIST_SCANNED {
         let Some(item) = tags.next().await else { break };
         scanned += 1;
@@ -207,7 +207,7 @@ pub(crate) async fn list_pinned_blobs(
             }
         };
         if blobs.len() == MAX_OFFER_LIST_ENTRIES {
-            has_more = true;
+            truncated = true;
         } else {
             blobs.push(meshmsg_protocol::OfferListItem {
                 direction: parsed.direction.parse()?,
@@ -228,10 +228,10 @@ pub(crate) async fn list_pinned_blobs(
         }
     }
     if scanned == MAX_OFFER_LIST_SCANNED {
-        has_more |= tags.next().await.is_some();
+        truncated |= tags.next().await.is_some();
     }
-    has_more |= item_errors != 0;
-    Ok((blobs, has_more, item_errors))
+    truncated |= item_errors != 0;
+    Ok((blobs, truncated, item_errors))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2162,11 +2162,10 @@ pub(crate) async fn download_attachment(
 
 pub(crate) async fn list_offers_request(store: Store) -> meshmsg_protocol::Response {
     match list_pinned_blobs(&store).await {
-        Ok((blobs, has_more, item_errors)) => {
+        Ok((blobs, truncated, item_errors)) => {
             meshmsg_protocol::Response::Offers(meshmsg_protocol::OffersList {
                 blobs,
-                truncated: has_more || item_errors != 0,
-                has_more,
+                truncated,
                 item_errors,
             })
         }

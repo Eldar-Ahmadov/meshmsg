@@ -1,9 +1,8 @@
 # Stable JSON and IPC contracts
 
-Local IPC uses exactly protocol version 2. JSON payload objects use a numeric
-`schema_version`; version 1 is the common family version. A family may have a
-higher version where its payload evolved (for example `message`/peer-directory v2
-and mutation results v3). Family versions are exact, not minimum versions.
+Local IPC uses exactly protocol version 2. Responses and events are strict tagged
+typed variants inside one canonical frame shape; there are no per-family schema
+versions or compatibility mappings.
 
 ## Correlation and mutation identity
 
@@ -26,7 +25,6 @@ Daemon IPC errors are compact typed frames:
 {
   "protocol_version": 2,
   "type": "error",
-  "schema_version": 1,
   "code": "daemon_offline",
   "outcome": "not_started",
   "request_id": "0123456789abcdef0123456789abcdef"
@@ -64,8 +62,8 @@ Each newline-delimited request is a strict nested envelope:
 The typed command union is: `send`, `private_send`, `subscribe`, `status`,
 `peers`, `offers`, `offers_remove`, `offers_prune`, `share`, `download`, and `stop`. Unknown, missing, duplicate, or wrong-typed envelope or
 command fields are rejected. Unsupported versions and malformed IDs fail closed.
-Responses are dispatched by the exact `(type, schema_version)` pair and then fully
-deserialized into a deny-unknown-fields DTO with semantic and bounded-value checks.
+Responses are dispatched by the exact `type` tag and then fully deserialized into
+a deny-unknown-fields typed variant with semantic and bounded-value checks.
 New broadcast producers accept 1 through 3900 UTF-8 bytes. Private/direct sends
 retain their separate 1 through 4096-byte body contract. EnvelopeV2 and event
 consumers retain the released v0.1.18-compatible 1 through 3928-byte worst-case
@@ -82,7 +80,7 @@ download tokens deliberately do not expire by timestamp, but revalidate the nonz
 signature, configured topic, identity, and complete metadata before any network work.
 Daemon-created message, queued, and attachment events cross the same typed event
 boundary before publication. Subscription frames are decoded directly into the closed
-typed event union; unknown families, unsupported versions, unknown fields, malformed
+typed event union; unknown families, protocol versions, unknown fields, malformed
 IDs, and invalid event semantics fail the read and terminate that subscription. They
 are not repaired into a synthetic error event, skipped, or followed by later frames
 from the same subscription. This applies to every command response and subscription event, including
@@ -100,15 +98,14 @@ CLI-only setup/state-file records are `initialized`, `joined`, `alias`, `invite`
 and `doctor`; they do not cross IPC. The exhaustive
 IPC success/event families are:
 
-- lifecycle: `stopping` v1;
-- state/directory: `status` v1, `connected` v1, `peers_snapshot` v2,
-  and `peer_discovered`/`peer_updated`/`peer_expired` v2;
-- messaging: `queued` v3, `private_accepted` v3, `message` v2,
-  `private_message` v1;
-- attachment: `attachment_offer` v2, `attachment_shared` v3, `offers` v1,
-  `offer_removed`/`offers_pruned` v3, `download_started`/`download_progress`/
-  `download_complete` v2 (all lifecycle/download records carry their operation ID);
-- loss indication: `lagged` v1.
+- lifecycle: `stopping`;
+- state/directory: `status`, `connected`, `peers_snapshot`, and
+  `peer_discovered`/`peer_updated`/`peer_expired`;
+- messaging: `queued`, `private_accepted`, `message`, and `private_message`;
+- attachment: `attachment_offer`, `attachment_shared`, `offers`, `offer_removed`,
+  `offers_pruned`, `download_started`, `download_progress`, and `download_complete`
+  (all lifecycle/download records carry their operation ID);
+- loss indication: `lagged`.
 
 Local filesystem paths are no longer present in status/daemon-started contracts.
 Attachment commands that inherently select a caller-owned input/output path keep it
@@ -135,7 +132,7 @@ record is the authoritative original selected set/result, so a retry cannot cons
 the next batch and `max_delete` bounds one operation. For remove, an exact retry
 replays the original counts rather than recomputing the already-achieved end state.
 For download, replay occurs before the no-clobber check and prevents duplicate
-network/export/install work. `download_complete` v2 includes a domain-separated
+network/export/install work. `download_complete` includes a domain-separated
 SHA-256 digest of the exact submitted token; the shared request-aware validator binds operation ID, token identity, offer ID, provider, kind, name,
 signed declared size when present, and exact output representation. A cached partial-success `download_complete` remains a
 success; callers inspect durability warnings rather than retrying the installed
@@ -145,17 +142,16 @@ without clobbering. Status exposes these bounds and `operation_cache_persistent:
 exercise synthetic expiry and pressure eviction deterministically; integrations
 exercise real response loss and daemon restart, not a ten-minute wall-clock wait.
 
-`offers` v1 contains at most 512 entries. `truncated` and its compatibility alias
-`has_more` must be equal; malformed meshmsg tags, unsupported formats, missing or
+`offers` contains at most 512 entries. `truncated` reports an incomplete bounded result; malformed meshmsg tags, unsupported formats, missing or
 partial blobs, and per-item store failures are omitted, counted, privately diagnosed,
 and force truncation. Producer validation is bounded to 4096 tag records plus one
 presence lookahead, including records after the 512th public item. A list/stream
-failure returns canonical `offers_failed` rather than panicking. Version 1 has no
-cursor, so truncation is a bounded prefix rather than pagination.
+failure returns canonical `offers_failed` rather than panicking. The current variant
+has no cursor, so truncation is a bounded prefix rather than pagination.
 
-Lifecycle-v3 successes and compact partial errors repeat the exact operation ID;
+Lifecycle successes and compact partial errors repeat the exact operation ID;
 remove/prune selectors, effective age, dry-run mode, maximum, and applicable cutoff.
-Remove has no cutoff. The sole schema-1 prune request representation contains
+Remove has no cutoff. The canonical prune request variant contains
 `operation_id`, required `older_than_secs`, nullable `direction`, `dry_run`, and
 `max_delete`; it never contains `cutoff_ms`. Strict deny-unknown-fields decoding
 therefore rejects cutoff-only, age-plus-cutoff, future-cutoff, saturated-cutoff, and
@@ -184,6 +180,5 @@ Attachment operation errors use the same compact boundary and retain exact
 operation-ID correlation. Lifecycle selectors and counts exist only in typed requests
 and lifecycle success variants; they are not repeated in generic errors.
 
-Adding optional fields still requires a new family version because DTOs deny unknown
-fields. A future transport version requires an explicit breaking migration;
-unsupported versions always fail closed.
+Adding or changing fields requires a future protocol-version migration because typed
+variants deny unknown fields. Unsupported protocol versions always fail closed.

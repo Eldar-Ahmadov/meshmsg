@@ -10,8 +10,7 @@ use iroh_gossip::proto::TopicId;
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 
-// The shared protocol crate owns framing bounds. Legacy in-crate DTOs use
-// these aliases until their producers and consumers migrate to protocol v2.
+// The shared protocol crate owns the local framing bounds.
 pub(crate) use contracts::valid_operation_id;
 pub(crate) use meshmsg_protocol::framing::{
     MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT_SIZE, MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE,
@@ -171,8 +170,11 @@ fn decode_response_frame(
 }
 
 #[cfg(test)]
-fn decode_response(frame: &[u8], expected_request_id: &str) -> Result<serde_json::Value> {
-    response_payload(decode_response_frame(frame, &expected_request_id.parse()?)?)
+fn decode_response(
+    frame: &[u8],
+    expected_request_id: &str,
+) -> Result<meshmsg_protocol::ResponseFrame> {
+    decode_response_frame(frame, &expected_request_id.parse()?)
 }
 
 pub(crate) async fn read_frame<S>(stream: &mut S, maximum: usize) -> Result<Vec<u8>>
@@ -231,25 +233,10 @@ pub(crate) fn validate_error_for_request(
     Ok(())
 }
 
-pub(crate) fn response_payload(
-    frame: meshmsg_protocol::ResponseFrame,
-) -> Result<serde_json::Value> {
-    meshmsg_protocol::DaemonFrame::Response(frame)
-        .into_payload_value()
-        .map_err(anyhow::Error::from)
-}
-
-pub(crate) fn event_payload(frame: meshmsg_protocol::EventFrame) -> Result<serde_json::Value> {
-    meshmsg_protocol::DaemonFrame::Event(frame)
-        .into_payload_value()
-        .map_err(anyhow::Error::from)
-}
-
 pub(crate) async fn send_request_checked(
     dir: &Path,
     request: &IpcRequest,
     expected_type: &str,
-    _expected_schema_version: Option<u64>,
 ) -> Result<meshmsg_protocol::ResponseFrame> {
     let frame = send_request(dir, request).await?;
     let matches = matches!(
@@ -384,19 +371,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn response_decoder_rejects_legacy_error_presentation_fields() {
+    fn response_decoder_rejects_error_presentation_fields() {
         let request_id = "0123456789abcdef0123456789abcdef";
-        let legacy = serde_json::json!({
+        let malformed = serde_json::json!({
             "protocol_version": meshmsg_protocol::PROTOCOL_VERSION,
             "request_id": request_id,
             "type": "error",
-            "schema_version": 2,
             "code": "invalid_request",
-            "outcome": "rejected",
-            "message": "legacy",
+            "outcome": "not_started",
+            "message": "not part of IPC",
             "retryable": false
         });
-        assert!(decode_response(&serde_json::to_vec(&legacy).unwrap(), request_id).is_err());
+        assert!(decode_response(&serde_json::to_vec(&malformed).unwrap(), request_id).is_err());
     }
 
     #[test]
@@ -404,7 +390,6 @@ mod tests {
         let request_id = "0123456789abcdef0123456789abcdef";
         let malformed = serde_json::json!({
             "protocol_version": 2,
-            "schema_version": 3,
             "request_id": request_id,
             "type": "queued",
             "operation_id": "11111111111111111111111111111111",
@@ -423,7 +408,6 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(4096);
         let malformed = serde_json::json!({
             "protocol_version": 2,
-            "schema_version": 2,
             "request_id": request_id,
             "type": "download_progress",
             "operation_id": "11111111111111111111111111111111",

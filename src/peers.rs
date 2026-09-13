@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 /// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
 /// locally derived and never extends beyond this bound.
 pub(crate) const PEER_LEASE_MS: u64 = meshmsg_protocol::PEER_LEASE_MS;
-pub(crate) const PEER_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
 pub(crate) const MAX_DYNAMIC_IDENTITIES: usize = meshmsg_protocol::MAX_PEERS;
 
@@ -114,21 +113,20 @@ mod tests {
         }
     }
 
-    fn snapshot_payload(snapshot: meshmsg_protocol::PeerSnapshot) -> serde_json::Value {
-        meshmsg_protocol::DaemonFrame::Response(meshmsg_protocol::ResponseFrame::new(
-            None,
-            meshmsg_protocol::Response::PeersSnapshot(snapshot),
+    fn snapshot_frame_value(snapshot: meshmsg_protocol::PeerSnapshot) -> serde_json::Value {
+        serde_json::to_value(meshmsg_protocol::DaemonFrame::Response(
+            meshmsg_protocol::ResponseFrame::new(
+                Some(meshmsg_protocol::RequestId::new_random()),
+                meshmsg_protocol::Response::PeersSnapshot(snapshot),
+            ),
         ))
-        .into_payload_value()
         .unwrap()
     }
 
-    fn event_payload(event: meshmsg_protocol::Event) -> serde_json::Value {
-        meshmsg_protocol::DaemonFrame::Event(meshmsg_protocol::EventFrame::new(
-            meshmsg_protocol::RequestId::new_random(),
-            event,
+    fn event_frame_value(event: meshmsg_protocol::Event) -> serde_json::Value {
+        serde_json::to_value(meshmsg_protocol::DaemonFrame::Event(
+            meshmsg_protocol::EventFrame::new(meshmsg_protocol::RequestId::new_random(), event),
         ))
-        .into_payload_value()
         .unwrap()
     }
 
@@ -137,7 +135,7 @@ mod tests {
         let a = "a".repeat(64);
         let b = "b".repeat(64);
         let c = "c".repeat(64);
-        let value = snapshot_payload(snapshot_value(
+        let value = snapshot_frame_value(snapshot_value(
             &b,
             Some("local"),
             true,
@@ -151,7 +149,8 @@ mod tests {
             ],
         ));
         assert_eq!(value["type"], "peers_snapshot");
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["protocol_version"], 2);
+        assert!(value["request_id"].as_str().is_some());
         assert_eq!(value["self"]["public_key"], b);
         assert_eq!(value["self"]["alias"], "local");
         assert_eq!(value["self"]["online"], true);
@@ -176,18 +175,21 @@ mod tests {
                 expires_at_ms: 1_000 + PEER_LEASE_MS,
             })
             .collect();
-        let snapshot = snapshot_value(
-            &"f".repeat(64),
-            Some("self"),
-            true,
-            1_000,
-            &"0".repeat(32),
-            0,
-            peers,
+        let frame = meshmsg_protocol::ResponseFrame::new(
+            Some(meshmsg_protocol::RequestId::new_random()),
+            meshmsg_protocol::Response::PeersSnapshot(snapshot_value(
+                &"f".repeat(64),
+                Some("self"),
+                true,
+                1_000,
+                &"0".repeat(32),
+                0,
+                peers,
+            )),
         );
         assert!(
-            serde_json::to_vec(&snapshot).unwrap().len() <= crate::ipc::MAX_IPC_EVENT_SIZE,
-            "maximum complete peer snapshot exceeds IPC frame"
+            serde_json::to_vec(&frame).unwrap().len() <= crate::ipc::MAX_IPC_EVENT_SIZE,
+            "maximum canonical peer snapshot response exceeds IPC frame"
         );
     }
 
@@ -207,7 +209,7 @@ mod tests {
             &"0".repeat(32),
             1,
         );
-        let value = event_payload(value);
+        let value = event_frame_value(value);
         assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_PEER_LIFECYCLE_EVENT_BYTES);
         assert!(value.get("body").is_none());
     }
@@ -222,9 +224,10 @@ mod tests {
             &"0".repeat(32),
             1,
         );
-        let discovered = event_payload(discovered);
+        let discovered = event_frame_value(discovered);
         assert_eq!(discovered["type"], "peer_discovered");
-        assert_eq!(discovered["schema_version"], 2);
+        assert_eq!(discovered["protocol_version"], 2);
+        assert!(discovered["request_id"].as_str().is_some());
         assert_eq!(discovered["directory_revision"], 1);
         assert_eq!(discovered["peer"]["public_key"], "c".repeat(64));
         let encoded = discovered.to_string();

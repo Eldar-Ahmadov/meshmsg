@@ -2,8 +2,6 @@
 use anyhow::{Context, Result};
 use meshmsg_protocol::{ErrorCode, OperationId, Outcome, ProtocolError};
 
-pub(crate) const SCHEMA_VERSION: u8 = 1;
-
 pub(crate) fn new_request_id() -> String {
     meshmsg_protocol::RequestId::new_random().into_string()
 }
@@ -74,50 +72,6 @@ impl ProtocolErrorAdapter {
             self.operation_id.as_deref(),
         )
     }
-    pub(crate) fn validate(&self) -> Result<()> {
-        self.typed()?;
-        if let Some(id) = &self.request_id {
-            anyhow::ensure!(valid_request_id(id), "invalid error request ID");
-        }
-        Ok(())
-    }
-    pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let request_id = value
-            .get("request_id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let operation_id = value
-            .get("operation_id")
-            .and_then(serde_json::Value::as_str);
-        let typed = protocol_error(
-            serde_json::from_value(value.get("code").cloned().context("missing error code")?)?,
-            serde_json::from_value(
-                value
-                    .get("outcome")
-                    .cloned()
-                    .context("missing error outcome")?,
-            )?,
-            operation_id,
-        )?;
-        let result = Self::from_typed(request_id, typed);
-        let allowed = [
-            "protocol_version",
-            "schema_version",
-            "request_id",
-            "type",
-            "operation_id",
-            "code",
-            "outcome",
-        ];
-        anyhow::ensure!(
-            value
-                .as_object()
-                .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str()))),
-            "malformed protocol error"
-        );
-        result.validate()?;
-        Ok(result)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,25 +131,4 @@ pub(crate) fn protocol_error(
         code,
         outcome,
     ))
-}
-
-/// Produce the historical JSON presentation shape for CLI adapters. The
-/// daemon wire boundary removes `message` and `retryable`; those values are
-/// always derived locally from the typed enums.
-pub(crate) fn present_error(request_id: Option<&str>, error: &ProtocolError) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "type": "error",
-        "schema_version": SCHEMA_VERSION,
-        "code": error.code,
-        "message": error.message(),
-        "outcome": error.outcome,
-        "retryable": error.retryable(),
-    });
-    if let Some(request_id) = request_id {
-        value["request_id"] = request_id.into();
-    }
-    if let Some(operation_id) = &error.operation_id {
-        value["operation_id"] = operation_id.to_string().into();
-    }
-    value
 }
