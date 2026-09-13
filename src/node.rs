@@ -45,7 +45,6 @@ use iroh_gossip::{
 use serde_byte_array::ByteArray;
 use std::{
     collections::{HashMap, VecDeque},
-    io::BufRead as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
@@ -77,7 +76,7 @@ use crate::{
         MAX_ENVELOPE_SIZE, MAX_MESSAGE_SIZE as GOSSIP_MAX_MESSAGE_SIZE, MAX_REPLAY_IDS_PER_SENDER,
         MAX_REPLAY_SENDERS_PER_SOURCE, MAX_TRANSPORT_SOURCES, PER_SENDER_REPLAY_BURST,
         PROTOCOL_HEADROOM as GOSSIP_PROTOCOL_HEADROOM, REPLAY_BUCKET_RETENTION,
-        REPLAY_BUCKET_WIDTH, SIGNATURE_LENGTH, TRANSPORT_SOURCE_BURST,
+        REPLAY_BUCKET_WIDTH, SIGNATURE_LENGTH, TRANSPORT_SOURCE_BURST, TRANSPORT_SOURCE_BYTE_BURST,
         TRANSPORT_SOURCE_IDLE_LIFETIME,
     },
     ipc::{
@@ -91,7 +90,12 @@ use std::{collections::BTreeMap, sync::atomic::Ordering};
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
 
-const IPC_EVENT_CAPACITY: usize = 256;
+/// At the maximum broadcast size, the shared subscriber ring retains at most
+/// 4 MiB of broadcast bodies before lagging slow readers.
+const IPC_EVENT_BROADCAST_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+const IPC_EVENT_CAPACITY: usize =
+    IPC_EVENT_BROADCAST_BUDGET_BYTES / meshmsg_protocol::MAX_SIGNED_BROADCAST_ENVELOPE_BYTES;
+const _: () = assert!(IPC_EVENT_CAPACITY > 0);
 /// Bounds all accepted local IPC connections, including long-lived subscriptions
 /// and subscriptions. Connections beyond this limit receive a small rejection and
 /// are closed without creating a handler task.
@@ -931,11 +935,12 @@ async fn write_local_response<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    let frame = meshmsg_protocol::ResponseFrame::try_new(request_id, response)
+        .map_err(anyhow::Error::msg)
+        .context("invalid local IPC response")?;
     write_local_frame(
         stream,
-        &meshmsg_protocol::DaemonFrame::Response(meshmsg_protocol::ResponseFrame::new(
-            request_id, response,
-        )),
+        &meshmsg_protocol::DaemonFrame::Response(frame),
         deadline,
     )
     .await
@@ -950,9 +955,12 @@ async fn write_local_event<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    let frame = meshmsg_protocol::EventFrame::try_new(request_id, event)
+        .map_err(anyhow::Error::msg)
+        .context("invalid local IPC event")?;
     write_local_frame(
         stream,
-        &meshmsg_protocol::DaemonFrame::Event(meshmsg_protocol::EventFrame::new(request_id, event)),
+        &meshmsg_protocol::DaemonFrame::Event(frame),
         deadline,
     )
     .await
@@ -2409,13 +2417,15 @@ pub async fn send_once(
 }
 
 fn caller_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
+    let path = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        Ok(std::env::current_dir()
+        std::env::current_dir()
             .context("read current directory")?
-            .join(path))
-    }
+            .join(path)
+    };
+    meshmsg_protocol::validate_ipc_path(&path).map_err(anyhow::Error::msg)?;
+    Ok(path)
 }
 
 pub async fn share(
@@ -2425,12 +2435,12 @@ pub async fn share(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
+    let path = caller_path(path)?;
     let status = send_request_checked(dir, &IpcRequest::Status, "status").await?;
     let maximum = match &status.response {
         meshmsg_protocol::Response::Status(status) => status.max_attachment_bytes,
         _ => unreachable!("checked response family"),
     };
-    let path = caller_path(path)?;
     let digest_path = path.clone();
     let source_digest =
         tokio::task::spawn_blocking(move || attachment::share_source_digest(&digest_path, maximum))
@@ -2591,14 +2601,15 @@ pub async fn download(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
+    // Retain and validate the exact absolute representation before contacting
+    // the daemon or constructing any typed IPC value.
+    let requested_output = caller_path(output)?;
     let status = send_request_checked(dir, &IpcRequest::Status, "status").await?;
     let status = match &status.response {
         meshmsg_protocol::Response::Status(status) => status,
         _ => unreachable!("checked response family"),
     };
-    // Retain the exact absolute representation submitted to the daemon. Do not
-    // canonicalize through symlinks or require the not-yet-created destination.
-    let requested_output = caller_path(output)?;
+    // Do not canonicalize through symlinks or require the not-yet-created destination.
     let topic_bytes: [u8; 32] = data_encoding::HEXLOWER
         .decode(status.topic.to_string().as_bytes())
         .context("daemon status topic is invalid")?
@@ -2649,10 +2660,37 @@ pub async fn listen(dir: &Path, json: bool) -> Result<()> {
 
 pub async fn chat(dir: &Path, json: bool) -> Result<()> {
     let mut reader = subscribe(dir).await?;
-    let (tx, mut rx) = mpsc::channel::<String>(8);
+    let (tx, mut rx) = mpsc::channel::<std::result::Result<String, &'static str>>(8);
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-            if tx.blocking_send(line).is_err() {
+        let mut input = std::io::stdin().lock();
+        let read_limit = crate::message::MAX_BROADCAST_BODY_BYTES
+            .checked_add(2)
+            .and_then(|value| u64::try_from(value).ok())
+            .expect("broadcast chat input bound is representable");
+        loop {
+            let mut bytes =
+                Vec::with_capacity(crate::message::MAX_BROADCAST_BODY_BYTES.min(8 * 1024));
+            let mut bounded = std::io::Read::take(&mut input, read_limit);
+            let read = std::io::BufRead::read_until(&mut bounded, b'\n', &mut bytes);
+            let value = match read {
+                Ok(0) => break,
+                Err(_) => Err("failed to read chat input"),
+                Ok(_) => {
+                    if bytes.ends_with(b"\n") {
+                        bytes.pop();
+                        if bytes.ends_with(b"\r") {
+                            bytes.pop();
+                        }
+                    }
+                    if bytes.len() > crate::message::MAX_BROADCAST_BODY_BYTES {
+                        Err("chat message exceeds the broadcast UTF-8 byte limit")
+                    } else {
+                        String::from_utf8(bytes).map_err(|_| "chat message is not valid UTF-8")
+                    }
+                }
+            };
+            let failed = value.is_err();
+            if tx.blocking_send(value).is_err() || failed {
                 break;
             }
         }
@@ -2660,10 +2698,10 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
     loop {
         tokio::select! {
             line = rx.recv() => match line {
-                Some(body) => {
-                    // `lines()` removes the terminator, so an empty value is a
-                    // blank input line. Ignore it without allocating an operation
-                    // ID or contacting the daemon.
+                Some(Ok(body)) => {
+                    // The bounded reader removes the terminator, so an empty
+                    // value is a blank input line. Ignore it without allocating
+                    // an operation ID or contacting the daemon.
                     if body.is_empty() {
                         continue;
                     }
@@ -2678,6 +2716,7 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
                     )
                     .await?;
                 }
+                Some(Err(error)) => anyhow::bail!(error),
                 None => break,
             },
             value = reader.read() => match value? {
@@ -3005,12 +3044,27 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn caller_share_path_preserves_the_exact_absolute_representation() {
+    fn caller_share_path_preserves_representation_and_rejects_oversize_before_ipc() {
         let current = std::env::current_dir().unwrap();
         let relative = Path::new("./directory/../file.txt");
         assert_eq!(caller_path(relative).unwrap(), current.join(relative));
         let absolute = current.join("./directory/../file.txt");
         assert_eq!(caller_path(&absolute).unwrap(), absolute);
+
+        let prefix = current.to_str().unwrap();
+        let separator = std::path::MAIN_SEPARATOR;
+        let exact = PathBuf::from(format!(
+            "{prefix}{separator}{}",
+            "x".repeat(meshmsg_protocol::MAX_IPC_PATH_BYTES - prefix.len() - 1)
+        ));
+        let oversized = PathBuf::from(format!("{}x", exact.display()));
+        assert_eq!(
+            exact.as_os_str().as_encoded_bytes().len(),
+            meshmsg_protocol::MAX_IPC_PATH_BYTES
+        );
+        assert!(caller_path(&exact).is_ok());
+        let error = caller_path(&oversized).unwrap_err().to_string();
+        assert!(error.contains("at most 32768 bytes"));
     }
 
     fn connected_fixture() -> meshmsg_protocol::Event {
@@ -3601,7 +3655,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_v2_is_topic_bound_and_replay_and_time_bounded() {
+    fn envelope_v3_is_topic_bound_and_replay_and_time_bounded() {
         let secret = SecretKey::generate();
         let topic = test_topic();
         let other_topic = TopicId::from_bytes([8; 32]);
@@ -3749,7 +3803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_daemon_interoperates_with_v2_and_rejects_other_protocol_versions() {
+    async fn local_daemon_interoperates_with_v3_and_rejects_other_protocol_versions() {
         let exercise = |request: Vec<u8>| async move {
             let (mut client, server) = tokio::io::duplex(4096);
             let (commands, mut command_rx) = mpsc::channel(1);
@@ -3790,7 +3844,7 @@ mod tests {
             meshmsg_protocol::Response::Stopping { .. }
         ));
         let mut unsupported_response = response.clone();
-        unsupported_response["protocol_version"] = 3.into();
+        unsupported_response["protocol_version"] = 2.into();
         assert!(
             serde_json::from_value::<meshmsg_protocol::ResponseFrame>(unsupported_response)
                 .is_err()
@@ -3822,12 +3876,12 @@ mod tests {
             meshmsg_protocol::Event::Connected(_)
         ));
         let mut unsupported_event: serde_json::Value = serde_json::from_slice(&connected).unwrap();
-        unsupported_event["protocol_version"] = 3.into();
+        unsupported_event["protocol_version"] = 2.into();
         assert!(serde_json::from_value::<meshmsg_protocol::EventFrame>(unsupported_event).is_err());
         drop(client);
         subscriber.await.unwrap().unwrap();
 
-        for version in [1, 3] {
+        for version in [1, 2] {
             let request = format!(
                 "{{\"protocol_version\":{version},\"request_id\":\"22222222222222222222222222222222\",\"request\":{{\"command\":\"stop\"}}}}\n"
             )
@@ -4269,7 +4323,7 @@ mod tests {
         let now_ms = 1_700_000_040_000;
         let mut sources = TransportSourceLimiter::default();
         for _ in 0..TRANSPORT_SOURCE_BURST {
-            assert!(sources.allow_verification(source, now_ms));
+            assert!(sources.allow_verification(source, now_ms, 1));
         }
         let global_tokens_before_malformed = sources.admission_global.milli_tokens;
         let mut replay = EnvelopeReplayCache::default();
@@ -4300,20 +4354,38 @@ mod tests {
         let other = SecretKey::generate().public();
         let mut limiter = TransportSourceLimiter::default();
         for _ in 0..TRANSPORT_SOURCE_BURST {
-            assert!(limiter.allow_verification(abusive, now_ms));
+            assert!(limiter.allow_verification(abusive, now_ms, 1));
         }
-        assert!(!limiter.allow_verification(abusive, now_ms));
-        assert!(limiter.allow_verification(other, now_ms));
+        assert!(!limiter.allow_verification(abusive, now_ms, 1));
+        assert!(limiter.allow_verification(other, now_ms, 1));
 
         let mut source_limited = TransportSourceLimiter::default();
         for _ in 0..MAX_TRANSPORT_SOURCES {
-            assert!(source_limited.allow_verification(SecretKey::generate().public(), now_ms));
+            assert!(source_limited.allow_verification(SecretKey::generate().public(), now_ms, 1));
         }
-        assert!(!source_limited.allow_verification(SecretKey::generate().public(), now_ms));
+        assert!(!source_limited.allow_verification(SecretKey::generate().public(), now_ms, 1));
         assert!(source_limited.allow_verification(
             SecretKey::generate().public(),
-            now_ms + TRANSPORT_SOURCE_IDLE_LIFETIME.as_millis() as u64
+            now_ms + TRANSPORT_SOURCE_IDLE_LIFETIME.as_millis() as u64,
+            1,
         ));
+    }
+
+    #[test]
+    fn transport_byte_budget_bounds_maximum_envelopes_and_refills() {
+        let now_ms = 1_700_000_040_000;
+        let source = SecretKey::generate().public();
+        let other = SecretKey::generate().public();
+        let mut limiter = TransportSourceLimiter::default();
+        let frames = TRANSPORT_SOURCE_BYTE_BURST / MAX_ENVELOPE_SIZE as u64;
+        assert_eq!(frames, 128);
+        for _ in 0..frames {
+            assert!(limiter.allow_verification(source, now_ms, MAX_ENVELOPE_SIZE));
+        }
+        assert!(!limiter.allow_verification(source, now_ms, MAX_ENVELOPE_SIZE));
+        assert!(limiter.allow_verification(other, now_ms, MAX_ENVELOPE_SIZE));
+        assert!(limiter.allow_verification(source, now_ms + 16, MAX_ENVELOPE_SIZE));
+        assert!(!limiter.allow_verification(source, now_ms + 16, 0));
     }
 
     #[test]
@@ -4472,44 +4544,69 @@ mod tests {
     }
 
     #[test]
-    fn envelope_boundary_matches_configured_gossip_headroom() {
+    fn envelope_boundary_matches_single_message_transport_headroom() {
         assert_eq!(
             GOSSIP_MAX_MESSAGE_SIZE - MAX_ENVELOPE_SIZE,
             GOSSIP_PROTOCOL_HEADROOM
         );
+        assert_eq!(MAX_ENVELOPE_SIZE, 65_536);
+        assert_eq!(crate::message::MAX_BROADCAST_BODY_BYTES, 65_358);
         let secret = SecretKey::generate();
-        let timestamp_ms = 1_700_000_000_000;
-        let body = "a".repeat(crate::message::MAX_BROADCAST_BODY_BYTES);
-        for timestamp in [timestamp_ms, u64::MAX] {
-            let encoded = Envelope::encode_at(
-                &secret,
-                test_topic(),
-                EnvelopeKind::Message,
-                body.clone(),
-                timestamp,
-            )
-            .unwrap();
-            assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
+        // Every postcard u64 varint-width transition, including both sides of
+        // each boundary, is exercised against every relevant string-length
+        // varint transition and the admitted body maximum.
+        let timestamps = [
+            0,
+            127,
+            128,
+            16_383,
+            16_384,
+            2_097_151,
+            2_097_152,
+            268_435_455,
+            268_435_456,
+            34_359_738_367,
+            34_359_738_368,
+            4_398_046_511_103,
+            4_398_046_511_104,
+            562_949_953_421_311,
+            562_949_953_421_312,
+            72_057_594_037_927_935,
+            72_057_594_037_927_936,
+            9_223_372_036_854_775_807,
+            9_223_372_036_854_775_808,
+            u64::MAX,
+        ];
+        for body_len in [1, 127, 128, 16_383, 16_384, 65_358] {
+            for timestamp in timestamps {
+                let encoded = Envelope::encode_at(
+                    &secret,
+                    test_topic(),
+                    EnvelopeKind::Message,
+                    "a".repeat(body_len),
+                    timestamp,
+                )
+                .unwrap();
+                assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
+                if body_len == crate::message::MAX_BROADCAST_BODY_BYTES && timestamp == u64::MAX {
+                    assert_eq!(encoded.len(), MAX_ENVELOPE_SIZE);
+                }
+            }
         }
-        assert!(Envelope::encode_at(
-            &secret,
-            test_topic(),
-            EnvelopeKind::Message,
-            "a".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1),
-            timestamp_ms,
-        )
-        .is_err());
     }
 
     #[test]
-    fn decode_rejects_oversized_signed_envelope() {
+    fn decode_rejects_exactly_65537_byte_envelope_and_v2() {
         let secret = SecretKey::generate();
-        let timestamp_ms = 1_700_000_000_000;
-        let body = "a".repeat(MAX_ENVELOPE_SIZE);
-        let envelope = unsigned_test_envelope(secret.public(), body, timestamp_ms);
+        let body = "a".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1);
+        let envelope = unsigned_test_envelope(secret.public(), body, u64::MAX);
         let encoded = postcard::to_stdvec(&envelope).unwrap();
-        assert!(encoded.len() > MAX_ENVELOPE_SIZE);
+        assert_eq!(encoded.len(), MAX_ENVELOPE_SIZE + 1);
         assert!(Envelope::decode(&encoded, test_topic()).is_err());
+
+        let mut v2 = unsigned_test_envelope(secret.public(), "v2".to_owned(), 1);
+        v2.version = 2;
+        assert!(Envelope::decode(&postcard::to_stdvec(&v2).unwrap(), test_topic()).is_err());
     }
 
     #[test]
@@ -4539,7 +4636,7 @@ mod tests {
         );
 
         assert_eq!(value["type"], "queued");
-        assert_eq!(value["protocol_version"], 2);
+        assert_eq!(value["protocol_version"], 3);
         assert!(contracts::valid_request_id(
             value["request_id"].as_str().unwrap()
         ));
@@ -6808,7 +6905,7 @@ mod tests {
         let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
         assert_eq!(received["type"], "peer_discovered");
         assert_eq!(received["peer"]["public_key"], "3".repeat(64));
-        assert_eq!(received["protocol_version"], 2);
+        assert_eq!(received["protocol_version"], 3);
         assert!(contracts::valid_request_id(
             received["request_id"].as_str().unwrap()
         ));

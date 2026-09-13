@@ -1,4 +1,4 @@
-//! Small adapter helpers around the strict protocol-v2 boundary.
+//! Small adapter helpers around the strict protocol-v3 boundary.
 use anyhow::{Context, Result};
 use meshmsg_protocol::{ErrorCode, OperationId, Outcome, ProtocolError};
 

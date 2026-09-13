@@ -374,9 +374,13 @@ fn read_stdin(description: &str, limit: usize) -> Result<String> {
 }
 
 fn read_utf8(reader: impl Read, source: &str, limit: usize) -> Result<String> {
+    let read_limit = u64::try_from(limit)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .context("input limit is not representable")?;
     let mut bytes = Vec::with_capacity(limit.min(8192));
     reader
-        .take(limit as u64 + 1)
+        .take(read_limit)
         .read_to_end(&mut bytes)
         .with_context(|| format!("read {source}"))?;
     anyhow::ensure!(

@@ -1,6 +1,6 @@
 # Stable JSON and IPC contracts
 
-Local IPC uses exactly protocol version 2. Responses and events are strict tagged
+Local IPC uses exactly protocol version 3. Responses and events are strict tagged
 typed variants inside one canonical frame shape; there are no per-family schema
 versions or compatibility mappings.
 
@@ -17,13 +17,13 @@ require an operation ID. Downloads require the sole typed mode `install`; the re
 message IDs retain their separate documented operation identity; a download's
 operation ID is not its offer ID.
 
-## Protocol-v2 error boundary
+## Protocol-v3 error boundary
 
 Daemon IPC errors are compact typed frames:
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "type": "error",
   "code": "daemon_offline",
   "outcome": "not_started",
@@ -53,7 +53,7 @@ Each newline-delimited request is a strict nested envelope:
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "request_id": "0123456789abcdef0123456789abcdef",
   "request": { "command": "status" }
 }
@@ -64,10 +64,13 @@ The typed command union is: `send`, `private_send`, `subscribe`, `status`,
 command fields are rejected. Unsupported versions and malformed IDs fail closed.
 Responses are dispatched by the exact `type` tag and then fully deserialized into
 a deny-unknown-fields typed variant with semantic and bounded-value checks.
-Broadcast producers, EnvelopeV2 receivers, and event consumers accept 1 through
-3900 UTF-8 bytes. Private/direct sends retain their separate 1 through 4096-byte
-body contract. The complete 4096-byte envelope bound is still checked before
-decoding. Local rejection occurs
+Broadcast producers, EnvelopeV3 receivers, and event consumers accept 1 through
+65,358 UTF-8 bytes. This single conservative limit subtracts the 178-byte
+worst-case postcard metadata/signature overhead (including maximum-width timestamp
+and body-length varints) from the complete 65,536-byte signed-envelope bound.
+Private/direct sends retain their separate 1 through 4,096-byte body and 6 KiB
+transport-frame contract. The complete 65,536-byte broadcast envelope bound is
+checked before decoding. Local rejection occurs
 before throttle/operation-cache admission, has `code:"invalid_message"` and
 `outcome:"not_started"`, and preserves the operation ID. Invalid signed remote text or attachment semantics are rejected before accepted-traffic
 or replay/rate admission and fanout, while every frame still pays a separate bounded
@@ -90,7 +93,7 @@ when `output` has the exact retained OS-string/byte representation it submitted;
 Path-equivalent dot components, repeated/trailing separators, and other lexical
 rewrites are rejected. Listen/chat therefore never print an unrecognized daemon event.
 Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
-attachment-storage pressure. Clients and the daemon are one protocol-v2 component
+attachment-storage pressure. Clients and the daemon are one protocol-v3 component
 set, so commands are submitted directly without status capability probes.
 
 CLI-only setup/state-file records are `initialized`, `joined`, `alias`, `invite`,
@@ -108,18 +111,27 @@ IPC success/event families are:
 
 Local filesystem paths are no longer present in status/daemon-started contracts.
 Attachment commands that inherently select a caller-owned input/output path keep it
-only on owner-authenticated IPC.
+only on owner-authenticated IPC. Every request, response, and event `PathBuf` must
+be an absolute UTF-8 path whose serialized value is at most 32,768 bytes; one byte
+over fails typed validation. Checked frame derivation sums simultaneous worst-case
+body/token/path input and, for output, body, two tokens, path, warnings, maximum
+peer snapshot, and maximum offer listing before applying sixfold JSON escaping.
+Request frames are capped at 1,129,432 bytes and response/event frames at 5,045,212
+bytes. CLI share/download paths are made absolute without canonicalization and
+validated before daemon contact or typed frame construction; fallible frame
+constructors return bounded-path errors rather than panicking.
 
 ## Compatibility and migration
 
 This is an intentional local-API compatibility boundary. Clients send only strict
-protocol-v2 IPC envelopes and require exact correlated replies. Older clients and
+protocol-v3 IPC envelopes and require exact correlated replies. Older clients and
 daemons are rejected before any payload is consumed. There is no permissive
-downgrade, capability probe, or field defaulting; operators must upgrade and restart
-the CLI and daemon together. The EnvelopeV2 wire shape and ALPN remain
-unchanged, but receive compatibility with v0.1.18 bodies of 3901–3928 bytes
-was intentionally removed. Current broadcasts are uniformly limited to 3900
-bytes.
+downgrade, capability probe, or field defaulting; operators must reinstall and
+restart the CLI and daemon together. Broadcast EnvelopeV3 and
+`/meshmsg/broadcast-gossip/3` are intentional hard breaks: V2 envelopes, signed
+attachment tokens, and Gossip peers are rejected without negotiation or fallback.
+Current broadcasts are uniformly limited to 65,358 UTF-8 bytes inside a 65,536-byte
+envelope.
 
 The shared daemon cache admits at most 1,024 completed plus in-flight operations.
 Matching concurrent requests join one execution. A terminal success, failure, or
@@ -174,7 +186,7 @@ successful non-dry-run removal has equal selected and removed counts; dry-run re
 zero; and an empty selection releases zero bytes. The same request-aware DTO
 validator is used by production, generic IPC dispatch, and CLI consumption;
 caller-side validation accepts one required daemon-authoritative cutoff while
-producer/generic validation binds its exact value. The protocol-v2 lifecycle command is submitted directly and its strict response is
+producer/generic validation binds its exact value. The protocol-v3 lifecycle command is submitted directly and its strict response is
 validated before consumption.
 
 Attachment operation errors use the same compact boundary and retain exact

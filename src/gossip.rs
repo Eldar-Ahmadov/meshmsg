@@ -10,9 +10,9 @@ use std::{
     time::Duration,
 };
 
-pub(crate) const ALPN: &[u8] = b"/meshmsg/broadcast-gossip/2";
+pub(crate) const ALPN: &[u8] = b"/meshmsg/broadcast-gossip/3";
 pub(crate) const ENVELOPE_DOMAIN: &str = "meshmsg-broadcast";
-pub(crate) const ENVELOPE_VERSION: u8 = 2;
+pub(crate) const ENVELOPE_VERSION: u8 = meshmsg_protocol::SIGNED_BROADCAST_ENVELOPE_VERSION;
 pub(crate) const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 pub(crate) const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
 pub(crate) const REPLAY_BUCKET_WIDTH: Duration = Duration::from_secs(60);
@@ -25,6 +25,12 @@ const TRANSPORT_SOURCE_RATE_PER_SEC: u64 = 500;
 pub(crate) const TRANSPORT_SOURCE_BURST: u64 = 1_000;
 const GLOBAL_TRANSPORT_RATE_PER_SEC: u64 = 1_500;
 pub(crate) const GLOBAL_TRANSPORT_BURST: u64 = 3_000;
+/// Byte budgets prevent the 16x larger envelope from turning count-based
+/// verification/admission limits into unbounded bandwidth and fanout work.
+pub(crate) const TRANSPORT_SOURCE_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
+pub(crate) const TRANSPORT_SOURCE_BYTE_BURST: u64 = 8 * 1024 * 1024;
+pub(crate) const GLOBAL_TRANSPORT_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+pub(crate) const GLOBAL_TRANSPORT_BYTE_BURST: u64 = 32 * 1024 * 1024;
 pub(crate) const TRANSPORT_SOURCE_IDLE_LIFETIME: Duration = Duration::from_secs(60);
 pub(crate) const MAX_TRANSPORT_SOURCES: usize = 128;
 pub(crate) const MAX_REPLAY_SENDERS_PER_SOURCE: usize = 256;
@@ -46,8 +52,15 @@ const _: () = assert!(
             + ENVELOPE_FUTURE_SKEW.as_secs()
             + REPLAY_BUCKET_WIDTH.as_secs()
 );
-pub(crate) const MAX_ENVELOPE_SIZE: usize = 4096;
+pub(crate) const MAX_ENVELOPE_SIZE: usize = meshmsg_protocol::MAX_SIGNED_BROADCAST_ENVELOPE_BYTES;
+/// Iroh 0.101's data frame adds a 32-byte topic, 32-byte content hash, enum
+/// discriminants, a payload-length varint, and delivery scope/round. Their
+/// postcard representation is bounded well below this audited 128-byte ceiling.
+const IROH_GOSSIP_0101_DATA_HEADER_BOUND: usize = 128;
+/// Iroh's configured limit includes that postcard protocol header. Keep an
+/// explicit conservative allowance while preserving a full 65,536-byte payload.
 pub(crate) const PROTOCOL_HEADROOM: usize = 512;
+const _: () = assert!(PROTOCOL_HEADROOM >= IROH_GOSSIP_0101_DATA_HEADER_BOUND);
 pub(crate) const MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + PROTOCOL_HEADROOM;
 pub(crate) const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -121,16 +134,29 @@ impl TokenBucket {
     }
 
     pub(crate) fn available(&self) -> bool {
-        self.milli_tokens >= 1_000
+        self.available_amount(1)
+    }
+
+    fn available_amount(&self, amount: u64) -> bool {
+        amount
+            .checked_mul(1_000)
+            .is_some_and(|required| self.milli_tokens >= required)
     }
 
     pub(crate) fn consume(&mut self) {
-        self.milli_tokens -= 1_000;
+        self.consume_amount(1);
+    }
+
+    fn consume_amount(&mut self, amount: u64) {
+        let required = amount.checked_mul(1_000).expect("bounded token amount");
+        debug_assert!(self.milli_tokens >= required);
+        self.milli_tokens -= required;
     }
 }
 
 pub(crate) struct TransportSourceState {
     verification_limiter: TokenBucket,
+    verification_byte_limiter: TokenBucket,
     pub(crate) admission_limiter: TokenBucket,
     last_seen_ms: u64,
 }
@@ -138,6 +164,7 @@ pub(crate) struct TransportSourceState {
 pub(crate) struct TransportSourceLimiter {
     pub(crate) sources: HashMap<PublicKey, TransportSourceState>,
     pub(crate) verification_global: TokenBucket,
+    verification_bytes_global: TokenBucket,
     pub(crate) admission_global: TokenBucket,
 }
 
@@ -148,6 +175,11 @@ impl Default for TransportSourceLimiter {
             verification_global: TokenBucket::new(
                 GLOBAL_TRANSPORT_RATE_PER_SEC,
                 GLOBAL_TRANSPORT_BURST,
+                0,
+            ),
+            verification_bytes_global: TokenBucket::new(
+                GLOBAL_TRANSPORT_BYTES_PER_SEC,
+                GLOBAL_TRANSPORT_BYTE_BURST,
                 0,
             ),
             admission_global: TokenBucket::new(
@@ -176,6 +208,11 @@ impl TransportSourceLimiter {
                         TRANSPORT_SOURCE_BURST,
                         now_ms,
                     ),
+                    verification_byte_limiter: TokenBucket::new(
+                        TRANSPORT_SOURCE_BYTES_PER_SEC,
+                        TRANSPORT_SOURCE_BYTE_BURST,
+                        now_ms,
+                    ),
                     admission_limiter: TokenBucket::new(
                         TRANSPORT_SOURCE_RATE_PER_SEC,
                         TRANSPORT_SOURCE_BURST,
@@ -188,21 +225,39 @@ impl TransportSourceLimiter {
         true
     }
 
-    pub(crate) fn allow_verification(&mut self, source: PublicKey, now_ms: u64) -> bool {
-        if !self.prepare_source(source, now_ms) {
+    pub(crate) fn allow_verification(
+        &mut self,
+        source: PublicKey,
+        now_ms: u64,
+        frame_bytes: usize,
+    ) -> bool {
+        let Ok(frame_bytes) = u64::try_from(frame_bytes) else {
+            return false;
+        };
+        if frame_bytes == 0 || !self.prepare_source(source, now_ms) {
             return false;
         }
         self.verification_global.refill(now_ms);
-        if !self.verification_global.available() {
+        self.verification_bytes_global.refill(now_ms);
+        if !self.verification_global.available()
+            || !self.verification_bytes_global.available_amount(frame_bytes)
+        {
             return false;
         }
         let state = self.sources.get_mut(&source).expect("source was inserted");
         state.verification_limiter.refill(now_ms);
-        if !state.verification_limiter.available() {
+        state.verification_byte_limiter.refill(now_ms);
+        if !state.verification_limiter.available()
+            || !state
+                .verification_byte_limiter
+                .available_amount(frame_bytes)
+        {
             return false;
         }
         self.verification_global.consume();
+        self.verification_bytes_global.consume_amount(frame_bytes);
         state.verification_limiter.consume();
+        state.verification_byte_limiter.consume_amount(frame_bytes);
         state.last_seen_ms = now_ms;
         true
     }
@@ -595,32 +650,18 @@ where
             // Bound work by the authenticated transport hop, not the signed
             // identity, which an invite holder can rotate cheaply.
             let source = message.delivered_from;
-            if !sources.allow_verification(source, now_ms) {
+            if !sources.allow_verification(source, now_ms, message.content.len()) {
                 return Vec::new();
             }
-            // Complete wire and kind-specific semantics precede freshness,
-            // replay, and accepted-traffic accounting. Rejected frames pay
-            // only the separate verification-attempt budget.
-            let accepted = Envelope::decode(&message.content, topic).and_then(|envelope| {
-                let event = match envelope.kind {
-                    EnvelopeKind::Message => message_event(&envelope),
-                    EnvelopeKind::AttachmentOffer => attachment_event(AttachmentEnvelope {
-                        from: envelope.from,
-                        message_id: envelope.message_id,
-                        timestamp_ms: envelope.timestamp_ms,
-                        body: &envelope.body,
-                        encoded: &message.content,
-                    })?,
-                };
-                anyhow::ensure!(
-                    sources.admission_available(source, now_ms),
-                    "broadcast transport source rate limit exceeded"
-                );
-                replay.accept(&envelope, source, now_ms)?;
-                sources.consume_admission(source, now_ms);
-                Ok(event)
-            });
-            accepted.map_or_else(|_| Vec::new(), |event| vec![event])
+            process_received(
+                source,
+                &message.content,
+                topic,
+                replay,
+                sources,
+                now_ms,
+                attachment_event,
+            )
         }
         Event::NeighborUp(_) | Event::NeighborDown(_) => Vec::new(),
         Event::Lagged => vec![meshmsg_protocol::Event::Lagged {
@@ -629,6 +670,42 @@ where
             message: "receiver fell behind; one or more events were dropped".into(),
         }],
     }
+}
+
+fn process_received<F>(
+    source: PublicKey,
+    content: &[u8],
+    topic: TopicId,
+    replay: &mut EnvelopeReplayCache,
+    sources: &mut TransportSourceLimiter,
+    now_ms: u64,
+    attachment_event: F,
+) -> Vec<meshmsg_protocol::Event>
+where
+    F: FnOnce(AttachmentEnvelope<'_>) -> Result<meshmsg_protocol::Event>,
+{
+    // Complete signature and kind-specific semantics precede freshness, replay,
+    // accepted-traffic accounting, and subscriber fanout.
+    let accepted = Envelope::decode(content, topic).and_then(|envelope| {
+        let event = match envelope.kind {
+            EnvelopeKind::Message => message_event(&envelope),
+            EnvelopeKind::AttachmentOffer => attachment_event(AttachmentEnvelope {
+                from: envelope.from,
+                message_id: envelope.message_id,
+                timestamp_ms: envelope.timestamp_ms,
+                body: &envelope.body,
+                encoded: content,
+            })?,
+        };
+        anyhow::ensure!(
+            sources.admission_available(source, now_ms),
+            "broadcast transport source rate limit exceeded"
+        );
+        replay.accept(&envelope, source, now_ms)?;
+        sources.consume_admission(source, now_ms);
+        Ok(event)
+    });
+    accepted.map_or_else(|_| Vec::new(), |event| vec![event])
 }
 
 pub(crate) fn queued_event(
@@ -672,8 +749,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn broadcast_v2_uses_an_explicit_protocol_with_bounded_headroom() {
+    fn broadcast_v3_uses_one_bounded_envelope_with_fixed_protocol_headroom() {
         assert_ne!(ALPN, iroh_gossip::net::GOSSIP_ALPN);
-        assert_eq!(MAX_MESSAGE_SIZE - MAX_ENVELOPE_SIZE, PROTOCOL_HEADROOM);
+        assert_eq!(MAX_ENVELOPE_SIZE, 65_536);
+        assert_eq!(IROH_GOSSIP_0101_DATA_HEADER_BOUND, 128);
+        assert_eq!(PROTOCOL_HEADROOM, 512);
+        assert_eq!(MAX_MESSAGE_SIZE, 66_048);
     }
 }

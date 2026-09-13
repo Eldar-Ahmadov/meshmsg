@@ -129,7 +129,7 @@ def main():
                 "directory_revision", "self", "peers", "request_id"
             }, value
             assert value["type"] == "peers_snapshot"
-            assert value["protocol_version"] == 2
+            assert value["protocol_version"] == 3
             assert len(value["request_id"]) == 32
             assert isinstance(value["generated_at_ms"], int)
             assert len(value["directory_epoch"]) == 32
@@ -153,7 +153,7 @@ def main():
 
         def validate_event(value, kind, alias):
             assert set(value) == EVENT_KEYS, value
-            assert value["type"] == kind and value["protocol_version"] == 2
+            assert value["type"] == kind and value["protocol_version"] == 3
             assert len(value["request_id"]) == 32
             assert len(value["directory_epoch"]) == 32
             assert isinstance(value["directory_revision"], int)

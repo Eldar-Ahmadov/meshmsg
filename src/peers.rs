@@ -149,7 +149,7 @@ mod tests {
             ],
         ));
         assert_eq!(value["type"], "peers_snapshot");
-        assert_eq!(value["protocol_version"], 2);
+        assert_eq!(value["protocol_version"], 3);
         assert!(value["request_id"].as_str().is_some());
         assert_eq!(value["self"]["public_key"], b);
         assert_eq!(value["self"]["alias"], "local");
@@ -226,7 +226,7 @@ mod tests {
         );
         let discovered = event_frame_value(discovered);
         assert_eq!(discovered["type"], "peer_discovered");
-        assert_eq!(discovered["protocol_version"], 2);
+        assert_eq!(discovered["protocol_version"], 3);
         assert!(discovered["request_id"].as_str().is_some());
         assert_eq!(discovered["directory_revision"], 1);
         assert_eq!(discovered["peer"]["public_key"], "c".repeat(64));

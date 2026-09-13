@@ -10,6 +10,8 @@ pub const MAX_OFFER_SCAN: usize = 4096;
 pub const MAX_LIFECYCLE_ITEMS: usize = 512;
 pub const MAX_WARNINGS: usize = 32;
 pub const MAX_PUBLIC_TEXT_BYTES: usize = 1024;
+/// Maximum UTF-8 serialization length of every local IPC path on every target.
+pub const MAX_IPC_PATH_BYTES: usize = 32 * 1024;
 
 /// A marker that serializes as the one supported protocol version and rejects
 /// every other value while deserializing.
@@ -55,15 +57,17 @@ pub struct RequestFrame {
 }
 
 impl RequestFrame {
-    pub fn new(request_id: RequestId, request: Request) -> Self {
-        request
-            .validate()
-            .expect("invalid protocol request construction");
-        Self {
+    pub fn try_new(request_id: RequestId, request: Request) -> Result<Self, &'static str> {
+        request.validate()?;
+        Ok(Self {
             protocol_version: ProtocolVersion,
             request_id,
             request,
-        }
+        })
+    }
+
+    pub fn new(request_id: RequestId, request: Request) -> Self {
+        Self::try_new(request_id, request).expect("invalid protocol request construction")
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -297,10 +301,20 @@ macro_rules! message_body {
     };
 }
 
-message_body!(BroadcastBody, 3900, "broadcast message body");
+message_body!(
+    BroadcastBody,
+    crate::MAX_BROADCAST_BODY_BYTES,
+    "broadcast message body"
+);
+// Private/direct traffic deliberately retains its independent 4096-byte body
+// and 6 KiB transport-frame contract.
 message_body!(PrivateBody, 4096, "private message body");
 message_body!(MessageBody, 4096, "message body");
-bounded_text!(AttachmentToken, 16_384, "attachment token");
+bounded_text!(
+    AttachmentToken,
+    crate::MAX_SIGNED_ATTACHMENT_TOKEN_BYTES,
+    "attachment token"
+);
 bounded_text!(Alias, 63, "alias");
 bounded_text!(Recipient, 64, "private message recipient");
 
@@ -458,15 +472,21 @@ pub struct ResponseFrame {
 }
 
 impl ResponseFrame {
-    pub fn new(request_id: Option<RequestId>, response: Response) -> Self {
-        response
-            .validate()
-            .expect("invalid protocol response construction");
-        Self {
+    pub fn try_new(
+        request_id: Option<RequestId>,
+        response: Response,
+    ) -> Result<Self, &'static str> {
+        response.validate()?;
+        valid_response_correlation(request_id.as_ref(), &response)?;
+        Ok(Self {
             protocol_version: ProtocolVersion,
             request_id,
             response,
-        }
+        })
+    }
+
+    pub fn new(request_id: Option<RequestId>, response: Response) -> Self {
+        Self::try_new(request_id, response).expect("invalid protocol response construction")
     }
 }
 
@@ -585,15 +605,17 @@ pub struct EventFrame {
 }
 
 impl EventFrame {
-    pub fn new(request_id: RequestId, event: Event) -> Self {
-        event
-            .validate()
-            .expect("invalid protocol event construction");
-        Self {
+    pub fn try_new(request_id: RequestId, event: Event) -> Result<Self, &'static str> {
+        event.validate()?;
+        Ok(Self {
             protocol_version: ProtocolVersion,
             request_id,
             event,
-        }
+        })
+    }
+
+    pub fn new(request_id: RequestId, event: Event) -> Self {
+        Self::try_new(request_id, event).expect("invalid protocol event construction")
     }
 }
 
@@ -976,8 +998,17 @@ fn valid_public_text(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
+pub fn validate_ipc_path(path: &std::path::Path) -> Result<(), &'static str> {
+    (path.is_absolute()
+        && path
+            .to_str()
+            .is_some_and(|value| !value.is_empty() && value.len() <= MAX_IPC_PATH_BYTES))
+    .then_some(())
+    .ok_or("IPC path must be absolute UTF-8 and at most 32768 bytes")
+}
+
 fn safe_ipc_path(path: &std::path::Path) -> bool {
-    path.is_absolute() && !path.as_os_str().is_empty()
+    validate_ipc_path(path).is_ok()
 }
 
 impl Message {
@@ -1196,7 +1227,7 @@ pub enum EventSource {
     Gossip,
 }
 
-/// Compact protocol-v2 error payload. Correlation and versioning are carried by
+/// Compact protocol-v3 error payload. Correlation and versioning are carried by
 /// the containing [`ResponseFrame`] or [`EventFrame`]; the flattened wire frame
 /// therefore contains exactly protocol version, request ID, optional operation
 /// ID, typed code, and typed outcome (plus the `type` discriminator).
@@ -1431,19 +1462,97 @@ impl fmt::Display for ErrorCode {
 mod tests {
     use super::*;
 
+    fn native_absolute_ascii_path(serialized_bytes: usize) -> PathBuf {
+        let prefix = if cfg!(windows) { r"C:\" } else { "/" };
+        assert!(serialized_bytes >= prefix.len());
+        PathBuf::from(format!(
+            "{prefix}{}",
+            "x".repeat(serialized_bytes - prefix.len())
+        ))
+    }
+
     #[test]
     fn unknown_versions_and_fields_fail_closed() {
         let id = RequestId::new_random();
-        for version in [1, 3, 255] {
+        for version in [1, 2, 255] {
             let wrong = format!(
                 r#"{{"protocol_version":{version},"request_id":"{id}","request":{{"command":"status"}}}}"#
             );
             assert!(serde_json::from_str::<RequestFrame>(&wrong).is_err());
         }
         let extra = format!(
-            r#"{{"protocol_version":2,"request_id":"{id}","request":{{"command":"status"}},"extra":true}}"#
+            r#"{{"protocol_version":3,"request_id":"{id}","request":{{"command":"status"}},"extra":true}}"#
         );
         assert!(serde_json::from_str::<RequestFrame>(&extra).is_err());
+    }
+
+    #[test]
+    fn every_ipc_path_rejects_exactly_one_byte_over_the_cross_platform_limit() {
+        let exact = native_absolute_ascii_path(MAX_IPC_PATH_BYTES);
+        let oversized = native_absolute_ascii_path(MAX_IPC_PATH_BYTES + 1);
+        assert_eq!(
+            exact.as_os_str().as_encoded_bytes().len(),
+            MAX_IPC_PATH_BYTES
+        );
+        assert_eq!(
+            oversized.as_os_str().as_encoded_bytes().len(),
+            MAX_IPC_PATH_BYTES + 1
+        );
+        let operation_id = OperationId::new_random();
+        let digest: ContentDigest = "a".repeat(64).parse().unwrap();
+        assert!(Request::Share {
+            operation_id: operation_id.clone(),
+            source_digest: digest.clone(),
+            path: exact.clone(),
+        }
+        .validate()
+        .is_ok());
+        assert!(Request::Share {
+            operation_id: operation_id.clone(),
+            source_digest: digest,
+            path: oversized.clone(),
+        }
+        .validate()
+        .is_err());
+        assert!(Request::Download {
+            operation_id,
+            offer: "x".into(),
+            output: oversized.clone(),
+            mode: DownloadMode::Install,
+        }
+        .validate()
+        .is_err());
+        assert!(Event::DownloadStarted {
+            operation_id: OperationId::new_random(),
+            output: oversized.clone(),
+        }
+        .validate()
+        .is_err());
+        assert!(Event::DownloadProgress {
+            operation_id: OperationId::new_random(),
+            received_bytes: 0,
+            total_bytes: 0,
+            output: oversized.clone(),
+        }
+        .validate()
+        .is_err());
+        let completion = DownloadResult {
+            operation_id: OperationId::new_random(),
+            token_digest: "b".repeat(64).parse().unwrap(),
+            offer_id: OfferId::new_random(),
+            kind: AttachmentKind::File,
+            name: AttachmentName::new("x").unwrap(),
+            size: 0,
+            from: "1".repeat(64).parse().unwrap(),
+            output: oversized,
+            mode: DownloadMode::Install,
+            installed: true,
+            pinned: true,
+            destination_synced: true,
+            cleanup_complete: true,
+            warnings: Vec::new(),
+        };
+        assert!(completion.validate().is_err());
     }
 
     #[test]
@@ -1480,7 +1589,7 @@ mod tests {
     fn response_and_event_families_reject_schema_versions_and_unknown_fields() {
         let request_id = RequestId::new_random();
         let response = format!(
-            r#"{{"protocol_version":2,"request_id":"{request_id}","type":"stopping","outcome":"accepted"}}"#
+            r#"{{"protocol_version":3,"request_id":"{request_id}","type":"stopping","outcome":"accepted"}}"#
         );
         assert!(serde_json::from_str::<ResponseFrame>(&response).is_ok());
         for malformed in [
@@ -1494,7 +1603,7 @@ mod tests {
         }
 
         let event = format!(
-            r#"{{"protocol_version":2,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
+            r#"{{"protocol_version":3,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
             "2".repeat(64)
         );
         assert!(serde_json::from_str::<EventFrame>(&event).is_ok());
@@ -1542,7 +1651,7 @@ mod tests {
         let message_id = MessageId::new_random();
         let decode_event = |kind: &str, body: &str, private_fields: &str| {
             serde_json::from_str::<EventFrame>(&format!(
-                r#"{{"protocol_version":2,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
+                r#"{{"protocol_version":3,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
             ))
         };
         assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES), "").is_ok());
@@ -1568,25 +1677,25 @@ mod tests {
 
         let invalid_responses = [
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"older_than_secs":null,"maximum":1,"dry_run":false,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false,"cutoff_ms":null}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"older_than_secs":null,"maximum":1,"dry_run":false,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false,"cutoff_ms":null}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","offer_id":null,"direction":null,"provider":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","offer_id":null,"direction":null,"provider":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
             ),
         ];
         for frame in invalid_responses {
@@ -1598,19 +1707,19 @@ mod tests {
 
         let invalid_events = [
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
             ),
             format!(
-                r#"{{"protocol_version":2,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
+                r#"{{"protocol_version":3,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
             ),
         ];
         for frame in invalid_events {

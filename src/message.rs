@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-/// Conservative limit for newly produced broadcast text. It leaves deterministic
-/// headroom for EnvelopeV2 metadata and signatures inside the 4096-byte frame.
-pub(crate) const MAX_BROADCAST_BODY_BYTES: usize = 3900;
+/// Conservative limit shared by every broadcast producer/consumer. The value
+/// is derived from the complete worst-case signed V3 postcard envelope.
+pub(crate) const MAX_BROADCAST_BODY_BYTES: usize = meshmsg_protocol::MAX_BROADCAST_BODY_BYTES;
 /// Direct/private messages use a separate bounded transport and retain their
 /// 4096-byte body contract.
 pub(crate) const MAX_PRIVATE_BODY_BYTES: usize = 4096;

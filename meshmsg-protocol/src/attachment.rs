@@ -8,10 +8,10 @@ use serde_byte_array::ByteArray;
 use std::{fmt, str::FromStr};
 
 const ENVELOPE_DOMAIN: &str = "meshmsg-broadcast";
-const ENVELOPE_VERSION: u8 = 2;
+const ENVELOPE_VERSION: u8 = crate::SIGNED_BROADCAST_ENVELOPE_VERSION;
 const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 const ATTACHMENT_OFFER_VERSION: u8 = 1;
-const MAX_ENVELOPE_SIZE: usize = 4096;
+const MAX_ENVELOPE_SIZE: usize = crate::MAX_SIGNED_BROADCAST_ENVELOPE_BYTES;
 pub const ENVELOPE_FUTURE_SKEW_MS: u64 = 60_000;
 pub const ENVELOPE_ACCEPTANCE_WINDOW_MS: u64 = 5 * 60_000;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
@@ -308,5 +308,30 @@ mod tests {
         let mut malformed = fixture(7, now);
         malformed.ticket = AttachmentToken::new("not-a-ticket").unwrap();
         assert!(validate_attachment_event(malformed.event(), &malformed.topic, now).is_err());
+
+        let mut v2 = fixture(7, now);
+        let decoded = BASE64URL_NOPAD
+            .decode(v2.token.as_str().as_bytes())
+            .unwrap();
+        let (mut envelope, remainder): (Envelope, &[u8]) =
+            postcard::take_from_bytes(&decoded).unwrap();
+        assert!(remainder.is_empty());
+        envelope.version = 2;
+        v2.token =
+            AttachmentToken::new(BASE64URL_NOPAD.encode(&postcard::to_stdvec(&envelope).unwrap()))
+                .unwrap();
+        assert!(validate_attachment_event(v2.event(), &v2.topic, now).is_err());
+    }
+
+    #[test]
+    fn signed_token_outer_bound_matches_64_kib_envelope() {
+        assert_eq!(MAX_ENVELOPE_SIZE, 65_536);
+        assert_eq!(AttachmentToken::MAX_BYTES, 87_382);
+        let exact = BASE64URL_NOPAD.encode(&vec![0; MAX_ENVELOPE_SIZE]);
+        assert_eq!(exact.len(), AttachmentToken::MAX_BYTES);
+        assert!(AttachmentToken::new(exact).is_ok());
+        let oversized = BASE64URL_NOPAD.encode(&vec![0; MAX_ENVELOPE_SIZE + 1]);
+        assert_eq!(oversized.len(), AttachmentToken::MAX_BYTES + 1);
+        assert!(AttachmentToken::new(oversized).is_err());
     }
 }

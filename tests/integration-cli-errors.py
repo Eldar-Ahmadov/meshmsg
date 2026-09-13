@@ -36,13 +36,13 @@ def run_case(command, response, expected_code="command_failed",
                     connection, _ = listener.accept()
                     with connection:
                         request = json.loads(connection.makefile("rb").readline())
-                        assert request["protocol_version"] == 2
+                        assert request["protocol_version"] == 3
                         assert len(request["request_id"]) == 32
                         assert "command" in request["request"]
                         reply = dict(response(request) if callable(response) else response)
                         if reply.pop("_correlate", True):
                             reply["request_id"] = request["request_id"]
-                        reply.setdefault("protocol_version", 2)
+                        reply.setdefault("protocol_version", 3)
                         connection.sendall(json.dumps(reply).encode() + b"\n")
             except BaseException as error:
                 failure.append(error)
@@ -62,7 +62,7 @@ def run_case(command, response, expected_code="command_failed",
         lines = child.stdout.splitlines()
         assert len(lines) == 1, (command, child.stdout)
         error = json.loads(lines[0])
-        assert error["protocol_version"] == 2 and error["type"] == "error"
+        assert error["protocol_version"] == 3 and error["type"] == "error"
         assert error["code"] == expected_code
         assert error["outcome"] == expected_outcome
         assert "schema_version" not in error
@@ -230,8 +230,8 @@ with tempfile.TemporaryDirectory(prefix="meshmsg-cli-offline-") as temporary:
     )
     assert child.returncode == 1 and child.stderr == ""
     error = json.loads(child.stdout)
-    assert error["protocol_version"] == 2 and len(error["request_id"]) == 32
+    assert error["protocol_version"] == 3 and len(error["request_id"]) == 32
     assert error["code"] == "daemon_offline" and error["outcome"] == "not_started"
     assert "message" not in error and "retryable" not in error
 
-print("PASS: CLI JSON failures are one canonical protocol-v2 stdout frame")
+print("PASS: CLI JSON failures are one canonical protocol-v3 stdout frame")

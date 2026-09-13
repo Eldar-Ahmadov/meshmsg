@@ -49,7 +49,8 @@ bash tests/run-linux-integrations.sh target/debug/meshmsg
 
 The driver requires `target/debug/meshmsg` and substitutes its `{BIN}` inventory
 placeholder. The five-peer test retains equal-peer messaging, selective endpoint
-advertising, restart/failover/rejoin, and owner-only IPC hardening coverage. The
+advertising, restart/failover/rejoin, owner-only IPC hardening, and exact V3
+65,358/65,359-byte positional/file/stdin/chat plus subscription-boundary coverage. The
 inventory also includes CLI errors, peer directory, attachments, direct messages,
 idempotency, and a generated-archive/mock-download installer test. The current
 per-command budgets total 3,620 seconds (60 minutes 20 seconds).

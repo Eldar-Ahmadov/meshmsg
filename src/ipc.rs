@@ -293,7 +293,9 @@ pub(crate) async fn write_request_with_id<S: AsyncWrite + Unpin>(
         contracts::valid_request_id(request_id),
         "invalid local IPC request ID"
     );
-    let frame = IpcRequestFrame::new(request_id.parse()?, request.clone());
+    let frame = IpcRequestFrame::try_new(request_id.parse()?, request.clone())
+        .map_err(anyhow::Error::msg)
+        .context("invalid local IPC request")?;
     meshmsg_protocol::write_json(stream, &frame, meshmsg_protocol::FrameLimit::Request)
         .await
         .map_err(anyhow::Error::from)
@@ -325,18 +327,26 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
     /// Reads one event while retaining any bytes consumed if this future is
     /// cancelled by a competing `select!` branch.
     pub(crate) async fn read(&mut self) -> Result<Option<meshmsg_protocol::EventFrame>> {
-        let limit = MAX_IPC_EVENT_SIZE + 2;
+        let limit = MAX_IPC_EVENT_SIZE
+            .checked_add(2)
+            .context("IPC event read limit overflow")?;
         anyhow::ensure!(self.frame.len() < limit, "daemon event is too large");
-        let remaining = limit - self.frame.len();
+        let remaining = limit
+            .checked_sub(self.frame.len())
+            .context("IPC event read bound underflow")?;
+        let read_limit = u64::try_from(remaining).context("IPC event read limit is too large")?;
         let read = (&mut self.reader)
-            .take(remaining as u64)
+            .take(read_limit)
             .read_until(b'\n', &mut self.frame)
             .await?;
         if read == 0 && self.frame.is_empty() {
             return Ok(None);
         }
         anyhow::ensure!(
-            self.frame.len() <= MAX_IPC_EVENT_SIZE + 1,
+            self.frame.len()
+                <= MAX_IPC_EVENT_SIZE
+                    .checked_add(1)
+                    .context("IPC event delimiter bound overflow")?,
             "daemon event is too large"
         );
         anyhow::ensure!(self.frame.ends_with(b"\n"), "incomplete daemon event");
@@ -370,6 +380,35 @@ pub(crate) async fn subscribe_with_id(
 mod tests {
     use super::*;
 
+    fn native_absolute_ascii_path(serialized_bytes: usize) -> std::path::PathBuf {
+        let prefix = if cfg!(windows) { r"C:\" } else { "/" };
+        assert!(serialized_bytes >= prefix.len());
+        std::path::PathBuf::from(format!(
+            "{prefix}{}",
+            "x".repeat(serialized_bytes - prefix.len())
+        ))
+    }
+
+    #[tokio::test]
+    async fn oversized_caller_path_returns_error_before_frame_construction() {
+        let output = native_absolute_ascii_path(meshmsg_protocol::MAX_IPC_PATH_BYTES + 1);
+        assert!(output.is_absolute());
+        assert_eq!(
+            output.as_os_str().as_encoded_bytes().len(),
+            meshmsg_protocol::MAX_IPC_PATH_BYTES + 1
+        );
+        let request = IpcRequest::Download {
+            operation_id: meshmsg_protocol::OperationId::new_random(),
+            offer: "x".into(),
+            output,
+            mode: meshmsg_protocol::DownloadMode::Install,
+        };
+        let mut bytes = Vec::new();
+        let error = write_request(&mut bytes, &request).await.unwrap_err();
+        assert!(error.to_string().contains("invalid local IPC request"));
+        assert!(bytes.is_empty());
+    }
+
     #[test]
     fn response_decoder_rejects_error_presentation_fields() {
         let request_id = "0123456789abcdef0123456789abcdef";
@@ -389,7 +428,7 @@ mod tests {
     fn response_decoder_rejects_structurally_valid_semantic_forgery() {
         let request_id = "0123456789abcdef0123456789abcdef";
         let malformed = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": 3,
             "request_id": request_id,
             "type": "queued",
             "operation_id": "11111111111111111111111111111111",
@@ -407,7 +446,7 @@ mod tests {
         let request_id = "0123456789abcdef0123456789abcdef";
         let (mut writer, reader) = tokio::io::duplex(4096);
         let malformed = serde_json::json!({
-            "protocol_version": 2,
+            "protocol_version": 3,
             "request_id": request_id,
             "type": "download_progress",
             "operation_id": "11111111111111111111111111111111",
