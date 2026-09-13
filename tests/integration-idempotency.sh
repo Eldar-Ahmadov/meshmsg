@@ -60,8 +60,8 @@ timeout 240 "$BIN" --state-dir "$ROOT/receiver" --json listen >"$ROOT/receiver.l
 LISTENER=$!
 wait_for 10 "receiver listener" grep -q '"type":"connected"' "$ROOT/receiver.listen"
 
-# Empty text is rejected before daemon admission from the CLI, and the daemon
-# independently rejects a crafted IPC request without reserving its operation ID.
+# Empty text is rejected before daemon admission from the CLI. A crafted IPC
+# request fails strict typed request decoding before its operation ID is admitted.
 EMPTY_ID=00000000000000000000000000000001
 if "$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$EMPTY_ID" '' >"$ROOT/empty-cli.out" 2>"$ROOT/empty-cli.err"; then
   fail "empty positional CLI send succeeded"
@@ -82,8 +82,8 @@ for form in file stdin; do
     || fail "empty $form CLI send did not report canonical not_started with generated ID"
 done
 EMPTY_IPC=$(ipc sender "{\"command\":\"send\",\"operation_id\":\"$EMPTY_ID\",\"body\":\"\"}")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "invalid_message" and v["outcome"] == "not_started" and v["operation_id"] == sys.argv[1]' "$EMPTY_ID" <<<"$EMPTY_IPC" \
-  || fail "daemon did not reject empty IPC send before admission"
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "invalid_request" and v["outcome"] == "not_started" and "operation_id" not in v' <<<"$EMPTY_IPC" \
+  || fail "daemon did not fail closed on an empty typed IPC send"
 sleep 1
 ! grep -Fq '"body":""' "$ROOT/receiver.listen" || fail "empty rejection reached the wire/feed"
 REUSED=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$EMPTY_ID" operation-id-reused-after-empty)
@@ -317,7 +317,7 @@ stop_node sender
 start_node sender
 wait_for 30 "receiver presence before conflict retry" knows_peer sender
 PRIVATE_CONFLICT=$(ipc sender "{\"command\":\"private_send\",\"operation_id\":\"$PRIVATE_ID\",\"to\":\"$RECEIVER\",\"body\":\"changed-private-body\"}")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "private_message_conflict" and v["outcome"] == "not_started" and v["retryable"] is False' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "private_message_conflict" and v["outcome"] == "not_started" and "retryable" not in v and "message" not in v' \
   <<<"$PRIVATE_CONFLICT" || fail "recipient did not reject changed content under a persisted private ID"
 sleep 1
 grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \

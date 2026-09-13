@@ -37,7 +37,9 @@ fn json_mode_requested(arguments: impl IntoIterator<Item = std::ffi::OsString>) 
         .any(|argument| argument == "--json")
 }
 
-fn authoritative_contract_failure(error: &anyhow::Error) -> Option<contracts::ErrorEnvelopeV1> {
+fn authoritative_contract_failure(
+    error: &anyhow::Error,
+) -> Option<contracts::ProtocolErrorAdapter> {
     error
         .downcast_ref::<contracts::ContractFailure>()
         .map(|failure| failure.0.clone())
@@ -62,11 +64,17 @@ fn report_failure(error: anyhow::Error, json: bool, daemon: bool) -> ExitCode {
                 ("command_failed", false, "not_started")
             };
             let mut envelope =
-                contracts::ErrorEnvelopeV1::new(code, &diagnostic, outcome, retryable);
+                contracts::ProtocolErrorAdapter::new(code, &diagnostic, outcome, retryable);
             envelope.request_id = Some(contracts::new_request_id());
             envelope
         });
-        println!("{}", envelope.into_value());
+        println!(
+            "{}",
+            contracts::present_error(
+                envelope.request_id.as_deref(),
+                &envelope.typed().expect("validated CLI protocol error")
+            )
+        );
     } else {
         eprintln!("error: {error:#}");
     }
@@ -347,7 +355,7 @@ mod tests {
     #[test]
     fn contextual_contract_failure_remains_authoritative() {
         let mut expected =
-            contracts::ErrorEnvelopeV1::new("daemon_disconnected", "", "partial", true);
+            contracts::ProtocolErrorAdapter::new("daemon_disconnected", "", "partial", true);
         expected.request_id = Some("11111111111111111111111111111111".into());
         let error = anyhow::anyhow!("private transport diagnostic")
             .context(contracts::ContractFailure(expected.clone()));

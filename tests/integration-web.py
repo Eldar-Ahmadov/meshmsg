@@ -195,8 +195,7 @@ class Handler(socketserver.StreamRequestHandler):
                     emit({'type': 'error', 'schema_version': 1,
                           'code': 'attachment_storage_busy',
                           'operation_id': value['operation_id'],
-                          'message': 'Local capacity is currently unavailable.',
-                          'outcome': 'not_started', 'retryable': True})
+                          'outcome': 'not_started'})
                     return
                 output = pathlib.Path(value['output'])
                 if (label == 'late-token'
@@ -244,8 +243,7 @@ class Handler(socketserver.StreamRequestHandler):
                     if previous[0] != fingerprint:
                         emit({'type': 'error', 'schema_version': 1,
                               'code': 'operation_id_conflict', 'operation_id': operation_id,
-                              'message': 'The operation ID is bound to different input.',
-                              'outcome': 'not_started', 'retryable': False})
+                              'outcome': 'not_started'})
                     else:
                         emit(previous[1])
                     return
@@ -254,8 +252,7 @@ class Handler(socketserver.StreamRequestHandler):
                 if path.name == 'post-broadcast-failure.txt':
                     outcome = {'type': 'error', 'schema_version': 1,
                                'code': 'share_failed', 'operation_id': operation_id,
-                               'message': 'Attachment sharing failed.',
-                               'outcome': 'unknown', 'retryable': True}
+                               'outcome': 'unknown'}
                     self.server.share_operations[operation_id] = (fingerprint, outcome)
                     self.server.broadcast(shared)
                     emit(outcome)
@@ -274,15 +271,14 @@ class Handler(socketserver.StreamRequestHandler):
                     if previous_body != value['body']:
                         emit({'type': 'error', 'schema_version': 1,
                               'code': 'operation_id_conflict', 'operation_id': operation_id,
-                              'message': 'The operation ID is bound to different input.',
-                              'outcome': 'not_started', 'retryable': False})
+                              'outcome': 'not_started'})
                     else:
                         emit(previous_outcome)
                     return
                 if value['body'] == 'reject':
                     outcome = {'type': 'error', 'schema_version': 1, 'code': 'send_failed',
-                               'operation_id': operation_id, 'message': 'Message submission failed.',
-                               'outcome': 'unknown', 'retryable': True}
+                               'operation_id': operation_id,
+                               'outcome': 'unknown'}
                 else:
                     outcome = {'type': 'queued', 'schema_version': 3,
                                'operation_id': operation_id, 'message_id': operation_id,
@@ -594,22 +590,27 @@ def main():
                 malformed_offer['offer_id'] = malformed_offer['offer_id'].upper()
                 daemon.broadcast(malformed_offer)
                 for response in [feed, other_tab]:
-                    diagnostic = next_event(response)
-                    assert diagnostic == {
+                    rejected = next_event(response)
+                    assert rejected == {
                         'type': 'error', 'schema_version': 1,
-                        'code': 'internal_contract_error',
-                        'message': 'An internal contract error occurred.',
-                        'outcome': 'unknown', 'retryable': False,
-                        'suppressed_since_last': 0}
-                    assert 'download_id' not in diagnostic
-                daemon.broadcast({'type': 'message', 'from': REMOTE_KEY,
-                                  'message_id': '4123456789abcdef0123456789abcdef',
-                                  'body': 'feed survived malformed attachment',
-                                  'timestamp_ms': int(time.time() * 1000)})
+                        'code': 'daemon_disconnected',
+                        'message': 'The daemon disconnected; the event feed has a gap.',
+                        'outcome': 'unknown', 'retryable': True}, rejected
+                    assert 'download_id' not in rejected
+                    assert response.readline() == b'\n'
+                    assert response.readline() == b'', (
+                        'malformed attachment subscription stayed open')
+                    response.close()
+
+                # A new subscription still accepts the unchanged canonical
+                # startup stream; fail-closed decoding does not weaken valid events.
+                feed = open_feed()
+                other_tab = open_feed()
                 for response in [feed, other_tab]:
-                    continued = next_event(response)
-                    assert continued['type'] == 'message'
-                    assert continued['body'] == 'feed survived malformed attachment'
+                    for expected_type in [
+                            'connected', 'peers_snapshot', 'attachment_offer',
+                            'message', 'lagged', 'peer_discovered']:
+                        assert next_event(response)['type'] == expected_type
 
                 upload_name = 'browser résumé.txt'
                 upload_payload = b'attachment sent from browser\n'
@@ -897,21 +898,6 @@ def main():
                         'timestamp_ms': incoming['timestamp_ms'], 'name': incoming['name'],
                         'kind': 'directory_tar_v1', 'size': incoming['size']}
 
-                daemon.broadcast({
-                    'type': 'error', 'schema_version': 1,
-                    'code': 'internal_contract_error',
-                    'message': 'An internal contract error occurred.',
-                    'retryable': False, 'outcome': 'unknown',
-                    'suppressed_since_last': 2})
-                for response in [feed, other_tab]:
-                    observed = next_event(response)
-                    assert observed == {
-                        'type': 'error', 'schema_version': 1,
-                        'code': 'internal_contract_error',
-                        'message': 'An internal contract error occurred.',
-                        'retryable': False, 'outcome': 'unknown',
-                        'suppressed_since_last': 2}
-
                 time.sleep(1.05)
                 synced = 'sent-from-another-web-tab'
                 assert api({'command': 'send', 'operation_id': '10000000000000000000000000000005', 'body': synced})[0] == 200
@@ -1014,8 +1000,21 @@ def main():
                     assert next_event(replacement_feed)['type'] == expected_type
                 daemon.broadcast(old_topic_offer)
                 rejected = next_event(replacement_feed)
-                assert rejected['type'] == 'error', rejected
-                assert rejected['code'] == 'internal_contract_error'
+                assert rejected == {
+                    'type': 'error', 'schema_version': 1,
+                    'code': 'daemon_disconnected',
+                    'message': 'The daemon disconnected; the event feed has a gap.',
+                    'outcome': 'unknown', 'retryable': True}, rejected
+                assert replacement_feed.readline() == b'\n'
+                assert replacement_feed.readline() == b'', (
+                    'cross-topic attachment subscription stayed open')
+                replacement_feed.close()
+
+                replacement_feed = open_feed()
+                for expected_type in [
+                        'connected', 'peers_snapshot', 'attachment_offer',
+                        'message', 'lagged', 'peer_discovered']:
+                    assert next_event(replacement_feed)['type'] == expected_type
                 new_topic_offer = daemon.fixture_offer(
                     'new-topic.txt', '30000000000000000000000000000009')
                 daemon.broadcast(new_topic_offer)

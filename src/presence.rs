@@ -501,7 +501,7 @@ pub(crate) fn snapshot(
     generated_at_ms: u64,
     directory_epoch: &str,
     directory_revision: u64,
-) -> serde_json::Value {
+) -> meshmsg_protocol::PeerSnapshot {
     peer_api::snapshot_value(
         self_peer,
         self_alias,
@@ -515,7 +515,7 @@ pub(crate) fn snapshot(
 
 pub(crate) fn emit_transitions(
     transitions: impl IntoIterator<Item = PeerTransition>,
-    events: &broadcast::Sender<serde_json::Value>,
+    events: &broadcast::Sender<meshmsg_protocol::Event>,
     directory_epoch: &str,
     directory_revision: &mut u64,
 ) {
@@ -527,8 +527,11 @@ pub(crate) fn emit_transitions(
         // The type-level field bounds make this unreachable; keep an explicit
         // final guard so future schema changes fail closed instead of creating
         // unexpectedly large subscription events.
-        if serde_json::to_vec(&value)
-            .is_ok_and(|encoded| encoded.len() <= peer_api::MAX_PEER_LIFECYCLE_EVENT_BYTES)
+        if serde_json::to_vec(&meshmsg_protocol::EventFrame::new(
+            meshmsg_protocol::RequestId::new_random(),
+            value.clone(),
+        ))
+        .is_ok_and(|encoded| encoded.len() <= peer_api::MAX_PEER_LIFECYCLE_EVENT_BYTES)
         {
             *directory_revision = candidate_revision;
             let _ = events.send(value.clone());

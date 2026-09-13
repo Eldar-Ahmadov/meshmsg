@@ -247,12 +247,20 @@ struct IncomingDirect {
     body: String,
 }
 
-fn incoming_event(msg: IncomingDirect) -> serde_json::Value {
-    serde_json::json!({
-        "type":"private_message", "schema_version":1, "private":true,
-        "from":msg.from.to_string(), "message_id":id_string(&msg.id),
-        "timestamp_ms":msg.timestamp_ms, "body":msg.body,
-        "acceptance_acknowledged":true, "durable":false, "read":false
+fn incoming_event(msg: IncomingDirect) -> meshmsg_protocol::Event {
+    meshmsg_protocol::Event::PrivateMessage(meshmsg_protocol::PrivateMessage {
+        private: true,
+        from: msg
+            .from
+            .to_string()
+            .parse()
+            .expect("public key is canonical"),
+        message_id: id_string(&msg.id).parse().expect("message ID is canonical"),
+        timestamp_ms: msg.timestamp_ms,
+        body: meshmsg_protocol::MessageBody::new(msg.body).expect("validated direct body"),
+        acceptance_acknowledged: true,
+        durable: false,
+        read: false,
     })
 }
 
@@ -260,7 +268,7 @@ fn incoming_event(msg: IncomingDirect) -> serde_json::Value {
 pub(crate) struct DirectHandler {
     secret: SecretKey,
     topic: TopicId,
-    incoming: mpsc::Sender<serde_json::Value>,
+    incoming: mpsc::Sender<meshmsg_protocol::Event>,
     replay: ReplayClient,
     connections: Arc<tokio::sync::Semaphore>,
 }
@@ -269,7 +277,7 @@ impl DirectHandler {
     fn new(
         secret: SecretKey,
         topic: TopicId,
-        incoming: mpsc::Sender<serde_json::Value>,
+        incoming: mpsc::Sender<meshmsg_protocol::Event>,
         state_dir: &Path,
     ) -> Result<(Self, ReplayWorker)> {
         let (replay, worker) = direct_replay::start(state_dir, secret.public(), topic)?;
@@ -383,7 +391,7 @@ pub(crate) fn setup(
 ) -> Result<(
     DirectHandler,
     ReplayWorker,
-    mpsc::Receiver<serde_json::Value>,
+    mpsc::Receiver<meshmsg_protocol::Event>,
 )> {
     let (incoming, receiver) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
     let (handler, replay) = DirectHandler::new(secret, topic, incoming, state_dir)?;
@@ -492,7 +500,7 @@ impl DirectSender {
     }
 
     /// Reserves one bounded send task before the caller spawns it.
-    pub(crate) fn try_reserve(&self) -> Result<DirectSendPermit, serde_json::Value> {
+    pub(crate) fn try_reserve(&self) -> Result<DirectSendPermit, meshmsg_protocol::ProtocolError> {
         self.permits
             .clone()
             .try_acquire_owned()
@@ -501,12 +509,11 @@ impl DirectSender {
                 _permit: permit,
             })
             .map_err(|_| {
-                serde_json::json!({
-                    "type":"error", "schema_version":1,
-                    "code":"private_send_busy",
-                    "message":"private-message send capacity reached",
-                    "outcome":"not_started", "retryable":true
-                })
+                meshmsg_protocol::ProtocolError::new(
+                    None,
+                    meshmsg_protocol::ErrorCode::PrivateSendBusy,
+                    meshmsg_protocol::Outcome::NotStarted,
+                )
             })
     }
 
@@ -526,7 +533,7 @@ impl DirectSendPermit {
         address: EndpointAddr,
         body: String,
         operation_id: [u8; 16],
-    ) -> serde_json::Value {
+    ) -> meshmsg_protocol::Response {
         match send(
             self.sender.endpoint,
             self.sender.secret,
@@ -537,57 +544,74 @@ impl DirectSendPermit {
         )
         .await
         {
-            Ok(DirectSendOutcome::Accepted(accepted)) => serde_json::json!({
-                "type":"private_accepted", "schema_version":3,
-                "to":accepted.recipient.to_string(),
-                "message_id":id_string(&accepted.id),
-                "timestamp_ms":accepted.timestamp_ms,
-                "body_bytes":accepted.body_bytes,
-                "acceptance_acknowledged":true,
-                "duplicate_accepted":accepted.duplicate,
-                "durable":false, "read":false
-            }),
-            Ok(DirectSendOutcome::Rejected(rejection)) => rejection_response(rejection),
-            Err(error) => serde_json::json!({
-                "type":"error", "schema_version":1,
-                "code":"private_send_failed", "message":format!("{error:#}"),
-                "outcome":"unknown", "retryable":true
-            }),
+            Ok(DirectSendOutcome::Accepted(accepted)) => {
+                meshmsg_protocol::Response::PrivateAccepted(meshmsg_protocol::PrivateAccepted {
+                    operation_id: id_string(&operation_id)
+                        .parse()
+                        .expect("operation ID is canonical"),
+                    to: accepted
+                        .recipient
+                        .to_string()
+                        .parse()
+                        .expect("public key is canonical"),
+                    message_id: id_string(&accepted.id)
+                        .parse()
+                        .expect("message ID is canonical"),
+                    timestamp_ms: accepted.timestamp_ms,
+                    body_bytes: accepted.body_bytes,
+                    acceptance_acknowledged: true,
+                    duplicate_accepted: accepted.duplicate,
+                    durable: false,
+                    read: false,
+                })
+            }
+            Ok(DirectSendOutcome::Rejected(rejection)) => {
+                rejection_response(rejection, operation_id)
+            }
+            Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                Some(
+                    id_string(&operation_id)
+                        .parse()
+                        .expect("operation ID is canonical"),
+                ),
+                meshmsg_protocol::ErrorCode::PrivateSendFailed,
+                meshmsg_protocol::Outcome::Unknown,
+            )),
         }
     }
 }
 
-fn rejection_response(rejection: DirectRejection) -> serde_json::Value {
-    let (code, message, outcome, retryable) = match rejection {
+fn rejection_response(
+    rejection: DirectRejection,
+    operation_id: [u8; 16],
+) -> meshmsg_protocol::Response {
+    let (code, outcome) = match rejection {
         DirectRejection::Conflict => (
-            "private_message_conflict",
-            "recipient has the same message ID bound to different content",
-            "not_started",
-            false,
+            meshmsg_protocol::ErrorCode::PrivateMessageConflict,
+            meshmsg_protocol::Outcome::NotStarted,
         ),
         DirectRejection::Busy => (
-            "private_recipient_busy",
-            "recipient replay or delivery capacity is busy",
-            "not_started",
-            true,
+            meshmsg_protocol::ErrorCode::PrivateRecipientBusy,
+            meshmsg_protocol::Outcome::NotStarted,
         ),
         DirectRejection::Unavailable => (
-            "private_replay_unavailable",
-            "recipient replay persistence is unavailable",
-            "not_started",
-            true,
+            meshmsg_protocol::ErrorCode::PrivateReplayUnavailable,
+            meshmsg_protocol::Outcome::NotStarted,
         ),
         DirectRejection::DeliveryOutcomeUnknown => (
-            "private_delivery_unknown",
-            "recipient durably recorded this message ID but cannot prove whether its volatile delivery was queued",
-            "unknown",
-            false,
+            meshmsg_protocol::ErrorCode::PrivateDeliveryUnknown,
+            meshmsg_protocol::Outcome::Unknown,
         ),
     };
-    serde_json::json!({
-        "type":"error", "schema_version":1, "code":code, "message":message,
-        "outcome":outcome, "retryable":retryable
-    })
+    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+        Some(
+            id_string(&operation_id)
+                .parse()
+                .expect("operation ID is canonical"),
+        ),
+        code,
+        outcome,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -648,8 +672,12 @@ mod tests {
             assert_eq!(ack.payload.id, frame.payload.id);
         }
         let delivered = rx.try_recv().unwrap();
-        assert_eq!(delivered["type"], "private_message");
-        assert_eq!(delivered["body"], "deliver once");
+        match delivered {
+            meshmsg_protocol::Event::PrivateMessage(message) => {
+                assert_eq!(message.body.as_str(), "deliver once");
+            }
+            _ => panic!("expected private-message event"),
+        }
         assert!(rx.try_recv().is_err());
         let conflict = DirectFrame::new_with_id(
             &sender,
@@ -770,10 +798,13 @@ mod tests {
                 false,
             ),
         ] {
-            let response = rejection_response(rejection);
-            assert_eq!(response["code"], code);
-            assert_eq!(response["outcome"], outcome);
-            assert_eq!(response["retryable"], retryable);
+            let response = rejection_response(rejection, [1; 16]);
+            let meshmsg_protocol::Response::Error(error) = response else {
+                panic!("expected error response");
+            };
+            assert_eq!(error.code.to_string(), code);
+            assert_eq!(crate::contracts::outcome_name(error.outcome), outcome);
+            assert_eq!(error.retryable(), retryable);
         }
     }
 

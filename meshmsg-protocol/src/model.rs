@@ -393,6 +393,17 @@ pub struct ResponseFrame {
     pub response: Response,
 }
 
+impl ResponseFrame {
+    pub fn new(request_id: Option<RequestId>, response: Response) -> Self {
+        Self {
+            protocol_version: ProtocolVersion,
+            schema_version: response.schema_version(),
+            request_id,
+            response,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
@@ -448,6 +459,18 @@ impl Response {
         match self {
             Self::Status(status) => status.validate(),
             _ => Ok(()),
+        }
+    }
+
+    pub fn schema_version(&self) -> u8 {
+        match self {
+            Self::Status(_) | Self::Offers(_) | Self::Stopping { .. } | Self::Error(_) => 1,
+            Self::Queued(_)
+            | Self::PrivateAccepted(_)
+            | Self::AttachmentShared(_)
+            | Self::OfferRemoved(_)
+            | Self::OffersPruned(_) => 3,
+            Self::PeersSnapshot(_) | Self::DownloadComplete(_) => 2,
         }
     }
 
@@ -507,6 +530,17 @@ pub struct EventFrame {
     pub request_id: RequestId,
     #[serde(flatten)]
     pub event: Event,
+}
+
+impl EventFrame {
+    pub fn new(request_id: RequestId, event: Event) -> Self {
+        Self {
+            protocol_version: ProtocolVersion,
+            schema_version: event.schema_version(),
+            request_id,
+            event,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -576,6 +610,28 @@ impl<'de> Deserialize<'de> for EventFrame {
 }
 
 impl Event {
+    pub fn schema_version(&self) -> u8 {
+        match self {
+            Self::Connected(_)
+            | Self::PrivateMessage(_)
+            | Self::PeerUp { .. }
+            | Self::PeerDown { .. }
+            | Self::Lagged { .. }
+            | Self::Stopping {}
+            | Self::Error(_) => 1,
+            Self::Message(_)
+            | Self::AttachmentOffer(_)
+            | Self::PeersSnapshot(_)
+            | Self::PeerDiscovered(_)
+            | Self::PeerUpdated(_)
+            | Self::PeerExpired(_)
+            | Self::DownloadStarted { .. }
+            | Self::DownloadProgress { .. }
+            | Self::DownloadComplete(_) => 2,
+            Self::Queued(_) | Self::AttachmentShared(_) => 3,
+        }
+    }
+
     fn supports_schema(&self, version: u8) -> bool {
         match self {
             Self::Connected(_)
@@ -921,37 +977,37 @@ pub enum EventSource {
     Gossip,
 }
 
+/// Compact protocol-v2 error payload. Correlation and versioning are carried by
+/// the containing [`ResponseFrame`] or [`EventFrame`]; the flattened wire frame
+/// therefore contains exactly protocol version, request ID, optional operation
+/// ID, typed code, and typed outcome (plus the `type`/schema discriminators).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<OperationId>,
     pub code: ErrorCode,
-    pub message: String,
     pub outcome: Outcome,
-    pub retryable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offer_id: Option<OfferId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selected_tags: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub removed_tags: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quota_bytes_released: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suppressed_since_last: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub direction: Option<OfferDirection>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<PeerId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub older_than_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub maximum: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dry_run: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cutoff_ms: Option<u64>,
+}
+
+impl ProtocolError {
+    pub fn new(operation_id: Option<OperationId>, code: ErrorCode, outcome: Outcome) -> Self {
+        Self {
+            operation_id,
+            code,
+            outcome,
+        }
+    }
+
+    /// Stable adapter text. It is intentionally not part of the protocol.
+    pub fn message(&self) -> &'static str {
+        self.code.message()
+    }
+
+    /// Retry guidance is a local presentation policy, not transmitted state.
+    pub fn retryable(&self) -> bool {
+        self.code.retryable(self.outcome)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -994,7 +1050,6 @@ pub enum ErrorCode {
     InvalidRequest,
     UnsupportedSchema,
     InvalidMessage,
-    NetworkEventRejected,
     InitialFrameTimeout,
     PrivateSendBusy,
     PrivateRecipientBusy,
@@ -1027,6 +1082,125 @@ pub enum ErrorCode {
     ShareOutcomeUnknown,
 }
 
+impl ErrorCode {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::DaemonOffline => "Daemon is offline.",
+            Self::CommandTimeout | Self::AttachmentCommandTimeout => {
+                "The request timed out; reconcile before retrying."
+            }
+            Self::DaemonStopping | Self::AttachmentStorageShutdown => {
+                "The daemon is shutting down or unavailable."
+            }
+            Self::IpcCapacity | Self::OperationCapacity | Self::AttachmentStorageBusy => {
+                "Local capacity is currently unavailable."
+            }
+            Self::OperationIdConflict => "The operation ID is bound to different input.",
+            Self::InvalidOperationId => "The operation ID is invalid.",
+            Self::InvalidSourceDigest => "The source digest is invalid.",
+            Self::ShareFailed => "Attachment sharing failed.",
+            Self::DownloadFailed => "Attachment download failed.",
+            Self::SendFailed | Self::PrivateSendFailed => "Message submission failed.",
+            Self::RecipientUnresolved => "The recipient could not be resolved.",
+            Self::InvalidRequest | Self::UnsupportedSchema => {
+                "The request contract is invalid or unsupported."
+            }
+            Self::InitialFrameTimeout => "The initial local request timed out.",
+            Self::InvalidMessage => "The message is invalid.",
+            Self::PrivateSendBusy | Self::PrivateRecipientBusy => {
+                "The requested operation is currently busy."
+            }
+            Self::PrivateMessageConflict => "The message ID is bound to different content.",
+            Self::PrivateReplayUnavailable => "Recipient replay protection is unavailable.",
+            Self::AttachmentQuotaExceeded => "The attachment storage quota is exceeded.",
+            Self::AttachmentMinFreeSpace => "The attachment free-space reserve is unavailable.",
+            Self::AttachmentTagCapacity => "The attachment pin capacity is exhausted.",
+            Self::AttachmentRemovalPartial => "Attachment removal completed only partially.",
+            Self::ShareOperationCapacity => "Attachment sharing capacity is unavailable.",
+            Self::DownloadOperationCapacity => "Attachment download capacity is unavailable.",
+            Self::DownloadStagingUnavailable => "Attachment download staging is unavailable.",
+            Self::InvalidDaemonResponse => "The daemon returned an invalid response.",
+            Self::DaemonDisconnected => "The daemon disconnected; the event feed has a gap.",
+            Self::RequestRejected => "The request was rejected.",
+            Self::FeedError => "The event feed failed.",
+            Self::CommandFailed => "The command failed.",
+            Self::StartupFailed => "Daemon startup failed.",
+            Self::InternalContractError => "An internal contract error occurred.",
+            Self::RequestForbidden => "The request is forbidden.",
+            Self::NotFound => "The requested resource was not found.",
+            Self::RequestThrottled | Self::SendThrottled => "The request was throttled.",
+            Self::RequestTimeout => "The request timed out.",
+            Self::PayloadTooLarge => "The request payload is too large.",
+            Self::UnsupportedMediaType => "The request media type is unsupported.",
+            Self::InvalidRange => "The requested byte range is invalid.",
+            Self::CapacityOrOffline | Self::DaemonUnavailable => "The service is unavailable.",
+            Self::RequestFailed => "The request failed.",
+            Self::IdempotencyUnsupported => "Retry-safe mutations are unsupported by the daemon.",
+            Self::SendOutcomeUnknown => "The message outcome is unknown.",
+            Self::ShareOutcomeUnknown => "The attachment sharing outcome is unknown.",
+            Self::InvalidAttachmentOffer
+            | Self::InvalidOfferSelector
+            | Self::InvalidPruneRequest => "The attachment request is invalid.",
+            Self::OffersBusy => "Attachment listing is currently busy.",
+            Self::OffersFailed | Self::AttachmentLifecycleInternal => {
+                "The attachment lifecycle operation failed."
+            }
+            Self::PrivateDeliveryUnknown => "The private-message outcome is unknown.",
+        }
+    }
+
+    pub fn retryable(self, outcome: Outcome) -> bool {
+        if outcome == Outcome::Partial {
+            return !matches!(
+                self,
+                Self::SendFailed
+                    | Self::InvalidDaemonResponse
+                    | Self::PrivateDeliveryUnknown
+                    | Self::InternalContractError
+            );
+        }
+        if outcome == Outcome::Unknown {
+            return !matches!(
+                self,
+                Self::PrivateDeliveryUnknown | Self::InternalContractError
+            );
+        }
+        matches!(
+            self,
+            Self::DaemonOffline
+                | Self::DaemonUnavailable
+                | Self::CapacityOrOffline
+                | Self::DaemonDisconnected
+                | Self::DaemonStopping
+                | Self::CommandTimeout
+                | Self::InitialFrameTimeout
+                | Self::IpcCapacity
+                | Self::OperationCapacity
+                | Self::AttachmentStorageBusy
+                | Self::PrivateSendBusy
+                | Self::PrivateRecipientBusy
+                | Self::PrivateReplayUnavailable
+                | Self::AttachmentMinFreeSpace
+                | Self::ShareOperationCapacity
+                | Self::DownloadOperationCapacity
+                | Self::DownloadStagingUnavailable
+                | Self::DownloadFailed
+                | Self::OffersBusy
+                | Self::StartupFailed
+                | Self::RequestThrottled
+                | Self::SendThrottled
+                | Self::RequestTimeout
+        )
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = serde_json::to_value(self).map_err(|_| fmt::Error)?;
+        formatter.write_str(value.as_str().ok_or(fmt::Error)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1218,37 @@ mod tests {
             r#"{{"protocol_version":2,"request_id":"{id}","request":{{"command":"status"}},"extra":true}}"#
         );
         assert!(serde_json::from_str::<RequestFrame>(&extra).is_err());
+    }
+
+    #[test]
+    fn protocol_error_wire_is_compact_typed_and_strict() {
+        let request_id = RequestId::new_random();
+        let operation_id = OperationId::new_random();
+        let frame = ResponseFrame {
+            protocol_version: ProtocolVersion,
+            schema_version: 1,
+            request_id: Some(request_id.clone()),
+            response: Response::Error(ProtocolError::new(
+                Some(operation_id.clone()),
+                ErrorCode::CommandTimeout,
+                Outcome::Unknown,
+            )),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        let keys = value.as_object().unwrap();
+        assert_eq!(keys.len(), 7);
+        for forbidden in ["message", "retryable", "selected_tags", "removed_tags"] {
+            assert!(!keys.contains_key(forbidden));
+        }
+        assert_eq!(
+            serde_json::from_value::<ResponseFrame>(value.clone()).unwrap(),
+            frame
+        );
+        for field in ["message", "retryable", "selected_tags"] {
+            let mut malformed = value.clone();
+            malformed[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<ResponseFrame>(malformed).is_err());
+        }
     }
 
     #[test]

@@ -27,38 +27,28 @@ the web bridge uses the ordinary download request in `raw` mode. Attachment `off
 message IDs retain their separate documented operation identity; a download's
 operation ID is not its offer ID.
 
-## Error envelope
+## Protocol-v2 error boundary
 
-Every machine-readable application error is:
+Daemon IPC errors are compact typed frames:
 
 ```json
 {
+  "protocol_version": 2,
   "type": "error",
   "schema_version": 1,
   "code": "daemon_offline",
-  "message": "Daemon is offline.",
-  "retryable": true,
   "outcome": "not_started",
   "request_id": "0123456789abcdef0123456789abcdef"
 }
 ```
 
-`code` is a closed, stable lowercase ASCII token. One canonical code specification
-shared by every producer and consumer defines its exact public message, admitted
-`(outcome, retryable)` pairs, operation-kind applicability, and whether request,
-operation, offer, removal-count, or suppression fields are required, optional, or
-forbidden. Unknown codes, noncanonical messages, and impossible combinations fail
-closed. `message` contains no control characters (including tabs) and is at most
-1024 UTF-8 bytes. `outcome` is exactly `not_started`, `unknown`, or `partial`, but
-only outcomes listed for that code are admitted. `request_id` is omitted only when
-no request could be decoded or admitted (for example pre-frame IPC timeout/capacity
-output). Operation-aware consumers additionally require the exact originating
-operation ID; offer IDs and partial-removal counts are accepted only for applicable
-codes.
-
-Public errors retain only canonical typed fields; arbitrary private causes are not
-included in responses or events. Automation must branch on stable error `code`
-values, never display text.
+`code` and `outcome` are closed enums owned by `meshmsg-protocol`. Mutation errors
+also carry the exact typed `operation_id`. Unknown enum values, versions, fields,
+or malformed IDs fail closed at that crate boundary. Errors never transmit a
+display message, retryable flag, offer selector, generic lifecycle accounting, or
+suppression counter. CLI and web adapters derive stable user-facing text and retry
+guidance from `ErrorCode` and `Outcome`; automation branches on those enums rather
+than display text. Lifecycle counts remain only on typed lifecycle success records.
 
 With `--json`, one-shot failures write exactly one error object to **stdout**, write
 nothing to stderr, and exit 1. Success exits 0. Streaming client commands use stdout
@@ -98,12 +88,13 @@ operation/offer ID plus the configured signed topic, kind, provider, ticket hash
 name, size, and nonzero timestamp before download registration or transfer work. Live
 IPC/HTTP attachment events must remain inside the wire freshness window. Saved signed
 download tokens deliberately do not expire by timestamp, but revalidate the nonzero time,
-signature, configured topic, identity, and complete metadata before any network work. Daemon-created
-message/queued/attachment events are contract-checked before publication; sampled guard
-failures become strict, subscriber-correlated `internal_contract_error` records with
-exact `suppressed_since_last` accounting and no synchronous stderr write.
-Unknown families, unsupported versions, and unknown/missing/wrong-typed fields fail
-closed. This applies to every command response and subscription event, including
+signature, configured topic, identity, and complete metadata before any network work.
+Daemon-created message, queued, and attachment events cross the same typed event
+boundary before publication. Subscription frames are decoded directly into the closed
+typed event union; unknown families, unsupported versions, unknown fields, malformed
+IDs, and invalid event semantics fail the read and terminate that subscription. They
+are not repaired into a synthetic error event, skipped, or followed by later frames
+from the same subscription. This applies to every command response and subscription event, including
 stop, attachment share/download metadata, and lifecycle/progress/loss/peer events.
 Download progress permits `0/0` only for an empty blob; otherwise `total_bytes` is
 positive and `received_bytes <= total_bytes`. A CLI download accepts completion only
@@ -154,13 +145,14 @@ operation IDs in separate headers. Every JSON response has `type`, exact
 
 SSE `data` records are JSON DTOs with the SSE connection's request ID. Connected,
 message, queued, attachment, lag, peer snapshot, and peer transition source DTOs are
-strictly deserialized before reconstruction from a public allowlist. A malformed or unsupported non-attachment daemon event terminates that IPC subscription
-and yields a sanitized SSE disconnect error; it is never skipped in a way that could hide
-a contract gap. A malformed attachment offer/share instead becomes a correlated strict, one-per-second
-sampled `internal_contract_error` with exact `suppressed_since_last` accounting and the
-subscription continues, preventing attacker-controlled wire metadata from terminating
-live feeds or creating a web download handle. A
-connected handshake that cannot be reconstructed as a valid public connected event,
+strictly deserialized before reconstruction from a public allowlist. Any malformed,
+noncanonical, semantically invalid, or unsupported daemon event—including an attachment
+offer/share—fails closed: the bridge terminates that IPC subscription and emits a
+sanitized SSE disconnect error before closing the feed. It does not synthesize an
+`internal_contract_error`, suppress or skip the bad event, or consume later frames from
+the failed subscription; reconnecting creates a new subscription with no replay.
+Invalid attachment events never create a web download handle. A connected handshake
+that cannot be reconstructed as a valid public connected event,
 including `endpoint_online:false`, yields a correlated `invalid_daemon_response`
 error and closes the feed cleanly. IPC connection establishment and reading this
 first frame share one eight-second startup deadline; the read receives only the
@@ -211,7 +203,7 @@ presence lookahead, including records after the 512th public item. A list/stream
 failure returns canonical `offers_failed` rather than panicking. Version 1 has no
 cursor, so truncation is a bounded prefix rather than pagination.
 
-Lifecycle-v3 successes and partial errors repeat the exact operation ID,
+Lifecycle-v3 successes and compact partial errors repeat the exact operation ID;
 remove/prune selectors, effective age, dry-run mode, maximum, and applicable cutoff.
 Remove has no cutoff. The sole schema-1 prune request representation contains
 `operation_id`, required `older_than_secs`, nullable `direction`, `dry_run`, and
@@ -238,12 +230,9 @@ caller-side validation accepts one required daemon-authoritative cutoff while
 producer/generic validation binds its exact value. The protocol-v2 lifecycle command is submitted directly and its strict response is
 validated before consumption.
 
-Attachment operation errors are additionally request-kind-aware. Share, remove,
-prune, and ordinary typed download each admit only their documented code set with
-canonical fixed message, outcome, retryability, operation ID, offer-ID applicability,
-and partial-removal accounting. `DownloadMode::Raw` does not create a separate error
-operation kind. A structurally valid error from another operation kind is rejected as
-an invalid daemon response.
+Attachment operation errors use the same compact boundary and retain exact
+operation-ID correlation. Lifecycle selectors and counts exist only in typed requests
+and lifecycle success variants; they are not repeated in generic errors.
 
 Adding optional fields still requires a new family version because DTOs deny unknown
 fields. A future transport version requires an explicit breaking migration;

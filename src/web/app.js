@@ -453,14 +453,6 @@ function connect() {
         reconnect(nextSource);
         break;
       case 'error':
-        if (value.code === 'internal_contract_error') {
-          const suppressed = Number.isSafeInteger(value.suppressed_since_last)
-            && value.suppressed_since_last > 0
-            ? ` · ${value.suppressed_since_last} similar event${value.suppressed_since_last === 1 ? '' : 's'} suppressed`
-            : '';
-          addEntry(`Warning · malformed internal event rejected${suppressed}`, value.message, undefined, 'warning');
-          break;
-        }
         if (value.code !== 'daemon_offline' && value.code !== 'daemon_disconnected') break;
         byId('status').textContent = 'Daemon offline or restarting.';
         reconnect(nextSource);

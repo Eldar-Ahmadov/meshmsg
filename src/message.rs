@@ -28,14 +28,15 @@ pub(crate) fn invalid_local_message(
     operation_id: &str,
     diagnostic: anyhow::Error,
 ) -> anyhow::Error {
-    let mut envelope = crate::contracts::ErrorEnvelopeV1::new(
-        "invalid_message",
-        diagnostic.to_string(),
-        "not_started",
-        false,
+    let error = meshmsg_protocol::ProtocolError::new(
+        Some(operation_id.parse().expect("validated operation ID")),
+        meshmsg_protocol::ErrorCode::InvalidMessage,
+        meshmsg_protocol::Outcome::NotStarted,
     );
-    envelope.request_id = Some(crate::contracts::new_request_id());
-    envelope.operation_id = Some(operation_id.to_owned());
+    let envelope = crate::contracts::ProtocolErrorAdapter::from_typed(
+        Some(crate::contracts::new_request_id()),
+        error,
+    );
     anyhow::Error::new(crate::contracts::ContractFailure(envelope)).context(diagnostic)
 }
 

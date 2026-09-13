@@ -1,4 +1,4 @@
-use crate::{contracts::ErrorEnvelopeV1, ids::id_string};
+use crate::ids::id_string;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh::{PublicKey, SecretKey};
@@ -40,7 +40,6 @@ const MAX_REPLAY_IDS_PER_SOURCE: usize = (TRANSPORT_SOURCE_BURST
     as usize;
 pub(crate) const MAX_ENVELOPE_REPLAY_ENTRIES: usize =
     (GLOBAL_REPLAY_BURST + GLOBAL_REPLAY_RATE_PER_SEC * REPLAY_BUCKET_RETENTION.as_secs()) as usize;
-pub(crate) const REJECTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const _: () = assert!(
     REPLAY_BUCKET_RETENTION.as_secs()
         >= ENVELOPE_ACCEPTANCE_WINDOW.as_secs()
@@ -233,36 +232,6 @@ impl TransportSourceLimiter {
         let state = self.sources.get_mut(&source).expect("source was reserved");
         state.admission_limiter.consume();
         state.last_seen_ms = now_ms;
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct RejectionSampler {
-    last_emitted_ms: Option<u64>,
-    suppressed: u64,
-}
-
-impl RejectionSampler {
-    pub(crate) fn event(
-        &mut self,
-        now_ms: u64,
-        _private_diagnostic: &str,
-    ) -> Option<serde_json::Value> {
-        let interval_ms = REJECTION_SAMPLE_INTERVAL.as_millis() as u64;
-        if self
-            .last_emitted_ms
-            .is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms)
-        {
-            let suppressed = std::mem::take(&mut self.suppressed);
-            self.last_emitted_ms = Some(now_ms);
-            let mut error =
-                ErrorEnvelopeV1::try_new_public("network_event_rejected", "not_started", false)
-                    .ok()?;
-            error.suppressed_since_last = Some(suppressed);
-            return Some(error.into_value());
-        }
-        self.suppressed = self.suppressed.saturating_add(1);
-        None
     }
 }
 
@@ -595,7 +564,6 @@ pub(crate) struct AttachmentEnvelope<'a> {
 pub(crate) struct EventHandler {
     replay: EnvelopeReplayCache,
     sources: TransportSourceLimiter,
-    rejections: RejectionSampler,
 }
 
 impl EventHandler {
@@ -605,16 +573,15 @@ impl EventHandler {
         topic: TopicId,
         now_ms: u64,
         attachment_event: F,
-    ) -> Vec<serde_json::Value>
+    ) -> Vec<meshmsg_protocol::Event>
     where
-        F: FnOnce(AttachmentEnvelope<'_>) -> Result<serde_json::Value>,
+        F: FnOnce(AttachmentEnvelope<'_>) -> Result<meshmsg_protocol::Event>,
     {
         network_event(
             value,
             topic,
             &mut self.replay,
             &mut self.sources,
-            &mut self.rejections,
             now_ms,
             attachment_event,
         )
@@ -626,12 +593,11 @@ pub(crate) fn network_event<F>(
     topic: TopicId,
     replay: &mut EnvelopeReplayCache,
     sources: &mut TransportSourceLimiter,
-    rejections: &mut RejectionSampler,
     now_ms: u64,
     attachment_event: F,
-) -> Vec<serde_json::Value>
+) -> Vec<meshmsg_protocol::Event>
 where
-    F: FnOnce(AttachmentEnvelope<'_>) -> Result<serde_json::Value>,
+    F: FnOnce(AttachmentEnvelope<'_>) -> Result<meshmsg_protocol::Event>,
 {
     match value {
         Event::Received(message) => {
@@ -639,10 +605,7 @@ where
             // identity, which an invite holder can rotate cheaply.
             let source = message.delivered_from;
             if !sources.allow_verification(source, now_ms) {
-                return rejections
-                    .event(now_ms, "broadcast verification rate limit exceeded")
-                    .into_iter()
-                    .collect();
+                return Vec::new();
             }
             // Complete wire and kind-specific semantics precede freshness,
             // replay, and accepted-traffic accounting. Rejected frames pay
@@ -666,24 +629,19 @@ where
                 sources.consume_admission(source, now_ms);
                 Ok(event)
             });
-            match accepted {
-                Ok(event) => vec![event],
-                Err(error) => rejections
-                    .event(now_ms, &error.to_string())
-                    .into_iter()
-                    .collect(),
-            }
+            accepted.map_or_else(|_| Vec::new(), |event| vec![event])
         }
-        Event::NeighborUp(peer) => {
-            vec![serde_json::json!({"type":"peer_up", "peer":peer.to_string()})]
-        }
-        Event::NeighborDown(peer) => {
-            vec![serde_json::json!({"type":"peer_down", "peer":peer.to_string()})]
-        }
-        Event::Lagged => vec![serde_json::json!({
-            "type":"lagged", "source":"gossip", "dropped":serde_json::Value::Null,
-            "message":"receiver fell behind; one or more events were dropped"
-        })],
+        Event::NeighborUp(peer) => vec![meshmsg_protocol::Event::PeerUp {
+            peer: peer.to_string().parse().expect("public key is canonical"),
+        }],
+        Event::NeighborDown(peer) => vec![meshmsg_protocol::Event::PeerDown {
+            peer: peer.to_string().parse().expect("public key is canonical"),
+        }],
+        Event::Lagged => vec![meshmsg_protocol::Event::Lagged {
+            source: meshmsg_protocol::EventSource::Gossip,
+            dropped: 0,
+            message: "receiver fell behind; one or more events were dropped".into(),
+        }],
     }
 }
 
@@ -692,21 +650,33 @@ pub(crate) fn queued_event(
     message_id: [u8; 16],
     body: String,
     timestamp_ms: u64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type":"queued", "schema_version":3,
-        "from":peer, "operation_id":id_string(&message_id),
-        "message_id":id_string(&message_id),
-        "timestamp_ms":timestamp_ms, "body":body,
-        "delivery_acknowledged":false
-    })
+) -> meshmsg_protocol::Queued {
+    meshmsg_protocol::Queued {
+        operation_id: id_string(&message_id)
+            .parse()
+            .expect("operation ID is canonical"),
+        from: peer.parse().expect("public key is canonical"),
+        message_id: id_string(&message_id)
+            .parse()
+            .expect("message ID is canonical"),
+        timestamp_ms,
+        body: meshmsg_protocol::BroadcastBody::new(body).expect("validated broadcast body"),
+        delivery_acknowledged: false,
+    }
 }
 
-pub(crate) fn message_event(msg: &Envelope) -> serde_json::Value {
-    serde_json::json!({
-        "type":"message", "schema_version":2, "from":msg.from.to_string(),
-        "message_id":id_string(&msg.message_id),
-        "timestamp_ms":msg.timestamp_ms, "body":msg.body
+pub(crate) fn message_event(msg: &Envelope) -> meshmsg_protocol::Event {
+    meshmsg_protocol::Event::Message(meshmsg_protocol::Message {
+        from: msg
+            .from
+            .to_string()
+            .parse()
+            .expect("public key is canonical"),
+        message_id: id_string(&msg.message_id)
+            .parse()
+            .expect("message ID is canonical"),
+        timestamp_ms: msg.timestamp_ms,
+        body: meshmsg_protocol::MessageBody::new(msg.body.clone()).expect("validated message body"),
     })
 }
 

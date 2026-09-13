@@ -4,8 +4,7 @@ use crate::{
     contracts,
     ids::id_string,
     ipc::{
-        LifecycleErrorV1, LifecycleRequestContext, LifecycleSuccessV3, OfferItemV1, OffersV1,
-        MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
+        LifecycleRequestContext, LifecycleSuccessV3, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
     },
 };
 use anyhow::{Context, Result};
@@ -79,6 +78,13 @@ pub(crate) fn parse_attachment_kind(value: &str) -> Option<AttachmentKind> {
         "file" => Some(AttachmentKind::File),
         "directory_tar_v1" => Some(AttachmentKind::DirectoryTarV1),
         _ => None,
+    }
+}
+
+fn protocol_attachment_kind(kind: AttachmentKind) -> meshmsg_protocol::AttachmentKind {
+    match kind {
+        AttachmentKind::File => meshmsg_protocol::AttachmentKind::File,
+        AttachmentKind::DirectoryTarV1 => meshmsg_protocol::AttachmentKind::DirectoryTarV1,
     }
 }
 
@@ -162,7 +168,9 @@ pub(crate) fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
     })
 }
 
-pub(crate) async fn list_pinned_blobs(store: &Store) -> Result<(Vec<OfferItemV1>, bool, usize)> {
+pub(crate) async fn list_pinned_blobs(
+    store: &Store,
+) -> Result<(Vec<meshmsg_protocol::OfferListItem>, bool, usize)> {
     let mut tags = store
         .tags()
         .list_prefix(BLOB_TAG_PREFIX)
@@ -203,13 +211,18 @@ pub(crate) async fn list_pinned_blobs(store: &Store) -> Result<(Vec<OfferItemV1>
         if blobs.len() == MAX_OFFER_LIST_ENTRIES {
             has_more = true;
         } else {
-            blobs.push(OfferItemV1 {
-                direction: parsed.direction.into(),
-                offer_id: parsed.offer_id,
-                provider: parsed.provider,
-                name: parsed.name,
-                kind: attachment_kind_name(parsed.kind).into(),
-                hash: tag.hash.to_string(),
+            blobs.push(meshmsg_protocol::OfferListItem {
+                direction: parsed.direction.parse()?,
+                offer_id: parsed.offer_id.parse()?,
+                provider: parsed.provider.map(|value| value.parse()).transpose()?,
+                name: meshmsg_protocol::AttachmentName::new(parsed.name)?,
+                kind: match parsed.kind {
+                    AttachmentKind::File => meshmsg_protocol::AttachmentKind::File,
+                    AttachmentKind::DirectoryTarV1 => {
+                        meshmsg_protocol::AttachmentKind::DirectoryTarV1
+                    }
+                },
+                hash: tag.hash.to_string().parse()?,
                 format: "raw".into(),
                 status: "complete".into(),
                 size: Some(size),
@@ -773,7 +786,9 @@ impl AttachmentStorage {
         self.recalculate_cached_status().await
     }
 
-    pub(crate) async fn automatic_retention_pass(&self) -> Result<Option<serde_json::Value>> {
+    pub(crate) async fn automatic_retention_pass(
+        &self,
+    ) -> Result<Option<meshmsg_protocol::Response>> {
         if self.retention_secs == 0 {
             return Ok(None);
         }
@@ -866,7 +881,7 @@ impl AttachmentStorage {
         older_than_secs: Option<u64>,
         maximum: usize,
         dry_run: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<meshmsg_protocol::Response> {
         let cutoff_ms = match older_than_secs {
             Some(age) => Some(crate::ipc::prune_cutoff_upper_bound(
                 unix_timestamp_ms()?,
@@ -899,7 +914,7 @@ impl AttachmentStorage {
         cutoff_ms: Option<u64>,
         maximum: usize,
         dry_run: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<meshmsg_protocol::Response> {
         self.remove_with_fault_at_cutoff(
             RemovalSpec {
                 operation_id,
@@ -921,7 +936,7 @@ impl AttachmentStorage {
         &self,
         spec: RemovalSpec<'_>,
         fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
-    ) -> Result<serde_json::Value> {
+    ) -> Result<meshmsg_protocol::Response> {
         let cutoff_ms = match spec.older_than_secs {
             Some(age) => Some(crate::ipc::prune_cutoff_upper_bound(
                 unix_timestamp_ms()?,
@@ -939,7 +954,7 @@ impl AttachmentStorage {
         spec: RemovalSpec<'_>,
         cutoff_ms: Option<u64>,
         fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
-    ) -> Result<serde_json::Value> {
+    ) -> Result<meshmsg_protocol::Response> {
         let RemovalSpec {
             operation_id,
             offer_id,
@@ -1028,15 +1043,14 @@ impl AttachmentStorage {
             .filter(|tag| !selected_set.contains(&tag.name));
         let projected_usage = unique_storage_usage(projected).0;
         if dry_run {
-            return Ok(LifecycleSuccessV3::new(
+            return Ok(lifecycle_response(LifecycleSuccessV3::new(
                 &lifecycle_context,
                 selected_names.len(),
                 0,
                 before.saturating_sub(projected_usage),
                 limited,
                 cutoff,
-            )?
-            .into_value());
+            )?));
         }
         let protection = self
             .protect_removed_blobs_from_gc(
@@ -1078,24 +1092,23 @@ impl AttachmentStorage {
             // start grace only for values whose deletion may have taken effect.
             let _ = self.reconcile().await;
             protection.finish(&possibly_unpinned);
-            let after = self.status().tagged_bytes;
-            let mut error = LifecycleErrorV1::new(
-                "attachment_removal_partial",
-                sync_error
-                    .unwrap_or_else(|| format!("{failures} attachment tag deletion(s) failed")),
-                if removed.is_empty() {
-                    "unknown"
-                } else {
-                    "partial"
-                },
-                true,
-            );
-            error.offer_id = offer_id.map(str::to_owned);
-            error.selected_tags = Some(selected_names.len());
-            error.removed_tags = Some(removed.len());
-            error.quota_bytes_released = Some(before.saturating_sub(after));
-            bind_partial_lifecycle_error(&mut error, &lifecycle_context, cutoff);
-            return Ok(error.into_value());
+            let _ = sync_error;
+            return Ok(meshmsg_protocol::Response::Error(
+                meshmsg_protocol::ProtocolError::new(
+                    Some(
+                        lifecycle_context
+                            .operation_id()
+                            .parse()
+                            .expect("validated operation ID"),
+                    ),
+                    meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
+                    if removed.is_empty() {
+                        meshmsg_protocol::Outcome::Unknown
+                    } else {
+                        meshmsg_protocol::Outcome::Partial
+                    },
+                ),
+            ));
         }
         // Successful deletion is now database-durable. Start a complete grace
         // interval from this boundary, not from pre-deletion guard acquisition.
@@ -1117,69 +1130,60 @@ impl AttachmentStorage {
                 .is_err()
         {
             self.recalculate_cached_status().await?;
-            let mut error = LifecycleErrorV1::new(
-                "attachment_removal_partial",
-                "attachment tags were removed but retention-index persistence failed",
-                if removed.is_empty() {
-                    "unknown"
-                } else {
-                    "partial"
-                },
-                true,
-            );
-            error.offer_id = offer_id.map(str::to_owned);
-            error.selected_tags = Some(selected_names.len());
-            error.removed_tags = Some(removed.len());
-            error.quota_bytes_released = Some(before.saturating_sub(self.status().tagged_bytes));
-            bind_partial_lifecycle_error(&mut error, &lifecycle_context, cutoff);
-            return Ok(error.into_value());
+            return Ok(meshmsg_protocol::Response::Error(
+                meshmsg_protocol::ProtocolError::new(
+                    Some(
+                        lifecycle_context
+                            .operation_id()
+                            .parse()
+                            .expect("validated operation ID"),
+                    ),
+                    meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
+                    if removed.is_empty() {
+                        meshmsg_protocol::Outcome::Unknown
+                    } else {
+                        meshmsg_protocol::Outcome::Partial
+                    },
+                ),
+            ));
         }
         self.recalculate_cached_status().await?;
-        Ok(LifecycleSuccessV3::new(
+        Ok(lifecycle_response(LifecycleSuccessV3::new(
             &lifecycle_context,
             selected_names.len(),
             removed.len(),
             before.saturating_sub(self.status().tagged_bytes),
             limited,
             cutoff,
-        )?
-        .into_value())
+        )?))
     }
 }
 
-pub(crate) fn bind_partial_lifecycle_error(
-    error: &mut LifecycleErrorV1,
-    context: &LifecycleRequestContext<'_>,
-    cutoff_ms: Option<u64>,
-) {
-    match context {
-        LifecycleRequestContext::Remove {
-            direction,
-            provider,
-            maximum,
-            ..
-        } => {
-            error.direction = direction.map(str::to_owned);
-            error.provider = provider.map(str::to_owned);
-            error.older_than_secs = None;
-            error.maximum = Some(*maximum);
-            error.dry_run = Some(false);
-            error.cutoff_ms = None;
-        }
-        LifecycleRequestContext::Prune {
-            older_than_secs,
-            direction,
-            dry_run,
-            maximum,
-            ..
-        } => {
-            error.direction = direction.map(str::to_owned);
-            error.provider = None;
-            error.older_than_secs = Some(*older_than_secs);
-            error.maximum = Some(*maximum);
-            error.dry_run = Some(*dry_run);
-            error.cutoff_ms = cutoff_ms;
-        }
+fn lifecycle_response(value: LifecycleSuccessV3) -> meshmsg_protocol::Response {
+    let result = meshmsg_protocol::LifecycleResult {
+        operation_id: value.operation_id.parse().expect("validated operation ID"),
+        offer_id: value
+            .offer_id
+            .map(|id| id.parse().expect("validated offer ID")),
+        direction: value
+            .direction
+            .map(|direction| direction.parse().expect("validated direction")),
+        provider: value
+            .provider
+            .map(|peer| peer.parse().expect("validated provider")),
+        older_than_secs: value.older_than_secs,
+        maximum: value.maximum,
+        dry_run: value.dry_run,
+        selected_tags: value.selected_tags,
+        removed_tags: value.removed_tags,
+        released_bytes: value.released_bytes,
+        limited: value.limited,
+        cutoff_ms: value.cutoff_ms,
+    };
+    match value.family.as_str() {
+        "offer_removed" => meshmsg_protocol::Response::OfferRemoved(result),
+        "offers_pruned" => meshmsg_protocol::Response::OffersPruned(result),
+        _ => unreachable!("validated lifecycle family"),
     }
 }
 
@@ -1380,66 +1384,75 @@ pub(crate) fn storage_operation_error(
     error: &anyhow::Error,
     share: bool,
     operation_id: Option<&str>,
-    offer_id: Option<&str>,
-) -> serde_json::Value {
-    let message = format!("{error:#}");
+    _offer_id: Option<&str>,
+) -> meshmsg_protocol::Response {
     let has_code = |expected: &str| {
         error
             .chain()
             .any(|cause| cause.to_string().starts_with(expected))
     };
-    let (code, outcome, retryable) = if has_code("attachment_quota_exceeded:") {
-        ("attachment_quota_exceeded", "not_started", false)
-    } else if has_code("attachment_min_free_space:") {
-        ("attachment_min_free_space", "not_started", true)
-    } else if has_code("attachment_tag_capacity:") {
-        ("attachment_tag_capacity", "not_started", false)
-    } else if has_code("attachment_storage_busy:") {
-        ("attachment_storage_busy", "not_started", true)
-    } else {
+    let (code, outcome) = if has_code("attachment_quota_exceeded:") {
         (
-            default_code,
+            meshmsg_protocol::ErrorCode::AttachmentQuotaExceeded,
+            meshmsg_protocol::Outcome::NotStarted,
+        )
+    } else if has_code("attachment_min_free_space:") {
+        (
+            meshmsg_protocol::ErrorCode::AttachmentMinFreeSpace,
+            meshmsg_protocol::Outcome::NotStarted,
+        )
+    } else if has_code("attachment_tag_capacity:") {
+        (
+            meshmsg_protocol::ErrorCode::AttachmentTagCapacity,
+            meshmsg_protocol::Outcome::NotStarted,
+        )
+    } else if has_code("attachment_storage_busy:") {
+        (
+            meshmsg_protocol::ErrorCode::AttachmentStorageBusy,
+            meshmsg_protocol::Outcome::NotStarted,
+        )
+    } else {
+        let code = match default_code {
+            "share_failed" => meshmsg_protocol::ErrorCode::ShareFailed,
+            "download_failed" => meshmsg_protocol::ErrorCode::DownloadFailed,
+            value if value.starts_with("offers_") => {
+                meshmsg_protocol::ErrorCode::AttachmentLifecycleInternal
+            }
+            _ => unreachable!("storage error code is canonical"),
+        };
+        (
+            code,
             if share || default_code.starts_with("offers_") {
-                "unknown"
+                meshmsg_protocol::Outcome::Unknown
             } else {
-                "not_started"
+                meshmsg_protocol::Outcome::NotStarted
             },
-            true,
         )
     };
-    let code = if default_code.starts_with("offers_") && code == default_code {
-        "attachment_lifecycle_internal"
-    } else {
-        code
-    };
-    let mut response = LifecycleErrorV1::new(code, message, outcome, retryable);
-    response.operation_id = operation_id.map(str::to_owned);
-    response.offer_id = offer_id.map(str::to_owned);
-    response.into_value()
+    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+        operation_id.map(|value| value.parse().expect("validated operation ID")),
+        code,
+        outcome,
+    ))
 }
 
 pub(crate) fn try_admit_transfer(
     limit: &Arc<Semaphore>,
-    busy_code: &'static str,
-    busy_message: &'static str,
-) -> Result<OwnedSemaphorePermit, serde_json::Value> {
-    limit
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| serde_json::json!({"type":"error", "code":busy_code, "message":busy_message}))
+    _busy_code: &'static str,
+    _busy_message: &'static str,
+) -> Result<OwnedSemaphorePermit, ()> {
+    limit.clone().try_acquire_owned().map_err(|_| ())
 }
 
 pub(crate) fn try_admit_offer_listing(
     limit: &Arc<Semaphore>,
-) -> Result<OwnedSemaphorePermit, serde_json::Value> {
+) -> Result<OwnedSemaphorePermit, meshmsg_protocol::ProtocolError> {
     limit.clone().try_acquire_owned().map_err(|_| {
-        LifecycleErrorV1::new(
-            "offers_busy",
-            "Attachment listing is currently busy.",
-            "not_started",
-            true,
+        meshmsg_protocol::ProtocolError::new(
+            None,
+            meshmsg_protocol::ErrorCode::OffersBusy,
+            meshmsg_protocol::Outcome::NotStarted,
         )
-        .into_value()
     })
 }
 
@@ -1459,7 +1472,7 @@ pub(crate) async fn share_attachment(
     source_digest: String,
     path: PathBuf,
     max_attachment_bytes: u64,
-) -> Result<serde_json::Value> {
+) -> Result<meshmsg_protocol::Response> {
     let ShareResources {
         store,
         storage,
@@ -1568,15 +1581,31 @@ pub(crate) async fn share_attachment(
             .broadcast(encoded.clone())
             .await
             .context("broadcast attachment offer after durable pin")?;
-        Ok(serde_json::json!({
-            "type":"attachment_shared", "schema_version":3,
-            "from":signed.from.to_string(),
-            "message_id":id_string(&message_id), "timestamp_ms":timestamp_ms,
-            "offer_id":offer.offer_id, "source_digest":source_digest,
-            "kind":offer.kind, "name":offer.name, "size":offer.size,
-            "ticket":offer.ticket, "offer":BASE64URL_NOPAD.encode(&encoded),
-            "delivery_acknowledged":false
-        }))
+        Ok(meshmsg_protocol::Response::AttachmentShared(
+            meshmsg_protocol::AttachmentShared {
+                operation_id: offer.offer_id.parse().expect("validated operation ID"),
+                from: signed
+                    .from
+                    .to_string()
+                    .parse()
+                    .expect("public key is canonical"),
+                message_id: id_string(&message_id)
+                    .parse()
+                    .expect("message ID is canonical"),
+                timestamp_ms,
+                offer_id: offer.offer_id.parse().expect("validated offer ID"),
+                source_digest: source_digest.parse().expect("validated source digest"),
+                kind: protocol_attachment_kind(offer.kind),
+                name: meshmsg_protocol::AttachmentName::new(offer.name)
+                    .expect("validated attachment name"),
+                size: offer.size,
+                ticket: meshmsg_protocol::AttachmentToken::new(offer.ticket)
+                    .expect("validated attachment ticket"),
+                offer: meshmsg_protocol::AttachmentToken::new(BASE64URL_NOPAD.encode(&encoded))
+                    .expect("bounded signed offer"),
+                delivery_acknowledged: false,
+            },
+        ))
     }
     .await;
 
@@ -1841,13 +1870,13 @@ pub(crate) async fn commit_download(
 
 pub(crate) async fn download_attachment(
     resources: DownloadResources,
-    events: broadcast::Sender<serde_json::Value>,
+    events: broadcast::Sender<meshmsg_protocol::Event>,
     operation_id: &str,
     offer_token: String,
     output: PathBuf,
     max_attachment_bytes: u64,
     raw_export: bool,
-) -> Result<serde_json::Value> {
+) -> Result<meshmsg_protocol::Response> {
     let DownloadResources {
         store,
         storage,
@@ -1961,12 +1990,12 @@ pub(crate) async fn download_attachment(
                             && (received_bytes >= next_report
                                 || received_bytes == verified_size) =>
                     {
-                        let _ = events.send(serde_json::json!({
-                            "type":"download_progress", "schema_version":2,
-                            "operation_id":operation_id,
-                            "received_bytes":received_bytes.min(verified_size),
-                            "total_bytes":verified_size, "output":output
-                        }));
+                        let _ = events.send(meshmsg_protocol::Event::DownloadProgress {
+                            operation_id: operation_id.parse().expect("validated operation ID"),
+                            received_bytes: received_bytes.min(verified_size),
+                            total_bytes: verified_size,
+                            output: output.clone(),
+                        });
                         next_report = received_bytes
                             .saturating_div(DOWNLOAD_PROGRESS_STEP)
                             .saturating_add(1)
@@ -1986,11 +2015,12 @@ pub(crate) async fn download_attachment(
         }
     };
     if size == 0 {
-        let _ = events.send(serde_json::json!({
-            "type":"download_progress", "schema_version":2,
-            "operation_id":operation_id,
-            "received_bytes":0, "total_bytes":0, "output":output
-        }));
+        let _ = events.send(meshmsg_protocol::Event::DownloadProgress {
+            operation_id: operation_id.parse().expect("validated operation ID"),
+            received_bytes: 0,
+            total_bytes: 0,
+            output: output.clone(),
+        });
     }
     anyhow::ensure!(
         size <= max_attachment_bytes,
@@ -2054,30 +2084,46 @@ pub(crate) async fn download_attachment(
             return Err(error);
         }
     };
-    Ok(serde_json::json!({
-        "type":"download_complete", "schema_version":2,
-        "operation_id":operation_id, "token_digest":token_digest,
-        "offer_id":offer.offer_id, "kind":offer.kind,
-        "name":offer.name, "size":size, "from":ticket.addr().id.to_string(),
-        "output":output, "installed":true, "pinned":true,
-        "destination_synced":commit.destination_synced,
-        "cleanup_complete":commit.cleanup_complete,
-        "warnings":commit.warnings
-    }))
+    Ok(meshmsg_protocol::Response::DownloadComplete(
+        meshmsg_protocol::DownloadResult {
+            operation_id: operation_id.parse().expect("validated operation ID"),
+            token_digest: token_digest.parse().expect("generated digest is canonical"),
+            offer_id: offer.offer_id.parse().expect("validated offer ID"),
+            kind: protocol_attachment_kind(offer.kind),
+            name: meshmsg_protocol::AttachmentName::new(offer.name)
+                .expect("validated attachment name"),
+            size,
+            from: ticket
+                .addr()
+                .id
+                .to_string()
+                .parse()
+                .expect("public key is canonical"),
+            output,
+            installed: true,
+            pinned: true,
+            destination_synced: commit.destination_synced,
+            cleanup_complete: commit.cleanup_complete,
+            warnings: commit.warnings,
+        },
+    ))
 }
 
-pub(crate) async fn list_offers_request(store: Store) -> serde_json::Value {
+pub(crate) async fn list_offers_request(store: Store) -> meshmsg_protocol::Response {
     match list_pinned_blobs(&store).await {
-        Ok((blobs, has_more, item_errors)) => match OffersV1::new(blobs, has_more, item_errors) {
-            Ok(offers) => offers.into_value(),
-            Err(error) => {
-                LifecycleErrorV1::new("offers_failed", error.to_string(), "unknown", true)
-                    .into_value()
-            }
-        },
-        Err(error) => serde_json::json!({
-            "type":"error", "code":"offers_failed", "message":error.to_string()
-        }),
+        Ok((blobs, has_more, item_errors)) => {
+            meshmsg_protocol::Response::Offers(meshmsg_protocol::OffersList {
+                blobs,
+                truncated: has_more || item_errors != 0,
+                has_more,
+                item_errors,
+            })
+        }
+        Err(_error) => contracts::protocol_error_response(
+            meshmsg_protocol::ErrorCode::OffersFailed,
+            meshmsg_protocol::Outcome::Unknown,
+            None,
+        ),
     }
 }
 
@@ -2087,7 +2133,7 @@ pub(crate) async fn remove_offer_request(
     offer_id: &str,
     direction: Option<&str>,
     provider: Option<&str>,
-) -> serde_json::Value {
+) -> meshmsg_protocol::Response {
     let valid_direction = direction.is_none_or(|value| matches!(value, "incoming" | "outgoing"));
     let valid_provider = provider.is_none_or(|value| {
         value
@@ -2095,28 +2141,18 @@ pub(crate) async fn remove_offer_request(
             .is_ok_and(|key| key.to_string() == value)
     });
     if !valid_provider {
-        let mut error = LifecycleErrorV1::new(
-            "invalid_offer_selector",
-            "provider must be a canonical public key",
-            "not_started",
-            false,
-        );
-        error.operation_id = Some(operation_id.to_owned());
-        error.offer_id = Some(offer_id.to_owned());
-        return error.into_value();
+        return meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id.parse().expect("validated operation ID")),
+            meshmsg_protocol::ErrorCode::InvalidOfferSelector,
+            meshmsg_protocol::Outcome::NotStarted,
+        ));
     }
     if !contracts::valid_operation_id(offer_id) || !valid_direction {
-        let mut error = LifecycleErrorV1::new(
-            "invalid_offer_selector",
-            "offer ID or direction is invalid",
-            "not_started",
-            false,
-        );
-        error.operation_id = Some(operation_id.to_owned());
-        if contracts::valid_operation_id(offer_id) {
-            error.offer_id = Some(offer_id.to_owned());
-        }
-        return error.into_value();
+        return meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id.parse().expect("validated operation ID")),
+            meshmsg_protocol::ErrorCode::InvalidOfferSelector,
+            meshmsg_protocol::Outcome::NotStarted,
+        ));
     }
     match storage
         .remove_at_cutoff(
@@ -2150,18 +2186,15 @@ pub(crate) async fn prune_offers_request(
     direction: Option<&str>,
     dry_run: bool,
     max_delete: usize,
-) -> serde_json::Value {
+) -> meshmsg_protocol::Response {
     if !direction.is_none_or(|value| matches!(value, "incoming" | "outgoing"))
         || !(1..=MAX_PRUNE_TAGS).contains(&max_delete)
     {
-        let mut error = LifecycleErrorV1::new(
-            "invalid_prune_request",
-            "prune direction or maximum is invalid",
-            "not_started",
-            false,
-        );
-        error.operation_id = Some(operation_id.to_owned());
-        return error.into_value();
+        return meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id.parse().expect("validated operation ID")),
+            meshmsg_protocol::ErrorCode::InvalidPruneRequest,
+            meshmsg_protocol::Outcome::NotStarted,
+        ));
     }
     match storage
         .remove_at_cutoff(
@@ -2193,7 +2226,7 @@ pub(crate) async fn share_request(
     source_digest: String,
     path: PathBuf,
     max_attachment_bytes: u64,
-) -> serde_json::Value {
+) -> meshmsg_protocol::Response {
     let gate = resources.storage.gate.clone();
     match gate.acquire_owned().await {
         Ok(_permit) => match share_attachment(
@@ -2210,36 +2243,31 @@ pub(crate) async fn share_request(
                 storage_operation_error("share_failed", &error, true, Some(&operation_id), None)
             }
         },
-        Err(_) => {
-            let mut error = LifecycleErrorV1::new(
-                "attachment_storage_shutdown",
-                "attachment storage is shutting down",
-                "unknown",
-                true,
-            );
-            error.operation_id = Some(operation_id);
-            error.into_value()
-        }
+        Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id.parse().expect("validated operation ID")),
+            meshmsg_protocol::ErrorCode::AttachmentStorageShutdown,
+            meshmsg_protocol::Outcome::Unknown,
+        )),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_request(
     resources: DownloadResources,
-    events: broadcast::Sender<serde_json::Value>,
+    events: broadcast::Sender<meshmsg_protocol::Event>,
     operation_id: String,
     offer: String,
     output: PathBuf,
     max_attachment_bytes: u64,
     mode: meshmsg_protocol::DownloadMode,
-) -> serde_json::Value {
+) -> meshmsg_protocol::Response {
     let gate = resources.storage.gate.clone();
     match gate.acquire_owned().await {
         Ok(_permit) => {
-            let _ = events.send(serde_json::json!({
-                "type":"download_started", "schema_version":2,
-                "operation_id":operation_id, "output":output
-            }));
+            let _ = events.send(meshmsg_protocol::Event::DownloadStarted {
+                operation_id: operation_id.parse().expect("validated operation ID"),
+                output: output.clone(),
+            });
             match download_attachment(
                 resources,
                 events,
@@ -2261,15 +2289,10 @@ pub(crate) async fn download_request(
                 ),
             }
         }
-        Err(_) => {
-            let mut error = LifecycleErrorV1::new(
-                "attachment_storage_shutdown",
-                "attachment storage is shutting down",
-                "unknown",
-                true,
-            );
-            error.operation_id = Some(operation_id);
-            error.into_value()
-        }
+        Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id.parse().expect("validated operation ID")),
+            meshmsg_protocol::ErrorCode::AttachmentStorageShutdown,
+            meshmsg_protocol::Outcome::Unknown,
+        )),
     }
 }

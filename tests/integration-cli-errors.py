@@ -161,28 +161,13 @@ def lifecycle_error(code, outcome, retryable, include_offer=False, partial=False
         if request["request"]["command"] == "status":
             return download_status()
         operation_id = request["request"]["operation_id"]
-        value = {
+        # Retry guidance and display text are derived by the CLI adapter, not IPC.
+        assert retryable in (True, False)
+        assert include_offer in (True, False) and partial in (True, False)
+        return {
             "type": "error", "schema_version": 1, "code": code,
-            "message": {
-                "operation_id_conflict": "The operation ID is bound to different input.",
-                "operation_capacity": "Local capacity is currently unavailable.",
-                "attachment_removal_partial": "Attachment removal completed only partially.",
-            }[code],
-            "operation_id": operation_id, "outcome": outcome, "retryable": retryable,
+            "operation_id": operation_id, "outcome": outcome,
         }
-        if include_offer:
-            value["offer_id"] = request["request"]["offer_id"]
-        if partial:
-            value.update(selected_tags=2, removed_tags=1, quota_bytes_released=4,
-                         maximum=512, dry_run=False)
-            if request["request"]["command"] == "offers_prune":
-                value.update(
-                    direction=request["request"]["direction"],
-                    older_than_secs=request["request"]["older_than_secs"],
-                    cutoff_ms=1,
-                    maximum=request["request"]["max_delete"],
-                )
-        return value
     return response
 
 
@@ -203,9 +188,8 @@ run_case(
                     include_offer=True, partial=True),
     expected_code="attachment_removal_partial", expected_outcome="partial",
     expected_retryable=True,
-    expected_fields={"operation_id": "c" * 32, "offer_id": "d" * 32,
-                     "selected_tags": 2, "removed_tags": 1,
-                     "quota_bytes_released": 4},
+    expected_fields={"operation_id": "c" * 32},
+    absent_fields=("offer_id", "selected_tags", "removed_tags", "quota_bytes_released"),
 )
 run_case(
     ["offers", "prune", "--operation-id", "e" * 32,
@@ -213,20 +197,17 @@ run_case(
     lifecycle_error("attachment_removal_partial", "partial", True, partial=True),
     expected_code="attachment_removal_partial", expected_outcome="partial",
     expected_retryable=True,
-    expected_fields={"operation_id": "e" * 32, "direction": "outgoing",
-                     "older_than_secs": 1, "maximum": 2, "dry_run": False,
-                     "selected_tags": 2, "removed_tags": 1,
-                     "quota_bytes_released": 4},
-    absent_fields=("offer_id", "provider"),
+    expected_fields={"operation_id": "e" * 32},
+    absent_fields=("offer_id", "provider", "direction", "older_than_secs",
+                   "maximum", "dry_run", "selected_tags", "removed_tags",
+                   "quota_bytes_released"),
 )
 
 # The stable listing-capacity error crosses a strict correlated fake IPC reply
 # and remains actionable in CLI JSON mode.
 run_case(
     ["offers"],
-    {"type": "error", "code": "offers_busy",
-     "message": "Attachment listing is currently busy.",
-     "outcome": "not_started", "retryable": True},
+    {"type": "error", "code": "offers_busy", "outcome": "not_started"},
     expected_code="offers_busy", expected_retryable=True,
 )
 

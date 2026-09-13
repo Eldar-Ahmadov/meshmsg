@@ -11,13 +11,16 @@ use iroh_blobs::{ticket::BlobTicket, BlobFormat};
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
+#[cfg(any(test, feature = "web"))]
 use std::time::Duration;
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 pub(crate) const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 pub(crate) const ATTACHMENT_OFFER_VERSION: u8 = 1;
 const MAX_ENVELOPE_SIZE: usize = 4096;
+#[cfg(any(test, feature = "web"))]
 const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
+#[cfg(any(test, feature = "web"))]
 pub(crate) const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -208,18 +211,30 @@ pub(crate) fn offer_event(
     timestamp_ms: u64,
     encoded: &[u8],
     offer: AttachmentOffer,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type":"attachment_offer", "schema_version":2,
-        "from":from.to_string(),
-        "message_id":id_string(&message_id),
-        "timestamp_ms":timestamp_ms,
-        "offer_id":offer.offer_id, "kind":offer.kind,
-        "name":offer.name, "size":offer.size, "ticket":offer.ticket,
-        "offer":BASE64URL_NOPAD.encode(encoded)
+) -> meshmsg_protocol::Event {
+    meshmsg_protocol::Event::AttachmentOffer(meshmsg_protocol::AttachmentOffer {
+        from: from.to_string().parse().expect("public key is canonical"),
+        message_id: id_string(&message_id)
+            .parse()
+            .expect("message ID is canonical"),
+        timestamp_ms,
+        offer_id: offer.offer_id.parse().expect("validated offer ID"),
+        kind: match offer.kind {
+            super::AttachmentKind::File => meshmsg_protocol::AttachmentKind::File,
+            super::AttachmentKind::DirectoryTarV1 => {
+                meshmsg_protocol::AttachmentKind::DirectoryTarV1
+            }
+        },
+        name: meshmsg_protocol::AttachmentName::new(offer.name).expect("validated attachment name"),
+        size: offer.size,
+        ticket: meshmsg_protocol::AttachmentToken::new(offer.ticket)
+            .expect("validated attachment ticket"),
+        offer: meshmsg_protocol::AttachmentToken::new(BASE64URL_NOPAD.encode(encoded))
+            .expect("bounded signed attachment offer"),
     })
 }
 
+#[cfg(any(test, feature = "web"))]
 pub(crate) fn validate_attachment_event(
     expected_topic: Option<TopicId>,
     live_now_ms: Option<u64>,
@@ -281,6 +296,14 @@ pub(crate) fn validate_attachment_event(
 }
 
 #[cfg(debug_assertions)]
+fn fixture_event_value(event: meshmsg_protocol::Event) -> serde_json::Value {
+    let schema_version = event.schema_version();
+    let mut value = serde_json::to_value(event).expect("attachment fixture serialization");
+    value["schema_version"] = schema_version.into();
+    value
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn signed_attachment_fixture(
     dir: &std::path::Path,
     offer_id: &str,
@@ -317,16 +340,16 @@ pub(crate) fn signed_attachment_fixture(
         .to_string(),
     };
     let signed = encode_signed_offer(&secret, topic, offer, timestamp_ms)?;
-    Ok(offer_event(
+    Ok(fixture_event_value(offer_event(
         signed.from,
         signed.message_id,
         signed.timestamp_ms,
         &signed.encoded,
         signed.offer,
-    ))
+    )))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "web"))]
 pub(crate) fn signed_attachment_event_for_test(
     secret: &SecretKey,
     offer_id: &str,
@@ -346,7 +369,7 @@ pub(crate) fn signed_attachment_event_for_test(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "web"))]
 pub(crate) fn signed_attachment_event_for_topic_for_test(
     secret: &SecretKey,
     topic: TopicId,
@@ -370,11 +393,11 @@ pub(crate) fn signed_attachment_event_for_topic_for_test(
     };
     let signed = encode_signed_offer(secret, topic, offer, timestamp_ms)
         .expect("test signed attachment envelope");
-    offer_event(
+    fixture_event_value(offer_event(
         signed.from,
         signed.message_id,
         signed.timestamp_ms,
         &signed.encoded,
         signed.offer,
-    )
+    ))
 }

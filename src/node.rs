@@ -8,13 +8,12 @@ use crate::{
         runtime::*,
     },
     config::{prepare_state_dir, State, StateLock},
-    contracts::{self, ErrorEnvelopeV1},
+    contracts::{self, ProtocolErrorAdapter},
     direct::{self, DIRECT_ALPN},
     gossip::{self, EventHandler as GossipEventHandler},
     invite::Invite,
     ipc::{
-        read_frame, send_request_checked, subscribe, valid_content_digest, valid_operation_id,
-        AttachmentOperationKind, IpcRequest, IpcRequestFrame, LifecycleErrorV1,
+        read_frame, send_request_checked, subscribe, IpcRequest, IpcRequestFrame,
         LifecycleRequestContext, LifecycleSuccessV3, MAX_IPC_REQUEST_SIZE,
     },
     peers as peer_api,
@@ -43,7 +42,6 @@ use iroh_gossip::{
     net::Gossip,
     proto::TopicId,
 };
-use serde::Deserialize;
 #[cfg(test)]
 use serde_byte_array::ByteArray;
 use std::{
@@ -69,16 +67,15 @@ use crate::{
     attachment::{
         protocol::{
             attachment_body, parse_attachment_body, parse_signed_offer_token,
-            signed_attachment_event_for_test, validate_attachment_event, AttachmentWire,
-            ATTACHMENT_OFFER_VERSION, ATTACHMENT_PREFIX,
+            validate_attachment_event, AttachmentWire, ATTACHMENT_OFFER_VERSION, ATTACHMENT_PREFIX,
         },
         AttachmentKind, AttachmentOffer,
     },
     gossip::{
         Envelope, EnvelopeKind, EnvelopeReplayCache, EnvelopeSignaturePayload, LegacyEnvelopeV1,
-        RejectionSampler, TokenBucket, TransportSourceLimiter, ENVELOPE_ACCEPTANCE_WINDOW,
-        ENVELOPE_DOMAIN, ENVELOPE_FUTURE_SKEW, ENVELOPE_VERSION, GLOBAL_REPLAY_BURST,
-        GLOBAL_TRANSPORT_BURST, MAX_ENVELOPE_REPLAY_ENTRIES, MAX_ENVELOPE_SIZE,
+        TokenBucket, TransportSourceLimiter, ENVELOPE_ACCEPTANCE_WINDOW, ENVELOPE_DOMAIN,
+        ENVELOPE_FUTURE_SKEW, ENVELOPE_VERSION, GLOBAL_REPLAY_BURST, GLOBAL_TRANSPORT_BURST,
+        MAX_ENVELOPE_REPLAY_ENTRIES, MAX_ENVELOPE_SIZE,
         MAX_MESSAGE_SIZE as GOSSIP_MAX_MESSAGE_SIZE, MAX_REPLAY_IDS_PER_SENDER,
         MAX_REPLAY_SENDERS_PER_SOURCE, MAX_TRANSPORT_SOURCES, PER_SENDER_REPLAY_BURST,
         PROTOCOL_HEADROOM as GOSSIP_PROTOCOL_HEADROOM, REPLAY_BUCKET_RETENTION,
@@ -96,7 +93,6 @@ use std::{collections::BTreeMap, sync::atomic::Ordering};
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
 
-const REJECTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const IPC_EVENT_CAPACITY: usize = 256;
 /// Bounds all accepted local IPC connections, including long-lived subscriptions
 /// and subscriptions. Connections beyond this limit receive a small rejection and
@@ -124,35 +120,6 @@ pub(crate) const DEFAULT_MIN_FREE_SPACE_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_ATTACHMENT_RETENTION_SECS: u64 = 0;
 #[cfg(unix)]
 const SOCKET_NAME: &str = "daemon.sock";
-#[derive(Default)]
-struct InternalContractGuard {
-    last_emitted_ms: Option<u64>,
-    suppressed: u64,
-}
-
-impl InternalContractGuard {
-    fn rejection(&mut self, now_ms: u64, _family: &str) -> Option<serde_json::Value> {
-        let interval_ms = REJECTION_SAMPLE_INTERVAL.as_millis() as u64;
-        if self
-            .last_emitted_ms
-            .is_some_and(|last| now_ms.saturating_sub(last) < interval_ms)
-        {
-            self.suppressed = self.suppressed.saturating_add(1);
-            return None;
-        }
-        let suppressed = std::mem::take(&mut self.suppressed);
-        self.last_emitted_ms = Some(now_ms);
-        let mut error = ErrorEnvelopeV1::new(
-            "internal_contract_error",
-            "generated event failed its strict contract",
-            "unknown",
-            false,
-        );
-        error.suppressed_since_last = Some(suppressed);
-        Some(error.into_value())
-    }
-}
-
 fn unix_timestamp_ms() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
 }
@@ -178,7 +145,7 @@ struct RunningNode {
     lookup: MemoryLookup,
     presence_lookup: MemoryLookup,
     direct_replay: direct::ReplayWorker,
-    direct_incoming: mpsc::Receiver<serde_json::Value>,
+    direct_incoming: mpsc::Receiver<meshmsg_protocol::Event>,
 }
 
 async fn start(state: &State, secret: SecretKey, state_dir: &Path) -> Result<RunningNode> {
@@ -287,14 +254,14 @@ struct PruneResolution {
 
 struct CompletedOperation {
     fingerprint: [u8; 32],
-    response: serde_json::Value,
+    response: meshmsg_protocol::Response,
     expires_at: StdInstant,
     prune_resolution: Option<PruneResolution>,
 }
 
 struct InFlightOperation {
     fingerprint: [u8; 32],
-    waiters: Vec<oneshot::Sender<serde_json::Value>>,
+    waiters: Vec<oneshot::Sender<meshmsg_protocol::Response>>,
     prune_resolution: Option<PruneResolution>,
 }
 
@@ -322,15 +289,12 @@ impl OperationCache {
         self.order.retain(|id| self.completed.contains_key(id));
     }
 
-    fn error(operation_id: &str, code: &str, diagnostic: &str) -> serde_json::Value {
-        let mut error = ErrorEnvelopeV1::new(
+    fn error(operation_id: &str, code: meshmsg_protocol::ErrorCode) -> meshmsg_protocol::Response {
+        contracts::protocol_error_response(
             code,
-            diagnostic,
-            "not_started",
-            code == "operation_capacity",
-        );
-        error.operation_id = Some(operation_id.to_owned());
-        error.into_value()
+            meshmsg_protocol::Outcome::NotStarted,
+            Some(operation_id.parse().expect("validated operation ID")),
+        )
     }
 
     /// Returns true only for the first caller that must execute the operation.
@@ -338,40 +302,23 @@ impl OperationCache {
         &mut self,
         operation_id: String,
         fingerprint: [u8; 32],
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
         now: StdInstant,
     ) -> bool {
         self.prune(now);
         if let Some(entry) = self.completed.get(&operation_id) {
             let response = if entry.fingerprint == fingerprint {
-                if let Some(resolution) = entry.prune_resolution {
-                    if entry
-                        .response
-                        .get("cutoff_ms")
-                        .is_some_and(|value| !value.is_null())
-                    {
-                        debug_assert_eq!(
-                            entry
-                                .response
-                                .get("older_than_secs")
-                                .and_then(serde_json::Value::as_u64),
-                            Some(resolution.older_than_secs)
-                        );
-                        debug_assert_eq!(
-                            entry
-                                .response
-                                .get("cutoff_ms")
-                                .and_then(serde_json::Value::as_u64),
-                            Some(resolution.cutoff_ms)
-                        );
-                    }
+                if let (Some(resolution), meshmsg_protocol::Response::OffersPruned(result)) =
+                    (entry.prune_resolution, &entry.response)
+                {
+                    debug_assert_eq!(result.older_than_secs, Some(resolution.older_than_secs));
+                    debug_assert_eq!(result.cutoff_ms, Some(resolution.cutoff_ms));
                 }
                 entry.response.clone()
             } else {
                 Self::error(
                     &operation_id,
-                    "operation_id_conflict",
-                    "operation ID was already used with different inputs",
+                    meshmsg_protocol::ErrorCode::OperationIdConflict,
                 )
             };
             let _ = reply.send(response);
@@ -383,8 +330,7 @@ impl OperationCache {
             } else {
                 let _ = reply.send(Self::error(
                     &operation_id,
-                    "operation_id_conflict",
-                    "operation ID is in flight with different inputs",
+                    meshmsg_protocol::ErrorCode::OperationIdConflict,
                 ));
             }
             return false;
@@ -393,8 +339,7 @@ impl OperationCache {
             let Some(oldest) = self.order.pop_front() else {
                 let _ = reply.send(Self::error(
                     &operation_id,
-                    "operation_capacity",
-                    "retry cache is full of in-flight operations",
+                    meshmsg_protocol::ErrorCode::OperationCapacity,
                 ));
                 return false;
             };
@@ -434,15 +379,12 @@ impl OperationCache {
     fn complete(
         &mut self,
         operation_id: &str,
-        mut response: serde_json::Value,
+        response: meshmsg_protocol::Response,
         now: StdInstant,
-    ) -> serde_json::Value {
+    ) -> meshmsg_protocol::Response {
         let Some(in_flight) = self.in_flight.remove(operation_id) else {
             return response;
         };
-        if let Some(object) = response.as_object_mut() {
-            object.insert("operation_id".into(), operation_id.into());
-        }
         for waiter in in_flight.waiters {
             let _ = waiter.send(response.clone());
         }
@@ -496,29 +438,29 @@ enum DaemonCommand {
     Send {
         operation_id: String,
         body: String,
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     PrivateSend {
         operation_id: String,
         to: String,
         body: String,
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Status {
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Peers {
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Offers {
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     OffersRemove {
         operation_id: String,
         offer_id: String,
         direction: Option<String>,
         provider: Option<String>,
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     OffersPrune {
         operation_id: String,
@@ -526,20 +468,20 @@ enum DaemonCommand {
         direction: Option<String>,
         dry_run: bool,
         max_delete: usize,
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Share {
         operation_id: String,
         source_digest: String,
         path: PathBuf,
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Download {
         operation_id: String,
         offer: String,
         output: PathBuf,
         mode: meshmsg_protocol::DownloadMode,
-        reply: oneshot::Sender<serde_json::Value>,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Stop,
 }
@@ -965,180 +907,111 @@ impl Default for LocalIpcTimeouts {
     }
 }
 
-tokio::task_local! {
-    static IPC_REQUEST_ID: std::cell::RefCell<Option<String>>;
-}
-
-fn normalize_ipc_response(value: &serde_json::Value, request_id: &str) -> serde_json::Value {
-    if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
-        let code = value
-            .get("code")
-            .and_then(serde_json::Value::as_str)
-            .filter(|code| contracts::known_error_code(code))
-            .unwrap_or("internal_contract_error");
-        let outcome = value
-            .get("outcome")
-            .and_then(serde_json::Value::as_str)
-            .filter(|outcome| matches!(*outcome, "not_started" | "unknown" | "partial"))
-            .unwrap_or(match code {
-                "invalid_request" | "unsupported_schema" | "invalid_message"
-                | "private_send_busy" => "not_started",
-                _ => "unknown",
-            });
-        let retryable = value
-            .get("retryable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(code == "private_send_busy" || outcome != "not_started");
-        let message = value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Daemon request failed.");
-        let mut error = ErrorEnvelopeV1::new(code, message, outcome, retryable);
-        error.request_id = Some(request_id.to_owned());
-        error.operation_id = value
-            .get("operation_id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| valid_operation_id(id))
-            .map(str::to_owned);
-        error.offer_id = value
-            .get("offer_id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| valid_operation_id(id))
-            .map(str::to_owned);
-        error.selected_tags = value
-            .get("selected_tags")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|count| usize::try_from(count).ok());
-        error.removed_tags = value
-            .get("removed_tags")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|count| usize::try_from(count).ok());
-        error.quota_bytes_released = value
-            .get("quota_bytes_released")
-            .and_then(serde_json::Value::as_u64);
-        error.direction = value
-            .get("direction")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        error.provider = value
-            .get("provider")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        error.older_than_secs = value
-            .get("older_than_secs")
-            .and_then(serde_json::Value::as_u64);
-        error.maximum = value
-            .get("maximum")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|count| usize::try_from(count).ok());
-        error.dry_run = value.get("dry_run").and_then(serde_json::Value::as_bool);
-        error.cutoff_ms = value.get("cutoff_ms").and_then(serde_json::Value::as_u64);
-        error.suppressed_since_last = value
-            .get("suppressed_since_last")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|_| code == "internal_contract_error");
-        return error.into_value();
-    }
-    contracts::correlate(value.clone(), request_id)
-}
-
-async fn write_local_response<S>(
+async fn write_local_frame<S>(
     stream: &mut S,
-    value: &serde_json::Value,
+    frame: &meshmsg_protocol::DaemonFrame,
     deadline: Duration,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let mut response = IPC_REQUEST_ID
-        .try_with(|current| {
-            current
-                .borrow()
-                .as_deref()
-                .map(|id| normalize_ipc_response(value, id))
-        })
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| value.clone());
-    response["protocol_version"] = meshmsg_protocol::PROTOCOL_VERSION.into();
-    let response: meshmsg_protocol::DaemonFrame = serde_json::from_value(response.clone())
-        .with_context(|| format!("daemon produced a noncanonical typed local frame: {response}"))?;
     tokio::time::timeout(
         deadline,
-        meshmsg_protocol::write_json(stream, &response, meshmsg_protocol::FrameLimit::Event),
+        meshmsg_protocol::write_json(stream, frame, meshmsg_protocol::FrameLimit::Event),
     )
     .await
-    .context("timed out writing local IPC response")?
+    .context("timed out writing local IPC frame")?
     .map_err(anyhow::Error::from)
 }
 
-fn annotate_operation_response(value: &mut serde_json::Value, operation_id: &str) {
-    value["operation_id"] = operation_id.into();
-    if value["type"] == "error" && value.get("schema_version").is_none() {
-        value["schema_version"] = 1.into();
-        value["retryable"] = true.into();
-        value["outcome"] = "unknown".into();
-    }
+async fn write_local_response<S>(
+    stream: &mut S,
+    request_id: Option<meshmsg_protocol::RequestId>,
+    response: meshmsg_protocol::Response,
+    deadline: Duration,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_local_frame(
+        stream,
+        &meshmsg_protocol::DaemonFrame::Response(meshmsg_protocol::ResponseFrame::new(
+            request_id, response,
+        )),
+        deadline,
+    )
+    .await
 }
 
-async fn command_response<F>(operation: F, deadline: Duration) -> serde_json::Value
+async fn write_local_event<S>(
+    stream: &mut S,
+    request_id: meshmsg_protocol::RequestId,
+    event: meshmsg_protocol::Event,
+    deadline: Duration,
+) -> Result<()>
 where
-    F: std::future::Future<Output = Result<serde_json::Value>>,
+    S: AsyncWrite + Unpin,
+{
+    write_local_frame(
+        stream,
+        &meshmsg_protocol::DaemonFrame::Event(meshmsg_protocol::EventFrame::new(request_id, event)),
+        deadline,
+    )
+    .await
+}
+
+async fn command_response<F>(
+    operation: F,
+    deadline: Duration,
+    operation_id: Option<meshmsg_protocol::OperationId>,
+) -> meshmsg_protocol::Response
+where
+    F: std::future::Future<Output = Result<meshmsg_protocol::Response>>,
 {
     match tokio::time::timeout(deadline, operation).await {
         Ok(Ok(value)) => value,
-        Ok(Err(_)) => serde_json::json!({
-            "type":"error", "code":"daemon_stopping", "retryable":true,
-            "message":"The daemon is shutting down or unavailable."
-        }),
-        Err(_) => serde_json::json!({
-            "type":"error", "code":"command_timeout", "retryable":true,
-            "message":"The request timed out; reconcile before retrying."
-        }),
+        Ok(Err(_)) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            operation_id,
+            meshmsg_protocol::ErrorCode::DaemonStopping,
+            meshmsg_protocol::Outcome::Unknown,
+        )),
+        Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            operation_id,
+            meshmsg_protocol::ErrorCode::CommandTimeout,
+            meshmsg_protocol::Outcome::Unknown,
+        )),
     }
 }
 
 async fn lifecycle_command_response<F>(
     operation: F,
     deadline: Duration,
-    operation_id: Option<String>,
-    offer_id: Option<String>,
-) -> serde_json::Value
+    operation_id: Option<meshmsg_protocol::OperationId>,
+    _offer_id: Option<String>,
+) -> meshmsg_protocol::Response
 where
-    F: std::future::Future<Output = Result<serde_json::Value>>,
+    F: std::future::Future<Output = Result<meshmsg_protocol::Response>>,
 {
     match tokio::time::timeout(deadline, operation).await {
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
-            let mut response = LifecycleErrorV1::new(
-                "attachment_storage_shutdown",
-                error.to_string(),
-                "unknown",
-                true,
-            );
-            response.operation_id = operation_id;
-            response.offer_id = offer_id;
-            response.into_value()
-        }
-        Err(_) => {
-            let mut response = LifecycleErrorV1::new(
-                "attachment_command_timeout",
-                "attachment lifecycle command exceeded its deadline; retry to reconcile the outcome",
-                "unknown",
-                true,
-            );
-            response.operation_id = operation_id;
-            response.offer_id = offer_id;
-            response.into_value()
-        }
+        Ok(Err(_)) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            operation_id,
+            meshmsg_protocol::ErrorCode::AttachmentStorageShutdown,
+            meshmsg_protocol::Outcome::Unknown,
+        )),
+        Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            operation_id,
+            meshmsg_protocol::ErrorCode::AttachmentCommandTimeout,
+            meshmsg_protocol::Outcome::Unknown,
+        )),
     }
 }
 
 async fn send_command(
     commands: &mpsc::Sender<DaemonCommand>,
     command: DaemonCommand,
-    response: oneshot::Receiver<serde_json::Value>,
-) -> Result<serde_json::Value> {
+    response: oneshot::Receiver<meshmsg_protocol::Response>,
+) -> Result<meshmsg_protocol::Response> {
     commands.send(command).await?;
     Ok(response.await?)
 }
@@ -1147,53 +1020,44 @@ async fn send_command(
 async fn handle_local_client<S>(
     stream: S,
     commands: mpsc::Sender<DaemonCommand>,
-    events: broadcast::Receiver<serde_json::Value>,
-    connected: serde_json::Value,
-    startup_peers: Option<serde_json::Value>,
+    events: broadcast::Receiver<meshmsg_protocol::Event>,
+    connected: meshmsg_protocol::Event,
+    startup_peers: Option<meshmsg_protocol::Event>,
 ) -> Result<()>
 where
     S: SubscriptionStream,
 {
-    IPC_REQUEST_ID
-        .scope(
-            std::cell::RefCell::new(None),
-            handle_local_client_with_timeouts(
-                stream,
-                commands,
-                events,
-                connected,
-                startup_peers,
-                LocalIpcTimeouts::default(),
-            ),
-        )
-        .await
+    handle_local_client_with_timeouts(
+        stream,
+        commands,
+        events,
+        connected,
+        startup_peers,
+        LocalIpcTimeouts::default(),
+    )
+    .await
 }
 
 async fn handle_local_client_with_timeouts<S>(
     stream: S,
     commands: mpsc::Sender<DaemonCommand>,
-    events: broadcast::Receiver<serde_json::Value>,
-    connected: serde_json::Value,
-    startup_peers: Option<serde_json::Value>,
+    events: broadcast::Receiver<meshmsg_protocol::Event>,
+    connected: meshmsg_protocol::Event,
+    startup_peers: Option<meshmsg_protocol::Event>,
     timeouts: LocalIpcTimeouts,
 ) -> Result<()>
 where
     S: SubscriptionStream,
 {
-    IPC_REQUEST_ID
-        .scope(
-            std::cell::RefCell::new(None),
-            handle_local_client_inner(stream, commands, events, connected, startup_peers, timeouts),
-        )
-        .await
+    handle_local_client_inner(stream, commands, events, connected, startup_peers, timeouts).await
 }
 
 async fn handle_local_client_inner<S>(
     mut stream: S,
     commands: mpsc::Sender<DaemonCommand>,
-    mut events: broadcast::Receiver<serde_json::Value>,
-    connected: serde_json::Value,
-    startup_peers: Option<serde_json::Value>,
+    mut events: broadcast::Receiver<meshmsg_protocol::Event>,
+    connected: meshmsg_protocol::Event,
+    startup_peers: Option<meshmsg_protocol::Event>,
     timeouts: LocalIpcTimeouts,
 ) -> Result<()>
 where
@@ -1207,133 +1071,56 @@ where
     {
         Ok(result) => result?,
         Err(_) => {
-            let error = ErrorEnvelopeV1::new(
-                "initial_frame_timeout",
-                "The initial local request timed out.",
-                "not_started",
-                true,
-            );
-            let _ = write_local_response(&mut stream, &error.into_value(), timeouts.response_write)
-                .await;
+            let _ = write_local_response(
+                &mut stream,
+                None,
+                meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                    None,
+                    meshmsg_protocol::ErrorCode::InitialFrameTimeout,
+                    meshmsg_protocol::Outcome::NotStarted,
+                )),
+                timeouts.response_write,
+            )
+            .await;
             return Ok(());
         }
     };
     let request_frame: IpcRequestFrame = match serde_json::from_slice(&frame) {
         Ok(frame) => frame,
         Err(_) => {
-            // Preserve the established reusable-operation behavior for a
-            // structurally valid v2 send envelope whose bounded typed body is
-            // the only rejected field. No command is admitted from this path.
-            let raw = serde_json::from_slice::<serde_json::Value>(&frame).ok();
-            let recoverable_send = raw.as_ref().and_then(|value| {
-                let request_id = value.get("request_id")?.as_str()?;
-                let request = value.get("request")?;
-                let operation_id = request.get("operation_id")?.as_str()?;
-                let body = request.get("body")?.as_str()?;
-                (value.get("protocol_version")?.as_u64()
-                    == Some(u64::from(meshmsg_protocol::PROTOCOL_VERSION))
-                    && request.get("command")?.as_str() == Some("send")
-                    && contracts::valid_request_id(request_id)
-                    && valid_operation_id(operation_id)
-                    && crate::message::validate_broadcast_body(body).is_err())
-                .then(|| (request_id.to_owned(), operation_id.to_owned()))
-            });
-            let mut error = if recoverable_send.is_some() {
-                ErrorEnvelopeV1::new(
-                    "invalid_message",
-                    "The message is invalid.",
-                    "not_started",
-                    false,
-                )
-            } else {
-                ErrorEnvelopeV1::new(
-                    "invalid_request",
-                    "The request contract is invalid or unsupported.",
-                    "not_started",
-                    false,
-                )
-            };
-            if let Some((request_id, operation_id)) = recoverable_send {
-                error.request_id = Some(request_id);
-                error.operation_id = Some(operation_id);
-            }
-            let _ = write_local_response(&mut stream, &error.into_value(), timeouts.response_write)
-                .await;
+            let _ = write_local_response(
+                &mut stream,
+                None,
+                meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                    None,
+                    meshmsg_protocol::ErrorCode::InvalidRequest,
+                    meshmsg_protocol::Outcome::NotStarted,
+                )),
+                timeouts.response_write,
+            )
+            .await;
             return Ok(());
         }
     };
-    let _ = IPC_REQUEST_ID.try_with(|current| {
-        *current.borrow_mut() = Some(request_frame.request_id.to_string());
-    });
+    let request_id = request_frame.request_id;
     let request = request_frame.request;
-    let operation_id = match &request {
-        IpcRequest::Send { operation_id, .. }
-        | IpcRequest::PrivateSend { operation_id, .. }
-        | IpcRequest::OffersRemove { operation_id, .. }
-        | IpcRequest::OffersPrune { operation_id, .. }
-        | IpcRequest::Share { operation_id, .. }
-        | IpcRequest::Download { operation_id, .. } => Some(operation_id),
-        _ => None,
-    };
-    if operation_id.is_some_and(|id| !valid_operation_id(id)) {
-        let id = operation_id.expect("operation ID was present");
-        write_local_response(
-            &mut stream,
-            &OperationCache::error(
-                id,
-                "invalid_operation_id",
-                "operation ID must be 32 lowercase hexadecimal characters",
-            ),
-            timeouts.response_write,
-        )
-        .await?;
-        return Ok(());
-    }
-    if let IpcRequest::Share {
-        operation_id,
-        source_digest,
-        ..
-    } = &request
-    {
-        if !valid_content_digest(source_digest) {
-            write_local_response(
+    match request {
+        IpcRequest::Subscribe => {
+            write_local_event(
                 &mut stream,
-                &OperationCache::error(
-                    operation_id,
-                    "invalid_source_digest",
-                    "source digest must be 64 lowercase hexadecimal characters",
-                ),
+                request_id.clone(),
+                connected,
                 timeouts.response_write,
             )
             .await?;
-            return Ok(());
-        }
-    }
-    let invalid_message = match &request {
-        IpcRequest::Send { operation_id, body } => crate::message::validate_broadcast_body(body)
-            .err()
-            .map(|error| (operation_id, error)),
-        IpcRequest::PrivateSend {
-            operation_id, body, ..
-        } => crate::message::validate_private_body(body)
-            .err()
-            .map(|error| (operation_id, error)),
-        _ => None,
-    };
-    if let Some((operation_id, error)) = invalid_message {
-        write_local_response(
-            &mut stream,
-            &OperationCache::error(operation_id, "invalid_message", &error.to_string()),
-            timeouts.response_write,
-        )
-        .await?;
-        return Ok(());
-    }
-    match request {
-        IpcRequest::Subscribe => {
-            write_local_response(&mut stream, &connected, timeouts.response_write).await?;
             if let Some(snapshot) = startup_peers {
-                write_local_response(&mut stream, &snapshot, timeouts.response_write).await?;
+                write_local_event(
+                    &mut stream,
+                    request_id.clone(),
+                    snapshot,
+                    timeouts.response_write,
+                )
+                .await?;
             }
             let mut read_closed = false;
             loop {
@@ -1354,16 +1141,21 @@ where
                         }
                     }
                     value = events.recv() => match value {
-                        Ok(value) => write_local_response(
-                            &mut stream, &value, timeouts.response_write
+                        Ok(value) => write_local_event(
+                            &mut stream,
+                            request_id.clone(),
+                            value,
+                            timeouts.response_write,
                         ).await?,
                         Err(broadcast::error::RecvError::Lagged(count)) => {
-                            write_local_response(
+                            write_local_event(
                                 &mut stream,
-                                &serde_json::json!({
-                                    "type":"lagged", "source":"local", "dropped":count,
-                                    "message":format!("local listener missed {count} events")
-                                }),
+                                request_id.clone(),
+                                meshmsg_protocol::Event::Lagged {
+                                    source: meshmsg_protocol::EventSource::Local,
+                                    dropped: count,
+                                    message: format!("local listener missed {count} events"),
+                                },
                                 timeouts.response_write,
                             )
                             .await?;
@@ -1376,7 +1168,7 @@ where
         IpcRequest::Send { operation_id, body } => {
             let response_operation_id = operation_id.clone();
             let (reply, response) = oneshot::channel();
-            let mut value = command_response(
+            let value = command_response(
                 send_command(
                     &commands,
                     DaemonCommand::Send {
@@ -1387,10 +1179,16 @@ where
                     response,
                 ),
                 timeouts.ordinary_command,
+                Some(response_operation_id),
             )
             .await;
-            annotate_operation_response(&mut value, &response_operation_id);
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::PrivateSend {
             operation_id,
@@ -1399,7 +1197,7 @@ where
         } => {
             let response_operation_id = operation_id.clone();
             let (reply, response) = oneshot::channel();
-            let mut value = command_response(
+            let value = command_response(
                 send_command(
                     &commands,
                     DaemonCommand::PrivateSend {
@@ -1411,37 +1209,64 @@ where
                     response,
                 ),
                 timeouts.private_command,
+                Some(response_operation_id),
             )
             .await;
-            annotate_operation_response(&mut value, &response_operation_id);
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::Status => {
             let (reply, response) = oneshot::channel();
             let value = command_response(
                 send_command(&commands, DaemonCommand::Status { reply }, response),
                 timeouts.ordinary_command,
+                None,
             )
             .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::Peers => {
             let (reply, response) = oneshot::channel();
             let value = command_response(
                 send_command(&commands, DaemonCommand::Peers { reply }, response),
                 timeouts.ordinary_command,
+                None,
             )
             .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::Offers => {
             let (reply, response) = oneshot::channel();
             let value = command_response(
                 send_command(&commands, DaemonCommand::Offers { reply }, response),
                 timeouts.list_command,
+                None,
             )
             .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::OffersRemove {
             operation_id,
@@ -1463,11 +1288,17 @@ where
                     response,
                 ),
                 timeouts.list_command,
-                Some(operation_id.into_string()),
+                Some(operation_id),
                 None,
             )
             .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::OffersPrune {
             operation_id,
@@ -1491,11 +1322,17 @@ where
                     response,
                 ),
                 timeouts.list_command,
-                Some(operation_id.into_string()),
+                Some(operation_id),
                 None,
             )
             .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::Share {
             operation_id,
@@ -1516,11 +1353,17 @@ where
                     response,
                 ),
                 timeouts.transfer_command,
-                Some(response_operation_id.into_string()),
+                Some(response_operation_id),
                 None,
             )
             .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::Download {
             operation_id,
@@ -1542,11 +1385,17 @@ where
                     response,
                 ),
                 timeouts.transfer_command,
-                Some(operation_id.into_string()),
+                Some(operation_id),
                 None,
             )
             .await;
-            write_local_response(&mut stream, &value, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                value,
+                timeouts.response_write,
+            )
+            .await?;
         }
         IpcRequest::Stop => {
             // Reserve bounded queue capacity before acknowledging. Once `send`
@@ -1557,18 +1406,30 @@ where
             {
                 Ok(Ok(permit)) => {
                     permit.send(DaemonCommand::Stop);
-                    serde_json::json!({"type":"stopping", "outcome":"accepted"})
+                    meshmsg_protocol::Response::Stopping {
+                        outcome: "accepted".into(),
+                    }
                 }
-                Ok(Err(_)) => serde_json::json!({
-                    "type":"error", "code":"daemon_stopping", "outcome":"not_started",
-                    "retryable":true, "message":"The daemon is shutting down or unavailable."
-                }),
-                Err(_) => serde_json::json!({
-                    "type":"error", "code":"command_timeout", "outcome":"not_started",
-                    "retryable":true, "message":"The request timed out; reconcile before retrying."
-                }),
+                Ok(Err(_)) => {
+                    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                        None,
+                        meshmsg_protocol::ErrorCode::DaemonStopping,
+                        meshmsg_protocol::Outcome::NotStarted,
+                    ))
+                }
+                Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                    None,
+                    meshmsg_protocol::ErrorCode::CommandTimeout,
+                    meshmsg_protocol::Outcome::NotStarted,
+                )),
             };
-            write_local_response(&mut stream, &response, timeouts.response_write).await?;
+            write_local_response(
+                &mut stream,
+                Some(request_id),
+                response,
+                timeouts.response_write,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1605,20 +1466,24 @@ async fn reject_local_client_at_capacity<S>(mut stream: S, write_timeout: Durati
 where
     S: AsyncWrite + Unpin,
 {
-    let error = ErrorEnvelopeV1::new(
-        "ipc_capacity",
-        "Local capacity is currently unavailable.",
-        "not_started",
-        true,
-    );
-    let _ = write_local_response(&mut stream, &error.into_value(), write_timeout).await;
+    let _ = write_local_response(
+        &mut stream,
+        None,
+        meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            None,
+            meshmsg_protocol::ErrorCode::IpcCapacity,
+            meshmsg_protocol::Outcome::NotStarted,
+        )),
+        write_timeout,
+    )
+    .await;
 }
 
 struct LocalClientSession {
     commands: mpsc::Sender<DaemonCommand>,
-    events: broadcast::Receiver<serde_json::Value>,
-    connected: serde_json::Value,
-    startup_peers: Option<serde_json::Value>,
+    events: broadcast::Receiver<meshmsg_protocol::Event>,
+    connected: meshmsg_protocol::Event,
+    startup_peers: Option<meshmsg_protocol::Event>,
 }
 
 async fn handle_admitted_local_client<S>(
@@ -1631,19 +1496,15 @@ where
     S: SubscriptionStream,
 {
     let _permit = permit;
-    IPC_REQUEST_ID
-        .scope(
-            std::cell::RefCell::new(None),
-            handle_local_client_with_timeouts(
-                stream,
-                session.commands,
-                session.events,
-                session.connected,
-                session.startup_peers,
-                timeouts,
-            ),
-        )
-        .await
+    handle_local_client_with_timeouts(
+        stream,
+        session.commands,
+        session.events,
+        session.connected,
+        session.startup_peers,
+        timeouts,
+    )
+    .await
 }
 
 /// Admit immediately after the platform listener has accepted/authenticated the
@@ -1812,7 +1673,6 @@ pub async fn run_daemon(
     presence_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut presence_sources = PresenceSourceLimiter::default();
     let mut gossip_events = GossipEventHandler::default();
-    let internal_contract_guard = Arc::new(Mutex::new(InternalContractGuard::default()));
     let connection_limit = Arc::new(Semaphore::new(LOCAL_IPC_CONNECTION_CAPACITY));
     let mut local_client_tasks = tokio::task::JoinSet::new();
     let mut transfer_tasks = tokio::task::JoinSet::new();
@@ -1855,28 +1715,25 @@ pub async fn run_daemon(
                             &directory_epoch,
                             directory_revision,
                         );
-                        let connected = serde_json::json!({
-                            "type":"connected", "peer":peer, "endpoint_online":true,
-                            "topic_joined":node.receiver.is_joined(),
-                            "alias":alias_config.effective(),
-                        });
+                        let connected = meshmsg_protocol::Event::Connected(
+                            meshmsg_protocol::Connected {
+                                peer: peer.parse().expect("public key is canonical"),
+                                endpoint_online: true,
+                                topic_joined: node.receiver.is_joined(),
+                                alias: alias_config.effective().map(str::parse).transpose()?,
+                            },
+                        );
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
                             events: event_tx.subscribe(),
                             connected,
-                            startup_peers: Some(startup_peers),
+                            startup_peers: Some(meshmsg_protocol::Event::PeersSnapshot(startup_peers)),
                         })
                     },
                 ).await?;
             }
             command = command_rx.recv() => match command {
                 Some(DaemonCommand::Send { operation_id, body, reply }) => {
-                    if let Err(error) = crate::message::validate_broadcast_body(&body) {
-                        let _ = reply.send(OperationCache::error(
-                            &operation_id, "invalid_message", &error.to_string(),
-                        ));
-                        continue;
-                    }
                     let fingerprint = operation_fingerprint("send", &[body.as_bytes()]);
                     if !operation_cache.lock().expect("operation cache poisoned").admit(
                         operation_id.clone(), fingerprint, reply, StdInstant::now()
@@ -1889,25 +1746,31 @@ pub async fn run_daemon(
                             operation_id_bytes(&operation_id), timestamp_ms,
                         ) {
                             Ok(envelope) => match node.sender.broadcast(envelope).await {
-                                Ok(()) => gossip::queued_event(
-                                    &peer, operation_id_bytes(&operation_id), body, timestamp_ms
+                                Ok(()) => meshmsg_protocol::Response::Queued(gossip::queued_event(
+                                    &peer, operation_id_bytes(&operation_id), body, timestamp_ms,
+                                )),
+                                Err(_error) => contracts::protocol_error_response(
+                                    meshmsg_protocol::ErrorCode::SendFailed,
+                                    meshmsg_protocol::Outcome::Unknown,
+                                    Some(operation_id.parse().expect("validated operation ID")),
                                 ),
-                                Err(error) => serde_json::json!({"type":"error", "schema_version":1, "code":"send_failed", "message":error.to_string(), "outcome":"unknown", "retryable":true}),
                             },
-                            Err(error) => serde_json::json!({"type":"error", "schema_version":1, "code":"invalid_message", "message":error.to_string(), "outcome":"not_started", "retryable":false}),
+                            Err(_error) => contracts::protocol_error_response(
+                                meshmsg_protocol::ErrorCode::InvalidMessage,
+                                meshmsg_protocol::Outcome::NotStarted,
+                                Some(operation_id.parse().expect("validated operation ID")),
+                            ),
                         },
-                        Err(error) => serde_json::json!({"type":"error", "schema_version":1, "code":"invalid_message", "message":error.to_string(), "outcome":"not_started", "retryable":false}),
+                        Err(_error) => contracts::protocol_error_response(
+                            meshmsg_protocol::ErrorCode::InvalidMessage,
+                            meshmsg_protocol::Outcome::NotStarted,
+                            Some(operation_id.parse().expect("validated operation ID")),
+                        ),
                     };
                     let response = operation_cache.lock().expect("operation cache poisoned")
                         .complete(&operation_id, response, StdInstant::now());
-                    if response["type"] == "queued" {
-                        publish_daemon_message_event(
-                            &event_tx,
-                            response.clone(),
-                            &mut internal_contract_guard.lock().expect("contract guard poisoned"),
-                            topic,
-                            unix_timestamp_ms().unwrap_or(0),
-                        );
+                    if let meshmsg_protocol::Response::Queued(queued) = response {
+                        let _ = event_tx.send(meshmsg_protocol::Event::Queued(queued));
                     }
                 }
                 Some(DaemonCommand::PrivateSend { operation_id, to, body, reply }) => {
@@ -1922,14 +1785,14 @@ pub async fn run_daemon(
                     presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                     let address = match directory.resolve(&to) {
                         Ok(address) => address,
-                        Err(error) => {
+                        Err(_error) => {
                             operation_cache.lock().expect("operation cache poisoned").complete(
                                 &operation_id,
-                                serde_json::json!({
-                                    "type":"error", "schema_version":1,
-                                    "code":"recipient_unresolved", "message":error.to_string(),
-                                    "outcome":"not_started", "retryable":false
-                                }),
+                                contracts::protocol_error_response(
+                                    meshmsg_protocol::ErrorCode::RecipientUnresolved,
+                                    meshmsg_protocol::Outcome::NotStarted,
+                                    Some(operation_id.parse().expect("validated operation ID")),
+                                ),
                                 StdInstant::now(),
                             );
                             continue;
@@ -1937,9 +1800,11 @@ pub async fn run_daemon(
                     };
                     let permit = match direct_sender.try_reserve() {
                         Ok(permit) => permit,
-                        Err(response) => {
+                        Err(error) => {
                             operation_cache.lock().expect("operation cache poisoned").complete(
-                                &operation_id, response, StdInstant::now(),
+                                &operation_id,
+                                meshmsg_protocol::Response::Error(error),
+                                StdInstant::now(),
                             );
                             continue;
                         }
@@ -1991,28 +1856,28 @@ pub async fn run_daemon(
                         attachment_retention_secs,
                     };
                     status.validate().map_err(anyhow::Error::msg)?;
-                    let _ = reply.send(serde_json::to_value(meshmsg_protocol::Response::Status(
-                        status,
-                    ))?);
+                    let _ = reply.send(meshmsg_protocol::Response::Status(status));
                 }
                 Some(DaemonCommand::Peers { reply }) => {
                     presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
                     let generated_at_ms = unix_timestamp_ms()?;
-                    let _ = reply.send(presence::snapshot(
-                        (&node.endpoint, &node.receiver),
-                        &directory,
-                        &peer,
-                        alias_config.effective(),
-                        generated_at_ms,
-                        &directory_epoch,
-                        directory_revision,
+                    let _ = reply.send(meshmsg_protocol::Response::PeersSnapshot(
+                        presence::snapshot(
+                            (&node.endpoint, &node.receiver),
+                            &directory,
+                            &peer,
+                            alias_config.effective(),
+                            generated_at_ms,
+                            &directory_epoch,
+                            directory_revision,
+                        ),
                     ));
                 }
                 Some(DaemonCommand::Offers { reply }) => {
                     let permit = match try_admit_offer_listing(&offer_list_limit) {
                         Ok(permit) => permit,
-                        Err(response) => {
-                            let _ = reply.send(response);
+                        Err(error) => {
+                            let _ = reply.send(meshmsg_protocol::Response::Error(error));
                             continue;
                         }
                     };
@@ -2040,28 +1905,26 @@ pub async fn run_daemon(
                         Some(value) => match value.parse::<PublicKey>() {
                             Ok(key) if key.to_string() == value => Some(value),
                             _ => {
-                                let mut error = LifecycleErrorV1::new(
-                                    "invalid_offer_selector", "provider must be a canonical public key",
-                                    "not_started", false,
+                                let error = meshmsg_protocol::ProtocolError::new(
+                                    Some(operation_id.parse().expect("validated operation ID")),
+                                    meshmsg_protocol::ErrorCode::InvalidOfferSelector,
+                                    meshmsg_protocol::Outcome::NotStarted,
                                 );
-                                error.operation_id = Some(operation_id.clone());
-                                error.offer_id = Some(offer_id.clone());
                                 operation_cache.lock().expect("operation cache poisoned").complete(
-                                    &operation_id, error.into_value(), StdInstant::now());
+                                    &operation_id, meshmsg_protocol::Response::Error(error), StdInstant::now());
                                 continue;
                             }
                         },
                         None => None,
                     };
                     if !contracts::valid_operation_id(&offer_id) || !valid_direction {
-                        let mut error = LifecycleErrorV1::new(
-                            "invalid_offer_selector", "offer ID or direction is invalid",
-                            "not_started", false,
+                        let error = meshmsg_protocol::ProtocolError::new(
+                            Some(operation_id.parse().expect("validated operation ID")),
+                            meshmsg_protocol::ErrorCode::InvalidOfferSelector,
+                            meshmsg_protocol::Outcome::NotStarted,
                         );
-                        error.operation_id = Some(operation_id.clone());
-                        if contracts::valid_operation_id(&offer_id) { error.offer_id = Some(offer_id.clone()); }
                         operation_cache.lock().expect("operation cache poisoned").complete(
-                            &operation_id, error.into_value(), StdInstant::now());
+                            &operation_id, meshmsg_protocol::Response::Error(error), StdInstant::now());
                         continue;
                     }
                     let storage = attachment_storage.clone();
@@ -2092,13 +1955,13 @@ pub async fn run_daemon(
                     if !direction.as_deref().is_none_or(|value| matches!(value, "incoming" | "outgoing"))
                         || !(1..=MAX_PRUNE_TAGS).contains(&max_delete)
                     {
-                        let mut error = LifecycleErrorV1::new(
-                            "invalid_prune_request", "prune direction or maximum is invalid",
-                            "not_started", false,
+                        let error = meshmsg_protocol::ProtocolError::new(
+                            Some(operation_id.parse().expect("validated operation ID")),
+                            meshmsg_protocol::ErrorCode::InvalidPruneRequest,
+                            meshmsg_protocol::Outcome::NotStarted,
                         );
-                        error.operation_id = Some(operation_id.clone());
                         operation_cache.lock().expect("operation cache poisoned").complete(
-                            &operation_id, error.into_value(), StdInstant::now());
+                            &operation_id, meshmsg_protocol::Response::Error(error), StdInstant::now());
                         continue;
                     }
                     let resolution = operation_cache
@@ -2136,13 +1999,13 @@ pub async fn run_daemon(
                     ) {
                         Ok(permit) => permit,
                         Err(_) => {
-                            let mut response = LifecycleErrorV1::new(
-                                "attachment_storage_busy", "attachment transfer capacity reached",
-                                "not_started", true,
+                            let error = meshmsg_protocol::ProtocolError::new(
+                                Some(operation_id.parse().expect("validated operation ID")),
+                                meshmsg_protocol::ErrorCode::AttachmentStorageBusy,
+                                meshmsg_protocol::Outcome::NotStarted,
                             );
-                            response.operation_id = Some(operation_id.clone());
                             operation_cache.lock().expect("operation cache poisoned")
-                                .complete(&operation_id, response.into_value(), StdInstant::now());
+                                .complete(&operation_id, meshmsg_protocol::Response::Error(error), StdInstant::now());
                             continue;
                         }
                     };
@@ -2154,7 +2017,6 @@ pub async fn run_daemon(
                     let state_dir = dir.to_path_buf();
                     let events = event_tx.clone();
                     let operation_cache = operation_cache.clone();
-                    let contract_guard = internal_contract_guard.clone();
                     transfer_tasks.spawn(async move {
                         let _permit = permit;
                         let response = share_request(
@@ -2174,14 +2036,8 @@ pub async fn run_daemon(
                         ).await;
                         let response = operation_cache.lock().expect("operation cache poisoned")
                             .complete(&operation_id, response, StdInstant::now());
-                        if response["type"] == "attachment_shared" {
-                            publish_daemon_message_event(
-                                &events,
-                                response,
-                                &mut contract_guard.lock().expect("contract guard poisoned"),
-                                topic,
-                                unix_timestamp_ms().unwrap_or(0),
-                            );
+                        if let meshmsg_protocol::Response::AttachmentShared(shared) = response {
+                            let _ = events.send(meshmsg_protocol::Event::AttachmentShared(shared));
                         }
                     });
                 }
@@ -2204,13 +2060,13 @@ pub async fn run_daemon(
                     ) {
                         Ok(permit) => permit,
                         Err(_) => {
-                            let mut error = LifecycleErrorV1::new(
-                                "attachment_storage_busy", "attachment transfer capacity reached",
-                                "not_started", true,
+                            let error = meshmsg_protocol::ProtocolError::new(
+                                Some(operation_id.parse().expect("validated operation ID")),
+                                meshmsg_protocol::ErrorCode::AttachmentStorageBusy,
+                                meshmsg_protocol::Outcome::NotStarted,
                             );
-                            error.operation_id = Some(operation_id.clone());
                             operation_cache.lock().expect("operation cache poisoned").complete(
-                                &operation_id, error.into_value(), StdInstant::now());
+                                &operation_id, meshmsg_protocol::Response::Error(error), StdInstant::now());
                             continue;
                         }
                     };
@@ -2241,8 +2097,8 @@ pub async fn run_daemon(
                         ).await;
                         let response = operation_cache.lock().expect("operation cache poisoned")
                             .complete(&operation_id, response, StdInstant::now());
-                        if response["type"] == "download_complete" {
-                            let _ = events.send(response);
+                        if let meshmsg_protocol::Response::DownloadComplete(complete) = response {
+                            let _ = events.send(meshmsg_protocol::Event::DownloadComplete(complete));
                         }
                     });
                 }
@@ -2279,14 +2135,8 @@ pub async fn run_daemon(
                             offer,
                         ))
                     });
-                    for full_value in values {
-                        publish_daemon_message_event(
-                            &event_tx,
-                            full_value,
-                            &mut internal_contract_guard.lock().expect("contract guard poisoned"),
-                            topic,
-                            now_ms,
-                        );
+                    for event in values {
+                        let _ = event_tx.send(event);
                     }
                 }
                 None => break,
@@ -2396,27 +2246,30 @@ fn invite_details(state: &State, self_id: PublicKey) -> Result<(bool, usize, boo
 
 #[cfg(test)]
 fn received_envelope_event(envelope: Envelope, encoded: &[u8]) -> serde_json::Value {
-    if envelope.kind == EnvelopeKind::Message {
-        return gossip::message_event(&envelope);
-    }
-    match validate_offer_binding(
-        envelope.from,
-        envelope.message_id,
-        envelope.timestamp_ms,
-        &envelope.body,
-    ) {
-        Ok(offer) => attachment_offer_event(
+    let event = if envelope.kind == EnvelopeKind::Message {
+        gossip::message_event(&envelope)
+    } else {
+        match validate_offer_binding(
             envelope.from,
             envelope.message_id,
             envelope.timestamp_ms,
-            encoded,
-            offer,
-        ),
-        Err(error) => serde_json::json!({
-            "type":"error", "code":"invalid_attachment_offer",
-            "message":error.to_string()
-        }),
-    }
+            &envelope.body,
+        ) {
+            Ok(offer) => attachment_offer_event(
+                envelope.from,
+                envelope.message_id,
+                envelope.timestamp_ms,
+                encoded,
+                offer,
+            ),
+            Err(_error) => meshmsg_protocol::Event::Error(meshmsg_protocol::ProtocolError::new(
+                None,
+                meshmsg_protocol::ErrorCode::InvalidAttachmentOffer,
+                meshmsg_protocol::Outcome::NotStarted,
+            )),
+        }
+    };
+    serde_json::to_value(event).expect("test event serialization")
 }
 
 #[cfg(test)]
@@ -2425,32 +2278,26 @@ fn network_event(
     topic: TopicId,
     replay: &mut EnvelopeReplayCache,
     sources: &mut TransportSourceLimiter,
-    rejections: &mut RejectionSampler,
     now_ms: u64,
 ) -> Vec<serde_json::Value> {
-    gossip::network_event(
-        value,
-        topic,
-        replay,
-        sources,
-        rejections,
-        now_ms,
-        |envelope| {
-            let offer = validate_offer_binding(
-                envelope.from,
-                envelope.message_id,
-                envelope.timestamp_ms,
-                envelope.body,
-            )?;
-            Ok(attachment_offer_event(
-                envelope.from,
-                envelope.message_id,
-                envelope.timestamp_ms,
-                envelope.encoded,
-                offer,
-            ))
-        },
-    )
+    gossip::network_event(value, topic, replay, sources, now_ms, |envelope| {
+        let offer = validate_offer_binding(
+            envelope.from,
+            envelope.message_id,
+            envelope.timestamp_ms,
+            envelope.body,
+        )?;
+        Ok(attachment_offer_event(
+            envelope.from,
+            envelope.message_id,
+            envelope.timestamp_ms,
+            envelope.encoded,
+            offer,
+        ))
+    })
+    .into_iter()
+    .map(|event| serde_json::to_value(event).expect("test event serialization"))
+    .collect()
 }
 
 #[cfg(test)]
@@ -2460,44 +2307,22 @@ fn queued_event(
     body: String,
     timestamp_ms: u64,
 ) -> serde_json::Value {
-    gossip::queued_event(peer, message_id, body, timestamp_ms)
+    meshmsg_protocol::DaemonFrame::Response(meshmsg_protocol::ResponseFrame::new(
+        None,
+        meshmsg_protocol::Response::Queued(gossip::queued_event(
+            peer,
+            message_id,
+            body,
+            timestamp_ms,
+        )),
+    ))
+    .into_payload_value()
+    .expect("test queued serialization")
 }
 
 #[cfg(test)]
 fn message_event(envelope: Envelope) -> serde_json::Value {
-    gossip::message_event(&envelope)
-}
-
-fn valid_daemon_message_event(value: &serde_json::Value, topic: TopicId, now_ms: u64) -> bool {
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("message" | "queued" | "attachment_offer" | "attachment_shared") => {
-            let correlated = contracts::correlate(value.clone(), &contracts::new_request_id());
-            crate::ipc::validate_success_payload_for_context(&correlated, Some(topic), Some(now_ms))
-                .is_ok()
-        }
-        _ => true,
-    }
-}
-
-fn publish_daemon_message_event(
-    events: &broadcast::Sender<serde_json::Value>,
-    value: serde_json::Value,
-    guard: &mut InternalContractGuard,
-    topic: TopicId,
-    now_ms: u64,
-) -> bool {
-    if valid_daemon_message_event(&value, topic, now_ms) {
-        let _ = events.send(value);
-        return true;
-    }
-    let family = value
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    if let Some(error) = guard.rejection(now_ms, family) {
-        let _ = events.send(error);
-    }
-    false
+    serde_json::to_value(gossip::message_event(&envelope)).expect("test message serialization")
 }
 
 #[cfg(unix)]
@@ -2535,71 +2360,6 @@ pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
     unreachable!("named pipe connection retry loop always returns")
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PrivateAcceptedResponse {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u64,
-    request_id: String,
-    operation_id: String,
-    to: String,
-    message_id: String,
-    timestamp_ms: u64,
-    body_bytes: usize,
-    acceptance_acknowledged: bool,
-    duplicate_accepted: bool,
-    durable: bool,
-    read: bool,
-}
-
-fn validate_private_acceptance(
-    value: &serde_json::Value,
-    operation_id: &str,
-    body_bytes: usize,
-) -> Result<()> {
-    let accepted: PrivateAcceptedResponse = serde_json::from_value(value.clone())
-        .context("daemon returned an invalid private-send acceptance")?;
-    anyhow::ensure!(
-        accepted.kind == "private_accepted"
-            && accepted.schema_version == 3
-            && accepted.acceptance_acknowledged
-            && !accepted.durable
-            && !accepted.read,
-        "daemon returned an invalid private-send acceptance"
-    );
-    anyhow::ensure!(
-        contracts::valid_request_id(&accepted.request_id),
-        "private-send acceptance request ID is invalid"
-    );
-    let _duplicate_accepted = accepted.duplicate_accepted;
-    anyhow::ensure!(
-        accepted.operation_id == operation_id && accepted.message_id == operation_id,
-        "private-send acceptance operation ID does not match the request"
-    );
-    let recipient = accepted
-        .to
-        .parse::<PublicKey>()
-        .context("private-send acceptance contains an invalid recipient")?;
-    anyhow::ensure!(
-        recipient.to_string() == accepted.to,
-        "private-send acceptance recipient is not canonical"
-    );
-    anyhow::ensure!(
-        accepted.message_id.len() == 32
-            && accepted
-                .message_id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "private-send acceptance contains an invalid message ID"
-    );
-    anyhow::ensure!(
-        accepted.timestamp_ms != 0 && accepted.body_bytes == body_bytes,
-        "private-send acceptance metadata does not match the request"
-    );
-    Ok(())
-}
-
 pub async fn send_once(
     dir: &Path,
     operation_id: Option<String>,
@@ -2621,8 +2381,16 @@ pub async fn send_once(
         )
         .await
         .with_context(|| format!("operation {operation_id}"))?;
-        validate_private_acceptance(&value, &operation_id, body.len())?;
-        value
+        match &value.response {
+            meshmsg_protocol::Response::PrivateAccepted(accepted) => anyhow::ensure!(
+                accepted.operation_id.to_string() == operation_id
+                    && accepted.message_id.to_string() == operation_id
+                    && accepted.body_bytes == body.len(),
+                "private-send acceptance metadata does not match the request"
+            ),
+            _ => unreachable!("checked response family"),
+        }
+        crate::ipc::response_payload(value)?
     } else {
         let value = send_request_checked(
             dir,
@@ -2635,12 +2403,15 @@ pub async fn send_once(
         )
         .await
         .with_context(|| format!("operation {operation_id}"))?;
-        anyhow::ensure!(
-            value["operation_id"].as_str() == Some(&operation_id)
-                && value["message_id"].as_str() == Some(&operation_id),
-            "daemon returned mismatched broadcast operation metadata"
-        );
-        value
+        match &value.response {
+            meshmsg_protocol::Response::Queued(queued) => anyhow::ensure!(
+                queued.operation_id.to_string() == operation_id
+                    && queued.message_id.to_string() == operation_id,
+                "daemon returned mismatched broadcast operation metadata"
+            ),
+            _ => unreachable!("checked response family"),
+        }
+        crate::ipc::response_payload(value)?
     };
     event(json, value);
     Ok(())
@@ -2664,10 +2435,11 @@ pub async fn share(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let maximum = match &status.response {
+        meshmsg_protocol::Response::Status(status) => status.max_attachment_bytes,
+        _ => unreachable!("checked response family"),
+    };
     let path = caller_path(path)?;
-    let maximum = status["max_attachment_bytes"]
-        .as_u64()
-        .context("daemon status omitted its attachment limit")?;
     let digest_path = path.clone();
     let source_digest =
         tokio::task::spawn_blocking(move || attachment::share_source_digest(&digest_path, maximum))
@@ -2682,9 +2454,7 @@ pub async fn share(
         },
         "attachment_shared",
         3,
-        AttachmentOperationKind::Share,
         &operation_id,
-        None,
     )
     .await
     .with_context(|| format!("operation {operation_id}"))?;
@@ -2708,13 +2478,13 @@ pub async fn peers(dir: &Path, json: bool) -> Result<()> {
     )
     .await
     .context("request peer directory; the daemon may need to be upgraded and restarted")?;
-    event(json, value);
+    event(json, crate::ipc::response_payload(value)?);
     Ok(())
 }
 
 pub async fn offers(dir: &Path, json: bool) -> Result<()> {
     let value = send_request_checked(dir, &IpcRequest::Offers, "offers", Some(1)).await?;
-    event(json, value);
+    event(json, crate::ipc::response_payload(value)?);
     Ok(())
 }
 
@@ -2723,26 +2493,27 @@ async fn send_lifecycle_request(
     request: &IpcRequest,
     expected_type: &str,
     expected_schema_version: u64,
-    operation_kind: AttachmentOperationKind,
     expected_operation_id: &str,
-    lifecycle_context: Option<&LifecycleRequestContext<'_>>,
 ) -> Result<serde_json::Value> {
-    let value = crate::ipc::send_request(dir, request).await?;
-    if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
-        let error = crate::ipc::validate_lifecycle_error_for_request(
-            &value,
-            operation_kind,
-            expected_operation_id,
-            lifecycle_context.and_then(|context| match context {
-                LifecycleRequestContext::Remove { offer_id, .. } => Some(*offer_id),
-                LifecycleRequestContext::Prune { .. } => None,
-            }),
-            lifecycle_context,
-        )?;
-        return Err(anyhow::Error::new(contracts::ContractFailure(error)));
-    }
-    crate::ipc::validate_response(&value, expected_type, Some(expected_schema_version))?;
-    Ok(value)
+    let frame = crate::ipc::send_request_checked(
+        dir,
+        request,
+        expected_type,
+        Some(expected_schema_version),
+    )
+    .await?;
+    let actual_operation_id = match &frame.response {
+        meshmsg_protocol::Response::AttachmentShared(value) => &value.operation_id,
+        meshmsg_protocol::Response::OfferRemoved(value)
+        | meshmsg_protocol::Response::OffersPruned(value) => &value.operation_id,
+        meshmsg_protocol::Response::DownloadComplete(value) => &value.operation_id,
+        _ => unreachable!("checked mutation response family"),
+    };
+    anyhow::ensure!(
+        actual_operation_id.to_string() == expected_operation_id,
+        "daemon response operation ID does not match the request"
+    );
+    crate::ipc::response_payload(frame)
 }
 
 pub async fn offers_remove(
@@ -2771,9 +2542,7 @@ pub async fn offers_remove(
         },
         "offer_removed",
         3,
-        AttachmentOperationKind::Remove,
         &operation_id,
-        Some(&lifecycle_context),
     )
     .await?;
     LifecycleSuccessV3::from_value_for_request(&value, &lifecycle_context)?;
@@ -2792,8 +2561,11 @@ pub async fn offers_prune(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
-    let effective_age = older_than_secs
-        .unwrap_or_else(|| status["attachment_retention_secs"].as_u64().unwrap_or(0));
+    let retention = match &status.response {
+        meshmsg_protocol::Response::Status(status) => status.attachment_retention_secs,
+        _ => unreachable!("checked response family"),
+    };
+    let effective_age = older_than_secs.unwrap_or(retention);
     let lifecycle_context = LifecycleRequestContext::Prune {
         operation_id: &operation_id,
         older_than_secs: effective_age,
@@ -2813,9 +2585,7 @@ pub async fn offers_prune(
         },
         "offers_pruned",
         3,
-        AttachmentOperationKind::Prune,
         &operation_id,
-        Some(&lifecycle_context),
     )
     .await?;
     LifecycleSuccessV3::from_value_for_request(&value, &lifecycle_context)?;
@@ -2832,16 +2602,15 @@ pub async fn download(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
     let status = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let status = match &status.response {
+        meshmsg_protocol::Response::Status(status) => status,
+        _ => unreachable!("checked response family"),
+    };
     // Retain the exact absolute representation submitted to the daemon. Do not
     // canonicalize through symlinks or require the not-yet-created destination.
     let requested_output = caller_path(output)?;
     let topic_bytes: [u8; 32] = data_encoding::HEXLOWER
-        .decode(
-            status["topic"]
-                .as_str()
-                .context("daemon status omitted its topic")?
-                .as_bytes(),
-        )
+        .decode(status.topic.to_string().as_bytes())
         .context("daemon status topic is invalid")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("daemon status topic has the wrong length"))?;
@@ -2862,9 +2631,7 @@ pub async fn download(
         },
         "download_complete",
         2,
-        AttachmentOperationKind::Download,
         &operation_id,
-        None,
     )
     .await?;
     crate::ipc::DownloadCompleteV2::validate_for_request(&value, &expected)?;
@@ -2877,7 +2644,7 @@ pub async fn listen(dir: &Path, json: bool) -> Result<()> {
     loop {
         tokio::select! {
             value = reader.read() => match value? {
-                Some(value) => event(json, value),
+                Some(frame) => event(json, crate::ipc::event_payload(frame)?),
                 None => anyhow::bail!("local daemon stopped; restart it with `meshmsg daemon`"),
             },
             _ = tokio::signal::ctrl_c() => break,
@@ -2921,7 +2688,7 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
                 None => break,
             },
             value = reader.read() => match value? {
-                Some(value) => event(json, value),
+                Some(frame) => event(json, crate::ipc::event_payload(frame)?),
                 None => anyhow::bail!("local daemon stopped; restart it with `meshmsg daemon`"),
             },
             _ = tokio::signal::ctrl_c() => break,
@@ -2931,33 +2698,37 @@ pub async fn chat(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub async fn status(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let frame = send_request_checked(dir, &IpcRequest::Status, "status", None).await?;
+    let value = match &frame.response {
+        meshmsg_protocol::Response::Status(value) => value,
+        _ => unreachable!("checked response family"),
+    };
     if json {
-        println!("{value}");
+        println!("{}", crate::ipc::response_payload(frame.clone())?);
     } else {
         println!(
             "daemon: running\npeer: {}\ntopic: {}\nalias: {}\nalias enabled: {}\nadvertised aliases: {}\nadvertises self: {}\nhas invite: {}\nbootstrap peers: {}\nself advertised: {}\nendpoint online: {}\ntopic joined: {}\nneighbors: {}\nattachment storage: {} / {} bytes ({} unique blobs, {} / {} pins)\nattachment filesystem available: {} bytes (minimum {})\nattachment storage pressure: {}\nattachment retention: {} seconds",
-            value["peer"].as_str().unwrap_or(""),
-            value["topic"].as_str().unwrap_or(""),
-            value["alias"].as_str().unwrap_or("(disabled)"),
-            value["alias_enabled"].as_bool().unwrap_or(false),
-            value["advertised_aliases"].as_u64().unwrap_or(0),
-            value["advertises_self"].as_bool().unwrap_or(false),
-            value["has_invite"].as_bool().unwrap_or(false),
-            value["bootstrap_peer_count"].as_u64().unwrap_or(0),
-            value["self_advertised"].as_bool().unwrap_or(false),
-            value["endpoint_online"].as_bool().unwrap_or(false),
-            value["topic_joined"].as_bool().unwrap_or(false),
-            value["neighbors"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["tagged_bytes"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["quota_bytes"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["tagged_blobs"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["tags"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["tag_capacity"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["available_bytes"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["min_free_bytes"].as_u64().unwrap_or(0),
-            value["attachment_storage"]["pressure"].as_bool().unwrap_or(false),
-            value["attachment_retention_secs"].as_u64().unwrap_or(0)
+            value.peer,
+            value.topic,
+            value.alias.as_ref().map(|alias| alias.as_str()).unwrap_or("(disabled)"),
+            value.alias_enabled,
+            value.advertised_aliases,
+            value.advertises_self,
+            value.has_invite,
+            value.bootstrap_peer_count,
+            value.self_advertised,
+            value.endpoint_online,
+            value.topic_joined,
+            value.neighbors,
+            value.attachment_storage.tagged_bytes,
+            value.attachment_storage.quota_bytes,
+            value.attachment_storage.tagged_blobs,
+            value.attachment_storage.tags,
+            value.attachment_storage.tag_capacity,
+            value.attachment_storage.available_bytes,
+            value.attachment_storage.min_free_bytes,
+            value.attachment_storage.pressure,
+            value.attachment_retention_secs
         );
     }
     Ok(())
@@ -2965,7 +2736,7 @@ pub async fn status(dir: &Path, json: bool) -> Result<()> {
 
 pub async fn stop(dir: &Path, json: bool) -> Result<()> {
     let value = send_request_checked(dir, &IpcRequest::Stop, "stopping", None).await?;
-    event(json, value);
+    event(json, crate::ipc::response_payload(value)?);
     Ok(())
 }
 
@@ -2983,10 +2754,9 @@ pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
         "captured_hostname":alias_config.hostname(), "custom_alias":alias_config.custom()
     });
     if json {
-        println!(
-            "{}",
-            contracts::correlate(value, &contracts::new_request_id())
-        );
+        let mut value = value;
+        value["request_id"] = contracts::new_request_id().into();
+        println!("{value}");
     } else {
         println!("ok: state, identity, topic, and invite are valid");
     }
@@ -3026,18 +2796,12 @@ fn event(json: bool, mut value: serde_json::Value) {
             value["schema_version"] = contracts::SCHEMA_VERSION.into();
         }
         if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
-            let request_id = value
-                .get("request_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("00000000000000000000000000000000");
-            let mut normalized = normalize_ipc_response(&value, request_id);
-            if value.get("request_id").is_none() {
-                normalized
-                    .as_object_mut()
-                    .expect("error object")
-                    .remove("request_id");
+            if let Ok(error) = ProtocolErrorAdapter::from_value(&value) {
+                value = contracts::present_error(
+                    error.request_id.as_deref(),
+                    &error.typed().expect("validated protocol error"),
+                );
             }
-            value = normalized;
         }
         println!("{value}");
     } else {
@@ -3218,12 +2982,34 @@ mod tests {
         assert_eq!(caller_path(&absolute).unwrap(), absolute);
     }
 
-    fn connected_fixture() -> serde_json::Value {
-        serde_json::json!({
-            "type":"connected", "peer":"2".repeat(64),
-            "endpoint_online":true, "topic_joined":true,
-            "alias":null
+    fn connected_fixture() -> meshmsg_protocol::Event {
+        meshmsg_protocol::Event::Connected(meshmsg_protocol::Connected {
+            peer: "2".repeat(64).parse().unwrap(),
+            endpoint_online: true,
+            topic_joined: true,
+            alias: None,
         })
+    }
+
+    fn response_value(response: &meshmsg_protocol::Response) -> serde_json::Value {
+        serde_json::to_value(response).unwrap()
+    }
+
+    fn response_error(response: &meshmsg_protocol::Response) -> &meshmsg_protocol::ProtocolError {
+        match response {
+            meshmsg_protocol::Response::Error(error) => error,
+            _ => panic!("expected protocol error"),
+        }
+    }
+
+    fn lifecycle_result(
+        response: &meshmsg_protocol::Response,
+    ) -> &meshmsg_protocol::LifecycleResult {
+        match response {
+            meshmsg_protocol::Response::OfferRemoved(value)
+            | meshmsg_protocol::Response::OffersPruned(value) => value,
+            _ => panic!("expected lifecycle response"),
+        }
     }
 
     fn test_topic() -> TopicId {
@@ -3361,26 +3147,35 @@ mod tests {
         let (conflict, conflict_response) = oneshot::channel();
         assert!(!cache.admit(id1.into(), different, conflict, now));
         assert_eq!(
-            conflict_response.await.unwrap()["code"],
-            "operation_id_conflict"
+            response_error(&conflict_response.await.unwrap()).code,
+            meshmsg_protocol::ErrorCode::OperationIdConflict,
         );
 
-        let terminal = serde_json::json!({
-            "type":"error", "schema_version":1, "code":"send_failed"
-        });
+        let terminal = contracts::protocol_error_response(
+            meshmsg_protocol::ErrorCode::SendFailed,
+            meshmsg_protocol::Outcome::Unknown,
+            Some(id1.parse().unwrap()),
+        );
         let stored = cache.complete(id1, terminal, now);
-        assert_eq!(stored["operation_id"], id1);
+        assert_eq!(
+            response_error(&stored)
+                .operation_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            id1
+        );
         assert_eq!(response1.await.unwrap(), stored);
         assert_eq!(duplicate_response.await.unwrap(), stored);
         let (cached, cached_response) = oneshot::channel();
         assert!(!cache.admit(id1.into(), fp1, cached, now));
         assert_eq!(cached_response.await.unwrap(), stored);
 
-        let partial = serde_json::json!({
-            "type":"download_complete", "schema_version":2,
-            "destination_synced":false, "cleanup_complete":false,
-            "warnings":["sync warning"]
-        });
+        let partial = contracts::protocol_error_response(
+            meshmsg_protocol::ErrorCode::DownloadFailed,
+            meshmsg_protocol::Outcome::Partial,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap()),
+        );
         let partial_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let partial_fp = operation_fingerprint("download", &[b"token", b"output"]);
         let mut partial_cache = OperationCache::new(2, Duration::from_secs(10));
@@ -3396,13 +3191,13 @@ mod tests {
         let removal_fp = operation_fingerprint("offers_remove", &[b"selector"]);
         let (removal_reply, removal_response) = oneshot::channel();
         assert!(partial_cache.admit(removal_id.into(), removal_fp, removal_reply, now));
-        let mut removal_error =
-            LifecycleErrorV1::new("attachment_removal_partial", "private", "partial", true);
-        removal_error.offer_id = Some("cccccccccccccccccccccccccccccccc".into());
-        removal_error.selected_tags = Some(2);
-        removal_error.removed_tags = Some(1);
-        removal_error.quota_bytes_released = Some(4);
-        let removal = partial_cache.complete(removal_id, removal_error.into_value(), now);
+        let removal_error =
+            ProtocolErrorAdapter::new("attachment_removal_partial", "private", "partial", true);
+        let removal = partial_cache.complete(
+            removal_id,
+            meshmsg_protocol::Response::Error(removal_error.typed().unwrap()),
+            now,
+        );
         assert_eq!(removal_response.await.unwrap(), removal);
         let (removal_retry, removal_retry_response) = oneshot::channel();
         assert!(!partial_cache.admit(removal_id.into(), removal_fp, removal_retry, now));
@@ -3411,7 +3206,15 @@ mod tests {
         let fp2 = operation_fingerprint("send", &[b"two"]);
         let (reply2, _response2) = oneshot::channel();
         assert!(cache.admit(id2.into(), fp2, reply2, now));
-        cache.complete(id2, serde_json::json!({"type":"queued"}), now);
+        cache.complete(
+            id2,
+            contracts::protocol_error_response(
+                meshmsg_protocol::ErrorCode::SendFailed,
+                meshmsg_protocol::Outcome::Unknown,
+                Some(id2.parse().unwrap()),
+            ),
+            now,
+        );
         let fp3 = operation_fingerprint("send", &[b"three"]);
         let (reply3, _response3) = oneshot::channel();
         assert!(cache.admit(id3.into(), fp3, reply3, now));
@@ -3423,7 +3226,15 @@ mod tests {
         let mut expired = OperationCache::new(2, Duration::from_millis(1));
         let (reply, _response) = oneshot::channel();
         assert!(expired.admit(id1.into(), fp1, reply, now));
-        expired.complete(id1, serde_json::json!({"type":"queued"}), now);
+        expired.complete(
+            id1,
+            contracts::protocol_error_response(
+                meshmsg_protocol::ErrorCode::SendFailed,
+                meshmsg_protocol::Outcome::Unknown,
+                Some(id1.parse().unwrap()),
+            ),
+            now,
+        );
         let (retry, _retry_response) = oneshot::channel();
         assert!(expired.admit(id1.into(), fp1, retry, now + Duration::from_millis(2)));
 
@@ -3436,78 +3247,30 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_partial_errors_survive_cache_normalization_and_strict_consumption() {
-        let now = StdInstant::now();
+    fn lifecycle_partial_errors_are_compact_across_operation_cache() {
         let operation = "11111111111111111111111111111111";
-        let offer = "22222222222222222222222222222222";
-        let provider = SecretKey::generate().public().to_string();
-        for (kind, context, cutoff) in [
-            (
-                AttachmentOperationKind::Remove,
-                LifecycleRequestContext::Remove {
-                    operation_id: operation,
-                    offer_id: offer,
-                    direction: Some("incoming"),
-                    provider: Some(&provider),
-                    maximum: 7,
-                },
-                None,
-            ),
-            (
-                AttachmentOperationKind::Prune,
-                LifecycleRequestContext::Prune {
-                    operation_id: operation,
-                    older_than_secs: 60,
-                    cutoff_ms: Some(10_000),
-                    direction: Some("outgoing"),
-                    dry_run: false,
-                    maximum: 7,
-                },
-                Some(10_000),
-            ),
-        ] {
-            let mut producer = LifecycleErrorV1::new(
-                "attachment_removal_partial",
-                "private store failure",
-                "partial",
-                true,
-            );
-            producer.selected_tags = Some(3);
-            producer.removed_tags = Some(1);
-            producer.quota_bytes_released = Some(4);
-            producer.offer_id = (kind == AttachmentOperationKind::Remove).then(|| offer.into());
-            bind_partial_lifecycle_error(&mut producer, &context, cutoff);
-
-            let mut cache = OperationCache::new(2, Duration::from_secs(60));
-            let (reply, _receiver) = oneshot::channel();
-            assert!(cache.admit(operation.into(), [7; 32], reply, now));
-            let cached = cache.complete(operation, producer.into_value(), now);
-            let normalized = normalize_ipc_response(&cached, "33333333333333333333333333333333");
-            let consumed = crate::ipc::validate_lifecycle_error_for_request(
-                &normalized,
-                kind,
-                operation,
-                (kind == AttachmentOperationKind::Remove).then_some(offer),
-                Some(&context),
-            )
-            .unwrap();
-            assert_eq!(consumed.direction.as_deref(), context_direction(&context));
-            assert_eq!(consumed.maximum, Some(7));
-            assert_eq!(consumed.dry_run, Some(false));
-            assert_eq!(consumed.cutoff_ms, cutoff);
-            match &context {
-                LifecycleRequestContext::Remove { provider, .. } => {
-                    assert_eq!(consumed.provider.as_deref(), *provider);
-                    assert_eq!(consumed.older_than_secs, None);
-                }
-                LifecycleRequestContext::Prune {
-                    older_than_secs, ..
-                } => {
-                    assert_eq!(consumed.provider, None);
-                    assert_eq!(consumed.older_than_secs, Some(*older_than_secs));
-                }
-            }
-        }
+        let mut producer = ProtocolErrorAdapter::new(
+            "attachment_removal_partial",
+            "private store failure",
+            "partial",
+            true,
+        );
+        producer.operation_id = Some(operation.into());
+        let mut cache = OperationCache::new(2, Duration::from_secs(60));
+        let now = StdInstant::now();
+        let (reply, _receiver) = oneshot::channel();
+        assert!(cache.admit(operation.into(), [7; 32], reply, now));
+        let value = cache.complete(
+            operation,
+            meshmsg_protocol::Response::Error(producer.typed().unwrap()),
+            now,
+        );
+        let error = response_error(&value);
+        assert_eq!(error.operation_id.as_ref().unwrap().as_str(), operation);
+        assert_eq!(error.outcome, meshmsg_protocol::Outcome::Partial);
+        let value = response_value(&value);
+        assert!(value.get("selected_tags").is_none());
+        assert!(value.get("retryable").is_none());
     }
 
     #[test]
@@ -3536,9 +3299,21 @@ mod tests {
         assert!(cache.admit(operation.into(), fingerprint(60), first_reply, now));
         let resolution = cache.resolve_prune(operation, 60, 100_000);
         assert_eq!(resolution.cutoff_ms, 40_000);
-        let terminal = serde_json::json!({
-            "type":"offers_pruned", "older_than_secs":60, "cutoff_ms":40_000
-        });
+        let terminal =
+            meshmsg_protocol::Response::OffersPruned(meshmsg_protocol::LifecycleResult {
+                operation_id: operation.parse().unwrap(),
+                offer_id: None,
+                direction: Some(meshmsg_protocol::OfferDirection::Outgoing),
+                provider: None,
+                older_than_secs: Some(60),
+                maximum: 1,
+                dry_run: false,
+                selected_tags: 0,
+                removed_tags: 0,
+                released_bytes: 0,
+                limited: false,
+                cutoff_ms: Some(40_000),
+            });
         cache.complete(operation, terminal.clone(), now);
         assert_eq!(
             cache.completed.get(operation).unwrap().prune_resolution,
@@ -3555,9 +3330,7 @@ mod tests {
             now + ttl - Duration::from_millis(1),
         ));
         let replayed = replay_receiver.blocking_recv().unwrap();
-        assert_eq!(replayed["type"], terminal["type"]);
-        assert_eq!(replayed["cutoff_ms"], terminal["cutoff_ms"]);
-        assert_eq!(replayed["operation_id"], operation);
+        assert_eq!(replayed, terminal);
 
         let (conflict_reply, conflict_receiver) = oneshot::channel();
         assert!(!cache.admit(
@@ -3567,25 +3340,18 @@ mod tests {
             now + Duration::from_secs(1),
         ));
         let conflict = conflict_receiver.blocking_recv().unwrap();
-        assert_eq!(conflict["code"], "operation_id_conflict");
-        assert_eq!(conflict["operation_id"], operation);
-    }
-
-    fn context_direction<'a>(context: &'a LifecycleRequestContext<'a>) -> Option<&'a str> {
-        match context {
-            LifecycleRequestContext::Remove { direction, .. }
-            | LifecycleRequestContext::Prune { direction, .. } => *direction,
-        }
-    }
-
-    #[test]
-    fn attachment_admission_is_fail_fast_even_when_limit_is_closed() {
-        let limit = Arc::new(Semaphore::new(1));
-        let permit = try_admit_transfer(&limit, "share_busy", "capacity reached").unwrap();
-        let busy = try_admit_transfer(&limit, "download_busy", "capacity reached").unwrap_err();
-        assert_eq!(busy["code"], "download_busy");
-        drop(permit);
-        assert!(try_admit_transfer(&limit, "download_busy", "capacity reached").is_ok());
+        assert_eq!(
+            response_error(&conflict).code,
+            meshmsg_protocol::ErrorCode::OperationIdConflict
+        );
+        assert_eq!(
+            response_error(&conflict)
+                .operation_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            operation
+        );
     }
 
     #[test]
@@ -3593,14 +3359,10 @@ mod tests {
         let limit = Arc::new(Semaphore::new(1));
         let active_listing = try_admit_offer_listing(&limit).unwrap();
         let busy = try_admit_offer_listing(&limit).unwrap_err();
-        let request_id = "11111111111111111111111111111111";
-        let normalized = normalize_ipc_response(&busy, request_id);
-        let error = ErrorEnvelopeV1::from_value(&normalized).unwrap();
-        assert_eq!(error.code, "offers_busy");
-        assert_eq!(error.message, "Attachment listing is currently busy.");
-        assert_eq!(error.outcome, "not_started");
-        assert!(error.retryable);
-        assert_eq!(error.request_id.as_deref(), Some(request_id));
+        assert_eq!(busy.code, meshmsg_protocol::ErrorCode::OffersBusy);
+        assert_eq!(busy.message(), "Attachment listing is currently busy.");
+        assert_eq!(busy.outcome, meshmsg_protocol::Outcome::NotStarted);
+        assert!(busy.retryable());
         drop(active_listing);
         assert!(try_admit_offer_listing(&limit).is_ok());
     }
@@ -3913,7 +3675,6 @@ mod tests {
         let source = SecretKey::generate().public();
         let mut replay = EnvelopeReplayCache::default();
         let mut sources = TransportSourceLimiter::default();
-        let mut rejections = RejectionSampler::default();
 
         let rejected = network_event(
             Event::Received(iroh_gossip::api::Message {
@@ -3924,15 +3685,9 @@ mod tests {
             topic,
             &mut replay,
             &mut sources,
-            &mut rejections,
             now_ms,
         );
-        assert_eq!(rejected.len(), 1);
-        let strict_rejection = ErrorEnvelopeV1::from_value(&rejected[0]).unwrap();
-        assert_eq!(strict_rejection.code, "network_event_rejected");
-        assert_eq!(strict_rejection.message, "A network event was rejected.");
-        assert_eq!(strict_rejection.outcome, "not_started");
-        assert!(!strict_rejection.retryable);
+        assert!(rejected.is_empty());
         assert_eq!(
             replay.live_ids, 0,
             "invalid semantics consumed replay state"
@@ -3947,7 +3702,6 @@ mod tests {
             topic,
             &mut replay,
             &mut sources,
-            &mut rejections,
             now_ms,
         );
         assert_eq!(accepted.len(), 1);
@@ -4013,11 +3767,7 @@ mod tests {
             server,
             commands,
             events.subscribe(),
-            serde_json::json!({
-                "type":"connected", "peer":"2".repeat(64),
-                "endpoint_online":true, "topic_joined":true,
-                "alias":null
-            }),
+            connected_fixture(),
             None,
         ));
         write_request_with_id(
@@ -4055,201 +3805,24 @@ mod tests {
                 meshmsg_protocol::Response::Error(_)
             ));
         }
-    }
 
-    #[tokio::test]
-    async fn generated_event_guard_keeps_live_strict_subscribers_and_reports_bounded_errors() {
-        let secret = SecretKey::generate();
-        let canonical = message_event(unsigned_test_envelope(
-            secret.public(),
-            "subscriber remains connected".to_owned(),
-            42,
-        ));
-        let (events, _) = broadcast::channel(8);
-        let (commands, _command_rx) = mpsc::channel(1);
-        let (mut first, first_server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
-        let (mut second, second_server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
-        let first_task = tokio::spawn(handle_local_client(
-            first_server,
-            commands.clone(),
-            events.subscribe(),
-            connected_fixture(),
-            None,
-        ));
-        let second_task = tokio::spawn(handle_local_client(
-            second_server,
-            commands,
-            events.subscribe(),
-            connected_fixture(),
-            None,
-        ));
-        write_request(&mut first, &IpcRequest::Subscribe)
-            .await
-            .unwrap();
-        write_request(&mut second, &IpcRequest::Subscribe)
-            .await
-            .unwrap();
-        let first_connected: serde_json::Value =
-            serde_json::from_slice(&read_frame(&mut first, MAX_IPC_EVENT_SIZE).await.unwrap())
-                .unwrap();
-        let second_connected: serde_json::Value =
-            serde_json::from_slice(&read_frame(&mut second, MAX_IPC_EVENT_SIZE).await.unwrap())
-                .unwrap();
-        let subscriber_ids = [
-            first_connected["request_id"].as_str().unwrap().to_owned(),
-            second_connected["request_id"].as_str().unwrap().to_owned(),
-        ];
-        assert_ne!(subscriber_ids[0], subscriber_ids[1]);
-
-        let mut guard = InternalContractGuard::default();
-        let now_ms = 1_700_000_000_000;
-        let mut malformed_message = canonical.clone();
-        malformed_message["body"] = "".into();
-        assert!(!publish_daemon_message_event(
-            &events,
-            malformed_message,
-            &mut guard,
-            test_topic(),
-            now_ms
-        ));
-        for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
-            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let mut error: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-            assert_eq!(
-                error["protocol_version"],
-                meshmsg_protocol::PROTOCOL_VERSION
-            );
-            error.as_object_mut().unwrap().remove("protocol_version");
-            let error = ErrorEnvelopeV1::from_value(&error).unwrap();
-            assert_eq!(error.code, "internal_contract_error");
-            assert_eq!(
-                error.request_id.as_deref(),
-                Some(subscriber_ids[index].as_str())
-            );
-            assert_eq!(error.suppressed_since_last, Some(0));
-        }
-
-        let mut suppressed_message = canonical.clone();
-        suppressed_message["body"] = "".into();
-        assert!(!publish_daemon_message_event(
-            &events,
-            suppressed_message,
-            &mut guard,
-            test_topic(),
-            now_ms + 1,
-        ));
-        assert_eq!(guard.suppressed, 1);
-
-        let malformed_queued = queued_event(
-            &secret.public().to_string(),
-            [8; 16],
-            "x".repeat(crate::message::MAX_V2_MESSAGE_BODY_BYTES + 1),
-            43,
-        );
-        assert!(!publish_daemon_message_event(
-            &events,
-            malformed_queued,
-            &mut guard,
-            test_topic(),
-            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64,
-        ));
-        for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
-            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let mut error: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-            assert_eq!(
-                error["protocol_version"],
-                meshmsg_protocol::PROTOCOL_VERSION
-            );
-            error.as_object_mut().unwrap().remove("protocol_version");
-            let error = ErrorEnvelopeV1::from_value(&error).unwrap();
-            assert_eq!(error.code, "internal_contract_error");
-            assert_eq!(
-                error.request_id.as_deref(),
-                Some(subscriber_ids[index].as_str())
-            );
-            assert_eq!(error.suppressed_since_last, Some(1));
-        }
-
-        let attachment_signer = SecretKey::generate();
-        let mut malformed_offer = signed_attachment_event_for_test(
-            &attachment_signer,
-            "09090909090909090909090909090909",
-            AttachmentKind::File,
-            "safe.txt",
-            4,
-            44,
-        );
-        malformed_offer["size"] = 5.into();
-        assert!(!publish_daemon_message_event(
-            &events,
-            malformed_offer,
-            &mut guard,
-            test_topic(),
-            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64 + 1,
-        ));
-
-        assert!(publish_daemon_message_event(
-            &events,
-            canonical,
-            &mut guard,
-            test_topic(),
-            now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64 + 2,
-        ));
-        for (index, stream) in [&mut first, &mut second].into_iter().enumerate() {
-            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-            assert_eq!(
-                value["protocol_version"],
-                meshmsg_protocol::PROTOCOL_VERSION
-            );
-            value.as_object_mut().unwrap().remove("protocol_version");
-            crate::ipc::validate_success_payload(&value).unwrap();
-            assert_eq!(value["request_id"], subscriber_ids[index]);
-            assert_eq!(value["body"], "subscriber remains connected");
-        }
-
-        let mut shared = signed_attachment_event_for_test(
-            &attachment_signer,
-            "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
-            AttachmentKind::File,
-            "shared.txt",
-            4,
-            now_ms + 3,
-        );
-        shared["type"] = "attachment_shared".into();
-        shared["schema_version"] = 3.into();
-        shared["operation_id"] = shared["message_id"].clone();
-        shared["source_digest"] = "01".repeat(32).into();
-        shared["delivery_acknowledged"] = false.into();
-        assert!(publish_daemon_message_event(
-            &events,
-            shared,
-            &mut guard,
-            test_topic(),
-            now_ms + 3,
-        ));
-        for stream in [&mut first, &mut second] {
-            let frame = read_frame(stream, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-            assert_eq!(
-                value["protocol_version"],
-                meshmsg_protocol::PROTOCOL_VERSION
-            );
-            value.as_object_mut().unwrap().remove("protocol_version");
-            crate::ipc::validate_success_payload_for_context(
-                &value,
-                Some(test_topic()),
-                Some(now_ms + 3),
-            )
-            .unwrap();
-            assert_eq!(value["type"], "attachment_shared");
-        }
-
-        drop(first);
-        drop(second);
-        drop(events);
-        first_task.await.unwrap().unwrap();
-        second_task.await.unwrap().unwrap();
+        // A failed typed decode is terminal. Even recognizable envelope fields
+        // are not reparsed to recover correlation or classify the rejection.
+        let oversized_send = serde_json::json!({
+            "protocol_version": meshmsg_protocol::PROTOCOL_VERSION,
+            "request_id": "44444444444444444444444444444444",
+            "request": {
+                "command": "send",
+                "operation_id": "55555555555555555555555555555555",
+                "body": "x".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1),
+            }
+        });
+        let mut request = serde_json::to_vec(&oversized_send).unwrap();
+        request.push(b'\n');
+        let response = exercise(request).await;
+        assert_eq!(response["code"], "invalid_request");
+        assert!(response.get("request_id").is_none());
+        assert!(response.get("operation_id").is_none());
     }
 
     #[test]
@@ -4289,7 +3862,6 @@ mod tests {
             let source = SecretKey::generate().public();
             let mut replay = EnvelopeReplayCache::default();
             let mut sources = TransportSourceLimiter::default();
-            let mut rejections = RejectionSampler::default();
             let rejected = network_event(
                 Event::Received(iroh_gossip::api::Message {
                     content: encode_unchecked_signed_envelope(
@@ -4305,10 +3877,9 @@ mod tests {
                 test_topic(),
                 &mut replay,
                 &mut sources,
-                &mut rejections,
                 now_ms,
             );
-            assert_eq!(rejected.len(), 1);
+            assert!(rejected.is_empty());
             assert_eq!(replay.live_ids, 0);
             assert_eq!(sources.sources.len(), 1);
             assert_eq!(
@@ -4334,7 +3905,6 @@ mod tests {
                 test_topic(),
                 &mut replay,
                 &mut sources,
-                &mut rejections,
                 now_ms,
             );
             assert_eq!(accepted.len(), 1);
@@ -4362,7 +3932,6 @@ mod tests {
         .unwrap();
         let mut replay = EnvelopeReplayCache::default();
         let mut sources = TransportSourceLimiter::default();
-        let mut rejections = RejectionSampler::default();
         let received = |content| {
             Event::Received(iroh_gossip::api::Message {
                 content,
@@ -4375,7 +3944,6 @@ mod tests {
             test_topic(),
             &mut replay,
             &mut sources,
-            &mut rejections,
             now_ms,
         );
         assert_eq!(accepted[0]["type"], "attachment_offer");
@@ -4386,12 +3954,9 @@ mod tests {
             test_topic(),
             &mut replay,
             &mut sources,
-            &mut rejections,
             now_ms,
         );
-        assert_eq!(duplicate.len(), 1);
-        assert_eq!(duplicate[0]["message"], "A network event was rejected.");
-        ErrorEnvelopeV1::from_value(&duplicate[0]).unwrap();
+        assert!(duplicate.is_empty());
         assert_eq!(replay.live_ids, 1);
 
         let alternate = encode_unchecked_signed_envelope(
@@ -4407,13 +3972,9 @@ mod tests {
             test_topic(),
             &mut replay,
             &mut sources,
-            &mut rejections,
             now_ms,
         );
-        assert!(
-            bypass.is_empty(),
-            "sampled malformed offer should be suppressed"
-        );
+        assert!(bypass.is_empty(), "malformed offer reached subscribers");
         assert_eq!(replay.live_ids, 1);
         assert_eq!(sources.admission_global.milli_tokens, source_tokens);
     }
@@ -4425,7 +3986,6 @@ mod tests {
         let now_ms = 1_700_000_040_000;
         let mut replay = EnvelopeReplayCache::default();
         let mut sources = TransportSourceLimiter::default();
-        let mut rejections = RejectionSampler::default();
         let received = |content| {
             Event::Received(iroh_gossip::api::Message {
                 content,
@@ -4454,7 +4014,6 @@ mod tests {
                 test_topic(),
                 &mut replay,
                 &mut sources,
-                &mut rejections,
                 now_ms,
             );
             assert_eq!(sources.admission_global.milli_tokens, initial_admission);
@@ -4479,7 +4038,6 @@ mod tests {
                 test_topic(),
                 &mut replay,
                 &mut sources,
-                &mut rejections,
                 now_ms,
             )[0]["type"],
             "message"
@@ -4491,7 +4049,6 @@ mod tests {
             test_topic(),
             &mut replay,
             &mut sources,
-            &mut rejections,
             now_ms,
         );
         assert_eq!(sources.admission_global.milli_tokens, after_valid);
@@ -4515,7 +4072,6 @@ mod tests {
                 test_topic(),
                 &mut replay,
                 &mut sources,
-                &mut rejections,
                 now_ms,
             )[0]["body"],
             "unrelated"
@@ -4670,7 +4226,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_validation_precedes_rate_admission_and_rejections_are_sampled() {
+    fn malformed_and_overloaded_remote_traffic_is_silent_before_admission() {
         let source = SecretKey::generate().public();
         let now_ms = 1_700_000_040_000;
         let mut sources = TransportSourceLimiter::default();
@@ -4679,7 +4235,6 @@ mod tests {
         }
         let global_tokens_before_malformed = sources.admission_global.milli_tokens;
         let mut replay = EnvelopeReplayCache::default();
-        let mut sampler = RejectionSampler::default();
         let values = network_event(
             Event::Received(iroh_gossip::api::Message {
                 content: Bytes::from_static(b"not an envelope"),
@@ -4689,32 +4244,15 @@ mod tests {
             test_topic(),
             &mut replay,
             &mut sources,
-            &mut sampler,
             now_ms,
         );
-        assert_eq!(values.len(), 1);
-        let rejection = ErrorEnvelopeV1::from_value(&values[0]).unwrap();
-        assert_eq!(rejection.code, "network_event_rejected");
-        assert_eq!(rejection.message, "A network event was rejected.");
-        assert_eq!(rejection.outcome, "not_started");
-        assert!(!rejection.retryable);
+        assert!(values.is_empty());
         assert_eq!(replay.live_ids, 0);
         assert_eq!(sources.sources.len(), 1);
         assert_eq!(
             sources.admission_global.milli_tokens,
             global_tokens_before_malformed
         );
-
-        for _ in 0..100 {
-            assert!(sampler.event(now_ms + 1, "rejected").is_none());
-        }
-        let sampled = sampler
-            .event(
-                now_ms + REJECTION_SAMPLE_INTERVAL.as_millis() as u64,
-                "rejected",
-            )
-            .unwrap();
-        assert_eq!(sampled["suppressed_since_last"], 100);
     }
 
     #[test]
@@ -4943,11 +4481,8 @@ mod tests {
             assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
             let envelope = Envelope::decode(&encoded, test_topic()).unwrap();
             assert_eq!(envelope.body.len(), length);
-            assert!(valid_daemon_message_event(
-                &message_event(envelope),
-                test_topic(),
-                1,
-            ));
+            let value = message_event(envelope);
+            assert!(serde_json::from_value::<meshmsg_protocol::Event>(value).is_ok());
         }
     }
 
@@ -5054,13 +4589,18 @@ mod tests {
 
     #[test]
     fn queued_event_has_canonical_send_metadata_and_does_not_claim_delivery() {
-        let value = queued_event("peer", [4; 16], "hello".to_owned(), 1_700_000_000_000);
+        let value = queued_event(
+            &"1".repeat(64),
+            [4; 16],
+            "hello".to_owned(),
+            1_700_000_000_000,
+        );
 
         assert_eq!(value["type"], "queued");
         assert_eq!(value["schema_version"], 3);
         assert_eq!(value["operation_id"], "04040404040404040404040404040404");
         assert_eq!(value["message_id"], "04040404040404040404040404040404");
-        assert_eq!(value["from"], "peer");
+        assert_eq!(value["from"], "1".repeat(64));
         assert_eq!(value["body"], "hello");
         assert_eq!(value["timestamp_ms"], 1_700_000_000_000_u64);
         assert_eq!(value["delivery_acknowledged"], false);
@@ -5077,69 +4617,6 @@ mod tests {
                 "delivery_acknowledged",
             ],
         );
-    }
-
-    #[test]
-    fn private_send_acceptance_is_validated_strictly() {
-        let recipient = SecretKey::generate().public().to_string();
-        let accepted = serde_json::json!({
-            "type":"private_accepted", "schema_version":3,
-            "request_id":"11111111111111111111111111111111",
-            "operation_id":"0123456789abcdef0123456789abcdef",
-            "to":recipient, "message_id":"0123456789abcdef0123456789abcdef",
-            "timestamp_ms":1_700_000_000_000_u64, "body_bytes":6,
-            "acceptance_acknowledged":true, "duplicate_accepted":false,
-            "durable":false, "read":false
-        });
-        validate_private_acceptance(&accepted, "0123456789abcdef0123456789abcdef", "秘密".len())
-            .unwrap();
-
-        for (code, message, outcome, retryable) in [
-            ("private_replay_unavailable", "recipient replay persistence is unavailable", "not_started", true),
-            ("private_delivery_unknown", "recipient durably recorded this message ID but cannot prove whether its volatile delivery was queued", "unknown", false),
-            ("private_send_failed", "private transport failed", "unknown", true),
-        ] {
-            let raw = serde_json::json!({
-                "type":"error", "schema_version":1, "code":code,
-                "message":message, "outcome":outcome, "retryable":retryable
-            });
-            let mut normalized = normalize_ipc_response(&raw, "11111111111111111111111111111111");
-            normalized["operation_id"] = "0123456789abcdef0123456789abcdef".into();
-            let error = ErrorEnvelopeV1::from_value(&normalized).unwrap();
-            error.validate_for_operation(
-                contracts::ErrorOperationKind::PrivateSend,
-                Some("0123456789abcdef0123456789abcdef"),
-            ).unwrap();
-            assert_eq!((error.outcome.as_str(), error.retryable), (outcome, retryable));
-        }
-
-        for invalid in [
-            {
-                let mut value = accepted.clone();
-                value["type"] = "queued".into();
-                value
-            },
-            {
-                let mut value = accepted.clone();
-                value["body_bytes"] = 7.into();
-                value
-            },
-            {
-                let mut value = accepted.clone();
-                value["body"] = "secret".into();
-                value
-            },
-            {
-                let mut value = accepted.clone();
-                value["message_id"] = "0123456789ABCDEF0123456789ABCDEF".into();
-                value
-            },
-        ] {
-            assert!(
-                validate_private_acceptance(&invalid, "0123456789abcdef0123456789abcdef", 6)
-                    .is_err()
-            );
-        }
     }
 
     #[tokio::test]
@@ -5615,9 +5092,9 @@ mod tests {
         assert_eq!(blobs.len(), MAX_OFFER_LIST_ENTRIES);
         assert!(has_more);
         assert_eq!(item_errors, 1);
-        assert_eq!(blobs[0].offer_id, format!("{:032x}", 0));
+        assert_eq!(blobs[0].offer_id.to_string(), format!("{:032x}", 0));
         assert_eq!(
-            blobs.last().unwrap().offer_id,
+            blobs.last().unwrap().offer_id.to_string(),
             format!("{:032x}", MAX_OFFER_LIST_ENTRIES - 1)
         );
         assert!(
@@ -6067,8 +5544,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = LifecycleErrorV1::from_value(&result).unwrap();
-        assert_eq!(error.removed_tags, Some(0));
+        assert!(matches!(result, meshmsg_protocol::Response::Error(_)));
         {
             let state = storage.state.lock().unwrap();
             assert!(matches!(
@@ -6103,8 +5579,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = LifecycleErrorV1::from_value(&result).unwrap();
-        assert_eq!(error.code, "attachment_removal_partial");
+        let error = response_error(&result);
+        assert_eq!(
+            error.code,
+            meshmsg_protocol::ErrorCode::AttachmentRemovalPartial
+        );
         let state = storage.state.lock().unwrap();
         for value in [prior_hash, new_hash] {
             assert!(matches!(
@@ -6271,8 +5750,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(removed["removed_tags"], 1);
-        assert_eq!(removed["released_bytes"], 0);
+        assert_eq!(lifecycle_result(&removed).removed_tags, 1);
+        assert_eq!(lifecycle_result(&removed).released_bytes, 0);
         let removed = storage
             .remove(
                 TEST_OPERATION_ID,
@@ -6285,7 +5764,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(removed["released_bytes"], 10);
+        assert_eq!(lifecycle_result(&removed).released_bytes, 10);
         assert_eq!(storage.status().tagged_bytes, 0);
         storage
             .admit_pin(
@@ -6445,15 +5924,19 @@ mod tests {
             .remove(TEST_OPERATION_ID, None, None, None, Some(10), 1, true)
             .await
             .unwrap();
-        assert_eq!(dry["selected_tags"], 1);
-        assert_eq!(dry["removed_tags"], 0);
-        assert_eq!(dry["limited"], true);
+        assert_eq!(lifecycle_result(&dry).selected_tags, 1);
+        assert_eq!(lifecycle_result(&dry).removed_tags, 0);
+        assert!(lifecycle_result(&dry).limited);
         assert_eq!(storage.status().tags, 3);
         let pruned = storage
             .remove(TEST_OPERATION_ID, None, None, None, Some(10), 2, false)
             .await
             .unwrap();
-        assert_eq!(pruned["removed_tags"], 2, "the exact cutoff is inclusive");
+        assert_eq!(
+            lifecycle_result(&pruned).removed_tags,
+            2,
+            "the exact cutoff is inclusive"
+        );
         assert_eq!(storage.status().tags, 1);
         let held = storage.gate.clone().acquire_owned().await.unwrap();
         let busy = storage
@@ -6828,9 +6311,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let error = LifecycleErrorV1::from_value(&value).unwrap();
-            assert_eq!(error.code, "attachment_removal_partial");
-            assert_eq!(error.removed_tags, Some(1));
+            let error = response_error(&value);
+            assert_eq!(
+                error.code,
+                meshmsg_protocol::ErrorCode::AttachmentRemovalPartial
+            );
             assert_eq!(storage.status().tags, 0);
             drop(storage);
             let reopened =
@@ -6885,10 +6370,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = LifecycleErrorV1::from_value(&value).unwrap();
-        assert_eq!(error.outcome, "partial");
-        assert_eq!(error.selected_tags, Some(2));
-        assert_eq!(error.removed_tags, Some(1));
+        let error = response_error(&value);
+        assert_eq!(error.outcome, meshmsg_protocol::Outcome::Partial);
         assert_eq!(storage.status().tags, 1);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
@@ -6957,7 +6440,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_timeout_and_shutdown_errors_are_strict_and_retryable() {
-        let (sender, receiver) = oneshot::channel::<serde_json::Value>();
+        let (sender, receiver) = oneshot::channel::<meshmsg_protocol::Response>();
         let offer_id = "99999999999999999999999999999999".to_owned();
         let timeout_value = lifecycle_command_response(
             async move { Ok(receiver.await?) },
@@ -6966,11 +6449,13 @@ mod tests {
             None,
         )
         .await;
-        let timeout = LifecycleErrorV1::from_value(&timeout_value).unwrap();
-        assert_eq!(timeout.code, "attachment_command_timeout");
-        assert_eq!(timeout.outcome, "unknown");
-        assert!(timeout.retryable);
-        assert_eq!(timeout.offer_id, None);
+        let timeout = response_error(&timeout_value);
+        assert_eq!(
+            timeout.code,
+            meshmsg_protocol::ErrorCode::AttachmentCommandTimeout
+        );
+        assert_eq!(timeout.outcome, meshmsg_protocol::Outcome::Unknown);
+        assert!(timeout.retryable());
         let _ = offer_id;
         drop(sender);
 
@@ -6981,9 +6466,12 @@ mod tests {
             None,
         )
         .await;
-        let shutdown = LifecycleErrorV1::from_value(&shutdown_value).unwrap();
-        assert_eq!(shutdown.code, "attachment_storage_shutdown");
-        assert_eq!(shutdown.outcome, "unknown");
+        let shutdown = response_error(&shutdown_value);
+        assert_eq!(
+            shutdown.code,
+            meshmsg_protocol::ErrorCode::AttachmentStorageShutdown
+        );
+        assert_eq!(shutdown.outcome, meshmsg_protocol::Outcome::Unknown);
     }
 
     #[tokio::test]
@@ -7033,12 +6521,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = LifecycleErrorV1::from_value(&partial).unwrap();
-        assert_eq!(error.code, "attachment_removal_partial");
-        assert_eq!(error.outcome, "unknown");
+        let error = response_error(&partial);
+        assert_eq!(
+            error.code,
+            meshmsg_protocol::ErrorCode::AttachmentRemovalPartial
+        );
+        assert_eq!(error.outcome, meshmsg_protocol::Outcome::Unknown);
         assert_eq!(enabled.status().tags, 1);
         let automatic = enabled.automatic_retention_pass().await.unwrap().unwrap();
-        assert_eq!(automatic["removed_tags"], 1);
+        assert_eq!(lifecycle_result(&automatic).removed_tags, 1);
         assert_eq!(enabled.status().tags, 0);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
@@ -7315,8 +6806,10 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(600), &mut task)
             .await
             .is_err());
-        let event = serde_json::json!({"type":"peer_up", "peer":"3".repeat(64)});
-        events.send(event.clone()).unwrap();
+        let event = meshmsg_protocol::Event::PeerUp {
+            peer: "3".repeat(64).parse().unwrap(),
+        };
+        events.send(event).unwrap();
         let received = tokio::time::timeout(
             Duration::from_secs(1),
             read_frame(&mut client, MAX_IPC_EVENT_SIZE),
@@ -7325,8 +6818,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
-        assert_eq!(received["type"], event["type"]);
-        assert_eq!(received["peer"], event["peer"]);
+        assert_eq!(received["type"], "peer_up");
+        assert_eq!(received["peer"], "3".repeat(64));
         assert_eq!(received["schema_version"], 1);
         assert!(contracts::valid_request_id(
             received["request_id"].as_str().unwrap()
@@ -7371,12 +6864,16 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
-        let startup = serde_json::json!({
-            "type":"peers_snapshot", "schema_version":2,
-            "generated_at_ms":1, "directory_epoch":"4".repeat(32),
-            "directory_revision":1,
-            "self":{"public_key":"2".repeat(64), "alias":null, "online":true},
-            "peers":[]
+        let startup = meshmsg_protocol::Event::PeersSnapshot(meshmsg_protocol::PeerSnapshot {
+            generated_at_ms: 1,
+            directory_epoch: "4".repeat(32).parse().unwrap(),
+            directory_revision: 1,
+            self_peer: meshmsg_protocol::SelfPeer {
+                public_key: "2".repeat(64).parse().unwrap(),
+                alias: None,
+                online: true,
+            },
+            peers: vec![],
         });
         let task = tokio::spawn(handle_local_client(
             server,
@@ -7395,8 +6892,8 @@ mod tests {
         );
         let snapshot = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
         let snapshot: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
-        assert_eq!(snapshot["type"], startup["type"]);
-        assert_eq!(snapshot["peers"], startup["peers"]);
+        assert_eq!(snapshot["type"], "peers_snapshot");
+        assert_eq!(snapshot["peers"], serde_json::json!([]));
         assert!(contracts::valid_request_id(
             snapshot["request_id"].as_str().unwrap()
         ));
@@ -7411,10 +6908,14 @@ mod tests {
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
         events
-            .send(serde_json::json!({"type":"peer_up", "peer":"3".repeat(64)}))
+            .send(meshmsg_protocol::Event::PeerUp {
+                peer: "3".repeat(64).parse().unwrap(),
+            })
             .unwrap();
         events
-            .send(serde_json::json!({"type":"peer_down", "peer":"3".repeat(64)}))
+            .send(meshmsg_protocol::Event::PeerDown {
+                peer: "3".repeat(64).parse().unwrap(),
+            })
             .unwrap();
         let task = tokio::spawn(handle_local_client(
             server,
@@ -7457,7 +6958,7 @@ mod tests {
         limit: &Arc<Semaphore>,
         tasks: &mut tokio::task::JoinSet<()>,
         commands: &mpsc::Sender<DaemonCommand>,
-        events: &broadcast::Sender<serde_json::Value>,
+        events: &broadcast::Sender<meshmsg_protocol::Event>,
         preparations: &Arc<std::sync::atomic::AtomicUsize>,
         timeouts: LocalIpcTimeouts,
     ) -> (LocalClientStream, bool) {
@@ -7538,7 +7039,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("protocol_version");
-        let rejection = ErrorEnvelopeV1::from_value(&rejection).unwrap();
+        let rejection = ProtocolErrorAdapter::from_value(&rejection).unwrap();
         assert_eq!(rejection.code, "ipc_capacity");
         assert_eq!(rejection.outcome, "not_started");
         assert!(rejection.retryable);
@@ -7602,13 +7103,10 @@ mod tests {
             .await;
             assert!(!admitted);
             let frame = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
-            let mut value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-            assert_eq!(
-                value["protocol_version"],
-                meshmsg_protocol::PROTOCOL_VERSION
-            );
-            value.as_object_mut().unwrap().remove("protocol_version");
-            let transport = ErrorEnvelopeV1::from_value(&value).unwrap();
+            let frame: meshmsg_protocol::ResponseFrame = serde_json::from_slice(&frame).unwrap();
+            let meshmsg_protocol::Response::Error(transport) = frame.response else {
+                panic!("expected transport error")
+            };
             crate::ipc::validate_error_for_request(&transport, &mutation).unwrap();
         }
 
@@ -7633,7 +7131,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("protocol_version");
-        let timeout_error = ErrorEnvelopeV1::from_value(&timeout_error).unwrap();
+        let timeout_error = ProtocolErrorAdapter::from_value(&timeout_error).unwrap();
         assert_eq!(timeout_error.code, "initial_frame_timeout");
         assert_eq!(timeout_error.outcome, "not_started");
         assert!(timeout_error.retryable);
@@ -7662,7 +7160,9 @@ mod tests {
             panic!("expected recovered status command")
         };
         reply
-            .send(serde_json::json!({"type":"stopping", "outcome":"accepted"}))
+            .send(meshmsg_protocol::Response::Stopping {
+                outcome: "accepted".into(),
+            })
             .unwrap();
         read_frame(&mut recovered, MAX_IPC_EVENT_SIZE)
             .await
@@ -7804,7 +7304,8 @@ mod tests {
         let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["code"], "command_timeout");
-        assert!(response["message"].as_str().unwrap().contains("reconcile"));
+        assert!(response.get("message").is_none());
+        assert!(response.get("retryable").is_none());
         drop(pending);
         task.await.unwrap().unwrap();
     }

@@ -4,7 +4,7 @@ use crate::{
     alias::validate_alias,
     attachment::{validate_display_name, AttachmentKind, AttachmentOffer},
     config::prepare_state_dir,
-    contracts::{self, ErrorEnvelopeV1},
+    contracts::{self, ProtocolErrorAdapter},
     ipc::{self, IpcRequest},
     message::{validate_broadcast_body, validate_v2_message_body},
     peers::{MAX_DYNAMIC_IDENTITIES, PEER_LEASE_MS},
@@ -87,7 +87,7 @@ enum DownloadJob {
         created: Instant,
     },
     Failed {
-        error: ipc::LifecycleErrorV1,
+        error: ProtocolErrorAdapter,
         created: Instant,
     },
 }
@@ -583,15 +583,23 @@ struct MutationErrorDto {
 
 impl MutationErrorDto {
     fn parse(value: Value, operation_id: &str) -> Option<Self> {
-        ErrorEnvelopeV1::from_value(&value).ok()?;
-        let error: Self = serde_json::from_value(value).ok()?;
-        (error.kind == "error"
-            && error.schema_version == 1
-            && error.operation_id == operation_id
-            && contracts::valid_request_id(&error.request_id)
-            && ipc::valid_operation_id(&error.operation_id)
+        let error = ProtocolErrorAdapter::from_value(&value).ok()?;
+        let request_id = error.request_id?;
+        let actual_operation_id = error.operation_id?;
+        (actual_operation_id == operation_id
+            && contracts::valid_request_id(&request_id)
+            && ipc::valid_operation_id(&actual_operation_id)
             && matches!(error.outcome.as_str(), "not_started" | "unknown"))
-        .then_some(error)
+        .then(|| Self {
+            kind: "error".into(),
+            schema_version: 1,
+            code: error.code,
+            message: error.message,
+            request_id,
+            operation_id: actual_operation_id,
+            retryable: error.retryable,
+            outcome: error.outcome,
+        })
     }
 
     fn status(&self) -> StatusCode {
@@ -842,7 +850,7 @@ fn json_response(status: StatusCode, mut value: Value) -> Response<Body> {
                 || status == StatusCode::REQUEST_TIMEOUT
                 || outcome == "unknown",
         );
-        let mut envelope = ErrorEnvelopeV1::new(
+        let mut envelope = ProtocolErrorAdapter::new(
             code,
             value
                 .get("message")
@@ -857,23 +865,15 @@ fn json_response(status: StatusCode, mut value: Value) -> Response<Body> {
             .and_then(Value::as_str)
             .filter(|id| ipc::valid_operation_id(id))
             .map(str::to_owned);
-        envelope.offer_id = value
-            .get("offer_id")
-            .and_then(Value::as_str)
-            .filter(|id| ipc::valid_operation_id(id))
-            .map(str::to_owned);
-        envelope.selected_tags = value
-            .get("selected_tags")
-            .and_then(Value::as_u64)
-            .and_then(|count| usize::try_from(count).ok());
-        envelope.removed_tags = value
-            .get("removed_tags")
-            .and_then(Value::as_u64)
-            .and_then(|count| usize::try_from(count).ok());
-        envelope.quota_bytes_released = value.get("quota_bytes_released").and_then(Value::as_u64);
-        value = envelope.into_value();
+        value = contracts::present_error(
+            Some(&request_id),
+            &envelope.typed().expect("known HTTP protocol error"),
+        );
     } else {
-        value = contracts::correlate(value, &request_id);
+        if value.get("schema_version").is_none() {
+            value["schema_version"] = contracts::SCHEMA_VERSION.into();
+        }
+        value["request_id"] = request_id.into();
     }
     response(status, "application/json", value.to_string())
 }
@@ -1225,7 +1225,7 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
         } => (owner, input, permit),
         DownloadAdmission::Replay => return download_started_response(&operation_id),
         DownloadAdmission::Conflict => {
-            let mut conflict = ipc::LifecycleErrorV1::new(
+            let mut conflict = ProtocolErrorAdapter::new(
                 "operation_id_conflict",
                 "operation ID is bound to a different browser offer",
                 "not_started",
@@ -1325,22 +1325,17 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
             Ok(Ok(value)) => {
                 let daemon_error = value["type"] == "error";
                 let error = if daemon_error {
-                    ipc::validate_lifecycle_error_for_request(
-                        &value,
-                        ipc::AttachmentOperationKind::Download,
-                        &operation,
-                        None,
-                        None,
+                    ipc::validate_lifecycle_error_for_request(&value, &operation).unwrap_or_else(
+                        |_| {
+                            operation_bound_download_error(
+                                "download_failed",
+                                "Daemon returned a malformed attachment lifecycle error.",
+                                "unknown",
+                                true,
+                                &operation,
+                            )
+                        },
                     )
-                    .unwrap_or_else(|_| {
-                        operation_bound_download_error(
-                            "download_failed",
-                            "Daemon returned a malformed attachment lifecycle error.",
-                            "unknown",
-                            true,
-                            &operation,
-                        )
-                    })
                 } else {
                     operation_bound_download_error(
                         "download_failed",
@@ -1398,14 +1393,14 @@ fn operation_bound_download_error(
     outcome: &str,
     retryable: bool,
     operation_id: &str,
-) -> ipc::LifecycleErrorV1 {
-    let mut error = ipc::LifecycleErrorV1::new(code, diagnostic, outcome, retryable);
+) -> ProtocolErrorAdapter {
+    let mut error = ProtocolErrorAdapter::new(code, diagnostic, outcome, retryable);
     error.operation_id = Some(operation_id.to_owned());
     error
 }
 
-fn public_lifecycle_error(error: ipc::LifecycleErrorV1) -> ipc::LifecycleErrorV1 {
-    // ErrorEnvelopeV1 construction and decoding already enforce fixed public
+fn public_lifecycle_error(error: ProtocolErrorAdapter) -> ProtocolErrorAdapter {
+    // ProtocolErrorAdapter construction and decoding already enforce fixed public
     // text for every admitted code. Never rewrite it from an internal cause.
     error
 }
@@ -1427,8 +1422,7 @@ fn download_status(state: &WebState, id: &str) -> Response<Body> {
         ),
         Some(DownloadJob::Failed { error, .. }) => json_response(
             StatusCode::UNPROCESSABLE_ENTITY,
-            serde_json::to_value(public_lifecycle_error(error.clone()))
-                .expect("lifecycle error DTO serializes"),
+            public_lifecycle_error(error.clone()).into_value(),
         ),
         None => error(
             StatusCode::NOT_FOUND,
@@ -1573,7 +1567,7 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
                 )),
             }
         }
-        Ok(Ok(value)) if !is_send && !is_peers && ipc::status_from_value(&value).is_ok() => {
+        Ok(Ok(value)) if !is_send && !is_peers => {
             json_response(StatusCode::OK, public_status(&value))
         }
         Ok(Ok(value)) if is_peers => match public_peers_snapshot(&value) {
@@ -1606,7 +1600,7 @@ fn sse_frame(value: &Value) -> Bytes {
     // JSON encoding escapes message newlines; untrusted text cannot inject SSE fields.
     let request_id = http_request_id();
     let value = if value.get("type").and_then(Value::as_str) == Some("error") {
-        let mut error = ErrorEnvelopeV1::new(
+        let mut error = ProtocolErrorAdapter::new(
             value
                 .get("code")
                 .and_then(Value::as_str)
@@ -1624,20 +1618,24 @@ fn sse_frame(value: &Value) -> Bytes {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
         );
-        error.request_id = Some(request_id);
-        error.suppressed_since_last = value
-            .get("suppressed_since_last")
-            .and_then(Value::as_u64)
-            .filter(|_| error.code == "internal_contract_error");
-        error.into_value()
+        error.request_id = Some(request_id.clone());
+        contracts::present_error(
+            Some(&request_id),
+            &error.typed().expect("known SSE protocol error"),
+        )
     } else {
-        contracts::correlate(value.clone(), &request_id)
+        let mut value = value.clone();
+        if value.get("schema_version").is_none() {
+            value["schema_version"] = contracts::SCHEMA_VERSION.into();
+        }
+        value["request_id"] = request_id.into();
+        value
     };
     Bytes::from(format!("data: {value}\n\n"))
 }
 
 async fn web_ipc_request(dir: &Path, request: &IpcRequest) -> Result<Value> {
-    ipc::send_request_with_id(dir, request, &http_request_id()).await
+    ipc::response_payload(ipc::send_request_with_id(dir, request, &http_request_id()).await?)
 }
 
 fn public_event(
@@ -1825,17 +1823,13 @@ fn public_event(
             }))
         }
         "error" => {
-            let error = ErrorEnvelopeV1::from_value(&value).ok()?;
+            let error = ProtocolErrorAdapter::from_value(&value).ok()?;
             (error.code == "internal_contract_error").then(|| {
-                let mut public = json!({
+                json!({
                     "type":"error", "schema_version":1,
                     "code":error.code, "message":error.message,
                     "retryable":error.retryable, "outcome":error.outcome
-                });
-                if let Some(suppressed) = error.suppressed_since_last {
-                    public["suppressed_since_last"] = suppressed.into();
-                }
-                public
+                })
             })
         }
         "peers_snapshot" => public_peers_snapshot(&value),
@@ -1914,6 +1908,10 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
             }
         };
         let download_supported = true;
+        let Ok(first) = ipc::event_payload(first) else {
+            let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
+            return;
+        };
         let Some(connected) = public_event(&state, subscription_topic, first, download_supported) else {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
             return;
@@ -1937,9 +1935,9 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
                 }
             };
             let value = match value {
-                Ok(Some(value)) => {
-                    public_event(&state, subscription_topic, value, download_supported)
-                },
+                Ok(Some(frame)) => ipc::event_payload(frame)
+                    .ok()
+                    .and_then(|value| public_event(&state, subscription_topic, value, download_supported)),
                 _ => {
                     let _ = timeout(Duration::from_secs(5), tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_disconnected", "message":"Daemon disconnected. Feed gap; no history. Reconnecting.", "retryable":true, "outcome":"unknown"})))).await;
                     return;
@@ -2255,7 +2253,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     )
     .await
     {
-        Ok(Ok(status)) if ipc::status_from_value(&status).is_ok() => status,
+        Ok(Ok(status)) => status,
         _ => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2417,15 +2415,9 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     match result {
         Ok(Ok(value)) if value["type"] == "error" => {
             let _ = fs::remove_dir_all(&operation_root);
-            let public_error = ipc::validate_lifecycle_error_for_request(
-                &value,
-                ipc::AttachmentOperationKind::Share,
-                &operation_id,
-                None,
-                None,
-            )
-            .ok()
-            .map(|error| public_lifecycle_error(error).into_value());
+            let public_error = ipc::validate_lifecycle_error_for_request(&value, &operation_id)
+                .ok()
+                .map(|error| public_lifecycle_error(error).into_value());
             match public_error.and_then(|value| MutationErrorDto::parse(value, &operation_id)) {
                 Some(error) => mutation_error_response(error),
                 None => mutation_error_response(local_mutation_error(
@@ -2440,20 +2432,22 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
         Ok(Ok(value)) => {
             let valid =
                 SharedMutationDto::parse(value, &operation_id, &source_digest, &name, received);
-            let _ = fs::remove_dir_all(&operation_root);
             match valid {
-                Some(shared) => json_response(
-                    StatusCode::OK,
-                    json!({
-                        "type":"attachment_shared", "schema_version":3,
-                        "operation_id":shared.operation_id,
-                        "message_id":shared.message_id,
-                        "offer_id":shared.offer_id,
-                        "source_digest":shared.source_digest,
-                        "name":shared.name, "size":shared.size,
-                        "delivery_acknowledged":false
-                    }),
-                ),
+                Some(shared) => {
+                    let _ = fs::remove_dir_all(&operation_root);
+                    json_response(
+                        StatusCode::OK,
+                        json!({
+                            "type":"attachment_shared", "schema_version":3,
+                            "operation_id":shared.operation_id,
+                            "message_id":shared.message_id,
+                            "offer_id":shared.offer_id,
+                            "source_digest":shared.source_digest,
+                            "name":shared.name, "size":shared.size,
+                            "delivery_acknowledged":false
+                        }),
+                    )
+                }
                 None => mutation_error_response(local_mutation_error(
                     &operation_id,
                     "invalid_daemon_response",
@@ -2757,128 +2751,28 @@ mod tests {
     }
 
     #[test]
-    fn browser_error_matrix_has_independent_rust_parity() {
-        let source = include_str!("web/app.js");
-        let expected = [
-            (
-                "operation_id_conflict",
-                "The operation ID is bound to different input.",
-                "not_started",
-                false,
-            ),
-            (
-                "operation_capacity",
-                "Local capacity is currently unavailable.",
-                "not_started",
-                true,
-            ),
-            (
-                "attachment_storage_busy",
-                "Local capacity is currently unavailable.",
-                "not_started",
-                true,
-            ),
-            (
-                "attachment_command_timeout",
-                "The request timed out; reconcile before retrying.",
-                "unknown",
-                true,
-            ),
-            (
-                "attachment_storage_shutdown",
-                "The daemon is shutting down or unavailable.",
-                "unknown",
-                true,
-            ),
-            (
-                "attachment_quota_exceeded",
-                "The attachment storage quota is exceeded.",
-                "not_started",
-                false,
-            ),
-            (
-                "attachment_min_free_space",
-                "The attachment free-space reserve is unavailable.",
-                "not_started",
-                true,
-            ),
-            (
-                "attachment_tag_capacity",
-                "The attachment pin capacity is exhausted.",
-                "not_started",
-                false,
-            ),
-            (
-                "download_operation_capacity",
-                "Attachment download capacity is unavailable.",
-                "not_started",
-                true,
-            ),
-            (
-                "download_staging_unavailable",
-                "Attachment download staging is unavailable.",
-                "not_started",
-                true,
-            ),
-            (
-                "not_found",
-                "The requested resource was not found.",
-                "not_started",
-                false,
-            ),
-        ];
-        for (code, message, outcome, retryable) in expected {
-            let spec = contracts::error_code_spec(code).unwrap();
-            assert_eq!(spec.message, message);
-            assert!(spec.semantics.contains(&(outcome, retryable)));
-            assert!(spec
-                .operations
-                .contains(&contracts::ErrorOperationKind::Download));
-            assert!(source.contains(&format!(
-                "['{code}', ['{message}', '{outcome}', {retryable}]]"
-            )));
-        }
-        let download = contracts::error_code_spec("download_failed").unwrap();
-        assert_eq!(
-            download.semantics,
-            &[("not_started", true), ("unknown", true)]
-        );
-        assert!(source.contains("[['not_started', true], ['unknown', true]]"));
-        assert!(!source.contains("['attachment_lifecycle_internal',"));
-    }
-
-    #[test]
     fn public_attachment_errors_preserve_actions_but_hide_private_diagnostics() {
         let operation_id = "0123456789abcdef0123456789abcdef";
-        let offer_id = "fedcba9876543210fedcba9876543210";
-        for (code, outcome, with_removal) in [
+        for (code, outcome, _with_removal) in [
             ("download_failed", "not_started", false),
             ("share_failed", "unknown", false),
             ("attachment_lifecycle_internal", "unknown", false),
             ("attachment_min_free_space", "not_started", false),
             ("attachment_removal_partial", "unknown", true),
         ] {
-            let mut private = ipc::LifecycleErrorV1::new(
+            let mut private = ProtocolErrorAdapter::new(
                 code,
                 "open /home/alice/private/file.bin failed: database secret detail",
                 outcome,
                 true,
             );
             private.operation_id = Some(operation_id.into());
-            if with_removal {
-                private.offer_id = Some(offer_id.into());
-                private.selected_tags = Some(2);
-                private.removed_tags = Some(1);
-                private.quota_bytes_released = Some(7);
-                private.maximum = Some(2);
-                private.dry_run = Some(false);
-            }
             let public = public_lifecycle_error(private);
             assert_eq!(public.code, code);
             assert_eq!(public.outcome, outcome);
             assert!(!public.message.contains("/home/alice"));
             assert!(!public.message.contains("database"));
-            assert!(ipc::LifecycleErrorV1::from_value(&public.into_value()).is_ok());
+            assert!(ProtocolErrorAdapter::from_value(&public.into_value()).is_ok());
         }
     }
 
@@ -2917,26 +2811,28 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef";
         let value = json!({
             "type":"error", "schema_version":1, "code":"send_failed",
-            "message":"Message submission failed.", "request_id":"11111111111111111111111111111111",
-            "operation_id":id, "retryable":true, "outcome":"unknown"
+            "request_id":"11111111111111111111111111111111",
+            "operation_id":id, "outcome":"unknown"
         });
         let parsed = MutationErrorDto::parse(value.clone(), id).unwrap();
-        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        let presented = serde_json::to_value(parsed).unwrap();
+        assert_eq!(presented["message"], "Message submission failed.");
+        assert_eq!(presented["retryable"], true);
         let mut extra = value.clone();
         extra["extra"] = true.into();
         assert!(MutationErrorDto::parse(extra, id).is_none());
         assert!(MutationErrorDto::parse(value, "fedcba9876543210fedcba9876543210").is_none());
 
         let mut lifecycle =
-            ipc::LifecycleErrorV1::new("attachment_quota_exceeded", "quota", "not_started", false);
+            ProtocolErrorAdapter::new("attachment_quota_exceeded", "quota", "not_started", false);
         lifecycle.request_id = Some("11111111111111111111111111111111".into());
         lifecycle.operation_id = Some(id.into());
         let lifecycle_value = lifecycle.into_value();
-        assert!(ipc::LifecycleErrorV1::from_value(&lifecycle_value).is_ok());
+        assert!(ProtocolErrorAdapter::from_value(&lifecycle_value).is_ok());
         assert!(MutationErrorDto::parse(lifecycle_value.clone(), id).is_some());
         let mut malformed = lifecycle_value;
         malformed["extra"] = true.into();
-        assert!(ipc::LifecycleErrorV1::from_value(&malformed).is_err());
+        assert!(ProtocolErrorAdapter::from_value(&malformed).is_err());
     }
 
     #[test]

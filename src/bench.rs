@@ -661,7 +661,7 @@ async fn receive_events(
         .await?
         .context("daemon stopped before subscription connected")?;
     anyhow::ensure!(
-        connected["type"] == "connected",
+        matches!(connected.event, meshmsg_protocol::Event::Connected { .. }),
         "unexpected subscription response"
     );
     events.send(serde_json::json!({"type":"bench_receive_started","schema_version":1,"run_id":run_id,"duration_secs":duration_secs,"expected":expected})).await.ok();
@@ -674,7 +674,10 @@ async fn receive_events(
     let mut reason = "deadline";
     loop {
         tokio::select! {
-            value = reader.read() => match value? { Some(value) => stats.record(&value), None => { reason = "daemon_stopped"; break; } },
+            value = reader.read() => match value? {
+                Some(frame) => stats.record(&ipc::event_payload(frame)?),
+                None => { reason = "daemon_stopped"; break; }
+            },
             _ = &mut deadline => break,
             _ = progress.tick() => { let _ = events.try_send(stats.value("bench_receive_progress", started.elapsed())); },
             _ = &mut cancel => { reason = "interrupted"; break; }
