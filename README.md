@@ -67,21 +67,9 @@ meshmsg stop
 
 See the [Usage reference](docs/usage.md) for all commands, invite behavior, input sources, status, diagnosis, and JSON automation.
 
-Benchmarking uses optional ordinary-protocol clients. The non-interactive client has no terminal UI dependencies; the TUI is a separate binary and feature:
-
-```sh
-cargo build --features bench --bin meshmsg-bench
-meshmsg-bench --json send --rate 100 --duration-secs 10
-
-cargo build --features bench-tui --bin meshmsg-bench-tui
-meshmsg-bench-tui
-```
-
-See [Benchmarking](docs/benchmarking.md) for coordinated runs, metrics, and NDJSON output.
-
 ## Interfaces
 
-meshmsg has no built-in web UI or HTTP bridge. Use the CLI or the owner-only local IPC protocol; benchmark clients also use that generic IPC interface.
+meshmsg has no built-in web UI or HTTP bridge. Use the CLI or the owner-only local IPC protocol.
 
 ## Attachments
 
@@ -107,7 +95,6 @@ Downloads are explicit, size-limited, content-verified, persistent across provid
 - [Stable JSON and IPC contracts](docs/contracts.md)
 - [Attachments](docs/attachments.md)
 - [Operations and security](docs/operations.md)
-- [Benchmarking](docs/benchmarking.md)
 - [Development and releases](docs/development.md)
 
 ## Development
@@ -116,9 +103,8 @@ Downloads are explicit, size-limited, content-verified, persistent across provid
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
+cargo check --locked --workspace --all-targets
 cargo build --locked
-cargo build --locked --features bench --bin meshmsg-bench
-cargo test --locked --workspace --all-targets --features bench-tui
 scripts/verify-lean-release.sh
 bash tests/integration-5-peer.sh target/debug/meshmsg
 bash tests/integration-attachments.sh target/debug/meshmsg

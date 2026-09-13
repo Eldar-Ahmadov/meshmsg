@@ -480,9 +480,6 @@ mod tests {
         ])
         .is_ok());
         assert!(parse(&["download", "--offer-stdin", "--output", "file.txt"]).is_ok());
-        for removed in ["bench-send", "bench-receive", "bench-tui"] {
-            assert!(parse(&[removed]).is_err());
-        }
     }
 
     #[test]

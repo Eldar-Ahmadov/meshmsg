@@ -10,27 +10,11 @@ edition = "2021"
 description = "Small peer-to-peer messaging and file-sharing CLI built on Iroh"
 license = "MIT OR Apache-2.0"
 
-[features]
-default = []
-bench = []
-bench-tui = ["bench", "dep:crossterm", "dep:ratatui"]
-
-[[bin]]
-name = "meshmsg-bench"
-path = "src/bin/meshmsg-bench.rs"
-required-features = ["bench"]
-
-[[bin]]
-name = "meshmsg-bench-tui"
-path = "src/bin/meshmsg-bench-tui.rs"
-required-features = ["bench-tui"]
-
 [dependencies]
 anyhow = "1"
 blake3 = "1"
 bytes = { version = "1", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
-crossterm = { version = "0.29", optional = true }
 data-encoding = "2"
 dirs = "6"
 futures-util = "0.3"
@@ -43,7 +27,6 @@ iroh-blobs = { version = "=0.103.0", default-features = false, features = ["fs-s
 iroh-gossip = "0.101"
 postcard = { version = "1", features = ["alloc", "use-std"] }
 rand = "0.10"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde-byte-array = "0.1"
 serde_json = "1"
