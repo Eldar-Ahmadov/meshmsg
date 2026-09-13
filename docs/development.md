@@ -51,15 +51,13 @@ The driver requires `target/debug/meshmsg` and substitutes its `{BIN}` inventory
 placeholder. The five-peer test retains equal-peer messaging, selective endpoint
 advertising, restart/failover/rejoin, and owner-only IPC hardening coverage. The
 inventory also includes CLI errors, peer directory, attachments, direct messages,
-idempotency, checksum-pinned v0.1.18 on-wire EnvelopeV2 boundaries, and a
-generated-archive/mock-download installer test. The current per-command budgets
-total 4,220 seconds (70 minutes 20 seconds).
+idempotency, and a generated-archive/mock-download installer test. The current
+per-command budgets total 3,620 seconds (60 minutes 20 seconds).
 The workflow allows 130 minutes,
 including setup/build/cleanup, while the driver rejects an inventory above its
 115-minute command budget.
 
-The networking harnesses require working Iroh networking and download
-checksum-pinned historical artifacts.
+The networking harnesses require working Iroh networking.
 
 ### Lean release verification
 

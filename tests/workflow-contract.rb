@@ -140,7 +140,6 @@ def validate(ci, verification, release, inventory)
     [1100, "bash", "tests/integration-5-peer.sh", "{BIN}"],
     [600, "bash", "tests/integration-attachments.sh", "{BIN}"],
     [600, "bash", "tests/integration-direct-messages.sh", "{BIN}"],
-    [600, "bash", "tests/integration-v018-message-boundary.sh", "{BIN}"],
     [600, "bash", "tests/integration-idempotency.sh", "{BIN}"],
     [60, "bash", "tests/integration-installer.sh", "{BIN}"]
   ]

@@ -537,7 +537,7 @@ impl Envelope {
 
     fn validate_general_semantics(&self) -> Result<()> {
         if self.kind == EnvelopeKind::Message {
-            crate::message::validate_v2_message_body(&self.body)?;
+            crate::message::validate_broadcast_body(&self.body)?;
         }
         Ok(())
     }
@@ -662,7 +662,8 @@ pub(crate) fn message_event(msg: &Envelope) -> meshmsg_protocol::Event {
             .parse()
             .expect("message ID is canonical"),
         timestamp_ms: msg.timestamp_ms,
-        body: meshmsg_protocol::MessageBody::new(msg.body.clone()).expect("validated message body"),
+        body: meshmsg_protocol::BroadcastBody::new(msg.body.clone())
+            .expect("validated broadcast body"),
     })
 }
 

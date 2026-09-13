@@ -64,11 +64,10 @@ The typed command union is: `send`, `private_send`, `subscribe`, `status`,
 command fields are rejected. Unsupported versions and malformed IDs fail closed.
 Responses are dispatched by the exact `type` tag and then fully deserialized into
 a deny-unknown-fields typed variant with semantic and bounded-value checks.
-New broadcast producers accept 1 through 3900 UTF-8 bytes. Private/direct sends
-retain their separate 1 through 4096-byte body contract. EnvelopeV2 and event
-consumers retain the released v0.1.18-compatible 1 through 3928-byte worst-case
-range. That exact maximum occurs with a one-byte postcard timestamp; the complete
-4096-byte envelope bound is still checked before decoding. Local rejection occurs
+Broadcast producers, EnvelopeV2 receivers, and event consumers accept 1 through
+3900 UTF-8 bytes. Private/direct sends retain their separate 1 through 4096-byte
+body contract. The complete 4096-byte envelope bound is still checked before
+decoding. Local rejection occurs
 before throttle/operation-cache admission, has `code:"invalid_message"` and
 `outcome:"not_started"`, and preserves the operation ID. Invalid signed remote text or attachment semantics are rejected before accepted-traffic
 or replay/rate admission and fanout, while every frame still pays a separate bounded

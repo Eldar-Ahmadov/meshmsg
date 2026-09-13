@@ -151,7 +151,7 @@ SENDER_PEER=$(python3 -c \
   <<<"$SENDER_STATUS") || fail "current daemon did not advertise safe private-send IPC"
 
 # Private positional/file/stdin inputs retain their independent 4096-byte
-# contract, while broadcasts are covered by the v0.1.18 boundary scenario.
+# contract; broadcast bounds are enforced separately by the current protocol.
 for size in 3900 3901 4096 4097; do
   python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_text("p" * int(sys.argv[2]))' \
     "$ROOT/private-$size.txt" "$size"
@@ -215,7 +215,7 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "privat
 wait_for 30 "canonical-key private delivery" grep -Fq "\"body\":\"$CANONICAL\"" "$ROOT/receiver.listen.log"
 ! grep -Fq "$CANONICAL" "$ROOT/spy.listen.log" || fail "canonical-key private body reached a third peer"
 
-# The no---to path remains the existing gossip broadcast with its old result.
+# The no---to path remains the current gossip broadcast.
 BROADCAST="broadcast-control-$(date +%s%N)"
 BROADCAST_RESULT=$("$BIN" --state-dir "$ROOT/sender" --json send "$BROADCAST")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "queued" and v["body"] == sys.argv[1] and v["delivery_acknowledged"] is False' "$BROADCAST" \
@@ -268,4 +268,4 @@ done
 
 kill "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
 wait "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
-echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/4096/4097 boundaries, authenticated private acknowledgements, broadcast compatibility, and DM log privacy"
+echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/4096/4097 boundaries, authenticated private acknowledgements, broadcast interoperability, and DM log privacy"

@@ -4,13 +4,8 @@ use anyhow::Result;
 /// headroom for EnvelopeV2 metadata and signatures inside the 4096-byte frame.
 pub(crate) const MAX_BROADCAST_BODY_BYTES: usize = 3900;
 /// Direct/private messages use a separate bounded transport and retain their
-/// released 4096-byte body contract.
+/// 4096-byte body contract.
 pub(crate) const MAX_PRIVATE_BODY_BYTES: usize = 4096;
-/// Largest text body that the released v0.1.18 EnvelopeV2 producer can encode
-/// in a 4096-byte frame. This worst case occurs with a one-byte postcard
-/// timestamp; receive/event consumers retain it even though current production
-/// uses the more conservative broadcast limit.
-pub(crate) const MAX_V2_MESSAGE_BODY_BYTES: usize = 3928;
 
 pub(crate) fn validate_broadcast_body(body: &str) -> Result<()> {
     validate_nonempty_bounded(body, MAX_BROADCAST_BODY_BYTES, "broadcast message")
@@ -18,10 +13,6 @@ pub(crate) fn validate_broadcast_body(body: &str) -> Result<()> {
 
 pub(crate) fn validate_private_body(body: &str) -> Result<()> {
     validate_nonempty_bounded(body, MAX_PRIVATE_BODY_BYTES, "private message")
-}
-
-pub(crate) fn validate_v2_message_body(body: &str) -> Result<()> {
-    validate_nonempty_bounded(body, MAX_V2_MESSAGE_BODY_BYTES, "broadcast message")
 }
 
 pub(crate) fn invalid_local_message(
@@ -54,7 +45,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn operation_and_worst_case_released_v2_boundaries_are_byte_based() {
+    fn message_body_boundaries_are_byte_based() {
         validate_broadcast_body(" ").unwrap();
         validate_broadcast_body(&"a".repeat(MAX_BROADCAST_BODY_BYTES)).unwrap();
         assert!(validate_broadcast_body("").is_err());
@@ -78,11 +69,5 @@ mod tests {
         assert_eq!(exact_multibyte.len(), MAX_BROADCAST_BODY_BYTES);
         validate_broadcast_body(&exact_multibyte).unwrap();
         assert!(validate_broadcast_body(&(exact_multibyte + "界")).is_err());
-
-        validate_v2_message_body(&"a".repeat(MAX_V2_MESSAGE_BODY_BYTES)).unwrap();
-        assert!(validate_v2_message_body(&"a".repeat(MAX_V2_MESSAGE_BODY_BYTES + 1)).is_err());
-        for released_valid in MAX_BROADCAST_BODY_BYTES + 1..=MAX_V2_MESSAGE_BODY_BYTES {
-            validate_v2_message_body(&"a".repeat(released_valid)).unwrap();
-        }
     }
 }

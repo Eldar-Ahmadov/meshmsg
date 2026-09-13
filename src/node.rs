@@ -2318,11 +2318,6 @@ fn queued_event(
     .expect("test queued serialization")
 }
 
-#[cfg(test)]
-fn message_event(envelope: Envelope) -> serde_json::Value {
-    serde_json::to_value(gossip::message_event(&envelope)).expect("test message serialization")
-}
-
 #[cfg(unix)]
 pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
     UnixStream::connect(dir.join(SOCKET_NAME))
@@ -3675,7 +3670,7 @@ mod tests {
     }
 
     #[test]
-    fn crafted_signed_empty_message_is_rejected_before_replay_and_next_message_survives() {
+    fn crafted_signed_invalid_messages_are_rejected_before_replay_and_next_message_survives() {
         let secret = SecretKey::generate();
         let topic = test_topic();
         let now_ms = 1_700_000_000_000;
@@ -3709,22 +3704,32 @@ mod tests {
         let mut replay = EnvelopeReplayCache::default();
         let mut sources = TransportSourceLimiter::default();
 
-        let rejected = network_event(
-            Event::Received(iroh_gossip::api::Message {
-                content: signed_envelope(String::new()).into(),
-                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                delivered_from: source,
-            }),
-            topic,
-            &mut replay,
-            &mut sources,
-            now_ms,
-        );
-        assert!(rejected.is_empty());
-        assert_eq!(
-            replay.live_ids, 0,
-            "invalid semantics consumed replay state"
-        );
+        for body in [
+            String::new(),
+            "x".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1),
+        ] {
+            let rejected = network_event(
+                Event::Received(iroh_gossip::api::Message {
+                    content: signed_envelope(body).into(),
+                    scope: iroh_gossip::proto::DeliveryScope::Neighbors,
+                    delivered_from: source,
+                }),
+                topic,
+                &mut replay,
+                &mut sources,
+                now_ms,
+            );
+            assert!(rejected.is_empty());
+            assert_eq!(
+                replay.live_ids, 0,
+                "invalid semantics consumed replay state"
+            );
+            assert_eq!(
+                sources.admission_global.milli_tokens,
+                GLOBAL_TRANSPORT_BURST * 1_000,
+                "invalid semantics consumed admission capacity"
+            );
+        }
 
         let accepted = network_event(
             Event::Received(iroh_gossip::api::Message {
@@ -4494,102 +4499,6 @@ mod tests {
             timestamp_ms,
         )
         .is_err());
-    }
-
-    #[test]
-    fn released_v2_body_range_remains_decodable_and_publishable() {
-        let secret = SecretKey::generate();
-        for length in [
-            crate::message::MAX_BROADCAST_BODY_BYTES + 1,
-            3923,
-            crate::message::MAX_V2_MESSAGE_BODY_BYTES,
-        ] {
-            let encoded = encode_unchecked_signed_envelope(
-                &secret,
-                EnvelopeKind::Message,
-                "a".repeat(length),
-                [5; 16],
-                1,
-            );
-            assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
-            let envelope = Envelope::decode(&encoded, test_topic()).unwrap();
-            assert_eq!(envelope.body.len(), length);
-            let value = message_event(envelope);
-            assert!(serde_json::from_value::<meshmsg_protocol::Event>(value).is_ok());
-        }
-    }
-
-    #[test]
-    fn released_v2_capacity_uses_exact_postcard_metadata_boundaries() {
-        let secret = SecretKey::generate();
-        // Postcard varints add one metadata byte at each 7-bit timestamp
-        // boundary. These capacities are measured on the complete released V2
-        // structure, including its string-length prefix and fixed signature.
-        for (timestamp_ms, capacity) in [
-            (0, 3928),
-            (127, 3928),
-            (1_u64 << 7, 3927),
-            ((1_u64 << 14) - 1, 3927),
-            (1_u64 << 14, 3926),
-            (1_u64 << 21, 3925),
-            (1_u64 << 28, 3924),
-            (1_u64 << 35, 3923),
-            (1_u64 << 42, 3922),
-            (1_u64 << 49, 3921),
-            (1_u64 << 56, 3920),
-            (1_u64 << 63, 3919),
-            (u64::MAX, 3919),
-        ] {
-            let at_limit = encode_unchecked_signed_envelope(
-                &secret,
-                EnvelopeKind::Message,
-                "a".repeat(capacity),
-                [6; 16],
-                timestamp_ms,
-            );
-            let over_limit = encode_unchecked_signed_envelope(
-                &secret,
-                EnvelopeKind::Message,
-                "a".repeat(capacity + 1),
-                [6; 16],
-                timestamp_ms,
-            );
-            assert_eq!(
-                at_limit.len(),
-                MAX_ENVELOPE_SIZE,
-                "timestamp {timestamp_ms}"
-            );
-            assert!(
-                Envelope::decode(&at_limit, test_topic()).is_ok(),
-                "exact frame rejected at timestamp {timestamp_ms}"
-            );
-            assert_eq!(
-                over_limit.len(),
-                MAX_ENVELOPE_SIZE + 1,
-                "timestamp {timestamp_ms}"
-            );
-            assert!(
-                Envelope::decode(&over_limit, test_topic()).is_err(),
-                "oversized frame accepted at timestamp {timestamp_ms}"
-            );
-        }
-
-        let body_127 = encode_unchecked_signed_envelope(
-            &secret,
-            EnvelopeKind::Message,
-            "a".repeat(127),
-            [7; 16],
-            0,
-        );
-        let body_128 = encode_unchecked_signed_envelope(
-            &secret,
-            EnvelopeKind::Message,
-            "a".repeat(128),
-            [7; 16],
-            0,
-        );
-        assert_eq!(body_128.len() - body_127.len(), 2);
-        assert_eq!(crate::message::MAX_V2_MESSAGE_BODY_BYTES, 3928);
     }
 
     #[test]

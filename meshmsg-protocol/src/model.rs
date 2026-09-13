@@ -791,7 +791,7 @@ pub struct Message {
     pub from: PeerId,
     pub message_id: MessageId,
     pub timestamp_ms: u64,
-    pub body: MessageBody,
+    pub body: BroadcastBody,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1536,6 +1536,25 @@ mod tests {
         assert!(decode_body("send", BroadcastBody::MAX_BYTES + 1).is_err());
         assert!(decode_body("private_send", PrivateBody::MAX_BYTES).is_ok());
         assert!(decode_body("private_send", PrivateBody::MAX_BYTES + 1).is_err());
+
+        let request_id = RequestId::new_random();
+        let peer = "0".repeat(64);
+        let message_id = MessageId::new_random();
+        let decode_event = |kind: &str, body: &str, private_fields: &str| {
+            serde_json::from_str::<EventFrame>(&format!(
+                r#"{{"protocol_version":2,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
+            ))
+        };
+        assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES), "").is_ok());
+        assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES + 1), "").is_err());
+        let private_fields =
+            r#","private":true,"acceptance_acknowledged":true,"durable":false,"read":false"#;
+        assert!(decode_event(
+            "private_message",
+            &"x".repeat(MessageBody::MAX_BYTES),
+            private_fields
+        )
+        .is_ok());
     }
 
     #[test]
