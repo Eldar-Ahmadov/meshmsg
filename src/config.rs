@@ -18,7 +18,6 @@ use std::{
 
 const LOCK_NAME: &str = ".meshmsg.lock";
 const CONFIG_NAME: &str = "config.json";
-const CONFIG_BACKUP_V0_NAME: &str = "config.json.v0.bak";
 const CONFIG_SCHEMA_VERSION: u8 = 1;
 const IDENTITY_VERSION: u8 = 1;
 pub(crate) const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -104,16 +103,6 @@ struct IdentityBinding {
     public_key: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyStateV0 {
-    advertise_self: bool,
-    topic: String,
-    invite: Option<String>,
-    #[serde(default)]
-    identity: Option<IdentityBinding>,
-}
-
 #[derive(Deserialize)]
 struct StateVersionProbe {
     #[serde(default)]
@@ -181,13 +170,13 @@ impl State {
     pub fn load(dir: &Path) -> Result<Self> {
         let bytes =
             persistent::read_file_bounded(&dir.join(CONFIG_NAME), CONFIG_NAME, MAX_CONFIG_BYTES)?;
-        decode_state(&bytes).map(|(state, _legacy)| state)
+        decode_state(&bytes)
     }
 
-    pub fn load_locked(dir: &Path, lock: &StateLock) -> Result<(Self, SecretKey)> {
+    pub fn load_locked(dir: &Path, _lock: &StateLock) -> Result<(Self, SecretKey)> {
         let bytes =
             persistent::read_file_bounded(&dir.join(CONFIG_NAME), CONFIG_NAME, MAX_CONFIG_BYTES)?;
-        let (state, legacy) = decode_state(&bytes)?;
+        let state = decode_state(&bytes)?;
         state.validate().context("validate config.json")?;
         let secret = load_bound_secret(
             dir,
@@ -199,9 +188,6 @@ impl State {
         state
             .validate_for_identity(secret.public())
             .context("validate config.json for selected identity")?;
-        if legacy {
-            migrate_legacy_config(dir, &bytes, &state, lock, false)?;
-        }
         Ok((state, secret))
     }
 
@@ -218,7 +204,7 @@ impl State {
         Ok((state, secret))
     }
 
-    /// Test/legacy helper for committing state without alias metadata.
+    /// Test helper for committing state without alias metadata.
     #[cfg(test)]
     pub fn save_new(&self, dir: &Path, force: bool) -> Result<String> {
         self.save_new_inner(dir, force, false)
@@ -285,91 +271,16 @@ impl State {
     }
 }
 
-fn decode_state(bytes: &[u8]) -> Result<(State, bool)> {
+fn decode_state(bytes: &[u8]) -> Result<State> {
     let probe: StateVersionProbe = persistent::parse_json(bytes, CONFIG_NAME)?;
-    match probe.schema_version {
-        None => {
-            let legacy: LegacyStateV0 = persistent::parse_json(bytes, CONFIG_NAME)?;
-            Ok((
-                State {
-                    schema_version: CONFIG_SCHEMA_VERSION,
-                    advertise_self: legacy.advertise_self,
-                    topic: legacy.topic,
-                    invite: legacy.invite,
-                    identity: legacy.identity,
-                },
-                true,
-            ))
-        }
-        Some(version) if version == u64::from(CONFIG_SCHEMA_VERSION) => {
-            let state: State = persistent::parse_json(bytes, CONFIG_NAME)?;
-            Ok((state, false))
-        }
-        Some(version) => Err(PersistentError::unsupported_version(CONFIG_NAME, version).into()),
+    let Some(version) = probe.schema_version else {
+        return Err(PersistentError::unsupported_version(CONFIG_NAME, 0).into());
+    };
+    if version != u64::from(CONFIG_SCHEMA_VERSION) {
+        return Err(PersistentError::unsupported_version(CONFIG_NAME, version).into());
     }
+    Ok(persistent::parse_json(bytes, CONFIG_NAME)?)
 }
-
-fn migrate_legacy_config(
-    dir: &Path,
-    legacy_bytes: &[u8],
-    state: &State,
-    lock: &StateLock,
-    fail_after_backup: bool,
-) -> Result<()> {
-    migrate_legacy_config_with_hook(dir, legacy_bytes, state, lock, fail_after_backup, || {})
-}
-
-fn migrate_legacy_config_with_hook(
-    dir: &Path,
-    legacy_bytes: &[u8],
-    state: &State,
-    _lock: &StateLock,
-    fail_after_backup: bool,
-    before_backup_commit: impl FnOnce(),
-) -> Result<()> {
-    let backup_path = dir.join(CONFIG_BACKUP_V0_NAME);
-    match atomic_write_new_with_hook_impl(
-        dir,
-        CONFIG_BACKUP_V0_NAME,
-        legacy_bytes,
-        0o600,
-        before_backup_commit,
-    ) {
-        Ok(()) => {}
-        Err(error) if error.downcast_ref::<NoReplaceCollision>().is_some() => {
-            let existing = persistent::read_file_bounded(
-                &backup_path,
-                CONFIG_BACKUP_V0_NAME,
-                MAX_CONFIG_BYTES,
-            )?;
-            anyhow::ensure!(
-                existing == legacy_bytes,
-                "existing config migration backup does not match legacy config"
-            );
-        }
-        Err(error) => return Err(error.context("write config migration backup")),
-    }
-    config_migration_crash_point("after_backup_sync");
-    if fail_after_backup {
-        bail!("injected config migration failure after backup");
-    }
-    let encoded = serde_json::to_vec_pretty(state).context("encode migrated config.json")?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_CONFIG_BYTES,
-        "migrated config.json exceeds size limit"
-    );
-    atomic_write(dir, CONFIG_NAME, &encoded, 0o600).context("commit config.json migration")
-}
-
-#[cfg(test)]
-fn config_migration_crash_point(point: &str) {
-    if std::env::var("MESHMSG_CONFIG_MIGRATION_CRASH_POINT").as_deref() == Ok(point) {
-        std::process::exit(91);
-    }
-}
-
-#[cfg(not(test))]
-fn config_migration_crash_point(_point: &str) {}
 
 fn new_generation() -> String {
     HEXLOWER.encode(&rand::random::<[u8; 16]>())
@@ -753,23 +664,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_state_and_missing_identity_are_rejected() {
+    fn current_state_with_unknown_fields_or_missing_identity_is_rejected() {
         let dir = test_dir();
         prepare_state_dir(&dir).unwrap();
-        let unsupported = serde_json::json!({
-            "topic":TopicId::from_bytes([1; 32]).to_string(), "invite":null
-        });
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&unsupported).unwrap(),
-        )
-        .unwrap();
-        assert!(format!("{:#}", State::load(&dir).unwrap_err()).contains("advertise_self"));
-
         let state_with_deprecated_field = serde_json::json!({
+            "schema_version": 1,
             "advertise_self":true,
             "topic":TopicId::from_bytes([1; 32]).to_string(),
             "invite":null,
+            "identity": null,
             "deprecated":true
         });
         fs::write(
@@ -780,6 +683,7 @@ mod tests {
         assert!(format!("{:#}", State::load(&dir).unwrap_err()).contains("unknown field"));
 
         let current_without_identity = serde_json::json!({
+            "schema_version": 1,
             "advertise_self":true,
             "topic":TopicId::from_bytes([1; 32]).to_string(),
             "invite":null
@@ -972,321 +876,6 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    fn legacy_config_bytes(dir: &Path) -> Vec<u8> {
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&fs::read(dir.join(CONFIG_NAME)).unwrap()).unwrap();
-        value.as_object_mut().unwrap().remove("schema_version");
-        serde_json::to_vec_pretty(&value).unwrap()
-    }
-
-    #[test]
-    fn legacy_config_migration_is_atomic_idempotent_and_identity_safe() {
-        let dir = test_dir();
-        let expected_peer = State::new_topic().save_new(&dir, false).unwrap();
-        let legacy = legacy_config_bytes(&dir);
-        atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-
-        let lock = StateLock::acquire(&dir).unwrap();
-        let (migrated, secret) = State::load_locked(&dir, &lock).unwrap();
-        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
-        assert_eq!(secret.public().to_string(), expected_peer);
-        assert_eq!(fs::read(dir.join(CONFIG_BACKUP_V0_NAME)).unwrap(), legacy);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(dir.join(CONFIG_BACKUP_V0_NAME))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        let committed = fs::read(dir.join(CONFIG_NAME)).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&committed).unwrap()["schema_version"],
-            CONFIG_SCHEMA_VERSION
-        );
-
-        let (_, restarted_secret) = State::load_locked(&dir, &lock).unwrap();
-        assert_eq!(restarted_secret.public(), secret.public());
-        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), committed);
-        assert_eq!(fs::read(dir.join(CONFIG_BACKUP_V0_NAME)).unwrap(), legacy);
-
-        atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-        let (_, restored_secret) = State::load_for_doctor(&dir).unwrap();
-        assert_eq!(restored_secret.public().to_string(), expected_peer);
-        drop(lock);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn migration_backup_no_replace_accepts_only_matching_concurrent_file() {
-        for matches in [true, false] {
-            let dir = test_dir();
-            State::new_topic().save_new(&dir, false).unwrap();
-            let legacy = legacy_config_bytes(&dir);
-            atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-            let (state, is_legacy) = decode_state(&legacy).unwrap();
-            assert!(is_legacy);
-            let lock = StateLock::acquire(&dir).unwrap();
-            let backup = dir.join(CONFIG_BACKUP_V0_NAME);
-            let collision = if matches {
-                legacy.clone()
-            } else {
-                b"concurrent mismatching backup".to_vec()
-            };
-
-            let result =
-                migrate_legacy_config_with_hook(&dir, &legacy, &state, &lock, false, || {
-                    fs::write(&backup, &collision).unwrap()
-                });
-            assert_eq!(fs::read(&backup).unwrap(), collision);
-            if matches {
-                result.unwrap();
-                assert_eq!(
-                    State::load(&dir).unwrap().schema_version,
-                    CONFIG_SCHEMA_VERSION
-                );
-            } else {
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("does not match legacy config"));
-                assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
-            }
-            drop(lock);
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn migration_backup_no_replace_rejects_concurrent_symlink_and_directory() {
-        use std::os::unix::fs::symlink;
-
-        for kind in ["symlink", "directory"] {
-            let dir = test_dir();
-            State::new_topic().save_new(&dir, false).unwrap();
-            let legacy = legacy_config_bytes(&dir);
-            atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-            let (state, _) = decode_state(&legacy).unwrap();
-            let lock = StateLock::acquire(&dir).unwrap();
-            let backup = dir.join(CONFIG_BACKUP_V0_NAME);
-            let target = dir.join("backup-target");
-            fs::write(&target, &legacy).unwrap();
-
-            let error = migrate_legacy_config_with_hook(
-                &dir,
-                &legacy,
-                &state,
-                &lock,
-                false,
-                || match kind {
-                    "symlink" => symlink(&target, &backup).unwrap(),
-                    "directory" => fs::create_dir(&backup).unwrap(),
-                    _ => unreachable!(),
-                },
-            )
-            .unwrap_err();
-            assert!(!error.to_string().is_empty());
-            assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
-            if kind == "symlink" {
-                assert!(fs::symlink_metadata(&backup)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink());
-                assert_eq!(fs::read(&target).unwrap(), legacy);
-            } else {
-                assert!(backup.is_dir());
-            }
-            drop(lock);
-            fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn migration_backup_no_replace_rejects_concurrent_reparse_point() {
-        use std::os::windows::fs::symlink_file;
-
-        let dir = test_dir();
-        State::new_topic().save_new(&dir, false).unwrap();
-        let legacy = legacy_config_bytes(&dir);
-        atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-        let (state, _) = decode_state(&legacy).unwrap();
-        let lock = StateLock::acquire(&dir).unwrap();
-        let backup = dir.join(CONFIG_BACKUP_V0_NAME);
-        let target = dir.join("backup-target");
-        fs::write(&target, &legacy).unwrap();
-
-        let error = migrate_legacy_config_with_hook(&dir, &legacy, &state, &lock, false, || {
-            symlink_file(&target, &backup).unwrap()
-        })
-        .unwrap_err();
-        assert!(!error.to_string().is_empty());
-        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
-        assert_eq!(fs::read(&target).unwrap(), legacy);
-        drop(lock);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn legacy_migration_validates_invite_against_identity_before_writing_backup() {
-        let dir = test_dir();
-        State::new_topic().save_new(&dir, false).unwrap();
-        let legacy = legacy_config_bytes(&dir);
-        let mut value: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
-        let topic = TopicId::from_str(value["topic"].as_str().unwrap()).unwrap();
-        let invite = Invite {
-            topic,
-            bootstrap_peers: (0..crate::invite::MAX_BOOTSTRAP_PEERS)
-                .map(|_| iroh::EndpointAddr::new(SecretKey::generate().public()))
-                .collect(),
-        };
-        value["invite"] = invite.to_string().into();
-        let invalid = serde_json::to_vec_pretty(&value).unwrap();
-        atomic_write(&dir, CONFIG_NAME, &invalid, 0o600).unwrap();
-
-        let lock = StateLock::acquire(&dir).unwrap();
-        assert!(
-            format!("{:#}", State::load_locked(&dir, &lock).unwrap_err())
-                .contains("cannot advertise self")
-        );
-        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), invalid);
-        assert!(!dir.join(CONFIG_BACKUP_V0_NAME).exists());
-        drop(lock);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn legacy_migration_refuses_identity_mismatch_before_writing_backup() {
-        let dir = test_dir();
-        State::new_topic().save_new(&dir, false).unwrap();
-        let legacy = legacy_config_bytes(&dir);
-        let mut value: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
-        value["identity"]["public_key"] = SecretKey::generate().public().to_string().into();
-        let tampered = serde_json::to_vec_pretty(&value).unwrap();
-        atomic_write(&dir, CONFIG_NAME, &tampered, 0o600).unwrap();
-
-        let lock = StateLock::acquire(&dir).unwrap();
-        assert!(State::load_locked(&dir, &lock)
-            .unwrap_err()
-            .to_string()
-            .contains("does not match"));
-        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), tampered);
-        assert!(!dir.join(CONFIG_BACKUP_V0_NAME).exists());
-        drop(lock);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn parallel_migration_subprocess_child() {
-        let Ok(dir) = std::env::var("MESHMSG_PARALLEL_MIGRATION_TEST_DIR") else {
-            return;
-        };
-        let dir = PathBuf::from(dir);
-        State::new_topic().save_new(&dir, false).unwrap();
-        let legacy = legacy_config_bytes(&dir);
-        atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-        let lock = StateLock::acquire(&dir).unwrap();
-        for _ in 0..8 {
-            State::load_locked(&dir, &lock).unwrap();
-        }
-    }
-
-    #[test]
-    fn parallel_repeated_migrations_use_isolated_locks_and_state() {
-        let executable = std::env::current_exe().unwrap();
-        let directories = (0..16).map(|_| test_dir()).collect::<Vec<_>>();
-        let mut children = directories
-            .iter()
-            .map(|dir| {
-                std::process::Command::new(&executable)
-                    .arg("--exact")
-                    .arg("config::tests::parallel_migration_subprocess_child")
-                    .env("MESHMSG_PARALLEL_MIGRATION_TEST_DIR", dir)
-                    .spawn()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let statuses = children
-            .iter_mut()
-            .map(|child| child.wait().unwrap())
-            .collect::<Vec<_>>();
-        for dir in &directories {
-            let _ = fs::remove_dir_all(dir);
-        }
-        assert!(statuses.iter().all(std::process::ExitStatus::success));
-    }
-
-    #[test]
-    fn config_migration_process_exit_child() {
-        let Ok(dir) = std::env::var("MESHMSG_CONFIG_MIGRATION_TEST_DIR") else {
-            return;
-        };
-        let dir = PathBuf::from(dir);
-        let lock = StateLock::acquire(&dir).unwrap();
-        let _ = State::load_locked(&dir, &lock).unwrap();
-        panic!("config migration crash point did not exit");
-    }
-
-    #[test]
-    fn config_migration_recovers_after_process_exit_at_backup_boundary() {
-        let dir = test_dir();
-        State::new_topic().save_new(&dir, false).unwrap();
-        let legacy = legacy_config_bytes(&dir);
-        atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("config::tests::config_migration_process_exit_child")
-            .arg("--nocapture")
-            .env("MESHMSG_CONFIG_MIGRATION_TEST_DIR", &dir)
-            .env("MESHMSG_CONFIG_MIGRATION_CRASH_POINT", "after_backup_sync")
-            .status()
-            .unwrap();
-        assert_eq!(status.code(), Some(91));
-        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
-        assert_eq!(fs::read(dir.join(CONFIG_BACKUP_V0_NAME)).unwrap(), legacy);
-
-        let lock = StateLock::acquire(&dir).unwrap();
-        State::load_locked(&dir, &lock).unwrap();
-        assert_eq!(
-            State::load(&dir).unwrap().schema_version,
-            CONFIG_SCHEMA_VERSION
-        );
-        drop(lock);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn failed_migration_keeps_legacy_authoritative_and_can_resume() {
-        let dir = test_dir();
-        State::new_topic().save_new(&dir, false).unwrap();
-        let legacy = legacy_config_bytes(&dir);
-        atomic_write(&dir, CONFIG_NAME, &legacy, 0o600).unwrap();
-        let (state, is_legacy) = decode_state(&legacy).unwrap();
-        assert!(is_legacy);
-        let lock = StateLock::acquire(&dir).unwrap();
-
-        let error = migrate_legacy_config(&dir, &legacy, &state, &lock, true).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("injected config migration failure"));
-        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), legacy);
-        assert_eq!(fs::read(dir.join(CONFIG_BACKUP_V0_NAME)).unwrap(), legacy);
-
-        migrate_legacy_config(&dir, &legacy, &state, &lock, false).unwrap();
-        assert_eq!(
-            State::load(&dir).unwrap().schema_version,
-            CONFIG_SCHEMA_VERSION
-        );
-        drop(lock);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
     #[test]
     fn config_bounds_truncation_and_future_versions_fail_closed() {
         let dir = test_dir();
@@ -1311,6 +900,24 @@ mod tests {
             crate::persistent::PersistentErrorKind::Parse
         );
 
+        let unversioned = serde_json::to_vec(&serde_json::json!({
+            "advertise_self": true,
+            "topic": TopicId::from_bytes([1; 32]).to_string(),
+            "invite": null,
+            "identity": null
+        }))
+        .unwrap();
+        fs::write(dir.join(CONFIG_NAME), &unversioned).unwrap();
+        let unsupported = State::load(&dir).unwrap_err();
+        assert_eq!(
+            unsupported
+                .downcast_ref::<PersistentError>()
+                .expect("typed persistent error")
+                .kind(),
+            crate::persistent::PersistentErrorKind::UnsupportedVersion
+        );
+        assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), unversioned);
+
         let future = serde_json::to_vec(&serde_json::json!({"schema_version":256})).unwrap();
         fs::write(dir.join(CONFIG_NAME), &future).unwrap();
         let lock = StateLock::acquire(&dir).unwrap();
@@ -1323,7 +930,6 @@ mod tests {
             crate::persistent::PersistentErrorKind::UnsupportedVersion
         );
         assert_eq!(fs::read(dir.join(CONFIG_NAME)).unwrap(), future);
-        assert!(!dir.join(CONFIG_BACKUP_V0_NAME).exists());
         drop(lock);
         fs::remove_dir_all(dir).unwrap();
     }

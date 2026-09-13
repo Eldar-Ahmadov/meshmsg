@@ -69,7 +69,7 @@ meshmsg init --no-default-alias
 meshmsg join --no-default-alias --token-stdin < invite.txt
 ```
 
-The CLI also accepts `--no-alias` as a compatibility spelling. A legacy state without `alias.json` is treated as opted out. Alias configuration is local to one state directory:
+The CLI also accepts `--no-alias` as a compatibility spelling. Current state requires an identity-bound `alias.json`; pre-current state without it fails closed. Alias configuration is local to one state directory:
 
 ```sh
 meshmsg alias show

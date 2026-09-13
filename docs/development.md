@@ -58,9 +58,9 @@ The driver requires `target/debug/meshmsg` and the sibling feature-built
 `target/debug/meshmsg-bench`; its `{BIN}` and `{BENCH_BIN}` inventory placeholders keep the executable roles explicit. The
 five-peer benchmark uses only the non-TUI binary and `bench` feature. It includes
 CLI errors, peer directory, five-peer, attachments, direct messages,
-idempotency, checksum-pinned v0.1.18 on-wire EnvelopeV2 boundaries,
-persistent-state migration/restart, and a generated-archive/mock-download installer
-test. The per-command budgets total under 82 minutes.
+idempotency, checksum-pinned v0.1.18 on-wire EnvelopeV2 boundaries, and a
+generated-archive/mock-download installer test. The current per-command budgets
+total 4,220 seconds (70 minutes 20 seconds).
 The workflow allows 130 minutes,
 including setup/build/cleanup, while the driver rejects an inventory above its
 115-minute command budget.

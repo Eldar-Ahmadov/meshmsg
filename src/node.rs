@@ -5138,7 +5138,48 @@ mod tests {
                 .await
                 .unwrap()
                 .into();
+        persist_attachment_index(&state, &AttachmentRetentionIndex::default()).unwrap();
         (root, state, store)
+    }
+
+    #[tokio::test]
+    async fn missing_attachment_index_initializes_only_an_empty_fresh_store() {
+        let (root, state, store) = lifecycle_test_store("missing-index-empty").await;
+        std::fs::remove_file(state.join(ATTACHMENT_INDEX_NAME)).unwrap();
+
+        let storage = AttachmentStorage::open(store.clone(), root.join("blobs"), &state, 100, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(storage.status().tags, 0);
+        assert!(state.join(ATTACHMENT_INDEX_NAME).is_file());
+
+        drop(storage);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn managed_pins_without_attachment_index_fail_closed() {
+        let (root, state, store) = lifecycle_test_store("missing-index-pins").await;
+        std::fs::remove_file(state.join(ATTACHMENT_INDEX_NAME)).unwrap();
+        let tag = outbound_blob_tag(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            AttachmentKind::File,
+            "existing.bin",
+        );
+        pin_test_blob(&store, &root, b"existing", &[tag]).await;
+
+        let error = AttachmentStorage::open(store.clone(), root.join("blobs"), &state, 100, 0, 0)
+            .await
+            .err()
+            .expect("managed pins without a current index must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("attachment retention index is missing"));
+        assert!(message.contains("restore attachment-retention-v1.json"));
+        assert!(!state.join(ATTACHMENT_INDEX_NAME).exists());
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn pin_test_blob(store: &Store, root: &Path, bytes: &[u8], tags: &[String]) {
@@ -5641,6 +5682,7 @@ mod tests {
             .await
             .unwrap()
             .into();
+        persist_attachment_index(&state, &AttachmentRetentionIndex::default()).unwrap();
         let data = vec![5_u8; 2 * 1024 * 1024];
         let tag = outbound_blob_tag(
             "fffffffffffffffffffffffffffffff1",
@@ -5793,10 +5835,14 @@ mod tests {
         ));
         crate::config::prepare_state_dir(&state).unwrap();
         let path = state.join(ATTACHMENT_INDEX_NAME);
-        assert!(load_attachment_index(&state)
-            .unwrap()
-            .created_at_ms
-            .is_empty());
+        let missing = load_attachment_index(&state).unwrap_err();
+        assert_eq!(
+            missing
+                .downcast_ref::<crate::persistent::PersistentError>()
+                .unwrap()
+                .kind(),
+            crate::persistent::PersistentErrorKind::Missing
+        );
 
         persist_attachment_index(&state, &AttachmentRetentionIndex::default()).unwrap();
         let mut exact = std::fs::read(&path).unwrap();

@@ -432,15 +432,32 @@ impl AttachmentStorage {
     ) -> Result<Self> {
         let state_dir = state_dir.to_owned();
         let index_dir = state_dir.clone();
-        let mut index = tokio::task::spawn_blocking(move || load_attachment_index(&index_dir))
+        let index_result = tokio::task::spawn_blocking(move || load_attachment_index(&index_dir))
             .await
-            .context("attachment index load task failed")??;
+            .context("attachment index load task failed")?;
         let live = collect_storage_tags_bounded(&store).await?;
         anyhow::ensure!(
             live.len() <= MAX_ATTACHMENT_TAGS,
             "attachment tag capacity exceeded: {} pins found, maximum is {MAX_ATTACHMENT_TAGS}; remove pins with a compatible older daemon or restore from backup",
             live.len()
         );
+        let mut index = match index_result {
+            Ok(index) => index,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::persistent::PersistentError>()
+                    .is_some_and(|error| {
+                        error.kind() == crate::persistent::PersistentErrorKind::Missing
+                    }) =>
+            {
+                anyhow::ensure!(
+                    live.is_empty(),
+                    "attachment retention index is missing while managed attachment pins exist; restore attachment-retention-v1.json from current state or remove the pins with a compatible older daemon"
+                );
+                AttachmentRetentionIndex::default()
+            }
+            Err(error) => return Err(error),
+        };
         let now = unix_timestamp_ms()?;
         let tags = live
             .into_iter()
@@ -1233,14 +1250,11 @@ fn clone_attachment_index(index: &AttachmentRetentionIndex) -> AttachmentRetenti
 
 pub(crate) fn load_attachment_index(state_dir: &Path) -> Result<AttachmentRetentionIndex> {
     let path = state_dir.join(ATTACHMENT_INDEX_NAME);
-    let Some(bytes) = crate::persistent::read_optional_file_bounded(
+    let bytes = crate::persistent::read_file_bounded(
         &path,
         "attachment retention index",
         MAX_ATTACHMENT_INDEX_BYTES,
-    )?
-    else {
-        return Ok(AttachmentRetentionIndex::default());
-    };
+    )?;
     let probe: AttachmentIndexVersionProbe = crate::persistent::parse_json_bounded_strings(
         &bytes,
         "attachment retention index",

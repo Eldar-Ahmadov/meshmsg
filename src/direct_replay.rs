@@ -174,7 +174,6 @@ enum WorkerRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum PersistedState {
-    LegacyUnknown,
     Recorded,
     DeliveryConfirmed,
 }
@@ -230,28 +229,6 @@ struct WalRecord {
     checksum: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyReplayState {
-    version: u8,
-    #[serde(deserialize_with = "persistent::string_64")]
-    recipient: String,
-    #[serde(deserialize_with = "persistent::string_64")]
-    topic: String,
-    #[serde(deserialize_with = "deserialize_legacy_replay_entries")]
-    entries: Vec<LegacyReplayEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyReplayEntry {
-    #[serde(deserialize_with = "persistent::string_64")]
-    sender: String,
-    #[serde(deserialize_with = "persistent::string_32")]
-    id: String,
-    expires_at_ms: u64,
-}
-
 #[derive(Deserialize)]
 struct SnapshotVersionProbe {
     payload: SnapshotPayloadVersionProbe,
@@ -286,46 +263,6 @@ where
             let mut entries = Vec::new();
             while entries.len() < MAX_REPLAY_ENTRIES {
                 let Some(entry) = access.next_element::<ReplayEntry>()? else {
-                    return Ok(entries);
-                };
-                entries.push(entry);
-            }
-            if access.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                return Err(serde::de::Error::invalid_length(
-                    MAX_REPLAY_ENTRIES + 1,
-                    &self,
-                ));
-            }
-            Ok(entries)
-        }
-    }
-    deserializer.deserialize_seq(EntriesVisitor)
-}
-
-fn deserialize_legacy_replay_entries<'de, D>(
-    deserializer: D,
-) -> Result<Vec<LegacyReplayEntry>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct EntriesVisitor;
-    impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
-        type Value = Vec<LegacyReplayEntry>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(
-                formatter,
-                "at most {MAX_REPLAY_ENTRIES} legacy replay entries"
-            )
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut access: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut entries = Vec::new();
-            while entries.len() < MAX_REPLAY_ENTRIES {
-                let Some(entry) = access.next_element::<LegacyReplayEntry>()? else {
                     return Ok(entries);
                 };
                 entries.push(entry);
@@ -435,14 +372,12 @@ pub(crate) fn start(
     let suffix = data_encoding::HEXLOWER.encode(&path_hasher.finalize());
     let snapshot_path = state_dir.join(format!("direct-replay-v2-{suffix}.snapshot.json"));
     let wal_path = state_dir.join(format!("direct-replay-v2-{suffix}.wal"));
-    let legacy_path = state_dir.join(format!("direct-replay-v1-{suffix}.json"));
-    start_paths(snapshot_path, wal_path, legacy_path, recipient, topic)
+    start_paths(snapshot_path, wal_path, recipient, topic)
 }
 
 fn start_paths(
     snapshot_path: PathBuf,
     wal_path: PathBuf,
-    legacy_path: PathBuf,
     recipient: PublicKey,
     topic: TopicId,
 ) -> Result<(ReplayClient, ReplayWorker)> {
@@ -453,7 +388,7 @@ fn start_paths(
     let thread = thread::Builder::new()
         .name("meshmsg-direct-replay".to_owned())
         .spawn(move || {
-            let store = ReplayStore::load(snapshot_path, wal_path, legacy_path, recipient, topic);
+            let store = ReplayStore::load(snapshot_path, wal_path, recipient, topic);
             match store {
                 Ok(mut store) => {
                     let _ = started_tx.send(Ok(()));
@@ -504,7 +439,6 @@ impl ReplayStore {
     fn load(
         snapshot_path: PathBuf,
         wal_path: PathBuf,
-        legacy_path: PathBuf,
         recipient: PublicKey,
         topic: TopicId,
     ) -> Result<Self> {
@@ -513,10 +447,7 @@ impl ReplayStore {
         let (mut entries, snapshot_present) =
             match load_snapshot(&snapshot_path, recipient, topic, now_wall)? {
                 Some(entries) => (entries, true),
-                None => (
-                    load_legacy(&legacy_path, recipient, topic, now_wall)?.unwrap_or_default(),
-                    false,
-                ),
+                None => (ReplayEntries::default(), false),
             };
         let (wal_records, wal_present) =
             load_wal(&wal_path, recipient, topic, now_wall, &mut entries)?;
@@ -530,9 +461,6 @@ impl ReplayStore {
                 live_ids: 0,
                 rate: TokenBucket::full(SENDER_RATE_BURST, now_mono),
             });
-            // A v1 migration may contain more entries than the new per-sender
-            // quota. Preserve those live replay IDs and reject further IDs from
-            // that sender until expiry instead of making the daemon unavailable.
             state.live_ids += 1;
         }
         anyhow::ensure!(
@@ -667,7 +595,6 @@ impl ReplayStore {
                 return Ok(ReplayDecision::Conflict);
             }
             return Ok(match metadata.state {
-                PersistedState::LegacyUnknown => ReplayDecision::Conflict,
                 PersistedState::Recorded => ReplayDecision::DeliveryOutcomeUnknown,
                 PersistedState::DeliveryConfirmed => ReplayDecision::DuplicateAccepted,
             });
@@ -883,58 +810,6 @@ fn load_snapshot(
         .into());
     }
     entries_from_records(file.payload.entries, now).map(Some)
-}
-
-fn load_legacy(
-    path: &Path,
-    recipient: PublicKey,
-    topic: TopicId,
-    now: u64,
-) -> Result<Option<ReplayEntries>> {
-    let Some(bytes) = persistent::read_optional_file_bounded(
-        path,
-        "legacy direct replay state",
-        MAX_SNAPSHOT_BYTES,
-    )?
-    else {
-        return Ok(None);
-    };
-    let probe: ReplayVersionProbe =
-        persistent::parse_json_bounded_strings(&bytes, "legacy direct replay state", 64)?;
-    if probe.version != 1 {
-        return Err(persistent::PersistentError::unsupported_version(
-            "legacy direct replay state",
-            probe.version,
-        )
-        .into());
-    }
-    let state: LegacyReplayState =
-        persistent::parse_json_bounded_strings(&bytes, "legacy direct replay state", 64)?;
-    validate_binding(&state.recipient, &state.topic, recipient, topic)?;
-    anyhow::ensure!(
-        state.entries.len() <= MAX_REPLAY_ENTRIES,
-        "legacy direct replay state capacity exceeded"
-    );
-    let mut entries = HashMap::new();
-    for entry in state.entries {
-        let key = parse_sender_and_id(&entry.sender, &entry.id)?;
-        if entry.expires_at_ms > now {
-            anyhow::ensure!(
-                entries
-                    .insert(
-                        key,
-                        ReplayMetadata {
-                            fingerprint: [0; 32],
-                            expires_at_ms: entry.expires_at_ms,
-                            state: PersistedState::LegacyUnknown,
-                        },
-                    )
-                    .is_none(),
-                "duplicate legacy direct replay entry"
-            );
-        }
-    }
-    Ok(Some(entries))
 }
 
 fn entries_from_records(records: Vec<ReplayEntry>, now: u64) -> Result<ReplayEntries> {
@@ -1251,7 +1126,6 @@ fn wal_checksum(
     hasher.update(metadata.fingerprint);
     hasher.update(metadata.expires_at_ms.to_le_bytes());
     hasher.update([match metadata.state {
-        PersistedState::LegacyUnknown => 0,
         PersistedState::Recorded => 1,
         PersistedState::DeliveryConfirmed => 2,
     }]);
@@ -1316,10 +1190,8 @@ fn merge_wal_metadata(
         // An old WAL can be replayed over a newer compact snapshot if the
         // process exited between snapshot commit and WAL reset. Never regress.
         (PersistedState::DeliveryConfirmed, PersistedState::Recorded)
-        | (PersistedState::LegacyUnknown, PersistedState::LegacyUnknown)
         | (PersistedState::Recorded, PersistedState::Recorded)
         | (PersistedState::DeliveryConfirmed, PersistedState::DeliveryConfirmed) => {}
-        _ => anyhow::bail!("invalid direct replay state transition"),
     }
     Ok(())
 }
@@ -1374,28 +1246,22 @@ fn id_string(id: &[u8; 16]) -> String {
 mod tests {
     use super::*;
 
-    fn test_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    fn test_paths() -> (PathBuf, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "meshmsg-direct-replay-worker-test-{}",
             rand::random::<u64>()
         ));
         fs::create_dir_all(&dir).unwrap();
-        (
-            dir.join("snapshot.json"),
-            dir.join("replay.wal"),
-            dir.join("legacy.json"),
-            dir,
-        )
+        (dir.join("snapshot.json"), dir.join("replay.wal"), dir)
     }
 
     fn loaded_store(
         snapshot: PathBuf,
         wal: PathBuf,
-        legacy: PathBuf,
         recipient: PublicKey,
         topic: TopicId,
     ) -> ReplayStore {
-        ReplayStore::load(snapshot, wal, legacy, recipient, topic).unwrap()
+        ReplayStore::load(snapshot, wal, recipient, topic).unwrap()
     }
 
     fn delivery(available: bool) -> Option<Box<dyn FnOnce() + Send + 'static>> {
@@ -1406,32 +1272,40 @@ mod tests {
         [id[0]; 32]
     }
 
-    #[test]
-    fn legacy_whole_map_state_migrates_without_losing_live_ids() {
+    #[tokio::test]
+    async fn v1_only_replay_file_is_ignored() {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([30; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let expires_at_ms = wall_ms().unwrap() + 60_000;
-        let legacy_state = LegacyReplayState {
-            version: 1,
-            recipient: recipient.to_string(),
-            topic: topic.to_string(),
-            entries: vec![LegacyReplayEntry {
-                sender: sender.to_string(),
-                id: id_string(&[3; 16]),
-                expires_at_ms,
-            }],
-        };
-        fs::write(&legacy, serde_json::to_vec(&legacy_state).unwrap()).unwrap();
-        let store = loaded_store(snapshot.clone(), wal.clone(), legacy, recipient, topic);
-        assert_eq!(
-            store.entries.get(&(sender, [3; 16])).unwrap().state,
-            PersistedState::LegacyUnknown
+        let (_, _, dir) = test_paths();
+        let mut path_hasher = Sha256::new();
+        path_hasher.update(recipient.as_bytes());
+        path_hasher.update(topic.as_bytes());
+        let suffix = data_encoding::HEXLOWER.encode(&path_hasher.finalize());
+        let old_path = dir.join(format!("direct-replay-v1-{suffix}.json"));
+        let old_bytes = format!(
+            "{{\"version\":1,\"recipient\":\"{recipient}\",\"topic\":\"{topic}\",\"entries\":[{{\"sender\":\"{sender}\",\"id\":\"{}\",\"expires_at_ms\":{}}}]}}",
+            id_string(&[3; 16]),
+            wall_ms().unwrap() + 60_000
         );
-        assert!(snapshot.is_file());
-        assert!(wal.is_file());
-        drop(store);
+        fs::write(&old_path, &old_bytes).unwrap();
+
+        let (client, mut worker) = start(&dir, recipient, topic).unwrap();
+        assert_eq!(
+            client
+                .admit(
+                    sender,
+                    [3; 16],
+                    fingerprint([3; 16]),
+                    wall_ms().unwrap() + 60_000,
+                    delivery(true),
+                )
+                .await
+                .unwrap(),
+            ReplayDecision::Accepted
+        );
+        worker.shutdown().await.unwrap();
+        assert_eq!(fs::read_to_string(old_path).unwrap(), old_bytes);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1439,7 +1313,7 @@ mod tests {
     fn replay_versions_are_probed_as_u64_before_specific_decode() {
         let recipient = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([29; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
+        let (snapshot, wal, dir) = test_paths();
         fs::write(
             &snapshot,
             format!(
@@ -1448,41 +1322,16 @@ mod tests {
             ),
         )
         .unwrap();
-        let error = ReplayStore::load(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        )
-        .unwrap_err();
+        let error = ReplayStore::load(snapshot.clone(), wal.clone(), recipient, topic).unwrap_err();
         assert!(error.to_string().contains("schema version 256"));
         fs::remove_file(&snapshot).unwrap();
-
-        fs::write(
-            &legacy,
-            format!(
-                "{{\"version\":256,\"recipient\":\"{recipient}\",\"topic\":\"{topic}\",\"entries\":[]}}"
-            ),
-        )
-        .unwrap();
-        let error = ReplayStore::load(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("schema version 256"));
-        fs::remove_file(&legacy).unwrap();
 
         fs::write(
             &wal,
             format!("{{\"version\":256,\"recipient\":\"{recipient}\",\"topic\":\"{topic}\"}}\n"),
         )
         .unwrap();
-        let error = ReplayStore::load(snapshot, wal, legacy, recipient, topic).unwrap_err();
+        let error = ReplayStore::load(snapshot, wal, recipient, topic).unwrap_err();
         assert!(error.to_string().contains("schema version 256"));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1540,63 +1389,26 @@ mod tests {
             )
             .is_err());
         }
-
-        let legacy_entry = format!(
-            "{{\"sender\":\"{sender}\",\"id\":\"{}\",\"expires_at_ms\":1}}",
-            "0".repeat(32)
-        );
-        let legacy = format!(
-            "{{\"version\":1,\"recipient\":\"{sender}\",\"topic\":\"{topic}\",\"entries\":[{}]}}",
-            std::iter::repeat_n(legacy_entry.as_str(), MAX_REPLAY_ENTRIES + 1)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        assert!(legacy.len() < MAX_SNAPSHOT_BYTES);
-        assert!(persistent::parse_json_bounded_strings::<LegacyReplayState>(
-            legacy.as_bytes(),
-            "legacy direct replay state",
-            64,
-        )
-        .is_err());
-        let escaped_legacy = |sender_value: &str| {
-            format!(
-                "{{\"version\":1,\"recipient\":\"{sender}\",\"topic\":\"{topic}\",\"entries\":[{{\"sender\":\"{sender_value}\",\"id\":\"{}\",\"expires_at_ms\":1}}]}}",
-                "0".repeat(32)
-            )
-        };
-        persistent::parse_json_bounded_strings::<LegacyReplayState>(
-            escaped_legacy(&r"\u0061".repeat(64)).as_bytes(),
-            "legacy direct replay state",
-            64,
-        )
-        .unwrap();
-        assert!(persistent::parse_json_bounded_strings::<LegacyReplayState>(
-            escaped_legacy(&r"\u0061".repeat(65)).as_bytes(),
-            "legacy direct replay state",
-            64,
-        )
-        .is_err());
     }
 
     #[cfg(unix)]
     #[test]
     fn replay_optional_files_and_wal_append_reject_dangling_links() {
         use std::os::unix::fs::symlink;
-        for role in ["snapshot", "legacy", "wal"] {
+        for role in ["snapshot", "wal"] {
             let recipient = iroh::SecretKey::generate().public();
             let topic = TopicId::from_bytes([27; 32]);
-            let (snapshot, wal, legacy, dir) = test_paths();
+            let (snapshot, wal, dir) = test_paths();
             let path = match role {
                 "snapshot" => &snapshot,
-                "legacy" => &legacy,
                 _ => &wal,
             };
             symlink(dir.join("missing-target"), path).unwrap();
-            assert!(ReplayStore::load(snapshot, wal, legacy, recipient, topic).is_err());
+            assert!(ReplayStore::load(snapshot, wal, recipient, topic).is_err());
             fs::remove_dir_all(dir).unwrap();
         }
 
-        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let (_snapshot, wal, dir) = test_paths();
         let target = dir.join("redirected");
         fs::write(&target, b"unchanged").unwrap();
         symlink(&target, &wal).unwrap();
@@ -1610,7 +1422,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn wal_append_detects_path_replacement_after_checked_open() {
-        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let (_snapshot, wal, dir) = test_paths();
         let saved = dir.join("opened-wal");
         let replacement = b"replacement WAL";
         let recipient = iroh::SecretKey::generate().public();
@@ -1653,7 +1465,7 @@ mod tests {
     #[test]
     fn wal_append_detects_symlink_replacement_after_checked_open() {
         use std::os::unix::fs::symlink;
-        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let (_snapshot, wal, dir) = test_paths();
         let saved = dir.join("opened-wal");
         let target = dir.join("redirect-target");
         fs::write(&target, b"unchanged").unwrap();
@@ -1709,8 +1521,8 @@ mod tests {
             let recipient = iroh::SecretKey::generate().public();
             let sender = iroh::SecretKey::generate().public();
             let topic = TopicId::from_bytes([23; 32]);
-            let (snapshot, wal, legacy, dir) = test_paths();
-            let mut store = loaded_store(snapshot, wal.clone(), legacy.clone(), recipient, topic);
+            let (snapshot, wal, dir) = test_paths();
+            let mut store = loaded_store(snapshot, wal.clone(), recipient, topic);
             let saved = dir.join("recorded-generation.wal");
             let target = dir.join("replacement-target");
             fs::write(&target, b"target remains unchanged").unwrap();
@@ -1770,8 +1582,7 @@ mod tests {
             }
             fs::rename(&saved, &wal).unwrap();
             drop(store);
-            let mut restarted =
-                loaded_store(dir.join("snapshot.json"), wal, legacy, recipient, topic);
+            let mut restarted = loaded_store(dir.join("snapshot.json"), wal, recipient, topic);
             assert_eq!(
                 restarted
                     .admit(sender, [4; 16], now + 60_000, true, now, Instant::now())
@@ -1788,8 +1599,8 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([21; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let mut store = loaded_store(snapshot, wal.clone(), legacy, recipient, topic);
+        let (snapshot, wal, dir) = test_paths();
+        let mut store = loaded_store(snapshot, wal.clone(), recipient, topic);
         let wal_for_delivery = wal.clone();
         let delivery = Box::new(move || {
             let mut file = fs::OpenOptions::new()
@@ -1826,7 +1637,7 @@ mod tests {
     #[test]
     fn windows_wal_append_rejects_reparse_points() {
         use std::os::windows::fs::symlink_file;
-        let (_snapshot, wal, _legacy, dir) = test_paths();
+        let (_snapshot, wal, dir) = test_paths();
         let target = dir.join("redirected");
         fs::write(&target, b"unchanged").unwrap();
         symlink_file(&target, &wal).unwrap();
@@ -1845,8 +1656,8 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([22; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let mut store = loaded_store(snapshot, wal.clone(), legacy, recipient, topic);
+        let (snapshot, wal, dir) = test_paths();
+        let mut store = loaded_store(snapshot, wal.clone(), recipient, topic);
         let saved = dir.join("recorded-generation.wal");
         let target = dir.join("replacement-target");
         fs::write(&target, b"unchanged").unwrap();
@@ -1879,15 +1690,9 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([31; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
+        let (snapshot, wal, dir) = test_paths();
         let now = wall_ms().unwrap();
-        let mut store = loaded_store(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        );
+        let mut store = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         assert_eq!(
             store
                 .admit(sender, [1; 16], now + 60_000, true, now, Instant::now())
@@ -1902,13 +1707,7 @@ mod tests {
             .unwrap()
             .write_all(b"{\"entry\":")
             .unwrap();
-        let recovered = loaded_store(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        );
+        let recovered = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         assert!(recovered.entries.contains_key(&(sender, [1; 16])));
         assert_eq!(fs::metadata(&wal).unwrap().len(), valid_len);
         drop(recovered);
@@ -1919,13 +1718,7 @@ mod tests {
             .unwrap()
             .write_all(&vec![b'x'; MAX_WAL_RECORD_BYTES])
             .unwrap();
-        let recovered = loaded_store(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        );
+        let recovered = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         assert!(recovered.entries.contains_key(&(sender, [1; 16])));
         assert_eq!(fs::metadata(&wal).unwrap().len(), valid_len);
         drop(recovered);
@@ -1937,16 +1730,12 @@ mod tests {
             .write_all(&vec![b'x'; MAX_WAL_RECORD_BYTES + 1])
             .unwrap();
         let oversized_tail = fs::read(&wal).unwrap();
-        assert!(ReplayStore::load(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("unterminated tail exceeds record limit"));
+        assert!(
+            ReplayStore::load(snapshot.clone(), wal.clone(), recipient, topic)
+                .unwrap_err()
+                .to_string()
+                .contains("unterminated tail exceeds record limit")
+        );
         assert_eq!(fs::read(&wal).unwrap(), oversized_tail);
         fs::OpenOptions::new()
             .write(true)
@@ -1961,7 +1750,7 @@ mod tests {
             .unwrap()
             .write_all(b"{}\n")
             .unwrap();
-        assert!(ReplayStore::load(snapshot, wal, legacy, recipient, topic)
+        assert!(ReplayStore::load(snapshot, wal, recipient, topic)
             .unwrap_err()
             .to_string()
             .contains("parse direct replay WAL record"));
@@ -1973,15 +1762,9 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([32; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
+        let (snapshot, wal, dir) = test_paths();
         let now = wall_ms().unwrap();
-        let mut store = loaded_store(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        );
+        let mut store = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         store
             .admit(sender, [2; 16], now + 60_000, true, now, Instant::now())
             .unwrap();
@@ -1991,13 +1774,7 @@ mod tests {
         // Crash after snapshot replacement but before WAL reset: duplicate replay
         // of the old WAL is harmless and still restores the exact live set.
         fs::write(&wal, &old_wal).unwrap();
-        let recovered = loaded_store(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        );
+        let recovered = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         assert_eq!(recovered.entries.len(), 1);
         drop(recovered);
         fs::write(&wal, compacted_wal).unwrap();
@@ -2005,7 +1782,7 @@ mod tests {
         let index = bytes.len() / 2;
         bytes[index] ^= 1;
         fs::write(&snapshot, bytes).unwrap();
-        assert!(ReplayStore::load(snapshot, wal, legacy, recipient, topic).is_err());
+        assert!(ReplayStore::load(snapshot, wal, recipient, topic).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2015,10 +1792,10 @@ mod tests {
         let abusive = iroh::SecretKey::generate().public();
         let honest = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([33; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
+        let (snapshot, wal, dir) = test_paths();
         let now_wall = wall_ms().unwrap();
         let now_mono = Instant::now();
-        let mut store = loaded_store(snapshot, wal, legacy, recipient, topic);
+        let mut store = loaded_store(snapshot, wal, recipient, topic);
         // Isolate quota behavior from token timing in this structural test.
         store.senders.insert(
             abusive,
@@ -2107,15 +1884,9 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([37; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
+        let (snapshot, wal, dir) = test_paths();
         let now = wall_ms().unwrap();
-        let mut store = loaded_store(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        );
+        let mut store = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         let wal_saved = dir.join("wal.saved");
         fs::rename(&wal, &wal_saved).unwrap();
         fs::create_dir(&wal).unwrap();
@@ -2142,7 +1913,7 @@ mod tests {
         drop(store);
         fs::remove_dir(&snapshot).unwrap();
         fs::write(&snapshot, snapshot_saved).unwrap();
-        let recovered = loaded_store(snapshot, wal, legacy, recipient, topic);
+        let recovered = loaded_store(snapshot, wal, recipient, topic);
         assert!(recovered.entries.contains_key(&(sender, [2; 16])));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2152,10 +1923,10 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([34; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
+        let (snapshot, wal, dir) = test_paths();
         let now_wall = wall_ms().unwrap();
         let start = Instant::now();
-        let mut store = loaded_store(snapshot, wal, legacy, recipient, topic);
+        let mut store = loaded_store(snapshot, wal, recipient, topic);
         for index in 0..SENDER_RATE_BURST as usize {
             assert_eq!(
                 store
@@ -2273,8 +2044,8 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([38; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let (client, mut worker) = start_paths(snapshot, wal, legacy, recipient, topic).unwrap();
+        let (snapshot, wal, dir) = test_paths();
+        let (client, mut worker) = start_paths(snapshot, wal, recipient, topic).unwrap();
         let (delivered_tx, delivered_rx) = std::sync::mpsc::sync_channel(1);
         let (reply, response) = oneshot::channel();
         let submitted = client
@@ -2302,9 +2073,8 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([40; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let (client, mut worker) =
-            start_paths(snapshot, wal.clone(), legacy, recipient, topic).unwrap();
+        let (snapshot, wal, dir) = test_paths();
+        let (client, mut worker) = start_paths(snapshot, wal.clone(), recipient, topic).unwrap();
         let expires = wall_ms().unwrap() + 60_000;
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -2379,8 +2149,8 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([43; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let (client, mut worker) = start_paths(snapshot, wal, legacy, recipient, topic).unwrap();
+        let (snapshot, wal, dir) = test_paths();
+        let (client, mut worker) = start_paths(snapshot, wal, recipient, topic).unwrap();
         assert_eq!(
             client
                 .admit(
@@ -2426,7 +2196,6 @@ mod tests {
         let (client, _worker) = start_paths(
             root.join("snapshot.json"),
             root.join("replay.wal"),
-            root.join("legacy.json"),
             recipient,
             topic,
         )
@@ -2470,7 +2239,7 @@ mod tests {
                 ReplayDecision::DuplicateAccepted,
             ),
         ] {
-            let (_, _, _, root) = test_paths();
+            let (_, _, root) = test_paths();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("direct_replay::tests::replay_transaction_process_exit_child")
@@ -2488,7 +2257,6 @@ mod tests {
             let (client, mut worker) = start_paths(
                 root.join("snapshot.json"),
                 root.join("replay.wal"),
-                root.join("legacy.json"),
                 recipient,
                 topic,
             )
@@ -2531,15 +2299,9 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([39; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let (client, mut worker) = start_paths(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        )
-        .unwrap();
+        let (snapshot, wal, dir) = test_paths();
+        let (client, mut worker) =
+            start_paths(snapshot.clone(), wal.clone(), recipient, topic).unwrap();
         let expires = wall_ms().unwrap() + 60_000;
         let first = {
             let client = client.clone();
@@ -2570,7 +2332,7 @@ mod tests {
         worker.shutdown().await.unwrap();
 
         let (restarted, mut restarted_worker) =
-            start_paths(snapshot, wal, legacy, recipient, topic).unwrap();
+            start_paths(snapshot, wal, recipient, topic).unwrap();
         assert_eq!(
             restarted
                 .admit(
@@ -2600,15 +2362,9 @@ mod tests {
         let recipient = iroh::SecretKey::generate().public();
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([35; 32]);
-        let (snapshot, wal, legacy, dir) = test_paths();
-        let (client, mut worker) = start_paths(
-            snapshot.clone(),
-            wal.clone(),
-            legacy.clone(),
-            recipient,
-            topic,
-        )
-        .unwrap();
+        let (snapshot, wal, dir) = test_paths();
+        let (client, mut worker) =
+            start_paths(snapshot.clone(), wal.clone(), recipient, topic).unwrap();
         let expires = wall_ms().unwrap() + 60_000;
         let mut tasks = Vec::new();
         for index in 0..SENDER_RATE_BURST as usize {
@@ -2626,7 +2382,7 @@ mod tests {
         }
         worker.shutdown().await.unwrap();
         let (restarted, mut restarted_worker) =
-            start_paths(snapshot, wal, legacy, recipient, topic).unwrap();
+            start_paths(snapshot, wal, recipient, topic).unwrap();
         assert_eq!(
             restarted
                 .admit(

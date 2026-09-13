@@ -18,9 +18,7 @@ pub(crate) const MAX_ALIAS_CONFIG_BYTES: usize = 4 * 1024;
 #[serde(deny_unknown_fields)]
 pub(crate) struct AliasConfig {
     version: u8,
-    /// Binds this file to the identity selected by config.json. Legacy missing
-    /// files are safe opt-out; an existing unbound/mismatched file is rejected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Binds this file to the identity selected by config.json.
     identity: Option<String>,
     /// The short hostname captured explicitly at init/join or reset-hostname time.
     hostname: Option<String>,
@@ -59,31 +57,17 @@ impl AliasConfig {
         self.save_unlocked(dir)
     }
 
-    /// Missing alias.json is a compatible, opted-out legacy configuration.
     #[cfg(test)]
     pub(crate) fn load(dir: &Path) -> Result<Self> {
-        Self::load_with_presence(dir).map(|(value, _present)| value)
+        Self::load_current(dir)
     }
 
-    fn load_with_presence(dir: &Path) -> Result<(Self, bool)> {
-        let path = dir.join(ALIAS_CONFIG_NAME);
-        let Some(bytes) = persistent::read_optional_file_bounded(
-            &path,
+    fn load_current(dir: &Path) -> Result<Self> {
+        let bytes = persistent::read_file_bounded(
+            &dir.join(ALIAS_CONFIG_NAME),
             ALIAS_CONFIG_NAME,
             MAX_ALIAS_CONFIG_BYTES,
-        )?
-        else {
-            return Ok((
-                Self {
-                    version: ALIAS_CONFIG_VERSION,
-                    identity: None,
-                    hostname: None,
-                    alias: None,
-                    enabled: false,
-                },
-                false,
-            ));
-        };
+        )?;
         let probe: AliasVersionProbe = persistent::parse_json(&bytes, ALIAS_CONFIG_NAME)?;
         if probe.version != u64::from(ALIAS_CONFIG_VERSION) {
             return Err(crate::persistent::PersistentError::unsupported_version(
@@ -93,31 +77,31 @@ impl AliasConfig {
             .into());
         }
         let value: Self = persistent::parse_json(&bytes, ALIAS_CONFIG_NAME)?;
-        if let Some(identity) = &value.identity {
-            let parsed = PublicKey::from_str(identity).context("invalid identity in alias.json")?;
-            anyhow::ensure!(
-                parsed.to_string() == *identity,
-                "alias identity must use its canonical public-key encoding"
-            );
-        }
+        let identity = value
+            .identity
+            .as_ref()
+            .context("identity binding missing from alias.json")?;
+        let parsed = PublicKey::from_str(identity).context("invalid identity in alias.json")?;
+        anyhow::ensure!(
+            parsed.to_string() == *identity,
+            "alias identity must use its canonical public-key encoding"
+        );
         if let Some(hostname) = &value.hostname {
             validate_alias(hostname)?;
         }
         if let Some(alias) = &value.alias {
             validate_alias(alias)?;
         }
-        Ok((value, true))
+        Ok(value)
     }
 
     pub(crate) fn load_for_identity(dir: &Path, identity: PublicKey) -> Result<Self> {
-        let (value, present) = Self::load_with_presence(dir)?;
-        if present {
-            let expected = identity.to_string();
-            anyhow::ensure!(
-                value.identity.as_deref() == Some(expected.as_str()),
-                "alias configuration does not match the selected identity"
-            );
-        }
+        let value = Self::load_current(dir)?;
+        let expected = identity.to_string();
+        anyhow::ensure!(
+            value.identity.as_deref() == Some(expected.as_str()),
+            "alias configuration does not match the selected identity"
+        );
         Ok(value)
     }
 
@@ -307,7 +291,7 @@ mod tests {
             .unwrap();
 
         // Simulate a crash after config.json replacement but before alias.json
-        // replacement by using the legacy state-only helper.
+        // replacement by using the test-only state helper.
         let new_peer = State::new_topic().save_new(&dir, true).unwrap();
         let new_peer = PublicKey::from_str(&new_peer).unwrap();
         let error = AliasConfig::load_for_identity(&dir, new_peer).unwrap_err();
@@ -347,7 +331,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dangling_alias_link_is_not_treated_as_legacy_absence() {
+    fn dangling_alias_link_is_not_treated_as_absence() {
         use std::os::unix::fs::symlink;
         let dir = test_dir();
         fs::create_dir_all(&dir).unwrap();
@@ -357,12 +341,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_is_legacy_opt_out() {
+    fn missing_file_fails_closed() {
         let dir = test_dir();
         fs::create_dir_all(&dir).unwrap();
-        let config = AliasConfig::load(&dir).unwrap();
-        assert!(!config.enabled());
-        assert_eq!(config.effective(), None);
+        assert!(AliasConfig::load(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }
