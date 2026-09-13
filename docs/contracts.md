@@ -102,7 +102,7 @@ IPC success/event families are:
 
 - lifecycle: `stopping` v1;
 - state/directory: `status` v1, `connected` v1, `peers_snapshot` v2,
-  `peer_discovered`/`peer_updated`/`peer_expired` v2 and `peer_up`/`peer_down` v1;
+  and `peer_discovered`/`peer_updated`/`peer_expired` v2;
 - messaging: `queued` v3, `private_accepted` v3, `message` v2,
   `private_message` v1;
 - attachment: `attachment_offer` v2, `attachment_shared` v3, `offers` v1,

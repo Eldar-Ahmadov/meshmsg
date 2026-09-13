@@ -120,7 +120,7 @@ Incoming content is named and synced before destination installation; after a cr
 
 A signed offer authenticates the provider and advertised metadata. The BLAKE3 content hash verifies downloaded bytes. Neither provides confidentiality: offers are reusable capabilities to fetch plaintext from the named provider, and attachment content is not end-to-end encrypted.
 
-Attachment offers use the topic-bound broadcast envelope V2. Raw Iroh `BlobTicket` values remain accepted as described above. Legacy meshmsg signed-envelope tokens are rejected explicitly because their signatures do not bind a topic; they are never silently treated as trusted V2 offers. Ask the provider to share the attachment again with a V2 daemon. V2 daemons use `/meshmsg/broadcast-gossip/2`, so pre-V2 peers neither receive nor inject V2 attachment offers.
+Attachment offers use the topic-bound broadcast envelope V2. Only that current signed shape is decoded; unsupported or malformed signed tokens fail closed generically. Raw Iroh `BlobTicket` values remain accepted as described above. V2 daemons use `/meshmsg/broadcast-gossip/2`, so pre-V2 peers neither receive nor inject V2 attachment offers.
 
 ## JSON events
 

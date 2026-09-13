@@ -658,12 +658,6 @@ pub enum Event {
     PeerDiscovered(PeerTransition),
     PeerUpdated(PeerTransition),
     PeerExpired(PeerTransition),
-    PeerUp {
-        peer: PeerId,
-    },
-    PeerDown {
-        peer: PeerId,
-    },
     DownloadStarted {
         operation_id: OperationId,
         output: PathBuf,
@@ -715,10 +709,7 @@ impl<'de> Deserialize<'de> for EventFrame {
 impl Event {
     fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Connected(_)
-            | Self::PeerUp { .. }
-            | Self::PeerDown { .. }
-            | Self::Stopping {} => Ok(()),
+            Self::Connected(_) | Self::Stopping {} => Ok(()),
             Self::Message(value) => value.validate(),
             Self::PrivateMessage(value) => value.validate(),
             Self::Queued(value) => value.validate(),
@@ -749,8 +740,6 @@ impl Event {
         match self {
             Self::Connected(_)
             | Self::PrivateMessage(_)
-            | Self::PeerUp { .. }
-            | Self::PeerDown { .. }
             | Self::Lagged { .. }
             | Self::Stopping {}
             | Self::Error(_) => 1,
@@ -771,8 +760,6 @@ impl Event {
         match self {
             Self::Connected(_)
             | Self::PrivateMessage(_)
-            | Self::PeerUp { .. }
-            | Self::PeerDown { .. }
             | Self::Lagged { .. }
             | Self::Stopping {}
             | Self::Error(_) => version == 1,

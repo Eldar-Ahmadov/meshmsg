@@ -59,15 +59,6 @@ pub(crate) enum EnvelopeKind {
     AttachmentOffer,
 }
 
-#[cfg(test)]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct LegacyEnvelopeV1 {
-    pub(crate) from: PublicKey,
-    pub(crate) timestamp_ms: u64,
-    pub(crate) body: String,
-    pub(crate) signature: Signature,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Envelope {
@@ -631,12 +622,7 @@ where
             });
             accepted.map_or_else(|_| Vec::new(), |event| vec![event])
         }
-        Event::NeighborUp(peer) => vec![meshmsg_protocol::Event::PeerUp {
-            peer: peer.to_string().parse().expect("public key is canonical"),
-        }],
-        Event::NeighborDown(peer) => vec![meshmsg_protocol::Event::PeerDown {
-            peer: peer.to_string().parse().expect("public key is canonical"),
-        }],
+        Event::NeighborUp(_) | Event::NeighborDown(_) => Vec::new(),
         Event::Lagged => vec![meshmsg_protocol::Event::Lagged {
             source: meshmsg_protocol::EventSource::Gossip,
             dropped: 0,

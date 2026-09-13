@@ -156,7 +156,6 @@ pub enum AliasCommand {
     /// Set and enable a custom alias (ASCII letters, digits, and hyphens)
     Set { alias: String },
     /// Clear and disable alias advertising (public-key direct messages remain available)
-    #[command(alias = "disable")]
     Clear,
     /// Capture the current short OS hostname and enable it as the default alias
     ResetHostname,
@@ -170,7 +169,7 @@ pub enum Command {
         #[arg(long)]
         force: bool,
         /// Do not capture or advertise a hostname alias
-        #[arg(long = "no-default-alias", alias = "no-alias")]
+        #[arg(long = "no-default-alias")]
         no_alias: bool,
     },
     /// Save configuration from an invite token
@@ -184,7 +183,7 @@ pub enum Command {
         #[arg(long)]
         force: bool,
         /// Do not capture or advertise a hostname alias
-        #[arg(long = "no-default-alias", alias = "no-alias")]
+        #[arg(long = "no-default-alias")]
         no_alias: bool,
     },
     /// Show or change this node's advertised alias (daemon must be stopped to change it)
@@ -418,7 +417,6 @@ mod tests {
     fn canonical_input_forms_parse() {
         assert!(parse(&["init"]).is_ok());
         assert!(parse(&["init", "--no-default-alias"]).is_ok());
-        assert!(parse(&["init", "--no-alias"]).is_ok());
         assert!(parse(&["join", "token"]).is_ok());
         assert!(parse(&["join", "--token-file", "invite.txt"]).is_ok());
         assert!(parse(&["join", "--token-stdin", "--advertise-self"]).is_ok());
@@ -427,7 +425,6 @@ mod tests {
         assert!(parse(&["alias", "show"]).is_ok());
         assert!(parse(&["alias", "set", "node-1"]).is_ok());
         assert!(parse(&["alias", "clear"]).is_ok());
-        assert!(parse(&["alias", "disable"]).is_ok());
         assert!(parse(&["alias", "reset-hostname"]).is_ok());
         assert!(parse(&["send", "message"]).is_ok());
         assert!(parse(&["send", "--to", "node-1", "private"]).is_ok());

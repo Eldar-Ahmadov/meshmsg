@@ -90,9 +90,6 @@ grep -q 'letters, digits, and hyphens' "$ROOT/invalid-alias.err" || fail "invali
 "$BIN" --state-dir "$ROOT/alias-lifecycle" --json alias clear | python3 -c \
   'import json,sys; v=json.load(sys.stdin); assert not v["enabled"] and v["custom"] is None and v["alias"] is None' \
   || fail "alias clear did not persist the privacy opt-out"
-"$BIN" --state-dir "$ROOT/alias-lifecycle" --json alias disable | python3 -c \
-  'import json,sys; v=json.load(sys.stdin); assert not v["enabled"] and v["alias"] is None' \
-  || fail "alias disable synonym did not remain opted out"
 "$BIN" --state-dir "$ROOT/alias-lifecycle" --json alias reset-hostname | python3 -c \
   'import json,sys; v=json.load(sys.stdin); assert v["enabled"] and v["alias"] == v["hostname"] and v["custom"] is None' \
   || fail "hostname reset did not recapture and enable the default alias"

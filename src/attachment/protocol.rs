@@ -10,28 +10,15 @@ use iroh::{PublicKey, SecretKey};
 use iroh_blobs::{ticket::BlobTicket, BlobFormat};
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
-use serde_byte_array::ByteArray;
 #[cfg(test)]
 use std::time::Duration;
 
-const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 pub(crate) const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 pub(crate) const ATTACHMENT_OFFER_VERSION: u8 = 1;
-const MAX_ENVELOPE_SIZE: usize = 4096;
 #[cfg(test)]
 const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 #[cfg(test)]
 pub(crate) const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
-
-type Signature = ByteArray<SIGNATURE_LENGTH>;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyEnvelopeV1 {
-    from: PublicKey,
-    timestamp_ms: u64,
-    body: String,
-    signature: Signature,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AttachmentWire {
@@ -120,25 +107,6 @@ pub(crate) fn validate_offer_binding(
     Ok(offer)
 }
 
-fn decode_legacy(data: &[u8]) -> Result<LegacyEnvelopeV1> {
-    anyhow::ensure!(
-        data.len() <= MAX_ENVELOPE_SIZE,
-        "legacy envelope is too large"
-    );
-    let (value, remainder): (LegacyEnvelopeV1, &[u8]) =
-        postcard::take_from_bytes(data).context("decode legacy message")?;
-    anyhow::ensure!(
-        remainder.is_empty(),
-        "legacy message contains trailing bytes"
-    );
-    let signed = postcard::to_stdvec(&(value.from, value.timestamp_ms, &value.body))?;
-    value
-        .from
-        .verify(&signed, &iroh::Signature::from_bytes(&value.signature))
-        .context("verify legacy message")?;
-    Ok(value)
-}
-
 pub(crate) fn parse_signed_offer_token(
     token: &str,
     expected_topic: TopicId,
@@ -146,17 +114,8 @@ pub(crate) fn parse_signed_offer_token(
     let bytes = BASE64URL_NOPAD
         .decode(token.as_bytes())
         .context("decode signed attachment offer")?;
-    let envelope = match Envelope::decode(&bytes, expected_topic) {
-        Ok(envelope) => envelope,
-        Err(v2_error) => {
-            if decode_legacy(&bytes).is_ok() {
-                anyhow::bail!(
-                    "legacy signed attachment offers are not accepted because they are not topic-bound; ask the sender to share the attachment again"
-                );
-            }
-            return Err(v2_error);
-        }
-    };
+    let envelope = Envelope::decode(&bytes, expected_topic)
+        .map_err(|_| anyhow::anyhow!("unsupported or malformed signed attachment token"))?;
     anyhow::ensure!(
         envelope.kind == EnvelopeKind::AttachmentOffer,
         "token is not an attachment offer"

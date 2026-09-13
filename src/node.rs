@@ -72,11 +72,10 @@ use crate::{
         AttachmentKind, AttachmentOffer,
     },
     gossip::{
-        Envelope, EnvelopeKind, EnvelopeReplayCache, EnvelopeSignaturePayload, LegacyEnvelopeV1,
-        TokenBucket, TransportSourceLimiter, ENVELOPE_ACCEPTANCE_WINDOW, ENVELOPE_DOMAIN,
-        ENVELOPE_FUTURE_SKEW, ENVELOPE_VERSION, GLOBAL_REPLAY_BURST, GLOBAL_TRANSPORT_BURST,
-        MAX_ENVELOPE_REPLAY_ENTRIES, MAX_ENVELOPE_SIZE,
-        MAX_MESSAGE_SIZE as GOSSIP_MAX_MESSAGE_SIZE, MAX_REPLAY_IDS_PER_SENDER,
+        Envelope, EnvelopeKind, EnvelopeReplayCache, EnvelopeSignaturePayload, TokenBucket,
+        TransportSourceLimiter, ENVELOPE_ACCEPTANCE_WINDOW, ENVELOPE_DOMAIN, ENVELOPE_FUTURE_SKEW,
+        ENVELOPE_VERSION, GLOBAL_REPLAY_BURST, GLOBAL_TRANSPORT_BURST, MAX_ENVELOPE_REPLAY_ENTRIES,
+        MAX_ENVELOPE_SIZE, MAX_MESSAGE_SIZE as GOSSIP_MAX_MESSAGE_SIZE, MAX_REPLAY_IDS_PER_SENDER,
         MAX_REPLAY_SENDERS_PER_SOURCE, MAX_TRANSPORT_SOURCES, PER_SENDER_REPLAY_BURST,
         PROTOCOL_HEADROOM as GOSSIP_PROTOCOL_HEADROOM, REPLAY_BUCKET_RETENTION,
         REPLAY_BUCKET_WIDTH, SIGNATURE_LENGTH, TRANSPORT_SOURCE_BURST,
@@ -2965,8 +2964,6 @@ fn event(json: bool, mut value: serde_json::Value) {
                         .unwrap_or_default()
                 );
             }
-            "peer_up" => println!("peer joined: {}", value["peer"].as_str().unwrap_or("")),
-            "peer_down" => println!("peer left: {}", value["peer"].as_str().unwrap_or("")),
             "connected" => println!("connected as {}", value["peer"].as_str().unwrap_or("")),
             "stopping" => println!("daemon stopping"),
             "lagged" => println!(
@@ -3002,6 +2999,20 @@ mod tests {
             endpoint_online: true,
             topic_joined: true,
             alias: None,
+        })
+    }
+
+    fn peer_discovered_fixture(revision: u64) -> meshmsg_protocol::Event {
+        meshmsg_protocol::Event::PeerDiscovered(meshmsg_protocol::PeerTransition {
+            directory_epoch: "4".repeat(32).parse().unwrap(),
+            directory_revision: revision,
+            peer: meshmsg_protocol::RemotePeer {
+                public_key: "3".repeat(64).parse().unwrap(),
+                alias: None,
+                online: true,
+                last_seen_ms: 1,
+                expires_at_ms: 2,
+            },
         })
     }
 
@@ -3562,27 +3573,6 @@ mod tests {
         *last ^= 1;
         assert!(
             parse_signed_offer_token(&BASE64URL_NOPAD.encode(&tampered), test_topic()).is_err()
-        );
-    }
-
-    #[test]
-    fn legacy_signed_attachment_tokens_are_rejected_with_migration_guidance() {
-        let secret = SecretKey::generate();
-        let body = attachment_body(&sample_offer(secret.public())).unwrap();
-        let timestamp_ms = 42;
-        let signed = postcard::to_stdvec(&(secret.public(), timestamp_ms, &body)).unwrap();
-        let legacy = LegacyEnvelopeV1 {
-            from: secret.public(),
-            timestamp_ms,
-            body,
-            signature: ByteArray::new(secret.sign(&signed).to_bytes()),
-        };
-        let token = BASE64URL_NOPAD.encode(&postcard::to_stdvec(&legacy).unwrap());
-
-        let error = parse_signed_offer_token(&token, test_topic()).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "legacy signed attachment offers are not accepted because they are not topic-bound; ask the sender to share the attachment again"
         );
     }
 
@@ -6859,10 +6849,7 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(600), &mut task)
             .await
             .is_err());
-        let event = meshmsg_protocol::Event::PeerUp {
-            peer: "3".repeat(64).parse().unwrap(),
-        };
-        events.send(event).unwrap();
+        events.send(peer_discovered_fixture(1)).unwrap();
         let received = tokio::time::timeout(
             Duration::from_secs(1),
             read_frame(&mut client, MAX_IPC_EVENT_SIZE),
@@ -6871,9 +6858,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
-        assert_eq!(received["type"], "peer_up");
-        assert_eq!(received["peer"], "3".repeat(64));
-        assert_eq!(received["schema_version"], 1);
+        assert_eq!(received["type"], "peer_discovered");
+        assert_eq!(received["peer"]["public_key"], "3".repeat(64));
+        assert_eq!(received["schema_version"], 2);
         assert!(contracts::valid_request_id(
             received["request_id"].as_str().unwrap()
         ));
@@ -6960,16 +6947,8 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(MAX_IPC_EVENT_SIZE);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, receiver) = broadcast::channel(1);
-        events
-            .send(meshmsg_protocol::Event::PeerUp {
-                peer: "3".repeat(64).parse().unwrap(),
-            })
-            .unwrap();
-        events
-            .send(meshmsg_protocol::Event::PeerDown {
-                peer: "3".repeat(64).parse().unwrap(),
-            })
-            .unwrap();
+        events.send(peer_discovered_fixture(1)).unwrap();
+        events.send(peer_discovered_fixture(2)).unwrap();
         let task = tokio::spawn(handle_local_client(
             server,
             commands,
