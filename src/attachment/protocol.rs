@@ -11,16 +11,16 @@ use iroh_blobs::{ticket::BlobTicket, BlobFormat};
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
-#[cfg(any(test, feature = "web"))]
+#[cfg(test)]
 use std::time::Duration;
 
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 pub(crate) const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 pub(crate) const ATTACHMENT_OFFER_VERSION: u8 = 1;
 const MAX_ENVELOPE_SIZE: usize = 4096;
-#[cfg(any(test, feature = "web"))]
+#[cfg(test)]
 const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
-#[cfg(any(test, feature = "web"))]
+#[cfg(test)]
 pub(crate) const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -234,7 +234,7 @@ pub(crate) fn offer_event(
     })
 }
 
-#[cfg(any(test, feature = "web"))]
+#[cfg(test)]
 pub(crate) fn validate_attachment_event(
     expected_topic: Option<TopicId>,
     live_now_ms: Option<u64>,
@@ -297,10 +297,12 @@ pub(crate) fn validate_attachment_event(
 
 #[cfg(debug_assertions)]
 fn fixture_event_value(event: meshmsg_protocol::Event) -> serde_json::Value {
-    let schema_version = event.schema_version();
-    let mut value = serde_json::to_value(event).expect("attachment fixture serialization");
-    value["schema_version"] = schema_version.into();
-    value
+    meshmsg_protocol::DaemonFrame::Event(meshmsg_protocol::EventFrame::new(
+        meshmsg_protocol::RequestId::new_random(),
+        event,
+    ))
+    .into_payload_value()
+    .expect("attachment fixture serialization")
 }
 
 #[cfg(debug_assertions)]
@@ -349,27 +351,7 @@ pub(crate) fn signed_attachment_fixture(
     )))
 }
 
-#[cfg(all(test, feature = "web"))]
-pub(crate) fn signed_attachment_event_for_test(
-    secret: &SecretKey,
-    offer_id: &str,
-    kind: super::AttachmentKind,
-    name: &str,
-    size: u64,
-    timestamp_ms: u64,
-) -> serde_json::Value {
-    signed_attachment_event_for_topic_for_test(
-        secret,
-        TopicId::from_bytes([7; 32]),
-        offer_id,
-        kind,
-        name,
-        size,
-        timestamp_ms,
-    )
-}
-
-#[cfg(all(test, feature = "web"))]
+#[cfg(test)]
 pub(crate) fn signed_attachment_event_for_topic_for_test(
     secret: &SecretKey,
     topic: TopicId,

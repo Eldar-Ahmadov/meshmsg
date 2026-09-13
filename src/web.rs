@@ -1,13 +1,11 @@
 //! Unauthenticated loopback HTTP bridge. Tailscale Serve is the access boundary;
 //! Host/Origin checks defend browsers, not hostile local or authorized clients.
 use crate::{
-    alias::validate_alias,
-    attachment::{validate_display_name, AttachmentKind, AttachmentOffer},
+    attachment::{validate_display_name, AttachmentKind},
     config::prepare_state_dir,
     contracts::{self, ProtocolErrorAdapter},
     ipc::{self, IpcRequest},
-    message::{validate_broadcast_body, validate_v2_message_body},
-    peers::{MAX_DYNAMIC_IDENTITIES, PEER_LEASE_MS},
+    message::validate_broadcast_body,
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -22,6 +20,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use iroh::PublicKey;
+#[cfg(test)]
 use iroh_gossip::proto::TopicId;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -582,6 +581,24 @@ struct MutationErrorDto {
 }
 
 impl MutationErrorDto {
+    fn from_typed(
+        request_id: Option<meshmsg_protocol::RequestId>,
+        error: meshmsg_protocol::ProtocolError,
+    ) -> Option<Self> {
+        let adapter = ProtocolErrorAdapter::from_typed(request_id.map(|id| id.to_string()), error);
+        Some(Self {
+            kind: "error".into(),
+            schema_version: 1,
+            code: adapter.code,
+            message: adapter.message,
+            request_id: adapter.request_id?,
+            operation_id: adapter.operation_id?,
+            retryable: adapter.retryable,
+            outcome: adapter.outcome,
+        })
+    }
+
+    #[cfg(test)]
     fn parse(value: Value, operation_id: &str) -> Option<Self> {
         let error = ProtocolErrorAdapter::from_value(&value).ok()?;
         let request_id = error.request_id?;
@@ -610,130 +627,6 @@ impl MutationErrorDto {
         } else {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueuedMutationDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    operation_id: String,
-    from: String,
-    message_id: String,
-    timestamp_ms: u64,
-    body: String,
-    delivery_acknowledged: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SharedMutationDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    operation_id: String,
-    from: String,
-    message_id: String,
-    timestamp_ms: u64,
-    offer_id: String,
-    source_digest: String,
-    #[serde(rename = "kind")]
-    kind_name: AttachmentKind,
-    name: String,
-    size: u64,
-    ticket: String,
-    offer: String,
-    delivery_acknowledged: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConnectedEventDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    peer: String,
-    endpoint_online: bool,
-    topic_joined: bool,
-    alias: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MessageEventDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    from: String,
-    message_id: String,
-    timestamp_ms: u64,
-    body: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OfferEventDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    from: String,
-    message_id: String,
-    timestamp_ms: u64,
-    offer_id: String,
-    name: String,
-    #[serde(rename = "kind")]
-    kind_name: AttachmentKind,
-    size: u64,
-    ticket: String,
-    offer: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaggedEventDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    source: String,
-    dropped: Option<u64>,
-    message: String,
-}
-
-impl SharedMutationDto {
-    fn parse(
-        value: Value,
-        operation_id: &str,
-        source_digest: &str,
-        name: &str,
-        size: u64,
-    ) -> Option<Self> {
-        let shared: Self = serde_json::from_value(value).ok()?;
-        (shared.kind == "attachment_shared"
-            && shared.schema_version == 3
-            && shared.operation_id == operation_id
-            && contracts::valid_request_id(&shared.request_id)
-            && shared.message_id == operation_id
-            && shared.offer_id == operation_id
-            && shared.source_digest == source_digest
-            && shared.kind_name == AttachmentKind::File
-            && shared.name == name
-            && shared.size == size
-            && ipc::valid_operation_id(&shared.message_id)
-            && ipc::valid_content_digest(&shared.source_digest)
-            && !shared.from.is_empty()
-            && shared.timestamp_ms != 0
-            && !shared.ticket.is_empty()
-            && !shared.offer.is_empty()
-            && !shared.delivery_acknowledged)
-            .then_some(shared)
     }
 }
 
@@ -869,11 +762,6 @@ fn json_response(status: StatusCode, mut value: Value) -> Response<Body> {
             Some(&request_id),
             &envelope.typed().expect("known HTTP protocol error"),
         );
-    } else {
-        if value.get("schema_version").is_none() {
-            value["schema_version"] = contracts::SCHEMA_VERSION.into();
-        }
-        value["request_id"] = request_id.into();
     }
     response(status, "application/json", value.to_string())
 }
@@ -969,185 +857,19 @@ fn public_key(value: &Value) -> Option<&str> {
     (key.to_string() == text).then_some(text)
 }
 
-fn public_alias(value: &Value) -> Option<Option<&str>> {
-    if value.is_null() {
-        return Some(None);
-    }
-    let alias = value.as_str()?;
-    validate_alias(alias).ok()?;
-    Some(Some(alias))
-}
-
-fn public_remote_peer(value: &Value, expected_online: bool) -> Option<Value> {
-    let public_key = public_key(&value["public_key"])?;
-    let alias = public_alias(&value["alias"])?;
-    let online = value["online"].as_bool()?;
-    if online != expected_online {
-        return None;
-    }
-    let last_seen_ms = value["last_seen_ms"].as_u64()?;
-    let expires_at_ms = value["expires_at_ms"].as_u64()?;
-    if expires_at_ms < last_seen_ms || expires_at_ms.saturating_sub(last_seen_ms) > PEER_LEASE_MS {
-        return None;
-    }
-    Some(json!({
-        "public_key":public_key, "alias":alias, "online":online,
-        "last_seen_ms":last_seen_ms, "expires_at_ms":expires_at_ms
-    }))
-}
-
-fn directory_position(value: &Value) -> Option<(&str, u64)> {
-    let epoch = value["directory_epoch"].as_str()?;
-    if epoch.len() != 32
-        || !epoch
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return None;
-    }
-    Some((epoch, value["directory_revision"].as_u64()?))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PeerSourceDto {
-    public_key: String,
-    alias: Option<String>,
-    online: bool,
-    last_seen_ms: u64,
-    expires_at_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SelfPeerSourceDto {
-    public_key: String,
-    alias: Option<String>,
-    online: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PeersSnapshotSourceDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    generated_at_ms: u64,
-    directory_epoch: String,
-    directory_revision: u64,
-    #[serde(rename = "self")]
-    self_peer: SelfPeerSourceDto,
-    peers: Vec<PeerSourceDto>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PeerTransitionSourceDto {
-    #[serde(rename = "type")]
-    kind: String,
-    schema_version: u8,
-    request_id: String,
-    directory_epoch: String,
-    directory_revision: u64,
-    peer: PeerSourceDto,
-}
-
-fn public_peers_snapshot(value: &Value) -> Option<Value> {
-    let decoded: PeersSnapshotSourceDto = serde_json::from_value(value.clone()).ok()?;
-    if decoded.kind != "peers_snapshot"
-        || decoded.schema_version != 2
-        || !contracts::valid_request_id(&decoded.request_id)
-    {
-        return None;
-    }
-    let _validated_shape = (
-        decoded.generated_at_ms,
-        decoded.directory_epoch,
-        decoded.directory_revision,
-        decoded.self_peer.public_key,
-        decoded.self_peer.alias,
-        decoded.self_peer.online,
-        decoded.peers.len(),
-    );
-    for peer in &decoded.peers {
-        let _ = (
-            &peer.public_key,
-            &peer.alias,
-            peer.online,
-            peer.last_seen_ms,
-            peer.expires_at_ms,
-        );
-    }
-    if value["type"] != "peers_snapshot" || value["schema_version"] != 2 {
-        return None;
-    }
-    let generated_at_ms = value["generated_at_ms"].as_u64()?;
-    let (directory_epoch, directory_revision) = directory_position(value)?;
-    let self_value = &value["self"];
-    let self_key = public_key(&self_value["public_key"])?;
-    let self_alias = public_alias(&self_value["alias"])?;
-    let self_online = self_value["online"].as_bool()?;
-    let source = value["peers"].as_array()?;
-    if source.len() > MAX_DYNAMIC_IDENTITIES {
-        return None;
-    }
-    let mut remotes = Vec::with_capacity(source.len());
-    let mut previous: Option<String> = None;
-    for item in source {
-        let peer = public_remote_peer(item, true)?;
-        let key = peer["public_key"].as_str()?;
-        if key == self_key || previous.as_deref().is_some_and(|previous| previous >= key) {
-            return None;
-        }
-        let last_seen_ms = peer["last_seen_ms"].as_u64()?;
-        let expires_at_ms = peer["expires_at_ms"].as_u64()?;
-        if last_seen_ms > generated_at_ms
-            || expires_at_ms < generated_at_ms
-            || expires_at_ms.saturating_sub(generated_at_ms) > PEER_LEASE_MS
-        {
-            return None;
-        }
-        previous = Some(key.to_owned());
-        remotes.push(peer);
-    }
-    Some(json!({
+fn public_typed_peers_snapshot(value: &meshmsg_protocol::PeerSnapshot) -> Value {
+    json!({
         "type":"peers_snapshot", "schema_version":2,
-        "generated_at_ms":generated_at_ms,
-        "directory_epoch":directory_epoch, "directory_revision":directory_revision,
-        "self":{"public_key":self_key, "alias":self_alias, "online":self_online},
-        "peers":remotes
-    }))
-}
-
-fn public_peer_transition(value: &Value, event_type: &str) -> Option<Value> {
-    let decoded: PeerTransitionSourceDto = serde_json::from_value(value.clone()).ok()?;
-    if decoded.kind != event_type
-        || decoded.schema_version != 2
-        || !contracts::valid_request_id(&decoded.request_id)
-    {
-        return None;
-    }
-    let _validated_shape = (
-        decoded.directory_epoch,
-        decoded.directory_revision,
-        decoded.peer.public_key,
-        decoded.peer.alias,
-        decoded.peer.online,
-        decoded.peer.last_seen_ms,
-        decoded.peer.expires_at_ms,
-    );
-    if value["schema_version"] != 2 {
-        return None;
-    }
-    let expected_online = event_type != "peer_expired";
-    let peer = public_remote_peer(&value["peer"], expected_online)?;
-    let (directory_epoch, directory_revision) = directory_position(value)?;
-    Some(json!({
-        "type":event_type, "schema_version":2,
-        "directory_epoch":directory_epoch, "directory_revision":directory_revision,
-        "peer":peer
-    }))
+        "generated_at_ms":value.generated_at_ms,
+        "directory_epoch":value.directory_epoch,
+        "directory_revision":value.directory_revision,
+        "self":{
+            "public_key":value.self_peer.public_key,
+            "alias":value.self_peer.alias,
+            "online":value.self_peer.online
+        },
+        "peers":value.peers
+    })
 }
 
 async fn bounded_download_ipc<F: Future>(
@@ -1163,22 +885,22 @@ fn raw_download_context(
     output: &Path,
 ) -> ipc::DownloadRequestContext {
     ipc::DownloadRequestContext {
-        operation_id: operation_id.to_owned(),
-        token_digest: ipc::download_token_digest(&stored.offer),
-        offer_id: stored.offer_id.clone(),
-        provider: stored.provider.clone(),
+        operation_id: operation_id.parse().expect("validated operation ID"),
+        token_digest: ipc::download_token_digest(&stored.offer)
+            .parse()
+            .expect("generated digest is canonical"),
+        offer_id: stored.offer_id.parse().expect("validated offer ID"),
+        provider: stored.provider.parse().expect("validated provider"),
         kind: match stored.kind {
-            AttachmentKind::File => "file".to_owned(),
-            AttachmentKind::DirectoryTarV1 => "directory_tar_v1".to_owned(),
+            AttachmentKind::File => meshmsg_protocol::AttachmentKind::File,
+            AttachmentKind::DirectoryTarV1 => meshmsg_protocol::AttachmentKind::DirectoryTarV1,
         },
-        name: stored.name.clone(),
+        name: meshmsg_protocol::AttachmentName::new(stored.name.clone())
+            .expect("validated attachment name"),
         declared_size: Some(stored.size),
         output: output.to_path_buf(),
+        mode: meshmsg_protocol::DownloadMode::Raw,
     }
-}
-
-fn compatible_download_complete(value: &Value, expected: &ipc::DownloadRequestContext) -> bool {
-    ipc::DownloadCompleteV2::validate_for_request(value, expected).is_ok()
 }
 
 fn operation_bound_download_http_error(
@@ -1273,7 +995,7 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
     tokio::spawn(HTTP_REQUEST_ID.scope(request_id, async move {
         let _permit = permit;
         let result = bounded_download_ipc(
-            web_ipc_request(
+            web_ipc_typed_request(
                 &dir,
                 &IpcRequest::Download {
                     operation_id: operation.parse().expect("validated web operation ID"),
@@ -1287,73 +1009,69 @@ fn start_download(state: &WebState, offer_handle: String, operation_id: String) 
         .await;
 
         let (job, remove_output) = match result {
-            Ok(Ok(value))
-                if value["type"] == "download_complete"
-                    && compatible_download_complete(&value, &expected) =>
-            {
-                match open_download_file(&output) {
-                    Ok((file, size))
-                        if value["size"].as_u64() == Some(size)
-                            && touch_download_root(&download_root).is_ok() =>
-                    {
-                        drop(file);
-                        (
-                            DownloadJob::Ready {
-                                path: output.clone(),
-                                name: input.name.clone(),
-                                size,
+            Ok(Ok(frame)) => match frame.response {
+                meshmsg_protocol::Response::DownloadComplete(value)
+                    if value.validate_for_request(&expected).is_ok() =>
+                {
+                    match open_download_file(&output) {
+                        Ok((file, size))
+                            if value.size == size
+                                && touch_download_root(&download_root).is_ok() =>
+                        {
+                            drop(file);
+                            (
+                                DownloadJob::Ready {
+                                    path: output.clone(),
+                                    name: input.name.clone(),
+                                    size,
+                                    created: Instant::now(),
+                                },
+                                false,
+                            )
+                        }
+                        _ => (
+                            DownloadJob::Failed {
+                                error: operation_bound_download_error(
+                                    "download_failed",
+                                    "Daemon completed without an exported file.",
+                                    "unknown",
+                                    true,
+                                    &operation,
+                                ),
                                 created: Instant::now(),
                             },
                             false,
-                        )
+                        ),
                     }
-                    _ => (
+                }
+                meshmsg_protocol::Response::Error(error) => {
+                    let error = ProtocolErrorAdapter::from_typed(
+                        frame.request_id.map(|id| id.to_string()),
+                        error,
+                    );
+                    let remove = error.outcome != "unknown";
+                    (
                         DownloadJob::Failed {
-                            error: operation_bound_download_error(
-                                "download_failed",
-                                "Daemon completed without an exported file.",
-                                "unknown",
-                                true,
-                                &operation,
-                            ),
+                            error: public_lifecycle_error(error),
                             created: Instant::now(),
                         },
-                        false,
-                    ),
+                        remove,
+                    )
                 }
-            }
-            Ok(Ok(value)) => {
-                let daemon_error = value["type"] == "error";
-                let error = if daemon_error {
-                    ipc::validate_lifecycle_error_for_request(&value, &operation).unwrap_or_else(
-                        |_| {
-                            operation_bound_download_error(
-                                "download_failed",
-                                "Daemon returned a malformed attachment lifecycle error.",
-                                "unknown",
-                                true,
-                                &operation,
-                            )
-                        },
-                    )
-                } else {
-                    operation_bound_download_error(
-                        "download_failed",
-                        "Daemon returned an incompatible attachment download response.",
-                        "unknown",
-                        true,
-                        &operation,
-                    )
-                };
-                let remove = !daemon_error || error.outcome != "unknown";
-                (
+                _ => (
                     DownloadJob::Failed {
-                        error: public_lifecycle_error(error),
+                        error: operation_bound_download_error(
+                            "download_failed",
+                            "Daemon returned an incompatible attachment download response.",
+                            "unknown",
+                            true,
+                            &operation,
+                        ),
                         created: Instant::now(),
                     },
-                    remove,
-                )
-            }
+                    true,
+                ),
+            },
             Ok(Err(_)) => (
                 DownloadJob::Failed {
                     error: operation_bound_download_error(
@@ -1517,36 +1235,27 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
         WebRequest::Peers {} => IpcRequest::Peers,
         WebRequest::Download { .. } | WebRequest::DownloadStatus { .. } => unreachable!(),
     };
-    match timeout(IPC_TIMEOUT, web_ipc_request(&state.dir, &request)).await {
-        Ok(Ok(value)) if is_send && value["type"] == "error" => {
-            let operation_id = &send_expected.as_ref().expect("send metadata exists").0;
-            match MutationErrorDto::parse(value, operation_id) {
-                Some(error) => mutation_error_response(error),
-                None => mutation_error_response(local_mutation_error(
-                    operation_id,
-                    "invalid_daemon_response",
-                    "Daemon returned an invalid mutation error; outcome unknown.",
-                    true,
-                    "unknown",
-                )),
-            }
-        }
-        Ok(Ok(value)) if is_send => {
+    match timeout(IPC_TIMEOUT, web_ipc_typed_request(&state.dir, &request)).await {
+        Ok(Ok(frame)) if is_send => {
             let (operation_id, expected_body) =
                 send_expected.as_ref().expect("send metadata exists");
-            match serde_json::from_value::<QueuedMutationDto>(value) {
-                Ok(queued)
-                    if queued.kind == "queued"
-                        && queued.schema_version == 3
-                        && contracts::valid_request_id(&queued.request_id)
-                        && queued.operation_id == *operation_id
-                        && contracts::valid_request_id(&queued.request_id)
-                        && queued.message_id == *operation_id
-                        && queued.body == *expected_body
-                        && ipc::valid_operation_id(&queued.message_id)
-                        && !queued.from.is_empty()
-                        && queued.timestamp_ms != 0
-                        && !queued.delivery_acknowledged =>
+            match frame.response {
+                meshmsg_protocol::Response::Error(error) => {
+                    MutationErrorDto::from_typed(frame.request_id, error)
+                        .map(mutation_error_response)
+                        .unwrap_or_else(|| {
+                            mutation_error_response(local_mutation_error(
+                                operation_id,
+                                "invalid_daemon_response",
+                                "Daemon returned an invalid mutation error; outcome unknown.",
+                                true,
+                                "unknown",
+                            ))
+                        })
+                }
+                meshmsg_protocol::Response::Queued(queued)
+                    if queued.operation_id.as_str() == operation_id
+                        && queued.body.as_str() == expected_body =>
                 {
                     json_response(
                         StatusCode::OK,
@@ -1567,12 +1276,22 @@ async fn api_request(state: &WebState, bytes: &[u8]) -> Response<Body> {
                 )),
             }
         }
-        Ok(Ok(value)) if !is_send && !is_peers => {
-            json_response(StatusCode::OK, public_status(&value))
-        }
-        Ok(Ok(value)) if is_peers => match public_peers_snapshot(&value) {
-            Some(value) => json_response(StatusCode::OK, value),
-            None => error(
+        Ok(Ok(frame)) if !is_send && !is_peers => match frame.response {
+            meshmsg_protocol::Response::Status(status) => json_response(
+                StatusCode::OK,
+                public_status(&serde_json::to_value(status).expect("status serialization")),
+            ),
+            _ => error(
+                StatusCode::BAD_GATEWAY,
+                "offline",
+                "Daemon returned an invalid status.",
+            ),
+        },
+        Ok(Ok(frame)) if is_peers => match frame.response {
+            meshmsg_protocol::Response::PeersSnapshot(peers) => {
+                json_response(StatusCode::OK, public_typed_peers_snapshot(&peers))
+            }
+            _ => error(
                 StatusCode::BAD_GATEWAY,
                 "offline",
                 "Daemon returned an invalid peer directory.",
@@ -1624,235 +1343,110 @@ fn sse_frame(value: &Value) -> Bytes {
             &error.typed().expect("known SSE protocol error"),
         )
     } else {
-        let mut value = value.clone();
-        if value.get("schema_version").is_none() {
-            value["schema_version"] = contracts::SCHEMA_VERSION.into();
-        }
-        value["request_id"] = request_id.into();
-        value
+        value.clone()
     };
     Bytes::from(format!("data: {value}\n\n"))
 }
 
-async fn web_ipc_request(dir: &Path, request: &IpcRequest) -> Result<Value> {
-    ipc::response_payload(ipc::send_request_with_id(dir, request, &http_request_id()).await?)
+async fn web_ipc_typed_request(
+    dir: &Path,
+    request: &IpcRequest,
+) -> Result<meshmsg_protocol::ResponseFrame> {
+    ipc::send_request_with_id(dir, request, &http_request_id()).await
 }
 
-fn public_event(
+fn public_typed_event(
     state: &WebState,
-    topic: TopicId,
-    value: Value,
+    frame: meshmsg_protocol::EventFrame,
     download_supported: bool,
 ) -> Option<Value> {
-    match value["type"].as_str()? {
-        "connected" => {
-            let decoded: ConnectedEventDto = serde_json::from_value(value.clone()).ok()?;
-            if decoded.kind != "connected"
-                || decoded.schema_version != 1
-                || !contracts::valid_request_id(&decoded.request_id)
-                || !decoded.endpoint_online
-            {
-                return None;
-            }
-            let _validated = (decoded.peer, decoded.topic_joined, decoded.alias);
-            let mut connected = json!({"type":"connected"});
-            if let Some(peer) = public_key(&value["peer"]) {
-                connected["peer"] = peer.into();
-            }
-            connected["download_supported"] = download_supported.into();
-            Some(connected)
-        }
-        "message" => {
-            let decoded: MessageEventDto = serde_json::from_value(value.clone()).ok()?;
-            if decoded.kind != "message"
-                || decoded.schema_version != 2
-                || !contracts::valid_request_id(&decoded.request_id)
-                || decoded.from.is_empty()
-                || decoded.timestamp_ms == 0
-                || validate_v2_message_body(&decoded.body).is_err()
-            {
-                return None;
-            }
-            let _validated_message_id = decoded.message_id;
-            let message_id = value["message_id"].as_str()?;
-            if value["schema_version"] != 2 || !valid_id(message_id) {
-                return None;
-            }
-            Some(json!({
-                "type":"message", "schema_version":2, "from":value["from"],
-                "message_id":message_id, "body":value["body"],
-                "timestamp_ms":value["timestamp_ms"]
-            }))
-        }
-        "queued" => {
-            let decoded: QueuedMutationDto = serde_json::from_value(value.clone()).ok()?;
-            if decoded.kind != "queued"
-                || decoded.schema_version != 3
-                || !contracts::valid_request_id(&decoded.request_id)
-                || decoded.from.is_empty()
-                || decoded.timestamp_ms == 0
-                || validate_v2_message_body(&decoded.body).is_err()
-                || decoded.delivery_acknowledged
-            {
-                return None;
-            }
-            let message_id = value["message_id"].as_str()?;
-            let operation_id = value["operation_id"].as_str()?;
-            if value["schema_version"] != 3 || !valid_id(message_id) || operation_id != message_id {
-                return None;
-            }
-            Some(json!({
-                "type":"queued", "schema_version":3, "from":value["from"],
-                "operation_id":operation_id, "message_id":message_id, "body":value["body"],
-                "timestamp_ms":value["timestamp_ms"], "delivery_acknowledged":false
-            }))
-        }
-        "attachment_offer" => {
-            let decoded: OfferEventDto = serde_json::from_value(value.clone()).ok()?;
-            let semantic_offer = AttachmentOffer {
-                offer_id: decoded.offer_id.clone(),
-                kind: decoded.kind_name,
-                name: decoded.name.clone(),
-                size: decoded.size,
-                ticket: decoded.ticket.clone(),
-            };
-            if decoded.kind != "attachment_offer"
-                || decoded.schema_version != 2
-                || !contracts::valid_request_id(&decoded.request_id)
-                || decoded.from.is_empty()
-                || decoded.timestamp_ms == 0
-                || !ipc::valid_operation_id(&decoded.message_id)
-                || decoded.offer_id != decoded.message_id
-                || !ipc::validate_attachment_event_fields(
-                    Some(topic),
-                    Some(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .ok()?
-                            .as_millis() as u64,
-                    ),
-                    &decoded.from,
-                    &decoded.message_id,
-                    decoded.timestamp_ms,
-                    &semantic_offer,
-                    &decoded.offer,
-                )
-            {
-                return None;
-            }
-            let _validated = (decoded.kind_name, decoded.size);
-            let message_id = value["message_id"].as_str()?;
-            if value["schema_version"] != 2 || !valid_id(message_id) {
-                return None;
-            }
-            let offer = value["offer"].as_str()?;
-            let name = value["name"].as_str()?;
-            let kind = value["kind"].as_str()?;
-            if !matches!(kind, "file" | "directory_tar_v1") || value["size"].as_u64().is_none() {
-                return None;
-            }
+    match frame.event {
+        meshmsg_protocol::Event::Connected(value) if value.endpoint_online => Some(json!({
+            "type":"connected",
+            "peer":value.peer,
+            "download_supported":download_supported
+        })),
+        meshmsg_protocol::Event::Message(value) => Some(json!({
+            "type":"message", "schema_version":2, "from":value.from,
+            "message_id":value.message_id, "body":value.body,
+            "timestamp_ms":value.timestamp_ms
+        })),
+        meshmsg_protocol::Event::Queued(value) => Some(json!({
+            "type":"queued", "schema_version":3, "from":value.from,
+            "operation_id":value.operation_id, "message_id":value.message_id,
+            "body":value.body, "timestamp_ms":value.timestamp_ms,
+            "delivery_acknowledged":false
+        })),
+        meshmsg_protocol::Event::AttachmentOffer(value) => {
             let mut public = json!({
                 "type":"attachment_offer", "schema_version":2,
-                "direction":"incoming", "from":value["from"], "message_id":message_id,
-                "timestamp_ms":value["timestamp_ms"], "name":name,
-                "kind":kind, "size":value["size"]
+                "direction":"incoming", "from":value.from,
+                "message_id":value.message_id, "timestamp_ms":value.timestamp_ms,
+                "name":value.name, "kind":value.kind, "size":value.size
             });
             if download_supported {
                 public["download_id"] = state
                     .remember_offer(StoredOffer {
-                        offer_id: decoded.offer_id.clone(),
-                        offer: offer.to_owned(),
-                        provider: decoded.from.clone(),
-                        kind: decoded.kind_name,
-                        name: name.to_owned(),
-                        size: decoded.size,
+                        offer_id: value.offer_id.to_string(),
+                        offer: value.offer.into_string(),
+                        provider: value.from.to_string(),
+                        kind: match value.kind {
+                            meshmsg_protocol::AttachmentKind::File => AttachmentKind::File,
+                            meshmsg_protocol::AttachmentKind::DirectoryTarV1 => {
+                                AttachmentKind::DirectoryTarV1
+                            }
+                        },
+                        name: value.name.into_string(),
+                        size: value.size,
                         created: Instant::now(),
                     })?
                     .into();
             }
             Some(public)
         }
-        "attachment_shared" => {
-            let decoded: SharedMutationDto = serde_json::from_value(value.clone()).ok()?;
-            let semantic_offer = AttachmentOffer {
-                offer_id: decoded.offer_id.clone(),
-                kind: decoded.kind_name,
-                name: decoded.name.clone(),
-                size: decoded.size,
-                ticket: decoded.ticket.clone(),
-            };
-            if decoded.kind != "attachment_shared"
-                || decoded.schema_version != 3
-                || !contracts::valid_request_id(&decoded.request_id)
-                || decoded.from.is_empty()
-                || decoded.timestamp_ms == 0
-                || decoded.operation_id != decoded.message_id
-                || decoded.offer_id != decoded.message_id
-                || !ipc::valid_operation_id(&decoded.message_id)
-                || !ipc::valid_content_digest(&decoded.source_digest)
-                || !ipc::validate_attachment_event_fields(
-                    Some(topic),
-                    Some(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .ok()?
-                            .as_millis() as u64,
-                    ),
-                    &decoded.from,
-                    &decoded.message_id,
-                    decoded.timestamp_ms,
-                    &semantic_offer,
-                    &decoded.offer,
-                )
-                || decoded.delivery_acknowledged
-            {
-                return None;
-            }
-            let _validated = (decoded.kind_name, decoded.size);
-            let message_id = value["message_id"].as_str()?;
-            let operation_id = value["operation_id"].as_str()?;
-            if value["schema_version"] != 3 || !valid_id(message_id) || operation_id != message_id {
-                return None;
-            }
+        meshmsg_protocol::Event::AttachmentShared(value) => Some(json!({
+            "type":"attachment_shared", "schema_version":3,
+            "direction":"outgoing", "from":value.from,
+            "operation_id":value.operation_id, "message_id":value.message_id,
+            "timestamp_ms":value.timestamp_ms, "name":value.name,
+            "kind":value.kind, "size":value.size
+        })),
+        meshmsg_protocol::Event::Error(error)
+            if error.code == meshmsg_protocol::ErrorCode::InternalContractError =>
+        {
+            let adapter =
+                ProtocolErrorAdapter::from_typed(Some(frame.request_id.to_string()), error);
             Some(json!({
-                "type":"attachment_shared", "schema_version":3,
-                "direction":"outgoing", "from":value["from"],
-                "operation_id":operation_id, "message_id":message_id,
-                "timestamp_ms":value["timestamp_ms"], "name":value["name"],
-                "kind":value["kind"], "size":value["size"]
+                "type":"error", "schema_version":1,
+                "code":adapter.code, "message":adapter.message,
+                "retryable":adapter.retryable, "outcome":adapter.outcome
             }))
         }
-        "error" => {
-            let error = ProtocolErrorAdapter::from_value(&value).ok()?;
-            (error.code == "internal_contract_error").then(|| {
-                json!({
-                    "type":"error", "schema_version":1,
-                    "code":error.code, "message":error.message,
-                    "retryable":error.retryable, "outcome":error.outcome
-                })
-            })
+        meshmsg_protocol::Event::PeersSnapshot(value) => Some(public_typed_peers_snapshot(&value)),
+        meshmsg_protocol::Event::PeerDiscovered(value) => {
+            Some(public_typed_peer_transition(value, "peer_discovered"))
         }
-        "peers_snapshot" => public_peers_snapshot(&value),
-        event_type @ ("peer_discovered" | "peer_updated" | "peer_expired") => {
-            public_peer_transition(&value, event_type)
+        meshmsg_protocol::Event::PeerUpdated(value) => {
+            Some(public_typed_peer_transition(value, "peer_updated"))
         }
-        "lagged" => {
-            let decoded: LaggedEventDto = serde_json::from_value(value).ok()?;
-            if decoded.kind != "lagged"
-                || decoded.schema_version != 1
-                || !contracts::valid_request_id(&decoded.request_id)
-                || !matches!(decoded.source.as_str(), "local" | "gossip")
-                || decoded.message.is_empty()
-            {
-                return None;
-            }
-            let _dropped = decoded.dropped;
-            Some(
-                json!({"type":"lagged", "message":"Feed gap: daemon dropped events. No history or replay is available."}),
-            )
+        meshmsg_protocol::Event::PeerExpired(value) => {
+            Some(public_typed_peer_transition(value, "peer_expired"))
         }
+        meshmsg_protocol::Event::Lagged { .. } => Some(json!({
+            "type":"lagged",
+            "message":"Feed gap: daemon dropped events. No history or replay is available."
+        })),
         _ => None,
     }
+}
+
+fn public_typed_peer_transition(value: meshmsg_protocol::PeerTransition, kind: &str) -> Value {
+    json!({
+        "type":kind, "schema_version":2,
+        "directory_epoch":value.directory_epoch,
+        "directory_revision":value.directory_revision,
+        "peer":value.peer
+    })
 }
 
 async fn within_startup_deadline<T>(
@@ -1888,7 +1482,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_offline", "message":"Daemon offline. Reconnecting; feed gaps have no history.", "retryable":true, "outcome":"unknown"}))).await;
             return;
         };
-        let Some(subscription_topic) = reader.expected_topic() else {
+        let Some(_subscription_topic) = reader.expected_topic() else {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon subscription has no configured topic.", "retryable":true, "outcome":"unknown"}))).await;
             return;
         };
@@ -1908,11 +1502,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
             }
         };
         let download_supported = true;
-        let Ok(first) = ipc::event_payload(first) else {
-            let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
-            return;
-        };
-        let Some(connected) = public_event(&state, subscription_topic, first, download_supported) else {
+        let Some(connected) = public_typed_event(&state, first, download_supported) else {
             let _ = tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"invalid_daemon_response", "message":"The daemon returned an invalid response.", "retryable":true, "outcome":"unknown"}))).await;
             return;
         };
@@ -1935,9 +1525,7 @@ async fn events(state: Arc<WebState>) -> Response<Body> {
                 }
             };
             let value = match value {
-                Ok(Some(frame)) => ipc::event_payload(frame)
-                    .ok()
-                    .and_then(|value| public_event(&state, subscription_topic, value, download_supported)),
+                Ok(Some(frame)) => public_typed_event(&state, frame, download_supported),
                 _ => {
                     let _ = timeout(Duration::from_secs(5), tx.send(sse_frame(&json!({"type":"error", "schema_version":1, "code":"daemon_disconnected", "message":"Daemon disconnected. Feed gap; no history. Reconnecting.", "retryable":true, "outcome":"unknown"})))).await;
                     return;
@@ -2182,12 +1770,6 @@ fn decode_upload_name(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-fn daemon_attachment_limit(status: &Value) -> Option<u64> {
-    status["max_attachment_bytes"]
-        .as_u64()
-        .filter(|limit| *limit > 0)
-}
-
 async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> Response<Body> {
     let Some(operation_id) = single_header(request.headers(), "x-meshmsg-operation-id")
         .filter(|value| ipc::valid_operation_id(value))
@@ -2247,13 +1829,22 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
             "Web attachment upload capacity reached.",
         );
     };
-    let status = match timeout(
+    let maximum = match timeout(
         IPC_TIMEOUT,
-        web_ipc_request(&state.dir, &IpcRequest::Status),
+        web_ipc_typed_request(&state.dir, &IpcRequest::Status),
     )
     .await
     {
-        Ok(Ok(status)) => status,
+        Ok(Ok(frame)) => match frame.response {
+            meshmsg_protocol::Response::Status(status) => status.max_attachment_bytes,
+            _ => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "not_shared",
+                    "The daemon returned an invalid attachment size limit.",
+                )
+            }
+        },
         _ => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2261,13 +1852,6 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
                 "Daemon offline or unresponsive. Start or restart it separately.",
             )
         }
-    };
-    let Some(maximum) = daemon_attachment_limit(&status) else {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "not_shared",
-            "The daemon returned an invalid attachment size limit.",
-        );
     };
     if declared_size.is_some_and(|size| size > maximum) {
         return error(
@@ -2399,7 +1983,7 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     let source_digest = data_encoding::HEXLOWER.encode(&digest);
     let result = timeout(
         WEB_SHARE_TIMEOUT,
-        web_ipc_request(
+        web_ipc_typed_request(
             &state.dir,
             &IpcRequest::Share {
                 operation_id: operation_id.parse().expect("validated upload operation ID"),
@@ -2413,50 +1997,49 @@ async fn upload_attachment(state: &WebState, mut request: Request<Incoming>) -> 
     // retention begins again at the latest terminal or unknown outcome.
     state.refresh_upload_operation(&operation_id, Instant::now());
     match result {
-        Ok(Ok(value)) if value["type"] == "error" => {
-            let _ = fs::remove_dir_all(&operation_root);
-            let public_error = ipc::validate_lifecycle_error_for_request(&value, &operation_id)
-                .ok()
-                .map(|error| public_lifecycle_error(error).into_value());
-            match public_error.and_then(|value| MutationErrorDto::parse(value, &operation_id)) {
-                Some(error) => mutation_error_response(error),
-                None => mutation_error_response(local_mutation_error(
-                    &operation_id,
-                    "invalid_daemon_response",
-                    "Daemon returned an invalid share error; outcome unknown.",
-                    true,
-                    "unknown",
-                )),
+        Ok(Ok(frame)) => match frame.response {
+            meshmsg_protocol::Response::Error(error) => {
+                let _ = fs::remove_dir_all(&operation_root);
+                MutationErrorDto::from_typed(frame.request_id, error)
+                    .map(mutation_error_response)
+                    .unwrap_or_else(|| {
+                        mutation_error_response(local_mutation_error(
+                            &operation_id,
+                            "invalid_daemon_response",
+                            "Daemon returned an invalid share error; outcome unknown.",
+                            true,
+                            "unknown",
+                        ))
+                    })
             }
-        }
-        Ok(Ok(value)) => {
-            let valid =
-                SharedMutationDto::parse(value, &operation_id, &source_digest, &name, received);
-            match valid {
-                Some(shared) => {
-                    let _ = fs::remove_dir_all(&operation_root);
-                    json_response(
-                        StatusCode::OK,
-                        json!({
-                            "type":"attachment_shared", "schema_version":3,
-                            "operation_id":shared.operation_id,
-                            "message_id":shared.message_id,
-                            "offer_id":shared.offer_id,
-                            "source_digest":shared.source_digest,
-                            "name":shared.name, "size":shared.size,
-                            "delivery_acknowledged":false
-                        }),
-                    )
-                }
-                None => mutation_error_response(local_mutation_error(
-                    &operation_id,
-                    "invalid_daemon_response",
-                    "Daemon returned an invalid share response; outcome unknown.",
-                    true,
-                    "unknown",
-                )),
+            meshmsg_protocol::Response::AttachmentShared(shared)
+                if shared.operation_id.as_str() == operation_id
+                    && shared.source_digest.as_str() == source_digest
+                    && shared.name.as_str() == name
+                    && shared.size == received =>
+            {
+                let _ = fs::remove_dir_all(&operation_root);
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "type":"attachment_shared", "schema_version":3,
+                        "operation_id":shared.operation_id,
+                        "message_id":shared.message_id,
+                        "offer_id":shared.offer_id,
+                        "source_digest":shared.source_digest,
+                        "name":shared.name, "size":shared.size,
+                        "delivery_acknowledged":false
+                    }),
+                )
             }
-        }
+            _ => mutation_error_response(local_mutation_error(
+                &operation_id,
+                "invalid_daemon_response",
+                "Daemon returned an invalid share response; outcome unknown.",
+                true,
+                "unknown",
+            )),
+        },
         Ok(Err(_)) | Err(_) => {
             // The daemon may still have opened the source or published its offer.
             // Retain the isolated staging directory for stale-startup cleanup.
@@ -2676,11 +2259,6 @@ mod tests {
             "request":value
         }))
         .unwrap()
-    }
-
-    fn ipc_event(mut value: Value) -> Value {
-        value["request_id"] = "11111111111111111111111111111111".into();
-        value
     }
 
     fn headers(host: &str, origin: Option<&str>) -> HeaderMap {
@@ -3421,6 +2999,7 @@ mod tests {
 
         let output = PathBuf::from("/tmp/expected.blob");
         let complete = json!({
+            "protocol_version":2,
             "type":"download_complete", "schema_version":2,
             "request_id":"11111111111111111111111111111111",
             "operation_id":"33333333333333333333333333333333",
@@ -3428,23 +3007,34 @@ mod tests {
             "offer_id":"22222222222222222222222222222222",
             "kind":"file", "name":"safe.txt", "size":4,
             "from":"0000000000000000000000000000000000000000000000000000000000000000",
-            "output":output.clone(), "installed":true, "pinned":true,
+            "output":output.clone(), "mode":"raw", "installed":true, "pinned":true,
             "destination_synced":true, "cleanup_complete":true, "warnings":[]
         });
         let expected = ipc::DownloadRequestContext {
-            operation_id: "33333333333333333333333333333333".into(),
-            token_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            offer_id: "22222222222222222222222222222222".into(),
-            provider: "0".repeat(64),
-            kind: "file".into(),
-            name: "safe.txt".into(),
+            operation_id: "33333333333333333333333333333333".parse().unwrap(),
+            token_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap(),
+            offer_id: "22222222222222222222222222222222".parse().unwrap(),
+            provider: "0".repeat(64).parse().unwrap(),
+            kind: meshmsg_protocol::AttachmentKind::File,
+            name: meshmsg_protocol::AttachmentName::new("safe.txt").unwrap(),
             declared_size: Some(4),
             output: output.clone(),
+            mode: meshmsg_protocol::DownloadMode::Raw,
         };
-        assert!(compatible_download_complete(&complete, &expected));
+        let compatible = |value: Value| {
+            serde_json::from_value::<meshmsg_protocol::ResponseFrame>(value)
+                .ok()
+                .and_then(|frame| match frame.response {
+                    meshmsg_protocol::Response::DownloadComplete(value) => Some(value),
+                    _ => None,
+                })
+                .is_some_and(|value| value.validate_for_request(&expected).is_ok())
+        };
+        assert!(compatible(complete.clone()));
         for mutation in [
             ("schema_version", json!(1)),
-            ("request_id", json!("bad")),
             ("operation_id", json!("44444444444444444444444444444444")),
             ("token_digest", json!("b".repeat(64))),
             ("offer_id", json!("44444444444444444444444444444444")),
@@ -3459,11 +3049,11 @@ mod tests {
         ] {
             let mut malformed = complete.clone();
             malformed[mutation.0] = mutation.1;
-            assert!(!compatible_download_complete(&malformed, &expected));
+            assert!(!compatible(malformed));
         }
         let mut unknown = complete.clone();
         unknown["extra"] = true.into();
-        assert!(!compatible_download_complete(&unknown, &expected));
+        assert!(!compatible(unknown));
     }
 
     #[test]
@@ -3488,7 +3078,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_names_and_attachment_limit_are_strict() {
+    fn upload_names_are_strict() {
         assert_eq!(
             decode_upload_name("r%C3%A9sum%C3%A9.txt").as_deref(),
             Some("résumé.txt")
@@ -3496,54 +3086,32 @@ mod tests {
         for invalid in ["%", "%zz", "%ff"] {
             assert!(decode_upload_name(invalid).is_none(), "{invalid}");
         }
-        assert_eq!(
-            daemon_attachment_limit(&json!({"max_attachment_bytes":123})),
-            Some(123)
-        );
-        for status in [
-            json!({}),
-            json!({"max_attachment_bytes":0}),
-            json!({"max_attachment_bytes":"123"}),
-        ] {
-            assert_eq!(daemon_attachment_limit(&status), None);
-        }
     }
 
     #[test]
-    fn upload_success_metadata_must_match_the_staged_file() {
-        let id = "0123456789abcdef0123456789abcdef";
-        let digest = "01".repeat(32);
-        let signer = iroh::SecretKey::generate();
-        let mut valid = crate::attachment::protocol::signed_attachment_event_for_test(
-            &signer,
-            id,
-            AttachmentKind::File,
-            "report.txt",
-            7,
-            1,
-        );
-        valid["type"] = "attachment_shared".into();
-        valid["schema_version"] = 3.into();
-        valid["request_id"] = "11111111111111111111111111111111".into();
-        valid["operation_id"] = id.into();
-        valid["source_digest"] = digest.clone().into();
-        valid["delivery_acknowledged"] = false.into();
-        assert!(SharedMutationDto::parse(valid.clone(), id, &digest, "report.txt", 7).is_some());
-        for (field, replacement) in [
-            ("operation_id", json!("fedcba9876543210fedcba9876543210")),
-            ("message_id", json!("fedcba9876543210fedcba9876543210")),
-            ("offer_id", json!("fedcba9876543210fedcba9876543210")),
-            ("source_digest", json!("02".repeat(32))),
-            ("name", json!("other.txt")),
-            ("size", json!(8)),
-        ] {
-            let mut mismatch = valid.clone();
-            mismatch[field] = replacement;
-            assert!(SharedMutationDto::parse(mismatch, id, &digest, "report.txt", 7).is_none());
-        }
-        let mut extra = valid;
-        extra["extra"] = true.into();
-        assert!(SharedMutationDto::parse(extra, id, &digest, "report.txt", 7).is_none());
+    fn typed_upload_success_adapter_uses_canonical_shared_response() {
+        let id: meshmsg_protocol::OperationId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let digest: meshmsg_protocol::ContentDigest = "01".repeat(32).parse().unwrap();
+        let shared = meshmsg_protocol::AttachmentShared {
+            operation_id: id.clone(),
+            from: "2".repeat(64).parse().unwrap(),
+            message_id: id.to_string().parse().unwrap(),
+            timestamp_ms: 1,
+            offer_id: id.to_string().parse().unwrap(),
+            source_digest: digest.clone(),
+            kind: meshmsg_protocol::AttachmentKind::File,
+            name: meshmsg_protocol::AttachmentName::new("report.txt").unwrap(),
+            size: 7,
+            ticket: meshmsg_protocol::AttachmentToken::new("ticket").unwrap(),
+            offer: meshmsg_protocol::AttachmentToken::new("eA").unwrap(),
+            delivery_acknowledged: false,
+        };
+        let response = meshmsg_protocol::Response::AttachmentShared(shared.clone());
+        assert!(response.validate().is_ok());
+        assert_eq!(shared.operation_id, id);
+        assert_eq!(shared.source_digest, digest);
+        assert_eq!(shared.name.as_str(), "report.txt");
+        assert_eq!(shared.size, 7);
     }
 
     #[test]
@@ -3579,255 +3147,44 @@ mod tests {
     }
 
     #[test]
-    fn only_safe_live_metadata_is_exposed_and_sse_newlines_are_escaped() {
+    fn active_typed_event_adapter_exposes_only_public_fields() {
         let state = state();
-        let public_event = |value| public_event(&state, TopicId::from_bytes([7; 32]), value, true);
-        assert!(public_event(json!({"type":"download_progress", "path":"secret"})).is_none());
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let incoming_signer = iroh::SecretKey::generate();
-        let incoming_peer = incoming_signer.public().to_string();
-        let incoming = public_event(ipc_event(
-            crate::attachment::protocol::signed_attachment_event_for_test(
-                &incoming_signer,
-                "01010101010101010101010101010101",
-                AttachmentKind::File,
-                "report.pdf",
-                1234,
-                now_ms,
-            ),
-        ))
-        .unwrap();
-        assert!(valid_id(incoming["download_id"].as_str().unwrap()));
-        let legacy = super::public_event(
-            &state,
-            TopicId::from_bytes([7; 32]),
-            json!({
-                "type":"attachment_offer", "schema_version":1,
-                "from":"peer", "timestamp_ms":42,
-                "name":"legacy.txt", "kind":"file", "size":1, "offer":"secret"
+        let request_id = meshmsg_protocol::RequestId::new_random();
+        let peer: meshmsg_protocol::PeerId = "2".repeat(64).parse().unwrap();
+        let message_id: meshmsg_protocol::MessageId = "3".repeat(32).parse().unwrap();
+        let message = meshmsg_protocol::EventFrame::new(
+            request_id.clone(),
+            meshmsg_protocol::Event::Message(meshmsg_protocol::Message {
+                from: peer.clone(),
+                message_id: message_id.clone(),
+                timestamp_ms: 1,
+                body: meshmsg_protocol::MessageBody::new("safe text").unwrap(),
             }),
-            false,
         );
-        assert!(legacy.is_none());
-        let mut expected_incoming = incoming.clone();
-        expected_incoming
-            .as_object_mut()
-            .unwrap()
-            .remove("download_id");
-        assert_eq!(
-            expected_incoming,
-            json!({
-                "type":"attachment_offer", "schema_version":2,
-                "direction":"incoming", "from":incoming_peer,
-                "message_id":"01010101010101010101010101010101",
-                "timestamp_ms":now_ms, "name":"report.pdf", "kind":"file", "size":1234
-            })
-        );
-        let outgoing_signer = iroh::SecretKey::generate();
-        let outgoing_peer = outgoing_signer.public().to_string();
-        let mut outgoing_event = crate::attachment::protocol::signed_attachment_event_for_test(
-            &outgoing_signer,
-            "02020202020202020202020202020202",
-            AttachmentKind::DirectoryTarV1,
-            "folder.tar",
-            5678,
-            now_ms,
-        );
-        outgoing_event["type"] = "attachment_shared".into();
-        outgoing_event["schema_version"] = 3.into();
-        outgoing_event["operation_id"] = "02020202020202020202020202020202".into();
-        outgoing_event["source_digest"] = "02".repeat(32).into();
-        outgoing_event["delivery_acknowledged"] = false.into();
-        let outgoing = public_event(ipc_event(outgoing_event)).unwrap();
-        assert_eq!(
-            outgoing,
-            json!({
-                "type":"attachment_shared", "schema_version":3,
-                "direction":"outgoing", "from":outgoing_peer,
-                "operation_id":"02020202020202020202020202020202",
-                "message_id":"02020202020202020202020202020202",
-                "timestamp_ms":now_ms, "name":"folder.tar", "kind":"directory_tar_v1", "size":5678
-            })
-        );
-        assert!(!incoming.to_string().contains("secret"));
-        assert!(!outgoing.to_string().contains("secret"));
-        let remembered_before = state.offers.lock().unwrap().len();
-        let mut malformed_offer = crate::attachment::protocol::signed_attachment_event_for_test(
-            &incoming_signer,
-            "03030303030303030303030303030303",
-            AttachmentKind::File,
-            "safe.txt",
-            4,
-            now_ms,
-        );
-        malformed_offer["offer_id"] = "0303030303030303030303030303030A".into();
-        assert!(public_event(ipc_event(malformed_offer)).is_none());
-        let cross_topic = crate::attachment::protocol::signed_attachment_event_for_topic_for_test(
-            &incoming_signer,
-            TopicId::from_bytes([8; 32]),
-            "04040404040404040404040404040404",
-            AttachmentKind::File,
-            "safe.txt",
-            4,
-            now_ms,
-        );
-        assert!(public_event(ipc_event(cross_topic)).is_none());
-        let stale = crate::attachment::protocol::signed_attachment_event_for_test(
-            &incoming_signer,
-            "05050505050505050505050505050505",
-            AttachmentKind::File,
-            "safe.txt",
-            4,
-            now_ms - crate::attachment::protocol::ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 - 1,
-        );
-        assert!(public_event(ipc_event(stale)).is_none());
-        assert_eq!(state.offers.lock().unwrap().len(), remembered_before);
-        assert!(public_event(json!({
-            "type":"private_message", "from":"peer", "body":"dm-secret",
-            "private":true, "timestamp_ms":44
-        }))
-        .is_none());
-        assert!(public_event(json!({
-            "type":"private_accepted", "to":"peer", "body":"dm-secret"
-        }))
-        .is_none());
-        assert!(public_event(json!({
-            "type":"peer_up", "peer":{"endpoint":"private-route", "body":"secret"}
-        }))
-        .is_none());
-        assert!(public_event(json!({
-            "type":"connected", "peer":{"endpoint":"private-route", "body":"secret"}
-        }))
-        .is_none());
-        let connected_source = ipc_event(json!({
-            "type":"connected", "schema_version":1, "peer":iroh::SecretKey::generate().public().to_string(),
-            "endpoint_online":true, "topic_joined":true, "alias":null
-        }));
-        let connected = public_event(connected_source.clone()).unwrap();
-        assert!(connected["download_supported"].as_bool().unwrap());
-        let mut offline_handshake = connected_source;
-        offline_handshake["endpoint_online"] = false.into();
-        assert!(public_event(offline_handshake).is_none());
-        for low_level_neighbor_event in [
-            json!({"type":"peer_up", "peer":"2su5Z4MwjA5XsXQFa4c8sEqi2zS6SLLXv4k7Fv9VwK8"}),
-            json!({"type":"peer_down", "peer":"10.0.0.1:443"}),
-            json!({"type":"peer_up", "peer":[{"endpoint":"private-route"}]}),
-        ] {
-            assert!(public_event(low_level_neighbor_event).is_none());
-        }
-        let malformed_status = public_status(&json!({
-            "type":"status", "peer":{"endpoint":"private-route", "body":"secret"},
-            "running":{"body":"secret"}, "neighbors":[{"address":"private"}],
-            "endpoint_online":true, "topic_joined":false
-        }));
-        assert_eq!(
-            malformed_status,
-            json!({"type":"status", "endpoint_online":true, "topic_joined":false})
-        );
-        assert!(!malformed_status.to_string().contains("private"));
-        assert!(!malformed_status.to_string().contains("body"));
-        let value = public_event(ipc_event(json!({
-            "type":"message", "schema_version":2,
-            "message_id":"03030303030303030303030303030303",
-            "body":"<script>\ndata: injected\n", "from":"peer", "timestamp_ms":41
-        })))
-        .unwrap();
-        let frame = String::from_utf8(sse_frame(&value).to_vec()).unwrap();
-        assert_eq!(frame.lines().count(), 2);
-        assert!(!frame.contains("secret"));
-        let queued = public_event(ipc_event(json!({
-            "type":"queued", "schema_version":3,
-            "operation_id":"04040404040404040404040404040404",
-            "message_id":"04040404040404040404040404040404",
-            "from":"local", "body":"hello", "timestamp_ms":42,
-            "delivery_acknowledged":false
-        })))
-        .unwrap();
-        assert_eq!(
-            queued,
-            json!({
-                "type":"queued", "schema_version":3,
-                "operation_id":"04040404040404040404040404040404",
-                "message_id":"04040404040404040404040404040404",
-                "from":"local", "body":"hello", "timestamp_ms":42,
-                "delivery_acknowledged":false
-            })
-        );
-        let status = public_status(
-            &json!({"type":"status", "peer":"peer", "socket":"private", "invite":"secret"}),
-        );
-        assert!(status.get("socket").is_none());
-        assert!(status.get("invite").is_none());
-        let status = public_status(&json!({
-            "type":"status", "attachment_retention_secs":60,
-            "attachment_storage":{
-                "tagged_bytes":10, "tagged_blobs":1, "tags":2, "tag_capacity":8192,
-                "quota_bytes":100, "available_bytes":1000, "min_free_bytes":20,
-                "sampled_at_ms":1, "pressure":false, "over_quota":false, "below_min_free":false,
-                "path":"private"
-            }
-        }));
-        assert_eq!(status["attachment_retention_secs"], 60);
-        assert_eq!(status["attachment_storage"]["tagged_bytes"], 10);
-        assert!(status["attachment_storage"].get("path").is_none());
-        let malformed = public_status(&json!({
-            "type":"status", "attachment_storage":{"tagged_bytes":10}
-        }));
-        assert!(malformed.get("attachment_storage").is_none());
+        let public = public_typed_event(&state, message, true).unwrap();
+        assert_eq!(public["type"], "message");
+        assert_eq!(public["from"], peer.to_string());
+        assert_eq!(public["message_id"], message_id.to_string());
+        assert_eq!(public["body"], "safe text");
+        assert!(public.get("offer").is_none());
+        assert!(public.get("ticket").is_none());
 
-        let self_key = iroh::SecretKey::generate().public().to_string();
-        let remote_key = iroh::SecretKey::generate().public().to_string();
-        let injected = ipc_event(json!({
-            "type":"peers_snapshot", "schema_version":2, "generated_at_ms":1_000,
-            "directory_epoch":"0123456789abcdef0123456789abcdef", "directory_revision":0,
-            "self":{"public_key":self_key, "alias":"local", "online":true},
-            "peers":[{
-                "public_key":remote_key, "alias":null, "online":true,
-                "last_seen_ms":900, "expires_at_ms":1_100
-            }]
-        }));
-        let sanitized = public_peers_snapshot(&injected).unwrap();
-        assert_eq!(sanitized["type"], "peers_snapshot");
-        assert_eq!(sanitized["self"]["public_key"], self_key);
-        assert_eq!(sanitized["peers"][0]["public_key"], remote_key);
-        for forbidden in [
-            "endpoint",
-            "address",
-            "socket",
-            "invite",
-            "capabilities",
-            "body",
-            "secret",
-            "route",
-        ] {
-            assert!(
-                !sanitized.to_string().contains(forbidden),
-                "leaked {forbidden}"
-            );
-        }
-        let transition = public_event(ipc_event(json!({
-            "type":"peer_updated", "schema_version":2,
-            "directory_epoch":"0123456789abcdef0123456789abcdef", "directory_revision":1,
-            "peer":{
-                "public_key":remote_key, "alias":"renamed", "online":true,
-                "last_seen_ms":1_000, "expires_at_ms":151_000
-            }
-        })))
-        .unwrap();
-        assert_eq!(transition["type"], "peer_updated");
-        assert!(transition["peer"].get("endpoint").is_none());
-        assert!(transition["peer"].get("body").is_none());
-        assert!(public_event(json!({
-            "type":"peer_discovered", "schema_version":1,
-            "peer":{
-                "public_key":remote_key, "alias":"UPPER", "online":true,
-                "last_seen_ms":1_000, "expires_at_ms":1_100
-            }
-        }))
-        .is_none());
+        let private = meshmsg_protocol::EventFrame::new(
+            request_id,
+            meshmsg_protocol::Event::PrivateMessage(meshmsg_protocol::PrivateMessage {
+                private: true,
+                from: peer,
+                message_id,
+                timestamp_ms: 1,
+                body: meshmsg_protocol::MessageBody::new("private").unwrap(),
+                acceptance_acknowledged: true,
+                durable: false,
+                read: false,
+            }),
+        );
+        assert!(public_typed_event(&state, private, true).is_none());
+        let frame = sse_frame(&public);
+        assert!(!std::str::from_utf8(&frame).unwrap().contains("request_id"));
     }
 
     #[test]

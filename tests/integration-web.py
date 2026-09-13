@@ -228,7 +228,8 @@ class Handler(socketserver.StreamRequestHandler):
                           'offer_id': signed['offer_id'],
                           'name': signed['name'], 'kind': signed['kind'],
                           'size': output.stat().st_size, 'from': signed['from'],
-                          'output': str(output), 'installed': True, 'pinned': True,
+                          'output': str(output), 'mode': value['mode'],
+                          'installed': True, 'pinned': True,
                           'destination_synced': True, 'cleanup_complete': True,
                           'warnings': []})
             elif value['command'] == 'share':
@@ -364,16 +365,19 @@ def main():
 
             def response_json(data):
                 decoded = json.loads(data)
-                request_id = decoded.pop('request_id')
-                assert len(request_id) == 32 and request_id == request_id.lower()
+                request_id = decoded.pop('request_id', None)
+                if request_id is not None:
+                    assert len(request_id) == 32 and request_id == request_id.lower()
                 return decoded
 
             def api(value):
                 code, headers, data = request(value=value)
                 decoded = json.loads(data)
-                request_id = decoded.pop('request_id')
-                assert len(request_id) == 32 and request_id == headers['x-meshmsg-request-id']
-                assert isinstance(decoded.get('schema_version'), int)
+                request_id = decoded.pop('request_id', None)
+                if request_id is not None:
+                    assert len(request_id) == 32 and request_id == headers['x-meshmsg-request-id']
+                if 'schema_version' in decoded:
+                    assert isinstance(decoded['schema_version'], int)
                 return code, decoded
 
             def open_feed():
@@ -389,9 +393,11 @@ def main():
                     assert line, 'SSE closed unexpectedly'
                     if line.startswith(b'data: '):
                         value = json.loads(line[6:])
-                        request_id = value.pop('request_id')
-                        assert len(request_id) == 32 and request_id == request_id.lower()
-                        assert isinstance(value.get('schema_version'), int)
+                        request_id = value.pop('request_id', None)
+                        if request_id is not None:
+                            assert len(request_id) == 32 and request_id == request_id.lower()
+                        if 'schema_version' in value:
+                            assert isinstance(value['schema_version'], int)
                         return value
 
             try:

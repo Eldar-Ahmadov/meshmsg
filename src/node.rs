@@ -14,7 +14,7 @@ use crate::{
     invite::Invite,
     ipc::{
         read_frame, send_request_checked, subscribe, IpcRequest, IpcRequestFrame,
-        LifecycleRequestContext, LifecycleSuccessV3, MAX_IPC_REQUEST_SIZE,
+        MAX_IPC_REQUEST_SIZE,
     },
     peers as peer_api,
     presence::{self, Directory, PresenceSourceLimiter},
@@ -2445,7 +2445,7 @@ pub async fn share(
         tokio::task::spawn_blocking(move || attachment::share_source_digest(&digest_path, maximum))
             .await
             .context("attachment digest task failed")??;
-    let value = send_lifecycle_request(
+    let frame = send_lifecycle_request(
         dir,
         &IpcRequest::Share {
             operation_id: operation_id.parse()?,
@@ -2458,14 +2458,15 @@ pub async fn share(
     )
     .await
     .with_context(|| format!("operation {operation_id}"))?;
+    let meshmsg_protocol::Response::AttachmentShared(shared) = &frame.response else {
+        unreachable!("checked attachment-shared family")
+    };
     anyhow::ensure!(
-        value["operation_id"].as_str() == Some(&operation_id)
-            && value["message_id"].as_str() == Some(&operation_id)
-            && value["offer_id"].as_str() == Some(&operation_id)
-            && value["source_digest"].as_str() == Some(&source_digest),
+        shared.operation_id.to_string() == operation_id
+            && shared.source_digest.to_string() == source_digest,
         "daemon returned mismatched share operation metadata"
     );
-    event(json, value);
+    event(json, crate::ipc::response_payload(frame)?);
     Ok(())
 }
 
@@ -2494,7 +2495,7 @@ async fn send_lifecycle_request(
     expected_type: &str,
     expected_schema_version: u64,
     expected_operation_id: &str,
-) -> Result<serde_json::Value> {
+) -> Result<meshmsg_protocol::ResponseFrame> {
     let frame = crate::ipc::send_request_checked(
         dir,
         request,
@@ -2513,7 +2514,7 @@ async fn send_lifecycle_request(
         actual_operation_id.to_string() == expected_operation_id,
         "daemon response operation ID does not match the request"
     );
-    crate::ipc::response_payload(frame)
+    Ok(frame)
 }
 
 pub async fn offers_remove(
@@ -2525,14 +2526,7 @@ pub async fn offers_remove(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(crate::ipc::new_operation_id);
-    let lifecycle_context = LifecycleRequestContext::Remove {
-        operation_id: &operation_id,
-        offer_id,
-        direction,
-        provider,
-        maximum: MAX_PRUNE_TAGS,
-    };
-    let value = send_lifecycle_request(
+    let frame = send_lifecycle_request(
         dir,
         &IpcRequest::OffersRemove {
             operation_id: operation_id.parse()?,
@@ -2545,8 +2539,22 @@ pub async fn offers_remove(
         &operation_id,
     )
     .await?;
-    LifecycleSuccessV3::from_value_for_request(&value, &lifecycle_context)?;
-    event(json, value);
+    let meshmsg_protocol::Response::OfferRemoved(result) = &frame.response else {
+        unreachable!("checked lifecycle family")
+    };
+    anyhow::ensure!(
+        result.offer_id.as_ref().map(ToString::to_string).as_deref() == Some(offer_id)
+            && result
+                .direction
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                == direction
+            && result.provider.as_ref().map(ToString::to_string).as_deref() == provider
+            && result.maximum == MAX_PRUNE_TAGS,
+        "lifecycle response does not match its request"
+    );
+    event(json, crate::ipc::response_payload(frame)?);
     Ok(())
 }
 
@@ -2566,15 +2574,7 @@ pub async fn offers_prune(
         _ => unreachable!("checked response family"),
     };
     let effective_age = older_than_secs.unwrap_or(retention);
-    let lifecycle_context = LifecycleRequestContext::Prune {
-        operation_id: &operation_id,
-        older_than_secs: effective_age,
-        cutoff_ms: None,
-        direction,
-        dry_run,
-        maximum: max_delete,
-    };
-    let value = send_lifecycle_request(
+    let frame = send_lifecycle_request(
         dir,
         &IpcRequest::OffersPrune {
             operation_id: operation_id.parse()?,
@@ -2588,8 +2588,22 @@ pub async fn offers_prune(
         &operation_id,
     )
     .await?;
-    LifecycleSuccessV3::from_value_for_request(&value, &lifecycle_context)?;
-    event(json, value);
+    let meshmsg_protocol::Response::OffersPruned(result) = &frame.response else {
+        unreachable!("checked lifecycle family")
+    };
+    anyhow::ensure!(
+        result.older_than_secs == Some(effective_age)
+            && result
+                .direction
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                == direction
+            && result.dry_run == dry_run
+            && result.maximum == max_delete,
+        "lifecycle response does not match its request"
+    );
+    event(json, crate::ipc::response_payload(frame)?);
     Ok(())
 }
 
@@ -2621,7 +2635,7 @@ pub async fn download(
         TopicId::from_bytes(topic_bytes),
     )
     .context("validate submitted attachment offer")?;
-    let value = send_lifecycle_request(
+    let frame = send_lifecycle_request(
         dir,
         &IpcRequest::Download {
             operation_id: operation_id.parse()?,
@@ -2634,8 +2648,13 @@ pub async fn download(
         &operation_id,
     )
     .await?;
-    crate::ipc::DownloadCompleteV2::validate_for_request(&value, &expected)?;
-    event(json, value);
+    let meshmsg_protocol::Response::DownloadComplete(result) = &frame.response else {
+        unreachable!("checked download family")
+    };
+    result
+        .validate_for_request(&expected)
+        .map_err(anyhow::Error::msg)?;
+    event(json, crate::ipc::response_payload(frame)?);
     Ok(())
 }
 
@@ -2747,15 +2766,14 @@ pub async fn doctor(dir: &Path, json: bool) -> Result<()> {
     let (has_invite, bootstrap_peer_count, self_advertised) =
         invite_details(&state, secret.public())?;
     let value = serde_json::json!({
-        "type":"doctor", "ok":true, "peer":secret.public().to_string(), "topic":state.topic,
+        "type":"doctor", "request_id":contracts::new_request_id(),
+        "ok":true, "peer":secret.public().to_string(), "topic":state.topic,
         "advertises_self":state.advertise_self, "has_invite":has_invite,
         "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
         "alias":alias_config.effective(), "alias_enabled":alias_config.enabled(),
         "captured_hostname":alias_config.hostname(), "custom_alias":alias_config.custom()
     });
     if json {
-        let mut value = value;
-        value["request_id"] = contracts::new_request_id().into();
         println!("{value}");
     } else {
         println!("ok: state, identity, topic, and invite are valid");
@@ -2792,9 +2810,6 @@ fn offer_listing_warnings(value: &serde_json::Value) -> Vec<String> {
 
 fn event(json: bool, mut value: serde_json::Value) {
     if json {
-        if value.get("schema_version").is_none() {
-            value["schema_version"] = contracts::SCHEMA_VERSION.into();
-        }
         if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
             if let Ok(error) = ProtocolErrorAdapter::from_value(&value) {
                 value = contracts::present_error(
@@ -3482,13 +3497,13 @@ mod tests {
             test_topic(),
         )
         .unwrap();
-        assert_eq!(context.offer_id, offer.offer_id);
-        assert_eq!(context.provider, secret.public().to_string());
-        assert_eq!(context.kind, "file");
-        assert_eq!(context.name, "report.txt");
+        assert_eq!(context.offer_id.to_string(), offer.offer_id);
+        assert_eq!(context.provider.to_string(), secret.public().to_string());
+        assert_eq!(context.kind, meshmsg_protocol::AttachmentKind::File);
+        assert_eq!(context.name.as_str(), "report.txt");
         assert_eq!(context.declared_size, Some(6));
         assert_eq!(
-            context.token_digest,
+            context.token_digest.to_string(),
             crate::ipc::download_token_digest(&token)
         );
         validate_attachment_event(

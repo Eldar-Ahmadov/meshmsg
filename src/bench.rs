@@ -523,76 +523,82 @@ impl ReceiveStats {
             malformed: 0,
         })
     }
-    fn record(&mut self, value: &Value) {
-        match value["type"].as_str() {
-            Some("message" | "private_message") => {
-                let Some(body) = value["body"].as_str() else {
-                    self.ignored += 1;
-                    return;
-                };
-                let frame = match parse_body(body) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => {
-                        self.ignored += 1;
-                        return;
-                    }
-                    Err(_) => {
-                        if body.contains(&self.run_id) {
-                            self.malformed += 1
-                        } else {
-                            self.ignored += 1
-                        };
-                        return;
-                    }
-                };
-                if frame.run_id != self.run_id {
-                    self.ignored += 1;
-                    return;
-                }
-                if self.expected.is_none() {
-                    self.expected = Some(frame.total);
-                    self.seen = vec![0; frame.total.div_ceil(8) as usize];
-                }
-                if self.expected != Some(frame.total) {
-                    self.malformed += 1;
-                    return;
-                }
-                let byte = (frame.sequence / 8) as usize;
-                let mask = 1 << (frame.sequence % 8);
-                if self.seen[byte] & mask != 0 {
-                    self.duplicates += 1;
-                    return;
-                }
-                self.seen[byte] |= mask;
-                if self.highest.is_some_and(|v| frame.sequence < v) {
-                    self.out_of_order += 1;
-                }
-                self.highest = Some(
-                    self.highest
-                        .map_or(frame.sequence, |v| v.max(frame.sequence)),
-                );
-                self.unique += 1;
-                self.body_bytes = self.body_bytes.saturating_add(body.len() as u64);
-                match unix_timestamp_ms().checked_sub(frame.timestamp_ms) {
-                    Some(latency) if latency <= MAX_LATENCY_MS => {
-                        self.observations += 1;
-                        if self.latencies.len() < MAX_LATENCY_SAMPLES {
-                            self.latencies.push(latency)
-                        } else {
-                            self.sampled = true;
-                        }
-                    }
-                    _ => self.clock_invalid += 1,
-                }
-            }
-            Some("lagged") if value["source"] == "local" => {
+    fn record(&mut self, event: &meshmsg_protocol::Event) {
+        match event {
+            meshmsg_protocol::Event::Message(value) => self.record_body(value.body.as_str()),
+            meshmsg_protocol::Event::PrivateMessage(value) => self.record_body(value.body.as_str()),
+            meshmsg_protocol::Event::Lagged {
+                source: meshmsg_protocol::EventSource::Local,
+                dropped,
+                ..
+            } => {
                 self.local_lag += 1;
-                self.local_dropped += value["dropped"].as_u64().unwrap_or(0);
+                self.local_dropped += dropped;
             }
-            Some("lagged") if value["source"] == "gossip" => self.gossip_lag += 1,
-            Some("peer_up") => self.peer_up += 1,
-            Some("peer_down") => self.peer_down += 1,
+            meshmsg_protocol::Event::Lagged {
+                source: meshmsg_protocol::EventSource::Gossip,
+                ..
+            } => self.gossip_lag += 1,
+            meshmsg_protocol::Event::PeerUp { .. } => self.peer_up += 1,
+            meshmsg_protocol::Event::PeerDown { .. } => self.peer_down += 1,
             _ => {}
+        }
+    }
+
+    fn record_body(&mut self, body: &str) {
+        let frame = match parse_body(body) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                self.ignored += 1;
+                return;
+            }
+            Err(_) => {
+                if body.contains(&self.run_id) {
+                    self.malformed += 1
+                } else {
+                    self.ignored += 1
+                };
+                return;
+            }
+        };
+        if frame.run_id != self.run_id {
+            self.ignored += 1;
+            return;
+        }
+        if self.expected.is_none() {
+            self.expected = Some(frame.total);
+            self.seen = vec![0; frame.total.div_ceil(8) as usize];
+        }
+        if self.expected != Some(frame.total) {
+            self.malformed += 1;
+            return;
+        }
+        let byte = (frame.sequence / 8) as usize;
+        let mask = 1 << (frame.sequence % 8);
+        if self.seen[byte] & mask != 0 {
+            self.duplicates += 1;
+            return;
+        }
+        self.seen[byte] |= mask;
+        if self.highest.is_some_and(|v| frame.sequence < v) {
+            self.out_of_order += 1;
+        }
+        self.highest = Some(
+            self.highest
+                .map_or(frame.sequence, |v| v.max(frame.sequence)),
+        );
+        self.unique += 1;
+        self.body_bytes = self.body_bytes.saturating_add(body.len() as u64);
+        match unix_timestamp_ms().checked_sub(frame.timestamp_ms) {
+            Some(latency) if latency <= MAX_LATENCY_MS => {
+                self.observations += 1;
+                if self.latencies.len() < MAX_LATENCY_SAMPLES {
+                    self.latencies.push(latency)
+                } else {
+                    self.sampled = true;
+                }
+            }
+            _ => self.clock_invalid += 1,
         }
     }
     fn percentile(sorted: &[u64], p: usize) -> Option<u64> {
@@ -675,7 +681,7 @@ async fn receive_events(
     loop {
         tokio::select! {
             value = reader.read() => match value? {
-                Some(frame) => stats.record(&ipc::event_payload(frame)?),
+                Some(frame) => stats.record(&frame.event),
                 None => { reason = "daemon_stopped"; break; }
             },
             _ = &mut deadline => break,

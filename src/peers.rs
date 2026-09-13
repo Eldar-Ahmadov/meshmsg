@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
 /// locally derived and never extends beyond this bound.
-pub(crate) const PEER_LEASE_MS: u64 = 150_000;
+pub(crate) const PEER_LEASE_MS: u64 = meshmsg_protocol::PEER_LEASE_MS;
 pub(crate) const PEER_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
-pub(crate) const MAX_DYNAMIC_IDENTITIES: usize = 1024;
+pub(crate) const MAX_DYNAMIC_IDENTITIES: usize = meshmsg_protocol::MAX_PEERS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,7 +110,7 @@ mod tests {
             alias: alias.map(str::to_owned),
             online: true,
             last_seen_ms: 100,
-            expires_at_ms: 200,
+            expires_at_ms: 1_100,
         }
     }
 

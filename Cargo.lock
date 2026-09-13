@@ -2309,8 +2309,13 @@ name = "meshmsg-protocol"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "iroh",
+ "iroh-blobs",
+ "iroh-gossip",
+ "postcard",
  "rand",
  "serde",
+ "serde-byte-array",
  "serde_json",
  "tokio",
 ]

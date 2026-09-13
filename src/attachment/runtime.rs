@@ -3,9 +3,7 @@ use crate::attachment;
 use crate::{
     contracts,
     ids::id_string,
-    ipc::{
-        LifecycleRequestContext, LifecycleSuccessV3, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED,
-    },
+    ipc::{LifecycleRequestContext, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED},
 };
 use anyhow::{Context, Result};
 use data_encoding::BASE64URL_NOPAD;
@@ -34,7 +32,7 @@ use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 pub(crate) const MAX_ATTACHMENT_TAG_SCAN: usize = MAX_ATTACHMENT_TAGS * 2 + 1;
-pub(crate) const MAX_PRUNE_TAGS: usize = 512;
+pub(crate) const MAX_PRUNE_TAGS: usize = meshmsg_protocol::MAX_LIFECYCLE_ITEMS;
 pub(crate) const MAX_ATTACHMENT_TAGS: usize = 8_192;
 pub(crate) const MAX_ATTACHMENT_INDEX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const ATTACHMENT_INDEX_NAME: &str = "attachment-retention-v1.json";
@@ -983,14 +981,16 @@ impl AttachmentStorage {
                 provider,
                 maximum,
             },
-            (None, older_than_secs) => LifecycleRequestContext::Prune {
-                operation_id,
-                older_than_secs: older_than_secs.unwrap_or(0),
-                cutoff_ms: Some(cutoff.context("prune cutoff missing")?),
-                direction,
-                dry_run,
-                maximum,
-            },
+            (None, older_than_secs) => {
+                let _ = cutoff.context("prune cutoff missing")?;
+                LifecycleRequestContext::Prune {
+                    operation_id,
+                    older_than_secs: older_than_secs.unwrap_or(0),
+                    direction,
+                    dry_run,
+                    maximum,
+                }
+            }
             _ => anyhow::bail!("invalid internal lifecycle request context"),
         };
         let (before, mut selected, tags) = {
@@ -1043,14 +1043,14 @@ impl AttachmentStorage {
             .filter(|tag| !selected_set.contains(&tag.name));
         let projected_usage = unique_storage_usage(projected).0;
         if dry_run {
-            return Ok(lifecycle_response(LifecycleSuccessV3::new(
+            return lifecycle_response(
                 &lifecycle_context,
                 selected_names.len(),
                 0,
                 before.saturating_sub(projected_usage),
                 limited,
                 cutoff,
-            )?));
+            );
         }
         let protection = self
             .protect_removed_blobs_from_gc(
@@ -1148,43 +1148,80 @@ impl AttachmentStorage {
             ));
         }
         self.recalculate_cached_status().await?;
-        Ok(lifecycle_response(LifecycleSuccessV3::new(
+        lifecycle_response(
             &lifecycle_context,
             selected_names.len(),
             removed.len(),
             before.saturating_sub(self.status().tagged_bytes),
             limited,
             cutoff,
-        )?))
+        )
     }
 }
 
-fn lifecycle_response(value: LifecycleSuccessV3) -> meshmsg_protocol::Response {
-    let result = meshmsg_protocol::LifecycleResult {
-        operation_id: value.operation_id.parse().expect("validated operation ID"),
-        offer_id: value
-            .offer_id
-            .map(|id| id.parse().expect("validated offer ID")),
-        direction: value
-            .direction
-            .map(|direction| direction.parse().expect("validated direction")),
-        provider: value
-            .provider
-            .map(|peer| peer.parse().expect("validated provider")),
-        older_than_secs: value.older_than_secs,
-        maximum: value.maximum,
-        dry_run: value.dry_run,
-        selected_tags: value.selected_tags,
-        removed_tags: value.removed_tags,
-        released_bytes: value.released_bytes,
-        limited: value.limited,
-        cutoff_ms: value.cutoff_ms,
+fn lifecycle_response(
+    context: &LifecycleRequestContext<'_>,
+    selected_tags: usize,
+    removed_tags: usize,
+    released_bytes: u64,
+    limited: bool,
+    cutoff_ms: Option<u64>,
+) -> Result<meshmsg_protocol::Response> {
+    let (offer_id, direction, provider, older_than_secs, maximum, dry_run, removed) = match context
+    {
+        LifecycleRequestContext::Remove {
+            offer_id,
+            direction,
+            provider,
+            maximum,
+            ..
+        } => (
+            Some((*offer_id).parse()?),
+            direction.map(str::parse).transpose()?,
+            provider.map(str::parse).transpose()?,
+            None,
+            *maximum,
+            false,
+            true,
+        ),
+        LifecycleRequestContext::Prune {
+            older_than_secs,
+            direction,
+            dry_run,
+            maximum,
+            ..
+        } => (
+            None,
+            direction.map(str::parse).transpose()?,
+            None,
+            Some(*older_than_secs),
+            *maximum,
+            *dry_run,
+            false,
+        ),
     };
-    match value.family.as_str() {
-        "offer_removed" => meshmsg_protocol::Response::OfferRemoved(result),
-        "offers_pruned" => meshmsg_protocol::Response::OffersPruned(result),
-        _ => unreachable!("validated lifecycle family"),
-    }
+    let result = meshmsg_protocol::LifecycleResult {
+        operation_id: context.operation_id().parse()?,
+        offer_id,
+        direction,
+        provider,
+        older_than_secs,
+        maximum,
+        dry_run,
+        selected_tags,
+        removed_tags,
+        released_bytes,
+        limited,
+        cutoff_ms,
+    };
+    let response = if removed {
+        meshmsg_protocol::Response::OfferRemoved(result)
+    } else {
+        meshmsg_protocol::Response::OffersPruned(result)
+    };
+    // Canonical construction validates the same invariants enforced while decoding.
+    response.validate().map_err(anyhow::Error::msg)?;
+    Ok(response)
 }
 
 fn clone_attachment_index(index: &AttachmentRetentionIndex) -> AttachmentRetentionIndex {
@@ -1675,14 +1712,17 @@ pub(crate) fn download_request_context(
             }
         };
     Ok(crate::ipc::DownloadRequestContext {
-        operation_id: operation_id.to_owned(),
-        token_digest: crate::ipc::download_token_digest(token),
-        offer_id,
-        provider,
-        kind,
-        name,
+        operation_id: operation_id.parse()?,
+        token_digest: crate::ipc::download_token_digest(token).parse()?,
+        offer_id: offer_id.parse()?,
+        provider: provider.parse()?,
+        kind: kind
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid attachment kind"))?,
+        name: meshmsg_protocol::AttachmentName::new(name)?,
         declared_size,
         output: output.to_path_buf(),
+        mode: meshmsg_protocol::DownloadMode::Install,
     })
 }
 
@@ -2100,6 +2140,11 @@ pub(crate) async fn download_attachment(
                 .parse()
                 .expect("public key is canonical"),
             output,
+            mode: if raw_export {
+                meshmsg_protocol::DownloadMode::Raw
+            } else {
+                meshmsg_protocol::DownloadMode::Install
+            },
             installed: true,
             pinned: true,
             destination_synced: commit.destination_synced,

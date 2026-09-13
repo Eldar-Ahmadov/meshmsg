@@ -76,11 +76,9 @@ json_invite() {
 python3 - "$ROOT/alias-default.json" <<'PY'
 import json, pathlib, socket, sys
 shown = json.loads(pathlib.Path(sys.argv[1]).read_text())
-request_id = shown.pop("request_id")
-assert len(request_id) == 32
+assert "request_id" not in shown and "schema_version" not in shown
 hostname = socket.gethostname().split('.', 1)[0].lower()
 assert shown == {
-    "schema_version": 1,
     "type": "alias", "enabled": True, "hostname": hostname,
     "custom": None, "alias": hostname,
 }
@@ -113,7 +111,7 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["peer"] != sys.arg
   || fail "forced replacement retained stale alias state"
 "$BIN" --state-dir "$ROOT/no-alias" --json init --no-default-alias >/dev/null
 "$BIN" --state-dir "$ROOT/no-alias" --json alias show | python3 -c \
-  'import json,sys; v=json.load(sys.stdin); r=v.pop("request_id"); assert len(r) == 32 and v == {"type":"alias","schema_version":1,"enabled":False,"hostname":None,"custom":None,"alias":None}' \
+  'import json,sys; v=json.load(sys.stdin); assert v == {"type":"alias","enabled":False,"hostname":None,"custom":None,"alias":None}' \
   || fail "init --no-default-alias did not persist explicit opt-out"
 cp "$ROOT/no-alias/alias.json" "$ROOT/no-alias/alias.json.saved"
 cp "$ROOT/alias-lifecycle/alias.json" "$ROOT/no-alias/alias.json"

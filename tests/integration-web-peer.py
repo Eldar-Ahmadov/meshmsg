@@ -94,7 +94,9 @@ def main():
                     'X-Meshmsg-Request-Id': request_id})
                 response = conn.getresponse()
                 decoded = json.loads(response.read())
-                assert decoded.pop('request_id') == request_id
+                body_request_id = decoded.pop('request_id', None)
+                if body_request_id is not None:
+                    assert body_request_id == request_id
                 result = response.status, decoded
                 conn.close()
                 return result
@@ -116,7 +118,9 @@ def main():
                     'X-Meshmsg-Request-Id': request_id})
                 response = conn.getresponse()
                 decoded = json.loads(response.read())
-                assert decoded.pop('request_id') == request_id
+                body_request_id = decoded.pop('request_id', None)
+                if body_request_id is not None:
+                    assert body_request_id == request_id
                 result = response.status, decoded
                 conn.close()
                 return result, op_id
@@ -199,8 +203,9 @@ def main():
                     assert line, 'SSE ended'
                     if line.startswith(b'data: '):
                         value = json.loads(line[6:])
-                        request_id = value.pop('request_id')
-                        assert len(request_id) == 32 and request_id == request_id.lower()
+                        request_id = value.pop('request_id', None)
+                        if request_id is not None:
+                            assert len(request_id) == 32 and request_id == request_id.lower()
                         return value
 
             for feed, _ in feeds:

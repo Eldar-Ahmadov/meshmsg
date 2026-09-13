@@ -3,6 +3,14 @@ use crate::PROTOCOL_VERSION;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, path::PathBuf};
 
+pub const MAX_PEERS: usize = 1024;
+pub const PEER_LEASE_MS: u64 = 150_000;
+pub const MAX_OFFERS: usize = 512;
+pub const MAX_OFFER_SCAN: usize = 4096;
+pub const MAX_LIFECYCLE_ITEMS: usize = 512;
+pub const MAX_WARNINGS: usize = 32;
+pub const MAX_PUBLIC_TEXT_BYTES: usize = 1024;
+
 /// A marker that serializes as the one supported protocol version and rejects
 /// every other value while deserializing.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -39,8 +47,7 @@ impl<'de> Deserialize<'de> for ProtocolVersion {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RequestFrame {
     pub protocol_version: ProtocolVersion,
     pub request_id: RequestId,
@@ -49,6 +56,9 @@ pub struct RequestFrame {
 
 impl RequestFrame {
     pub fn new(request_id: RequestId, request: Request) -> Self {
+        request
+            .validate()
+            .expect("invalid protocol request construction");
         Self {
             protocol_version: ProtocolVersion,
             request_id,
@@ -57,7 +67,30 @@ impl RequestFrame {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        Ok(())
+        self.request.validate()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestFrameWire {
+    protocol_version: ProtocolVersion,
+    request_id: RequestId,
+    request: Request,
+}
+
+impl<'de> Deserialize<'de> for RequestFrame {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RequestFrameWire::deserialize(deserializer)?;
+        wire.request.validate().map_err(de::Error::custom)?;
+        Ok(Self {
+            protocol_version: wire.protocol_version,
+            request_id: wire.request_id,
+            request: wire.request,
+        })
     }
 }
 
@@ -102,6 +135,27 @@ pub enum Request {
         mode: DownloadMode,
     },
     Stop,
+}
+
+impl Request {
+    fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::OffersPrune { max_delete, .. }
+                if !(1..=MAX_LIFECYCLE_ITEMS).contains(max_delete) =>
+            {
+                Err("invalid lifecycle maximum")
+            }
+            Self::Share { path, .. } if !safe_ipc_path(path) => Err("unsafe share path"),
+            Self::Download { offer, output, .. }
+                if offer.is_empty()
+                    || offer.len() > AttachmentToken::MAX_BYTES
+                    || !safe_ipc_path(output) =>
+            {
+                Err("invalid download request")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 macro_rules! bounded_text {
@@ -383,6 +437,18 @@ pub enum AttachmentKind {
     DirectoryTarV1,
 }
 
+impl std::str::FromStr for AttachmentKind {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "file" => Ok(Self::File),
+            "directory_tar_v1" => Ok(Self::DirectoryTarV1),
+            _ => Err("invalid attachment kind"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ResponseFrame {
     pub protocol_version: ProtocolVersion,
@@ -395,6 +461,9 @@ pub struct ResponseFrame {
 
 impl ResponseFrame {
     pub fn new(request_id: Option<RequestId>, response: Response) -> Self {
+        response
+            .validate()
+            .expect("invalid protocol response construction");
         Self {
             protocol_version: ProtocolVersion,
             schema_version: response.schema_version(),
@@ -445,6 +514,8 @@ impl<'de> Deserialize<'de> for ResponseFrame {
             ));
         }
         wire.response.validate().map_err(de::Error::custom)?;
+        valid_response_correlation(wire.request_id.as_ref(), &wire.response)
+            .map_err(de::Error::custom)?;
         Ok(Self {
             protocol_version: wire.protocol_version,
             schema_version: wire.schema_version,
@@ -454,11 +525,40 @@ impl<'de> Deserialize<'de> for ResponseFrame {
     }
 }
 
+fn valid_response_correlation(
+    request_id: Option<&RequestId>,
+    response: &Response,
+) -> Result<(), &'static str> {
+    match (request_id, response) {
+        (
+            None,
+            Response::Error(ProtocolError {
+                operation_id: None,
+                code:
+                    ErrorCode::IpcCapacity | ErrorCode::InitialFrameTimeout | ErrorCode::InvalidRequest,
+                ..
+            }),
+        ) => Ok(()),
+        (Some(_), _) => Ok(()),
+        _ => Err("uncorrelated daemon response"),
+    }
+}
+
 impl Response {
-    fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Status(status) => status.validate(),
-            _ => Ok(()),
+            Self::Queued(value) => value.validate(),
+            Self::PrivateAccepted(value) => value.validate(),
+            Self::PeersSnapshot(value) => value.validate(),
+            Self::Offers(value) => value.validate(),
+            Self::AttachmentShared(value) => value.validate(),
+            Self::OfferRemoved(value) => value.validate_removed(),
+            Self::OffersPruned(value) => value.validate_pruned(),
+            Self::DownloadComplete(value) => value.validate(),
+            Self::Stopping { outcome } if outcome == "stopping" || outcome == "accepted" => Ok(()),
+            Self::Stopping { .. } => Err("invalid stopping outcome"),
+            Self::Error(value) => value.validate(),
         }
     }
 
@@ -534,6 +634,9 @@ pub struct EventFrame {
 
 impl EventFrame {
     pub fn new(request_id: RequestId, event: Event) -> Self {
+        event
+            .validate()
+            .expect("invalid protocol event construction");
         Self {
             protocol_version: ProtocolVersion,
             schema_version: event.schema_version(),
@@ -600,6 +703,7 @@ impl<'de> Deserialize<'de> for EventFrame {
         if !wire.event.supports_schema(wire.schema_version) {
             return Err(de::Error::custom("unsupported event family schema version"));
         }
+        wire.event.validate().map_err(de::Error::custom)?;
         Ok(Self {
             protocol_version: wire.protocol_version,
             schema_version: wire.schema_version,
@@ -610,6 +714,38 @@ impl<'de> Deserialize<'de> for EventFrame {
 }
 
 impl Event {
+    fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Connected(_)
+            | Self::PeerUp { .. }
+            | Self::PeerDown { .. }
+            | Self::Stopping {} => Ok(()),
+            Self::Message(value) => value.validate(),
+            Self::PrivateMessage(value) => value.validate(),
+            Self::Queued(value) => value.validate(),
+            Self::AttachmentOffer(value) => value.validate(),
+            Self::AttachmentShared(value) => value.validate(),
+            Self::PeersSnapshot(value) => value.validate(),
+            Self::PeerDiscovered(value) | Self::PeerUpdated(value) => value.validate(true),
+            Self::PeerExpired(value) => value.validate(false),
+            Self::DownloadStarted { output, .. } if safe_ipc_path(output) => Ok(()),
+            Self::DownloadStarted { .. } => Err("unsafe download output path"),
+            Self::DownloadProgress {
+                received_bytes,
+                total_bytes,
+                output,
+                ..
+            } if received_bytes <= total_bytes && safe_ipc_path(output) => Ok(()),
+            Self::DownloadProgress { .. } => Err("invalid download progress"),
+            Self::DownloadComplete(value) => value.validate(),
+            Self::Lagged { message, .. } if valid_public_text(message, MAX_PUBLIC_TEXT_BYTES) => {
+                Ok(())
+            }
+            Self::Lagged { .. } => Err("invalid lag event"),
+            Self::Error(value) => value.validate(),
+        }
+    }
+
     pub fn schema_version(&self) -> u8 {
         match self {
             Self::Connected(_)
@@ -805,21 +941,6 @@ pub struct PrivateAccepted {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Peer {
-    pub peer: PeerId,
-    pub alias: Option<Alias>,
-    pub online: bool,
-    pub last_seen_ms: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PeersSnapshot {
-    pub peers: Vec<Peer>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct AttachmentOffer {
     pub from: PeerId,
     pub message_id: MessageId,
@@ -830,32 +951,6 @@ pub struct AttachmentOffer {
     pub size: u64,
     pub ticket: AttachmentToken,
     pub offer: AttachmentToken,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct OffersSnapshot {
-    pub offers: Vec<AttachmentOffer>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct OffersChanged {
-    pub operation_id: OperationId,
-    pub selected: u16,
-    pub removed: u16,
-    pub released_bytes: u64,
-    pub dry_run: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DownloadComplete {
-    pub operation_id: OperationId,
-    pub offer_id: OfferId,
-    pub output: PathBuf,
-    pub size: u64,
-    pub mode: DownloadMode,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -954,6 +1049,20 @@ pub struct LifecycleResult {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct DownloadRequestContext {
+    pub operation_id: OperationId,
+    pub token_digest: ContentDigest,
+    pub offer_id: OfferId,
+    pub provider: PeerId,
+    pub kind: AttachmentKind,
+    pub name: AttachmentName,
+    pub declared_size: Option<u64>,
+    pub output: PathBuf,
+    pub mode: DownloadMode,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DownloadResult {
     pub operation_id: OperationId,
     pub token_digest: ContentDigest,
@@ -963,11 +1072,230 @@ pub struct DownloadResult {
     pub size: u64,
     pub from: PeerId,
     pub output: PathBuf,
+    pub mode: DownloadMode,
     pub installed: bool,
     pub pinned: bool,
     pub destination_synced: bool,
     pub cleanup_complete: bool,
     pub warnings: Vec<String>,
+}
+
+fn valid_public_text(value: &str, maximum: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn safe_ipc_path(path: &std::path::Path) -> bool {
+    path.is_absolute() && !path.as_os_str().is_empty()
+}
+
+impl Message {
+    fn validate(&self) -> Result<(), &'static str> {
+        (self.timestamp_ms != 0)
+            .then_some(())
+            .ok_or("invalid message timestamp")
+    }
+}
+
+impl PrivateMessage {
+    fn validate(&self) -> Result<(), &'static str> {
+        (self.private
+            && self.timestamp_ms != 0
+            && self.acceptance_acknowledged
+            && !self.durable
+            && !self.read)
+            .then_some(())
+            .ok_or("invalid private-message acceptance flags")
+    }
+}
+
+impl Queued {
+    fn validate(&self) -> Result<(), &'static str> {
+        (self.operation_id.as_str() == self.message_id.as_str()
+            && self.timestamp_ms != 0
+            && !self.delivery_acknowledged)
+            .then_some(())
+            .ok_or("invalid queued-message correlation")
+    }
+}
+
+impl PrivateAccepted {
+    fn validate(&self) -> Result<(), &'static str> {
+        (self.operation_id.as_str() == self.message_id.as_str()
+            && self.timestamp_ms != 0
+            && self.body_bytes > 0
+            && self.body_bytes <= PrivateBody::MAX_BYTES
+            && self.acceptance_acknowledged
+            && !self.durable
+            && !self.read)
+            .then_some(())
+            .ok_or("invalid private acceptance")
+    }
+}
+
+fn valid_signed_offer_shape(value: &AttachmentToken) -> bool {
+    !value.as_str().is_empty()
+        && data_encoding::BASE64URL_NOPAD
+            .decode(value.as_str().as_bytes())
+            .is_ok_and(|decoded| !decoded.is_empty())
+}
+
+impl AttachmentOffer {
+    fn validate(&self) -> Result<(), &'static str> {
+        (self.offer_id.as_str() == self.message_id.as_str()
+            && self.timestamp_ms != 0
+            && !self.ticket.as_str().is_empty()
+            && valid_signed_offer_shape(&self.offer))
+        .then_some(())
+        .ok_or("invalid attachment offer binding")
+    }
+}
+
+impl AttachmentShared {
+    fn validate(&self) -> Result<(), &'static str> {
+        (self.operation_id.as_str() == self.message_id.as_str()
+            && self.offer_id.as_str() == self.message_id.as_str()
+            && self.timestamp_ms != 0
+            && !self.ticket.as_str().is_empty()
+            && valid_signed_offer_shape(&self.offer)
+            && !self.delivery_acknowledged)
+            .then_some(())
+            .ok_or("invalid shared-attachment binding")
+    }
+}
+
+impl RemotePeer {
+    fn validate(&self, expected_online: bool) -> Result<(), &'static str> {
+        (self.online == expected_online
+            && self.expires_at_ms >= self.last_seen_ms
+            && self.expires_at_ms.saturating_sub(self.last_seen_ms) <= PEER_LEASE_MS)
+            .then_some(())
+            .ok_or("invalid peer lease")
+    }
+}
+
+impl PeerSnapshot {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.peers.len() > MAX_PEERS {
+            return Err("peer snapshot exceeds capacity");
+        }
+        let mut previous: Option<&PeerId> = None;
+        for peer in &self.peers {
+            peer.validate(true)?;
+            if peer.public_key == self.self_peer.public_key
+                || previous.is_some_and(|value| value >= &peer.public_key)
+                || peer.last_seen_ms > self.generated_at_ms
+                || peer.expires_at_ms < self.generated_at_ms
+                || peer.expires_at_ms.saturating_sub(self.generated_at_ms) > PEER_LEASE_MS
+            {
+                return Err("invalid peer snapshot ordering or lease");
+            }
+            previous = Some(&peer.public_key);
+        }
+        Ok(())
+    }
+}
+
+impl PeerTransition {
+    fn validate(&self, online: bool) -> Result<(), &'static str> {
+        if self.directory_revision == 0 {
+            return Err("invalid peer directory revision");
+        }
+        self.peer.validate(online)
+    }
+}
+
+impl OfferListItem {
+    fn validate(&self) -> Result<(), &'static str> {
+        let selector_valid = match self.direction {
+            OfferDirection::Incoming => self.provider.is_some(),
+            OfferDirection::Outgoing => self.provider.is_none(),
+        };
+        (selector_valid && self.format == "raw" && self.status == "complete" && self.size.is_some())
+            .then_some(())
+            .ok_or("invalid offer list item")
+    }
+}
+
+impl OffersList {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.blobs.len() > MAX_OFFERS
+            || self.item_errors > MAX_OFFER_SCAN
+            || self.has_more && !self.truncated
+            || self.item_errors != 0 && !self.truncated
+        {
+            return Err("invalid offer listing bounds");
+        }
+        self.blobs.iter().try_for_each(OfferListItem::validate)
+    }
+}
+
+impl LifecycleResult {
+    fn validate_counts(&self) -> Result<(), &'static str> {
+        (self.maximum > 0
+            && self.maximum <= MAX_LIFECYCLE_ITEMS
+            && self.selected_tags <= self.maximum
+            && self.removed_tags <= self.selected_tags
+            && (!self.dry_run || self.removed_tags == 0)
+            && (self.dry_run || self.removed_tags == self.selected_tags)
+            && (!self.limited || self.selected_tags == self.maximum)
+            && (self.selected_tags != 0 || self.released_bytes == 0))
+            .then_some(())
+            .ok_or("invalid lifecycle counts or outcome")
+    }
+
+    fn validate_removed(&self) -> Result<(), &'static str> {
+        self.validate_counts()?;
+        (self.offer_id.is_some()
+            && self.older_than_secs.is_none()
+            && !self.dry_run
+            && self.cutoff_ms.is_none())
+        .then_some(())
+        .ok_or("invalid offer removal selectors")
+    }
+
+    fn validate_pruned(&self) -> Result<(), &'static str> {
+        self.validate_counts()?;
+        (self.offer_id.is_none()
+            && self.provider.is_none()
+            && self.older_than_secs.is_some()
+            && self.cutoff_ms.is_some())
+        .then_some(())
+        .ok_or("invalid offer prune selectors")
+    }
+}
+
+impl DownloadResult {
+    fn validate(&self) -> Result<(), &'static str> {
+        (safe_ipc_path(&self.output)
+            && self.installed
+            && self.pinned
+            && (self.destination_synced && self.cleanup_complete || !self.warnings.is_empty())
+            && self.warnings.len() <= MAX_WARNINGS
+            && self
+                .warnings
+                .iter()
+                .all(|warning| valid_public_text(warning, MAX_PUBLIC_TEXT_BYTES)))
+        .then_some(())
+        .ok_or("invalid download completion")
+    }
+
+    pub fn validate_for_request(
+        &self,
+        expected: &DownloadRequestContext,
+    ) -> Result<(), &'static str> {
+        self.validate()?;
+        (self.operation_id == expected.operation_id
+            && self.token_digest == expected.token_digest
+            && self.offer_id == expected.offer_id
+            && self.from == expected.provider
+            && self.kind == expected.kind
+            && self.name == expected.name
+            && expected.declared_size.is_none_or(|size| self.size == size)
+            && self.output == expected.output
+            && self.mode == expected.mode)
+            .then_some(())
+            .ok_or("download completion does not match request")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -991,6 +1319,13 @@ pub struct ProtocolError {
 }
 
 impl ProtocolError {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.outcome == Outcome::Partial && self.operation_id.is_none() {
+            return Err("partial outcome requires operation correlation");
+        }
+        Ok(())
+    }
+
     pub fn new(operation_id: Option<OperationId>, code: ErrorCode, outcome: Outcome) -> Self {
         Self {
             operation_id,
@@ -1311,6 +1646,70 @@ mod tests {
         assert!(decode_body("send", BroadcastBody::MAX_BYTES + 1).is_err());
         assert!(decode_body("private_send", PrivateBody::MAX_BYTES).is_ok());
         assert!(decode_body("private_send", PrivateBody::MAX_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn every_active_family_rejects_structurally_valid_semantic_forgeries() {
+        let request = "1".repeat(32);
+        let operation = "2".repeat(32);
+        let other = "3".repeat(32);
+        let peer = "4".repeat(64);
+        let other_peer = "5".repeat(64);
+        let digest = "6".repeat(64);
+
+        let invalid_responses = [
+            format!(
+                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"older_than_secs":null,"maximum":1,"dry_run":false,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false,"cutoff_ms":null}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":3,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","offer_id":null,"direction":null,"provider":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"has_more":true,"item_errors":0}}"#
+            ),
+        ];
+        for frame in invalid_responses {
+            assert!(
+                serde_json::from_str::<ResponseFrame>(&frame).is_err(),
+                "{frame}"
+            );
+        }
+
+        let invalid_events = [
+            format!(
+                r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":2,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":2,"schema_version":1,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
+            ),
+        ];
+        for frame in invalid_events {
+            assert!(
+                serde_json::from_str::<EventFrame>(&frame).is_err(),
+                "{frame}"
+            );
+        }
     }
 
     #[test]

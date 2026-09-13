@@ -1,7 +1,5 @@
 //! Shared bounded newline-delimited local daemon protocol. Platform connection
 //! ownership checks remain in node::connect_daemon for both CLI and web clients.
-#[cfg(feature = "web")]
-use crate::attachment::AttachmentOffer;
 use crate::{
     config::State,
     contracts::{self, ProtocolErrorAdapter},
@@ -9,8 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use iroh_gossip::proto::TopicId;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 
 // The shared protocol crate owns framing bounds. Legacy in-crate DTOs use
@@ -20,51 +17,12 @@ pub(crate) use meshmsg_protocol::framing::{
     MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT_SIZE, MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE,
 };
 
-#[cfg(feature = "web")]
-pub(crate) fn validate_lifecycle_error_for_request(
-    value: &serde_json::Value,
-    operation_id: &str,
-) -> Result<ProtocolErrorAdapter> {
-    let error = ProtocolErrorAdapter::from_value(value)?;
-    error.validate_operation_id(Some(operation_id))?;
-    Ok(error)
-}
-
-pub(crate) fn valid_content_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 pub(crate) fn prune_cutoff_upper_bound(now_ms: u64, older_than_secs: u64) -> u64 {
     now_ms.saturating_sub(older_than_secs.saturating_mul(1000))
 }
 
 pub(crate) fn new_operation_id() -> String {
     meshmsg_protocol::OperationId::new_random().into_string()
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LifecycleSuccessV3 {
-    #[serde(rename = "type")]
-    pub(crate) family: String,
-    pub(crate) schema_version: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) request_id: Option<String>,
-    pub(crate) operation_id: String,
-    pub(crate) offer_id: Option<String>,
-    pub(crate) direction: Option<String>,
-    pub(crate) provider: Option<String>,
-    pub(crate) older_than_secs: Option<u64>,
-    pub(crate) maximum: usize,
-    pub(crate) dry_run: bool,
-    pub(crate) selected_tags: usize,
-    pub(crate) removed_tags: usize,
-    pub(crate) released_bytes: u64,
-    pub(crate) limited: bool,
-    pub(crate) cutoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,9 +37,6 @@ pub(crate) enum LifecycleRequestContext<'a> {
     Prune {
         operation_id: &'a str,
         older_than_secs: u64,
-        /// `None` for a caller validating a daemon-resolved cutoff; `Some` for
-        /// the daemon producer and generic strict response validation.
-        cutoff_ms: Option<u64>,
         direction: Option<&'a str>,
         dry_run: bool,
         maximum: usize,
@@ -96,216 +51,7 @@ impl LifecycleRequestContext<'_> {
     }
 }
 
-impl LifecycleSuccessV3 {
-    pub(crate) fn new(
-        context: &LifecycleRequestContext<'_>,
-        selected_tags: usize,
-        removed_tags: usize,
-        released_bytes: u64,
-        limited: bool,
-        cutoff_ms: Option<u64>,
-    ) -> Result<Self> {
-        let (
-            family,
-            operation_id,
-            offer_id,
-            direction,
-            provider,
-            older_than_secs,
-            maximum,
-            dry_run,
-        ) = match context {
-            LifecycleRequestContext::Remove {
-                operation_id,
-                offer_id,
-                direction,
-                provider,
-                maximum,
-            } => (
-                "offer_removed",
-                *operation_id,
-                Some(*offer_id),
-                *direction,
-                *provider,
-                None,
-                *maximum,
-                false,
-            ),
-            LifecycleRequestContext::Prune {
-                operation_id,
-                older_than_secs,
-                direction,
-                dry_run,
-                maximum,
-                ..
-            } => (
-                "offers_pruned",
-                *operation_id,
-                None,
-                *direction,
-                None,
-                Some(*older_than_secs),
-                *maximum,
-                *dry_run,
-            ),
-        };
-        let result = Self {
-            family: family.into(),
-            schema_version: 3,
-            request_id: None,
-            operation_id: operation_id.into(),
-            offer_id: offer_id.map(str::to_owned),
-            direction: direction.map(str::to_owned),
-            provider: provider.map(str::to_owned),
-            older_than_secs,
-            maximum,
-            dry_run,
-            selected_tags,
-            removed_tags,
-            released_bytes,
-            limited,
-            cutoff_ms,
-        };
-        result.validate_for_request(context, false)?;
-        Ok(result)
-    }
-
-    pub(crate) fn from_value_for_request(
-        value: &serde_json::Value,
-        context: &LifecycleRequestContext<'_>,
-    ) -> Result<Self> {
-        let dto: Self =
-            serde_json::from_value(value.clone()).context("malformed lifecycle response")?;
-        dto.validate_for_request(context, true)?;
-        Ok(dto)
-    }
-
-    fn validate_for_request(
-        &self,
-        context: &LifecycleRequestContext<'_>,
-        correlated: bool,
-    ) -> Result<()> {
-        let expected = match context {
-            LifecycleRequestContext::Remove {
-                operation_id,
-                offer_id,
-                direction,
-                provider,
-                maximum,
-            } => (
-                "offer_removed",
-                *operation_id,
-                Some(*offer_id),
-                *direction,
-                *provider,
-                None,
-                *maximum,
-                false,
-            ),
-            LifecycleRequestContext::Prune {
-                operation_id,
-                older_than_secs,
-                direction,
-                dry_run,
-                maximum,
-                ..
-            } => (
-                "offers_pruned",
-                *operation_id,
-                None,
-                *direction,
-                None,
-                Some(*older_than_secs),
-                *maximum,
-                *dry_run,
-            ),
-        };
-        anyhow::ensure!(
-            self.family == expected.0
-                && self.schema_version == 3
-                && self.operation_id == expected.1
-                && self.offer_id.as_deref() == expected.2
-                && self.direction.as_deref() == expected.3
-                && self.provider.as_deref() == expected.4
-                && self.older_than_secs == expected.5
-                && self.maximum == expected.6
-                && self.dry_run == expected.7,
-            "lifecycle response does not match its request"
-        );
-        anyhow::ensure!(
-            valid_operation_id(&self.operation_id)
-                && self.maximum > 0
-                && self.selected_tags <= self.maximum
-                && self.removed_tags <= self.selected_tags
-                && (!self.dry_run || self.removed_tags == 0)
-                && (self.dry_run || self.removed_tags == self.selected_tags)
-                && (!self.limited || self.selected_tags == self.maximum)
-                && (self.selected_tags != 0 || self.released_bytes == 0),
-            "invalid lifecycle selection/count/byte invariants"
-        );
-        anyhow::ensure!(
-            self.direction
-                .as_deref()
-                .is_none_or(|v| matches!(v, "incoming" | "outgoing"))
-                && self.provider.as_deref().is_none_or(valid_peer_id),
-            "invalid lifecycle selectors"
-        );
-        anyhow::ensure!(
-            match context {
-                LifecycleRequestContext::Remove { .. } => self.cutoff_ms.is_none(),
-                LifecycleRequestContext::Prune { cutoff_ms, .. } =>
-                    cutoff_ms.is_none_or(|expected| self.cutoff_ms == Some(expected))
-                        && self.cutoff_ms.is_some(),
-            },
-            "invalid lifecycle cutoff"
-        );
-        anyhow::ensure!(
-            if correlated {
-                self.request_id
-                    .as_deref()
-                    .is_some_and(contracts::valid_request_id)
-            } else {
-                self.request_id.is_none()
-            },
-            "invalid lifecycle request correlation"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DownloadCompleteV2 {
-    #[serde(rename = "type")]
-    family: String,
-    schema_version: u8,
-    request_id: String,
-    pub(crate) operation_id: String,
-    pub(crate) token_digest: String,
-    pub(crate) offer_id: String,
-    pub(crate) kind: String,
-    pub(crate) name: String,
-    pub(crate) size: u64,
-    pub(crate) from: String,
-    pub(crate) output: PathBuf,
-    installed: bool,
-    pinned: bool,
-    destination_synced: bool,
-    cleanup_complete: bool,
-    warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DownloadRequestContext {
-    pub(crate) operation_id: String,
-    pub(crate) token_digest: String,
-    pub(crate) offer_id: String,
-    pub(crate) provider: String,
-    pub(crate) kind: String,
-    pub(crate) name: String,
-    pub(crate) declared_size: Option<u64>,
-    pub(crate) output: PathBuf,
-}
+pub(crate) use meshmsg_protocol::DownloadRequestContext;
 
 pub(crate) fn download_token_digest(token: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -316,108 +62,8 @@ pub(crate) fn download_token_digest(token: &str) -> String {
     data_encoding::HEXLOWER.encode(&digest.finalize())
 }
 
-impl DownloadCompleteV2 {
-    pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let dto: Self = serde_json::from_value(value.clone())
-            .context("malformed download-complete response")?;
-        anyhow::ensure!(
-            valid_family(
-                &dto.family,
-                "download_complete",
-                dto.schema_version,
-                &dto.request_id
-            ) && dto.schema_version == 2
-                && valid_operation_id(&dto.operation_id)
-                && valid_content_digest(&dto.token_digest)
-                && valid_operation_id(&dto.offer_id)
-                && matches!(dto.kind.as_str(), "file" | "directory_tar_v1")
-                && valid_public_text(&dto.name, 255)
-                && valid_peer_id(&dto.from)
-                && !dto.output.as_os_str().is_empty()
-                && dto.installed
-                && dto.pinned
-                && dto.warnings.len() <= 32
-                && dto
-                    .warnings
-                    .iter()
-                    .all(|warning| valid_public_text(warning, contracts::MAX_PUBLIC_MESSAGE_BYTES)),
-            "invalid download-complete response"
-        );
-        let _ = (dto.size, dto.destination_synced, dto.cleanup_complete);
-        Ok(dto)
-    }
-
-    pub(crate) fn validate_for_request(
-        value: &serde_json::Value,
-        expected: &DownloadRequestContext,
-    ) -> Result<Self> {
-        let dto = Self::from_value(value)?;
-        anyhow::ensure!(
-            dto.operation_id == expected.operation_id,
-            "download operation ID mismatch"
-        );
-        anyhow::ensure!(
-            dto.token_digest == expected.token_digest,
-            "download token identity mismatch"
-        );
-        anyhow::ensure!(
-            dto.offer_id == expected.offer_id,
-            "download offer ID mismatch"
-        );
-        anyhow::ensure!(dto.from == expected.provider, "download provider mismatch");
-        anyhow::ensure!(dto.kind == expected.kind, "download kind mismatch");
-        anyhow::ensure!(dto.name == expected.name, "download name mismatch");
-        anyhow::ensure!(
-            expected.declared_size.is_none_or(|size| dto.size == size),
-            "download declared size mismatch"
-        );
-        anyhow::ensure!(
-            dto.output.as_os_str() == expected.output.as_os_str(),
-            "download output mismatch"
-        );
-        Ok(dto)
-    }
-}
-
-#[cfg(feature = "web")]
-pub(crate) fn validate_attachment_event_fields(
-    expected_topic: Option<TopicId>,
-    live_now_ms: Option<u64>,
-    from: &str,
-    message_id: &str,
-    timestamp_ms: u64,
-    offer: &AttachmentOffer,
-    offer_token: &str,
-) -> bool {
-    crate::attachment::protocol::validate_attachment_event(
-        expected_topic,
-        live_now_ms,
-        from,
-        message_id,
-        timestamp_ms,
-        offer,
-        offer_token,
-    )
-    .is_ok()
-}
-
-fn valid_peer_id(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn valid_family(family: &str, expected: &str, version: u8, request_id: &str) -> bool {
-    family == expected && version > 0 && contracts::valid_request_id(request_id)
-}
-
-fn valid_public_text(value: &str, maximum: usize) -> bool {
-    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
-}
-
-pub(crate) const MAX_OFFER_LIST_ENTRIES: usize = 512;
-pub(crate) const MAX_OFFER_LIST_SCANNED: usize = 4096;
+pub(crate) const MAX_OFFER_LIST_ENTRIES: usize = meshmsg_protocol::MAX_OFFERS;
+pub(crate) const MAX_OFFER_LIST_SCANNED: usize = meshmsg_protocol::MAX_OFFER_SCAN;
 
 pub(crate) use meshmsg_protocol::{Request as IpcRequest, RequestFrame as IpcRequestFrame};
 
@@ -448,16 +94,12 @@ fn decode_event_frame(
         &frame.request_id == expected_request_id,
         "daemon event request ID does not match the subscription"
     );
-    #[cfg(feature = "web")]
     if let Some(topic) = expected_topic {
         validate_typed_attachment_event(topic, &frame.event)?;
     }
-    #[cfg(not(feature = "web"))]
-    let _ = expected_topic;
     Ok(frame)
 }
 
-#[cfg(feature = "web")]
 fn validate_typed_attachment_event(topic: TopicId, event: &meshmsg_protocol::Event) -> Result<()> {
     let (from, message_id, timestamp_ms, offer_id, kind, name, size, ticket, token) = match event {
         meshmsg_protocol::Event::AttachmentOffer(value) => (
@@ -484,27 +126,26 @@ fn validate_typed_attachment_event(topic: TopicId, event: &meshmsg_protocol::Eve
         ),
         _ => return Ok(()),
     };
-    let offer = AttachmentOffer {
-        offer_id: offer_id.to_string(),
-        kind: match kind {
-            meshmsg_protocol::AttachmentKind::File => crate::attachment::AttachmentKind::File,
-            meshmsg_protocol::AttachmentKind::DirectoryTarV1 => {
-                crate::attachment::AttachmentKind::DirectoryTarV1
-            }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before Unix epoch")?
+        .as_millis() as u64;
+    meshmsg_protocol::validate_attachment_event(
+        meshmsg_protocol::AttachmentEventRef {
+            from,
+            message_id,
+            timestamp_ms,
+            offer_id,
+            kind,
+            name,
+            size,
+            ticket,
+            offer: token,
         },
-        name: name.as_str().to_owned(),
-        size,
-        ticket: ticket.as_str().to_owned(),
-    };
-    crate::attachment::protocol::validate_attachment_event(
-        Some(topic),
-        None,
-        from.as_str(),
-        message_id.as_str(),
-        timestamp_ms,
-        &offer,
-        token.as_str(),
+        &topic.to_string().parse()?,
+        now_ms,
     )
+    .map_err(anyhow::Error::from)
 }
 
 fn decode_response_frame(
@@ -675,7 +316,6 @@ pub(crate) struct SubscriptionReader<S> {
     reader: BufReader<S>,
     frame: Vec<u8>,
     request_id: meshmsg_protocol::RequestId,
-    #[cfg(feature = "web")]
     expected_topic: Option<TopicId>,
 }
 
@@ -685,15 +325,12 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
         request_id: String,
         expected_topic: Option<TopicId>,
     ) -> Self {
-        #[cfg(not(feature = "web"))]
-        let _ = expected_topic;
         Self {
             reader: BufReader::new(stream),
             frame: Vec::new(),
             request_id: request_id
                 .parse()
                 .expect("validated subscription request ID"),
-            #[cfg(feature = "web")]
             expected_topic,
         }
     }
@@ -721,17 +358,8 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
             "daemon event is too large"
         );
         anyhow::ensure!(self.frame.ends_with(b"\n"), "incomplete daemon event");
-        let result = decode_event_frame(&self.frame, &self.request_id, {
-            #[cfg(feature = "web")]
-            {
-                self.expected_topic
-            }
-            #[cfg(not(feature = "web"))]
-            {
-                None
-            }
-        })
-        .context("invalid daemon event");
+        let result = decode_event_frame(&self.frame, &self.request_id, self.expected_topic)
+            .context("invalid daemon event");
         self.frame.clear();
         result.map(Some)
     }
@@ -748,12 +376,7 @@ pub(crate) async fn subscribe_with_id(
     let mut stream = connect_daemon(dir).await?;
     // Load after connecting so a stopped daemon's atomic state/socket
     // replacement cannot pair a new subscription with the previous topic.
-    #[cfg(not(test))]
     let expected_topic = Some(State::load(dir)?.topic_id()?);
-    #[cfg(test)]
-    let expected_topic = State::load(dir)
-        .ok()
-        .and_then(|state| state.topic_id().ok());
     write_request_with_id(&mut stream, &IpcRequest::Subscribe, request_id).await?;
     Ok(SubscriptionReader::new_correlated_for_topic(
         stream,
@@ -779,6 +402,105 @@ mod tests {
             "retryable": false
         });
         assert!(decode_response(&serde_json::to_vec(&legacy).unwrap(), request_id).is_err());
+    }
+
+    #[test]
+    fn response_decoder_rejects_structurally_valid_semantic_forgery() {
+        let request_id = "0123456789abcdef0123456789abcdef";
+        let malformed = serde_json::json!({
+            "protocol_version": 2,
+            "schema_version": 3,
+            "request_id": request_id,
+            "type": "queued",
+            "operation_id": "11111111111111111111111111111111",
+            "from": "2".repeat(64),
+            "message_id": "33333333333333333333333333333333",
+            "timestamp_ms": 1,
+            "body": "accepted JSON, forged semantics",
+            "delivery_acknowledged": false
+        });
+        assert!(decode_response(&serde_json::to_vec(&malformed).unwrap(), request_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_reader_rejects_semantically_malformed_event() {
+        let request_id = "0123456789abcdef0123456789abcdef";
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let malformed = serde_json::json!({
+            "protocol_version": 2,
+            "schema_version": 2,
+            "request_id": request_id,
+            "type": "download_progress",
+            "operation_id": "11111111111111111111111111111111",
+            "received_bytes": 2,
+            "total_bytes": 1,
+            "output": "/tmp/output"
+        });
+        tokio::spawn(async move {
+            let mut bytes = serde_json::to_vec(&malformed).unwrap();
+            bytes.push(b'\n');
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
+                .await
+                .unwrap();
+        });
+        let mut subscription =
+            SubscriptionReader::new_correlated_for_topic(reader, request_id.to_owned(), None);
+        assert!(subscription.read().await.is_err());
+    }
+
+    async fn rejects_attachment_frame(
+        event_topic: TopicId,
+        expected_topic: TopicId,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let request_id = "0123456789abcdef0123456789abcdef";
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let secret = iroh::SecretKey::generate();
+        let mut event = crate::attachment::protocol::signed_attachment_event_for_topic_for_test(
+            &secret,
+            event_topic,
+            "11111111111111111111111111111111",
+            crate::attachment::AttachmentKind::File,
+            "safe.txt",
+            7,
+            now_ms,
+        );
+        event["protocol_version"] = meshmsg_protocol::PROTOCOL_VERSION.into();
+        event["request_id"] = request_id.into();
+        mutate(&mut event);
+        let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+        tokio::spawn(async move {
+            let mut bytes = serde_json::to_vec(&event).unwrap();
+            bytes.push(b'\n');
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
+                .await
+                .unwrap();
+        });
+        let mut subscription = SubscriptionReader::new_correlated_for_topic(
+            reader,
+            request_id.to_owned(),
+            Some(expected_topic),
+        );
+        assert!(subscription.read().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn default_subscription_rejects_forged_cross_topic_and_malformed_attachment_events() {
+        let topic = TopicId::from_bytes([7; 32]);
+        rejects_attachment_frame(topic, topic, |event| {
+            let offer = event["offer"].as_str().unwrap();
+            let replacement = if offer.ends_with('A') { 'B' } else { 'A' };
+            event["offer"] = format!("{}{replacement}", &offer[..offer.len() - 1]).into();
+        })
+        .await;
+        rejects_attachment_frame(TopicId::from_bytes([8; 32]), topic, |_| {}).await;
+        rejects_attachment_frame(topic, topic, |event| {
+            event["ticket"] = "not-a-ticket".into();
+        })
+        .await;
     }
 
     #[test]

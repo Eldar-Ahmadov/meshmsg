@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use meshmsg_protocol::{ErrorCode, OperationId, Outcome, ProtocolError};
 
 pub(crate) const SCHEMA_VERSION: u8 = 1;
-pub(crate) const MAX_PUBLIC_MESSAGE_BYTES: usize = 1024;
 
 pub(crate) fn new_request_id() -> String {
     meshmsg_protocol::RequestId::new_random().into_string()
@@ -80,15 +79,6 @@ impl ProtocolErrorAdapter {
         if let Some(id) = &self.request_id {
             anyhow::ensure!(valid_request_id(id), "invalid error request ID");
         }
-        Ok(())
-    }
-    #[cfg(feature = "web")]
-    pub(crate) fn validate_operation_id(&self, operation_id: Option<&str>) -> Result<()> {
-        self.validate()?;
-        anyhow::ensure!(
-            self.operation_id.as_deref() == operation_id,
-            "error operation ID does not match request"
-        );
         Ok(())
     }
     pub(crate) fn from_value(value: &serde_json::Value) -> Result<Self> {

@@ -399,11 +399,6 @@ impl Cli {
 
 pub fn print_result(json: bool, human: &str, value: serde_json::Value) {
     if json {
-        let mut value = value;
-        if value.get("schema_version").is_none() {
-            value["schema_version"] = crate::contracts::SCHEMA_VERSION.into();
-        }
-        value["request_id"] = crate::contracts::new_request_id().into();
         println!("{value}");
     } else {
         println!("{human}");
