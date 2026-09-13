@@ -25,8 +25,8 @@ use bytes::Bytes;
 use data_encoding::BASE64URL_NOPAD;
 use futures_util::TryStreamExt;
 use iroh::{
-    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint, PublicKey,
-    SecretKey, Watcher,
+    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint,
+    EndpointAddr, PublicKey, SecretKey, Watcher,
 };
 use iroh_blobs::{
     api::{downloader::Downloader, Store},
@@ -96,6 +96,16 @@ const IPC_EVENT_BROADCAST_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 const IPC_EVENT_CAPACITY: usize =
     IPC_EVENT_BROADCAST_BUDGET_BYTES / meshmsg_protocol::MAX_SIGNED_BROADCAST_ENVELOPE_BYTES;
 const _: () = assert!(IPC_EVENT_CAPACITY > 0);
+const NEIGHBOR_PRESENCE_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn on_neighbor_up<T>(
+    is_presence_neighbor: bool,
+    available: &mut bool,
+    announce: impl FnOnce() -> T,
+) -> Option<T> {
+    (is_presence_neighbor && std::mem::take(available)).then(announce)
+}
+
 /// Bounds all accepted local IPC connections, including long-lived subscriptions
 /// and subscriptions. Connections beyond this limit receive a small rejection and
 /// are closed without creating a handler task.
@@ -1544,6 +1554,23 @@ where
     Ok(true)
 }
 
+fn spawn_neighbor_presence_announcement(
+    tasks: &mut tokio::task::JoinSet<()>,
+    sender: GossipSender,
+    secret: SecretKey,
+    topic: TopicId,
+    alias: Option<String>,
+    endpoint: EndpointAddr,
+) {
+    tasks.spawn(async move {
+        let _ = tokio::time::timeout(
+            NEIGHBOR_PRESENCE_ANNOUNCE_TIMEOUT,
+            presence::announce(&sender, &secret, topic, alias.as_deref(), endpoint),
+        )
+        .await;
+    });
+}
+
 async fn drain_local_client_tasks(tasks: &mut tokio::task::JoinSet<()>, grace: Duration) {
     let deadline = tokio::time::Instant::now() + grace;
     while !tasks.is_empty() {
@@ -1678,6 +1705,10 @@ pub async fn run_daemon(
     let mut presence_cleanup = tokio::time::interval(presence::CLEANUP_INTERVAL);
     presence_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut presence_sources = PresenceSourceLimiter::default();
+    // Daemon-lifetime state: consume this before starting the sole reconnect
+    // announcement so neither send failure nor later churn can retry it.
+    let mut first_neighbor_presence_announcement = true;
+    let mut neighbor_presence_tasks = tokio::task::JoinSet::new();
     let mut gossip_events = GossipEventHandler::default();
     let connection_limit = Arc::new(Semaphore::new(LOCAL_IPC_CONNECTION_CAPACITY));
     let mut local_client_tasks = tokio::task::JoinSet::new();
@@ -2112,18 +2143,6 @@ pub async fn run_daemon(
             },
             incoming = node.receiver.try_next() => match incoming? {
                 Some(value) => {
-                    if let Event::NeighborUp(remote) = &value {
-                        // A new client may have bootstrapped through an older node that does
-                        // not know the derived presence topic. Join it directly as well.
-                        let _ = node.presence_sender.join_peers(vec![*remote]).await;
-                        presence::announce(
-                            &node.presence_sender,
-                            &node.secret,
-                            topic,
-                            alias_config.effective(),
-                            node.endpoint.addr(),
-                        ).await;
-                    }
                     let now_ms = unix_timestamp_ms()?;
                     let values = gossip_events.handle(value, topic, now_ms, |envelope| {
                         let offer = validate_offer_binding(
@@ -2160,7 +2179,24 @@ pub async fn run_daemon(
                     }
                 }
                 Some(Event::NeighborDown(source)) => presence_sources.remove(source),
-                Some(Event::NeighborUp(_) | Event::Lagged) => {}
+                Some(Event::NeighborUp(_)) => {
+                    let _ = on_neighbor_up(
+                        true,
+                        &mut first_neighbor_presence_announcement,
+                        || {
+                            // Exactly one bounded task can be created in this daemon lifetime.
+                            spawn_neighbor_presence_announcement(
+                                &mut neighbor_presence_tasks,
+                                node.presence_sender.clone(),
+                                node.secret.clone(),
+                                topic,
+                                alias_config.effective().map(str::to_owned),
+                                node.endpoint.addr(),
+                            );
+                        },
+                    );
+                }
+                Some(Event::Lagged) => {}
                 None => break,
             },
             incoming = node.direct_incoming.recv() => {
@@ -2232,8 +2268,10 @@ pub async fn run_daemon(
     drop(event_tx);
     transfer_tasks.abort_all();
     offer_list_tasks.abort_all();
+    neighbor_presence_tasks.abort_all();
     while transfer_tasks.join_next().await.is_some() {}
     while offer_list_tasks.join_next().await.is_some() {}
+    while neighbor_presence_tasks.join_next().await.is_some() {}
     drain_local_client_tasks(&mut local_client_tasks, LOCAL_IPC_SHUTDOWN_GRACE).await;
     node.router.shutdown().await?;
     node.direct_replay.shutdown().await?;
@@ -3042,6 +3080,67 @@ mod tests {
     use iroh_blobs::protocol::ChunkRangesExt;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn broadcast_neighbor_never_triggers_presence_work() {
+        let mut available = true;
+        let mut announcements = 0;
+        for _ in 0..10_000 {
+            assert_eq!(
+                on_neighbor_up(false, &mut available, || announcements += 1),
+                None
+            );
+        }
+        assert_eq!(announcements, 0);
+        assert!(available);
+    }
+
+    #[test]
+    fn first_presence_neighbor_triggers_one_announcement() {
+        let mut available = true;
+        let mut announcements = 0;
+        assert_eq!(
+            on_neighbor_up(true, &mut available, || announcements += 1),
+            Some(())
+        );
+        assert_eq!(announcements, 1);
+        assert!(!available);
+    }
+
+    #[test]
+    fn repeated_presence_neighbors_trigger_no_additional_announcements() {
+        let mut available = true;
+        let mut announcements = 0;
+        let _ = on_neighbor_up(true, &mut available, || announcements += 1);
+        for _ in 0..10_000 {
+            assert_eq!(
+                on_neighbor_up(true, &mut available, || announcements += 1),
+                None
+            );
+        }
+        assert_eq!(announcements, 1);
+    }
+
+    #[test]
+    fn failed_first_presence_announcement_is_not_retried_by_churn() {
+        let mut available = true;
+        let mut attempts = 0;
+        let failed = on_neighbor_up(true, &mut available, || {
+            attempts += 1;
+            Err::<(), ()>(())
+        });
+        assert!(matches!(failed, Some(Err(()))));
+        for is_presence in [false, true].into_iter().cycle().take(10_000) {
+            assert_eq!(
+                on_neighbor_up(is_presence, &mut available, || {
+                    attempts += 1;
+                    Ok::<(), ()>(())
+                }),
+                None
+            );
+        }
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn caller_share_path_preserves_representation_and_rejects_oversize_before_ipc() {
