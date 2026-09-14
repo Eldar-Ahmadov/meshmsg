@@ -1,40 +1,47 @@
-//! Shared bounded newline-delimited local daemon protocol. Platform connection
-//! ownership checks remain in node::connect_daemon for local clients.
+//! Shared bounded newline-delimited local daemon protocol.
+pub(crate) mod server;
+mod transport;
+
 use crate::{
     config::State,
     contracts::{self, ProtocolErrorAdapter},
-    node::{connect_daemon, LocalClientStream},
 };
 use anyhow::{Context, Result};
 use iroh_gossip::proto::TopicId;
 use std::path::Path;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+pub(crate) use transport::LocalListener;
+pub(crate) use transport::{
+    bind_local_endpoint, connect_daemon, LocalClientStream, SubscriptionStream,
+};
 
 // The shared protocol crate owns the local framing bounds.
 pub(crate) use contracts::valid_operation_id;
-pub(crate) use meshmsg_protocol::framing::{
-    MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT_SIZE, MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE,
-};
+#[cfg(test)]
+pub(crate) use meshmsg_protocol::framing::MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT_SIZE;
+#[cfg(test)]
+pub(crate) use meshmsg_protocol::framing::MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE;
 
 pub(crate) fn prune_cutoff_upper_bound(now_ms: u64, older_than_secs: u64) -> u64 {
     now_ms.saturating_sub(older_than_secs.saturating_mul(1000))
 }
 
-pub(crate) fn new_operation_id() -> String {
-    meshmsg_protocol::OperationId::new_random().into_string()
+pub(crate) fn new_operation_id() -> meshmsg_protocol::OperationId {
+    meshmsg_protocol::OperationId::new_random()
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum LifecycleRequestContext<'a> {
     Remove {
-        operation_id: &'a str,
+        operation_id: &'a meshmsg_protocol::OperationId,
         offer_id: &'a str,
         direction: Option<&'a str>,
         provider: Option<&'a str>,
         maximum: usize,
     },
     Prune {
-        operation_id: &'a str,
+        operation_id: &'a meshmsg_protocol::OperationId,
         older_than_secs: u64,
         direction: Option<&'a str>,
         dry_run: bool,
@@ -43,7 +50,7 @@ pub(crate) enum LifecycleRequestContext<'a> {
 }
 
 impl LifecycleRequestContext<'_> {
-    pub(crate) fn operation_id(&self) -> &str {
+    pub(crate) fn operation_id(&self) -> &meshmsg_protocol::OperationId {
         match self {
             Self::Remove { operation_id, .. } | Self::Prune { operation_id, .. } => operation_id,
         }
@@ -52,35 +59,22 @@ impl LifecycleRequestContext<'_> {
 
 pub(crate) use meshmsg_protocol::DownloadRequestContext;
 
-pub(crate) fn download_token_digest(token: &str) -> String {
+pub(crate) fn download_token_digest(token: &str) -> meshmsg_protocol::ContentDigest {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
     digest.update(b"meshmsg-download-token-v1\0");
     digest.update((token.len() as u64).to_le_bytes());
     digest.update(token.as_bytes());
-    data_encoding::HEXLOWER.encode(&digest.finalize())
+    data_encoding::HEXLOWER
+        .encode(&digest.finalize())
+        .parse()
+        .expect("SHA-256 digest is canonical")
 }
 
 pub(crate) const MAX_OFFER_LIST_ENTRIES: usize = meshmsg_protocol::MAX_OFFERS;
 pub(crate) const MAX_OFFER_LIST_SCANNED: usize = meshmsg_protocol::MAX_OFFER_SCAN;
 
 pub(crate) use meshmsg_protocol::{Request as IpcRequest, RequestFrame as IpcRequestFrame};
-
-fn expected_error_operation_id(request: &IpcRequest) -> Option<&str> {
-    match request {
-        IpcRequest::Send { operation_id, .. }
-        | IpcRequest::PrivateSend { operation_id, .. }
-        | IpcRequest::OffersRemove { operation_id, .. }
-        | IpcRequest::OffersPrune { operation_id, .. }
-        | IpcRequest::Share { operation_id, .. }
-        | IpcRequest::Download { operation_id, .. } => Some(operation_id.as_str()),
-        IpcRequest::Subscribe
-        | IpcRequest::Offers
-        | IpcRequest::Status
-        | IpcRequest::Peers
-        | IpcRequest::Stop => None,
-    }
-}
 
 fn decode_event_frame(
     bytes: &[u8],
@@ -177,6 +171,7 @@ fn decode_response(
     decode_response_frame(frame, &expected_request_id.parse()?)
 }
 
+#[cfg(test)]
 pub(crate) async fn read_frame<S>(stream: &mut S, maximum: usize) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
@@ -202,77 +197,38 @@ pub(crate) async fn send_request_with_id(
     let request_id: meshmsg_protocol::RequestId = request_id.parse()?;
     let mut stream = connect_daemon(dir).await?;
     write_request_with_id(&mut stream, request, request_id.as_ref()).await?;
-    let bytes = read_frame(&mut stream, MAX_IPC_EVENT_SIZE).await?;
+    let mut reader = meshmsg_protocol::FrameReader::new(stream);
+    let bytes = reader
+        .read_frame(meshmsg_protocol::FrameLimit::Event)
+        .await
+        .map_err(anyhow::Error::from)?;
     let frame = decode_response_frame(&bytes, &request_id)?;
-    if let meshmsg_protocol::Response::Error(error) = &frame.response {
-        validate_error_for_request(error, request)?;
-    }
+    request
+        .validate_response(&frame.response)
+        .map_err(anyhow::Error::msg)?;
     Ok(frame)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_error_for_request(
     error: &meshmsg_protocol::ProtocolError,
     request: &IpcRequest,
 ) -> Result<()> {
-    let pre_admission = error.operation_id.is_none()
-        && matches!(
-            error.code,
-            meshmsg_protocol::ErrorCode::IpcCapacity
-                | meshmsg_protocol::ErrorCode::InitialFrameTimeout
-        );
-    anyhow::ensure!(
-        pre_admission
-            || error
-                .operation_id
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref()
-                == expected_error_operation_id(request),
-        "error operation ID does not match request"
-    );
-    Ok(())
+    request
+        .validate_response(&meshmsg_protocol::Response::Error(error.clone()))
+        .map_err(anyhow::Error::msg)
 }
 
 pub(crate) async fn send_request_checked(
     dir: &Path,
     request: &IpcRequest,
-    expected_type: &str,
 ) -> Result<meshmsg_protocol::ResponseFrame> {
     let frame = send_request(dir, request).await?;
-    let matches = matches!(
-        (&frame.response, expected_type),
-        (meshmsg_protocol::Response::Status(_), "status")
-            | (meshmsg_protocol::Response::Queued(_), "queued")
-            | (
-                meshmsg_protocol::Response::PrivateAccepted(_),
-                "private_accepted"
-            )
-            | (
-                meshmsg_protocol::Response::PeersSnapshot(_),
-                "peers_snapshot"
-            )
-            | (meshmsg_protocol::Response::Offers(_), "offers")
-            | (
-                meshmsg_protocol::Response::AttachmentShared(_),
-                "attachment_shared"
-            )
-            | (meshmsg_protocol::Response::OfferRemoved(_), "offer_removed")
-            | (meshmsg_protocol::Response::OffersPruned(_), "offers_pruned")
-            | (
-                meshmsg_protocol::Response::DownloadComplete(_),
-                "download_complete"
-            )
-            | (meshmsg_protocol::Response::Stopping { .. }, "stopping")
-    );
     if let meshmsg_protocol::Response::Error(error) = frame.response.clone() {
         return Err(anyhow::Error::new(contracts::ContractFailure(
             ProtocolErrorAdapter::from_typed(frame.request_id.map(|id| id.to_string()), error),
         )));
     }
-    anyhow::ensure!(
-        matches,
-        "daemon returned unexpected response type (expected {expected_type})"
-    );
     Ok(frame)
 }
 
@@ -302,8 +258,7 @@ pub(crate) async fn write_request_with_id<S: AsyncWrite + Unpin>(
 }
 
 pub(crate) struct SubscriptionReader<S> {
-    reader: BufReader<S>,
-    frame: Vec<u8>,
+    reader: meshmsg_protocol::FrameReader<S>,
     request_id: meshmsg_protocol::RequestId,
     expected_topic: Option<TopicId>,
 }
@@ -315,8 +270,7 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
         expected_topic: Option<TopicId>,
     ) -> Self {
         Self {
-            reader: BufReader::new(stream),
-            frame: Vec::new(),
+            reader: meshmsg_protocol::FrameReader::new(stream),
             request_id: request_id
                 .parse()
                 .expect("validated subscription request ID"),
@@ -327,33 +281,17 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
     /// Reads one event while retaining any bytes consumed if this future is
     /// cancelled by a competing `select!` branch.
     pub(crate) async fn read(&mut self) -> Result<Option<meshmsg_protocol::EventFrame>> {
-        let limit = MAX_IPC_EVENT_SIZE
-            .checked_add(2)
-            .context("IPC event read limit overflow")?;
-        anyhow::ensure!(self.frame.len() < limit, "daemon event is too large");
-        let remaining = limit
-            .checked_sub(self.frame.len())
-            .context("IPC event read bound underflow")?;
-        let read_limit = u64::try_from(remaining).context("IPC event read limit is too large")?;
-        let read = (&mut self.reader)
-            .take(read_limit)
-            .read_until(b'\n', &mut self.frame)
-            .await?;
-        if read == 0 && self.frame.is_empty() {
+        let Some(frame) = self
+            .reader
+            .read_frame_or_eof(meshmsg_protocol::FrameLimit::Event)
+            .await
+            .map_err(anyhow::Error::from)?
+        else {
             return Ok(None);
-        }
-        anyhow::ensure!(
-            self.frame.len()
-                <= MAX_IPC_EVENT_SIZE
-                    .checked_add(1)
-                    .context("IPC event delimiter bound overflow")?,
-            "daemon event is too large"
-        );
-        anyhow::ensure!(self.frame.ends_with(b"\n"), "incomplete daemon event");
-        let result = decode_event_frame(&self.frame, &self.request_id, self.expected_topic)
-            .context("invalid daemon event");
-        self.frame.clear();
-        result.map(Some)
+        };
+        decode_event_frame(&frame, &self.request_id, self.expected_topic)
+            .context("invalid daemon event")
+            .map(Some)
     }
 }
 
@@ -428,7 +366,7 @@ mod tests {
     fn response_decoder_rejects_structurally_valid_semantic_forgery() {
         let request_id = "0123456789abcdef0123456789abcdef";
         let malformed = serde_json::json!({
-            "protocol_version": 3,
+            "protocol_version": 4,
             "request_id": request_id,
             "type": "queued",
             "operation_id": "11111111111111111111111111111111",
@@ -446,7 +384,7 @@ mod tests {
         let request_id = "0123456789abcdef0123456789abcdef";
         let (mut writer, reader) = tokio::io::duplex(4096);
         let malformed = serde_json::json!({
-            "protocol_version": 3,
+            "protocol_version": 4,
             "request_id": request_id,
             "type": "download_progress",
             "operation_id": "11111111111111111111111111111111",
@@ -522,14 +460,55 @@ mod tests {
     }
 
     #[test]
+    fn ipc_uses_protocol_request_response_family_and_operation_validation() {
+        let operation_id = meshmsg_protocol::OperationId::new_random();
+        let request = IpcRequest::Send {
+            operation_id: operation_id.clone(),
+            body: meshmsg_protocol::BroadcastBody::new("hello").unwrap(),
+        };
+        let wrong_operation = meshmsg_protocol::OperationId::new_random();
+        let mismatched = meshmsg_protocol::Response::Queued(meshmsg_protocol::Queued {
+            message_id: wrong_operation.as_str().parse().unwrap(),
+            operation_id: wrong_operation,
+            from: "1".repeat(64).parse().unwrap(),
+            timestamp_ms: 1,
+            body: meshmsg_protocol::BroadcastBody::new("hello").unwrap(),
+            delivery_acknowledged: false,
+        });
+        assert!(request.validate_response(&mismatched).is_err());
+
+        let error = meshmsg_protocol::ProtocolError::new(
+            Some(meshmsg_protocol::OperationId::new_random()),
+            meshmsg_protocol::ErrorCode::CommandTimeout,
+            meshmsg_protocol::Outcome::Unknown,
+        );
+        assert!(validate_error_for_request(&error, &request).is_err());
+    }
+
+    #[test]
     fn response_decoder_requires_exact_correlation() {
         let frame = meshmsg_protocol::ResponseFrame::new(
             Some("0123456789abcdef0123456789abcdef".parse().unwrap()),
-            meshmsg_protocol::Response::Stopping {
-                outcome: "stopping".to_owned(),
-            },
+            meshmsg_protocol::Response::Stopping {},
         );
         let bytes = serde_json::to_vec(&frame).unwrap();
         assert!(decode_response(&bytes, "11111111111111111111111111111111").is_err());
+    }
+    #[tokio::test]
+    async fn ipc_reader_rejects_oversized_request() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut left, mut right) = tokio::io::duplex(MAX_IPC_REQUEST_SIZE + 1);
+        let writer = tokio::spawn(async move {
+            right
+                .write_all(&vec![b'a'; MAX_IPC_REQUEST_SIZE + 1])
+                .await
+                .unwrap();
+        });
+        let error = read_frame(&mut left, MAX_IPC_REQUEST_SIZE)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+        writer.await.unwrap();
     }
 }

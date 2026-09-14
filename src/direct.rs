@@ -27,7 +27,7 @@ const DIRECT_VERSION: u8 = 2;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 const MAX_DIRECT_FRAME: usize = 6 * 1024;
 const INCOMING_QUEUE_CAPACITY: usize = 256;
-const SEND_CONCURRENCY: usize = 8;
+pub(crate) const SEND_CONCURRENCY: usize = 8;
 const DIRECT_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLAY_SAFETY_MARGIN: Duration = Duration::from_secs(30);
@@ -500,7 +500,10 @@ impl DirectSender {
     }
 
     /// Reserves one bounded send task before the caller spawns it.
-    pub(crate) fn try_reserve(&self) -> Result<DirectSendPermit, meshmsg_protocol::ProtocolError> {
+    pub(crate) fn try_reserve(
+        &self,
+        operation_id: meshmsg_protocol::OperationId,
+    ) -> Result<DirectSendPermit, meshmsg_protocol::ProtocolError> {
         self.permits
             .clone()
             .try_acquire_owned()
@@ -510,7 +513,7 @@ impl DirectSender {
             })
             .map_err(|_| {
                 meshmsg_protocol::ProtocolError::new(
-                    None,
+                    Some(operation_id),
                     meshmsg_protocol::ErrorCode::PrivateSendBusy,
                     meshmsg_protocol::Outcome::NotStarted,
                 )
@@ -772,30 +775,30 @@ mod tests {
 
     #[test]
     fn send_outcomes_map_to_stable_ipc_contracts() {
-        for (rejection, code, outcome, retryable) in [
+        for (rejection, code, outcome, retry_advice) in [
             (
                 DirectRejection::Conflict,
                 "private_message_conflict",
                 "not_started",
-                false,
+                meshmsg_protocol::RetryAdvice::Never,
             ),
             (
                 DirectRejection::Busy,
                 "private_recipient_busy",
                 "not_started",
-                true,
+                meshmsg_protocol::RetryAdvice::NewOperationAfterConditionsChange,
             ),
             (
                 DirectRejection::Unavailable,
                 "private_replay_unavailable",
                 "not_started",
-                true,
+                meshmsg_protocol::RetryAdvice::NewOperationAfterConditionsChange,
             ),
             (
                 DirectRejection::DeliveryOutcomeUnknown,
                 "private_delivery_unknown",
                 "unknown",
-                false,
+                meshmsg_protocol::RetryAdvice::SameOperationReconciliation,
             ),
         ] {
             let response = rejection_response(rejection, [1; 16]);
@@ -804,7 +807,7 @@ mod tests {
             };
             assert_eq!(error.code.to_string(), code);
             assert_eq!(crate::contracts::outcome_name(error.outcome), outcome);
-            assert_eq!(error.retryable(), retryable);
+            assert_eq!(error.retry_advice(), retry_advice);
         }
     }
 

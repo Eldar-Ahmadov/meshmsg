@@ -22,7 +22,7 @@ hostname = "0.4"
 fs2 = "0.4"
 libc = "0.2"
 iroh = "1"
-meshmsg-protocol = { path = "meshmsg-protocol" }
+meshmsg-protocol = { path = "meshmsg-protocol", default-features = false, features = ["attachment-authenticity"] }
 iroh-blobs = { version = "=0.103.0", default-features = false, features = ["fs-store"] }
 iroh-gossip = "0.101"
 postcard = { version = "1", features = ["alloc", "use-std"] }

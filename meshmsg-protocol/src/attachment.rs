@@ -114,12 +114,7 @@ pub fn validate_attachment_event(
         return Err(invalid("invalid signed attachment envelope shape"));
     }
 
-    let topic_bytes: [u8; 32] = data_encoding::HEXLOWER
-        .decode(expected_topic.as_str().as_bytes())
-        .map_err(|_| invalid("invalid expected attachment topic"))?
-        .try_into()
-        .map_err(|_| invalid("invalid expected attachment topic"))?;
-    if envelope.topic != GossipTopicId::from_bytes(topic_bytes) {
+    if envelope.topic != GossipTopicId::from_bytes(expected_topic.to_bytes()) {
         return Err(invalid("attachment event belongs to another topic"));
     }
     let oldest = now_ms.saturating_sub(ENVELOPE_ACCEPTANCE_WINDOW_MS);

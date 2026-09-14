@@ -1,5 +1,9 @@
 use serde::{de::DeserializeOwned, Serialize};
-use std::{fmt, io};
+use std::{
+    fmt, io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// JSON can expand every UTF-8 input byte to a six-byte `\\u00XX` escape.
@@ -143,8 +147,30 @@ impl<S: AsyncRead> FrameReader<S> {
         }
     }
 
+    pub fn get_ref(&self) -> &S {
+        self.reader.get_ref()
+    }
+
     pub fn get_mut(&mut self) -> &mut S {
         self.reader.get_mut()
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FrameReader<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.reader.get_mut()).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.reader.get_mut()).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.reader.get_mut()).poll_shutdown(context)
     }
 }
 
@@ -153,6 +179,18 @@ impl<S: AsyncRead + Unpin> FrameReader<S> {
     /// subsequent reads fail rather than interpreting an attacker-controlled
     /// suffix as a new frame. Reconnect to resume after either terminal error.
     pub async fn read_frame(&mut self, limit: FrameLimit) -> Result<Vec<u8>, ProtocolIoError> {
+        self.read_frame_or_eof(limit)
+            .await?
+            .ok_or(ProtocolIoError::IncompleteFrame)
+    }
+
+    /// Read one frame, returning `None` only when the stream closes cleanly
+    /// before any bytes of the next frame. Buffered bytes after a prior frame
+    /// are retained and consumed before the underlying stream is polled.
+    pub async fn read_frame_or_eof(
+        &mut self,
+        limit: FrameLimit,
+    ) -> Result<Option<Vec<u8>>, ProtocolIoError> {
         if self.poisoned {
             return Err(ProtocolIoError::Poisoned);
         }
@@ -174,6 +212,9 @@ impl<S: AsyncRead + Unpin> FrameReader<S> {
                 .read_until(b'\n', &mut self.frame)
                 .await?;
             if count == 0 {
+                if self.frame.is_empty() {
+                    return Ok(None);
+                }
                 self.frame.clear();
                 self.poisoned = true;
                 return Err(ProtocolIoError::IncompleteFrame);
@@ -183,7 +224,7 @@ impl<S: AsyncRead + Unpin> FrameReader<S> {
                 if self.frame.is_empty() {
                     return Err(ProtocolIoError::EmptyFrame);
                 }
-                return Ok(std::mem::take(&mut self.frame));
+                return Ok(Some(std::mem::take(&mut self.frame)));
             }
             if self.frame.len() > maximum {
                 self.frame.clear();
@@ -191,6 +232,12 @@ impl<S: AsyncRead + Unpin> FrameReader<S> {
                 return Err(ProtocolIoError::FrameTooLarge { maximum });
             }
         }
+    }
+
+    /// Read non-framing bytes without bypassing bytes already buffered while
+    /// parsing the preceding frame.
+    pub async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, ProtocolIoError> {
+        Ok(self.reader.read(buffer).await?)
     }
 
     pub async fn read_json<T>(&mut self, limit: FrameLimit) -> Result<T, ProtocolIoError>
@@ -202,32 +249,13 @@ impl<S: AsyncRead + Unpin> FrameReader<S> {
     }
 }
 
-/// Read one non-empty newline-delimited frame without ever buffering more than
-/// `limit + 1` bytes. Use [`FrameReader`] for a sequence of frames.
+/// Read one non-empty newline-delimited frame with bounded buffering. Use one
+/// persistent [`FrameReader`] whenever more data may follow this frame.
 pub async fn read_frame<S>(stream: &mut S, limit: FrameLimit) -> Result<Vec<u8>, ProtocolIoError>
 where
     S: AsyncRead + Unpin,
 {
-    let maximum = limit.bytes();
-    let mut frame = Vec::with_capacity(maximum.min(8192));
-    let mut byte = [0_u8; 1];
-    loop {
-        let count = stream.read(&mut byte).await?;
-        if count == 0 {
-            return Err(ProtocolIoError::IncompleteFrame);
-        }
-        if byte[0] == b'\n' {
-            return if frame.is_empty() {
-                Err(ProtocolIoError::EmptyFrame)
-            } else {
-                Ok(frame)
-            };
-        }
-        if frame.len() == maximum {
-            return Err(ProtocolIoError::FrameTooLarge { maximum });
-        }
-        frame.push(byte[0]);
-    }
+    FrameReader::new(stream).read_frame(limit).await
 }
 
 pub async fn read_json<S, T>(stream: &mut S, limit: FrameLimit) -> Result<T, ProtocolIoError>
@@ -450,6 +478,42 @@ mod tests {
                 .unwrap(),
             Example { value: 8 }
         );
+    }
+
+    #[tokio::test]
+    async fn buffered_bytes_are_preserved_for_frames_and_post_frame_reads() {
+        let mut frames = FrameReader::new(&b"{\"value\":7}\n{\"value\":8}\n"[..]);
+        assert_eq!(
+            frames
+                .read_json::<Example>(FrameLimit::Custom(64))
+                .await
+                .unwrap(),
+            Example { value: 7 }
+        );
+        assert_eq!(
+            frames
+                .read_json::<Example>(FrameLimit::Custom(64))
+                .await
+                .unwrap(),
+            Example { value: 8 }
+        );
+        assert!(frames
+            .read_frame_or_eof(FrameLimit::Custom(64))
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut subscription = FrameReader::new(&b"{}\nunexpected"[..]);
+        assert_eq!(
+            subscription
+                .read_frame(FrameLimit::Custom(64))
+                .await
+                .unwrap(),
+            b"{}"
+        );
+        let mut buffered = [0; 10];
+        subscription.read(&mut buffered).await.unwrap();
+        assert_eq!(&buffered, b"unexpected");
     }
 
     #[tokio::test]

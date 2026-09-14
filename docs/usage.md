@@ -25,17 +25,17 @@ meshmsg daemon
 
 Fresh state has `advertise_self=true` but no invite. After the endpoint becomes online, the daemon atomically stores an invite containing its endpoint. Until that first successful daemon startup, `meshmsg invite` intentionally fails.
 
-The attachment limit defaults to 4 GiB. Configure it for each daemon invocation with bytes or an environment variable:
+Configure attachment limits for each daemon invocation with byte-valued options or their environment-variable equivalents:
 
 ```sh
-meshmsg daemon --max-attachment-bytes 8589934592
-MESHMSG_MAX_ATTACHMENT_BYTES=8589934592 meshmsg daemon
-meshmsg daemon --max-attachment-storage-bytes 17179869184 \
-  --min-attachment-free-bytes 1073741824 \
-  --attachment-retention-secs 2592000
+meshmsg daemon --max-attachment-bytes "$MAX_BLOB_BYTES"
+MESHMSG_MAX_ATTACHMENT_BYTES="$MAX_BLOB_BYTES" meshmsg daemon
+meshmsg daemon --max-attachment-storage-bytes "$MAX_STORAGE_BYTES" \
+  --min-attachment-free-bytes "$MIN_FREE_BYTES" \
+  --attachment-retention-secs "$RETENTION_SECONDS"
 ```
 
-The matching storage variables are `MESHMSG_MAX_ATTACHMENT_STORAGE_BYTES`, `MESHMSG_MIN_ATTACHMENT_FREE_BYTES`, and `MESHMSG_ATTACHMENT_RETENTION_SECS`. Defaults are 16 GiB total unique retained content, a 1 GiB free-space reserve, and automatic retention disabled. Set a nonzero retention explicitly to opt in; zero prevents surprise deletion during upgrades. See [Attachments](attachments.md) for lifecycle, deduplication, and pressure semantics.
+The matching storage variables are `MESHMSG_MAX_ATTACHMENT_STORAGE_BYTES`, `MESHMSG_MIN_ATTACHMENT_FREE_BYTES`, and `MESHMSG_ATTACHMENT_RETENTION_SECS`. Automatic retention is opt-in. See the canonical [attachment limits and defaults](contracts.md#attachment-limits-and-defaults) for exact values and [Attachments](attachments.md) for lifecycle, deduplication, and pressure semantics.
 
 Export the invite from another terminal:
 
@@ -90,27 +90,27 @@ An alias is signed discovery metadata, not a verified person, account, or author
 
 ## Peer directory
 
-`meshmsg peers` asks the running daemon for a sanitized, point-in-time directory. Use `meshmsg --json peers` for the canonical protocol-v3 frame:
+`meshmsg peers` asks the running daemon for a sanitized, point-in-time directory. Use `meshmsg --json peers` for the canonical protocol-v4 frame:
 
 ```json
-{"protocol_version":3,"request_id":"0123456789abcdef0123456789abcdef","type":"peers_snapshot","generated_at_ms":1700000000000,"directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":7,"self":{"public_key":"<local-key>","alias":"laptop","online":true},"peers":[{"public_key":"<remote-key>","alias":"build-node-2","online":true,"last_seen_ms":1699999999000,"expires_at_ms":1700000149000}]}
+{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"peers_snapshot","generated_at_ms":1700000000000,"directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":7,"self":{"public_key":"<local-key>","alias":"laptop","online":true},"peers":[{"public_key":"<remote-key>","alias":"build-node-2","online":true,"last_seen_ms":1699999999000,"expires_at_ms":1700000149000}]}
 ```
 
 `self` is always a separate object and the remote `peers` array always excludes it. The array is sorted bytewise by canonical `public_key`; `alias` is always present and is either a normalized alias or JSON `null`. `self.online` is true only when the local endpoint is online **and** its topic is joined. A remote is present with `online:true` only while its authenticated signed-presence lease is current. This is a local freshness judgment, not an active reachability probe, trust assertion, Gossip-neighbor relationship, or delivery guarantee. Expired remotes are omitted.
 
-`last_seen_ms` is the local daemon's receipt time, not the sender-controlled signed timestamp. `expires_at_ms` is locally derived and no more than the fixed 150,000 ms presence lifetime after receipt. The snapshot contains at most 1,024 remote identities and fits a bounded 512 KiB IPC frame. It never contains endpoint addresses, relays, sockets, raw signed records, signatures, invites, capabilities, or message bodies.
+`last_seen_ms` is the local daemon's receipt time, not the sender-controlled signed timestamp. `expires_at_ms` is locally derived from the presence lifetime. The snapshot is bounded by the [authoritative peer and response/event limits](contracts.md#ipc); notably, responses and events use the roughly 5 MiB event limit, not the smaller request limit. It never contains endpoint addresses, relays, sockets, raw signed records, signatures, invites, capabilities, or message bodies.
 
 Local subscriptions start with `connected`, then an atomic `peers_snapshot`, then live events that occurred after that snapshot:
 
 ```json
-{"protocol_version":3,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_discovered","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":8,"peer":{"public_key":"<remote-key>","alias":"node-1","online":true,"last_seen_ms":1700000000000,"expires_at_ms":1700000150000}}
-{"protocol_version":3,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_updated","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":9,"peer":{"public_key":"<remote-key>","alias":"node-2","online":true,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
-{"protocol_version":3,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_expired","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":10,"peer":{"public_key":"<remote-key>","alias":"node-2","online":false,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
+{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_discovered","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":8,"peer":{"public_key":"<remote-key>","alias":"node-1","online":true,"last_seen_ms":1700000000000,"expires_at_ms":1700000150000}}
+{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_updated","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":9,"peer":{"public_key":"<remote-key>","alias":"node-2","online":true,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
+{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_expired","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":10,"peer":{"public_key":"<remote-key>","alias":"node-2","online":false,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
 ```
 
 These events are reconstructed from an explicit metadata allowlist, are limited to 512 encoded JSON bytes, and contain no message body or routing data. An identical periodic presence refresh advances freshness in later snapshots without emitting an event. First observation emits `peer_discovered`; an alias change emits `peer_updated`; hidden routing-only changes emit no public event; lease cleanup emits one `peer_expired`; a later valid presence emits `peer_discovered` again. Low-level broadcast-Gossip neighbor changes are not local IPC directory events.
 
-A stateful client should use the subscription's startup snapshot, apply lifecycle events only when their `directory_epoch` matches and `directory_revision` increases without a gap, and replace all state after a gap, `lagged`, reconnect, or epoch change. The revision is a lifecycle-event cursor: silent freshness refreshes and hidden route-only updates may change a later snapshot without incrementing it. `meshmsg listen` prints the startup snapshot and live events. The CLI submits the strict protocol-v3 peer-directory command directly; older daemons are rejected by the protocol boundary without fallback.
+A stateful client should use the subscription's startup snapshot, apply lifecycle events only when their `directory_epoch` matches and `directory_revision` increases without a gap, and replace all state after a gap, `lagged`, reconnect, or epoch change. The revision is a lifecycle-event cursor: silent freshness refreshes and hidden route-only updates may change a later snapshot without incrementing it. `meshmsg listen` prints the startup snapshot and live events. The CLI submits the strict protocol-v4 peer-directory command directly; older daemons are rejected by the protocol boundary without fallback.
 
 ## Messaging
 
@@ -129,15 +129,15 @@ Stop the daemon cleanly:
 meshmsg stop
 ```
 
-Client commands use owner-only local IPC and never create another Iroh endpoint. IPC uses the strict protocol-v3 request envelope and exact request/response correlation documented in [Stable contracts](contracts.md); unversioned clients and replies fail closed. The daemon permits at most 64 simultaneous local connections (including listeners), requires an initial request frame within eight seconds, and returns `ipc_capacity` when full. Ordinary commands have a 10-second daemon-side IPC deadline; offer listing, private send, and attachment operations use longer command-appropriate bounds. A `command_timeout` releases the connection slot but can leave the outcome of an already-submitted mutating operation unknown. Clients fail with an actionable error when the daemon is unavailable.
+Client commands use owner-only local IPC and never create another Iroh endpoint. IPC uses the strict protocol-v4 request envelope and exact request/response correlation documented in [Stable contracts](contracts.md); unversioned clients and replies fail closed. The daemon permits at most 64 simultaneous local connections (including listeners), requires an initial request frame within eight seconds, and returns `ipc_capacity` when full. Ordinary commands have a 10-second daemon-side IPC deadline; offer listing, private send, and attachment operations use longer command-appropriate bounds. A `command_timeout` releases the connection slot but can leave the outcome of an already-submitted mutating operation unknown. Clients fail with an actionable error when the daemon is unavailable.
 
 A successful send reports `queued`:
 
 ```json
-{"protocol_version":3,"request_id":"0123456789abcdef0123456789abcdef","type":"queued","operation_id":"<32-lowercase-hex>","from":"<peer-id>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body":"hello","delivery_acknowledged":false}
+{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"queued","operation_id":"<32-lowercase-hex>","from":"<peer-id>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body":"hello","delivery_acknowledged":false}
 ```
 
-`queued` means the local Gossip implementation accepted the broadcast request. It is not a delivery acknowledgement. The operation ID is also the signed V3 wire message ID, so a retry uses the same replay identity. Remote `message` IPC records use the same canonical frame. Broadcast bodies must contain at least one byte and are limited to 65,358 UTF-8 bytes for both local production and remote acceptance. Empty or oversized requests are rejected with `invalid_message` and `outcome:"not_started"` before operation-cache admission, preserving their explicit or generated operation ID for correction and reuse. Signed remote envelopes with invalid text or attachment semantics are dropped before replay admission. Broadcasts use the topic-bound V3 Gossip protocol and do not interoperate with pre-V3 peers.
+`queued` means the local Gossip implementation accepted the broadcast request. It is not a delivery acknowledgement. The operation ID is also the signed V3 wire message ID, so a retry uses the same replay identity. Remote `message` IPC records use the same canonical frame. Broadcast body and envelope bounds, rejection behavior, and wire-version invariants are defined in the [authoritative IPC contract](contracts.md#ipc). Signed remote envelopes with invalid text or attachment semantics are dropped before replay admission.
 
 ### Retry-safe operation IDs
 
@@ -150,11 +150,15 @@ meshmsg --json offers prune --operation-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ma
 meshmsg --json download --operation-id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb '<offer>' --output ./report.pdf
 ```
 
-The daemon joins concurrent duplicates and returns the exact cached terminal success, failure, or download partial success without repeating broadcast, transfer, publication, deletion, export, or installation work. Reusing an ID with a different operation kind, recipient, body, exact submitted absolute share-path representation, share-content digest, lifecycle selector/age/dry-run/limit, download token or exact output representation fails with versioned `operation_id_conflict`; errors and successful mutation responses include `operation_id`. A prune request carries stable caller intent—effective age, direction, dry-run, and limit—but no caller-selected cutoff. On first cache admission the daemon resolves exactly one cutoff as `daemon_now_ms.saturating_sub(age.saturating_mul(1000))`, retains it with the cache entry, and reports it in lifecycle success output. Thus rerunning the identical CLI command with the same ID after losing its response needs no hidden cutoff and replays the original selected set; `--max-delete` bounds one operation rather than each transport attempt. Remove retries replay the original authoritative counts. A terminal failure remains terminal for that ID—use a new ID only when intentionally starting a new attempt.
+The daemon joins concurrent duplicates and returns the exact cached terminal success, failure, or download partial success without repeating broadcast, transfer, publication, deletion, export, or installation work. Reusing an ID with a different operation kind, recipient, body, exact submitted absolute share-path representation, share-content digest, lifecycle selector/age/dry-run/limit, download token or exact output representation fails with versioned `operation_id_conflict`; errors and successful mutation responses include `operation_id`. A prune request carries stable caller intent—effective age, direction, dry-run, and limit—but no caller-selected cutoff. On first cache admission the daemon resolves exactly one cutoff as `daemon_now_ms.saturating_sub(age.saturating_mul(1000))`, retains it with the cache entry, and reports it in lifecycle success output. Thus rerunning the identical CLI command with the same ID after losing its response needs no hidden cutoff and replays the original selected set; `--max-delete` bounds one operation rather than each transport attempt. Remove retries replay the original authoritative counts.
 
-The daemon retains at most 1,024 in-flight/terminal IDs. Terminal entries expire after 10 minutes and oldest terminal entries can be evicted under pressure; in-flight entries are never evicted. The cache is intentionally memory-only and is cleared by daemon restart. Status reports `operation_cache_capacity`, `operation_cache_ttl_ms`, and `operation_cache_persistent:false`. Therefore same-ID retry protection applies only while the ID remains in the current daemon's cache. After expiry, eviction, or restart, do not reuse an old ID unless repeating the side effect is acceptable. Private receivers still durably suppress the same wire ID for their separate replay window, but that does not make sender operation outcomes restart-persistent.
+Once admitted to the operation cache, a terminal result remains terminal for its ID, including `outcome:"not_started"`: the cache retains both the request fingerprint and exact result. Local clients derive typed retry advice without adding a protocol-v4 field. `same-operation reconciliation` is reserved for uncertain or possibly-started outcomes; retry only the exact input with the same ID, and reconcile externally where documented. An admitted condition-dependent `not_started` failure—such as `attachment_storage_busy`, `private_recipient_busy`, `recipient_unresolved`, `attachment_quota_exceeded`, `attachment_tag_capacity`, or `download_failed`—cannot make progress under the cached ID. Wait for the reported condition to change, then intentionally start a new attempt with a new ID. Stable validation and conflict failures advise no unchanged retry.
 
-This IPC is intentionally incompatible with mutation requests from older clients: all mutations above require `operation_id`; `download` requires the sole typed `install` mode, and `share` additionally requires its validated 64-character lowercase `source_digest`. Current components submit these strict protocol-v3 commands directly; there is no capability negotiation or fallback. The canonical `offers_prune` request variant requires `operation_id`, `older_than_secs`, nullable `direction`, `dry_run`, and `max_delete`; `cutoff_ms` is not a request field and deny-unknown-fields parsing rejects it. All local responses and events use protocol version 3 with no family schema field. Incoming wire records retain their independent existing schemas.
+Some failures happen before cache admission and therefore have no cached terminal result. `operation_capacity` rejects the operation before binding its ID, so the exact request may be retried with the same ID after capacity becomes available. `ipc_capacity`, `initial_frame_timeout`, and `offers_busy` likewise advise retrying the same request and do not require an operation ID. Errors on non-mutating requests use this neutral same-request advice rather than operation-ID wording.
+
+The cache is bounded, memory-only, and cleared by daemon restart. Therefore same-ID retry protection applies only while the ID remains in the current daemon's cache. After expiry, eviction, or restart, do not reuse an old ID unless repeating the side effect is acceptable. Private receiver replay suppression does not make sender outcomes restart-persistent. See [Operation retries and cache](contracts.md#operation-retries-and-cache) for the exact capacity, retention, fingerprint, retry-advice, and lifecycle replay rules.
+
+Mutation request requirements and protocol-v4 compatibility rules are defined by the [authoritative contract](contracts.md#compatibility-and-migration). Current components submit strict protocol-v4 commands directly; there is no capability negotiation or fallback.
 
 ### Private sends
 
@@ -167,17 +171,17 @@ printf '%s' 'private hello' | meshmsg send --to '<full-peer-key>' --message-stdi
 
 Public-key parsing takes precedence over alias parsing and requires the canonical full encoding. The daemon must know a current signed endpoint presence for that key, unless its endpoint was pinned from the local invite. Alias lookup uses unexpired signed presence records and succeeds only when exactly one peer currently advertises the normalized alias. Zero matches or collisions fail closed; meshmsg never guesses or falls back to broadcast. Because presence is periodic and expires, a recently started, disconnected, renamed, or stopped peer may temporarily be unresolved, and a stopped peer's alias may remain visible until expiry.
 
-The CLI submits the strict protocol-v3 `private_send` IPC command directly; it never encodes a recipient into the broadcast `send` command, retries automatically, or falls back to broadcast. A daemon outside the current protocol-v3 component set rejects the request at the protocol boundary. Upgrade and restart the daemon, then rerun the command only after reviewing that failure.
+The CLI submits the strict protocol-v4 `private_send` IPC command directly; it never encodes a recipient into the broadcast `send` command, retries automatically, or falls back to broadcast. A daemon outside the current protocol-v4 component set rejects the request at the protocol boundary. Upgrade and restart the daemon, then rerun the command only after reviewing that failure.
 
 A private message travels over a separate authenticated, encrypted Iroh connection and is signed and bound to the sender, recipient, and topic. It is not placed in the broadcast message stream. On success, human output says the private message was accepted; JSON reports metadata, never the sent body:
 
 ```json
-{"protocol_version":3,"request_id":"0123456789abcdef0123456789abcdef","type":"private_accepted","operation_id":"<32-lowercase-hex>","to":"<full-peer-key>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body_bytes":13,"acceptance_acknowledged":true,"duplicate_accepted":false,"durable":false,"read":false}
+{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"private_accepted","operation_id":"<32-lowercase-hex>","to":"<full-peer-key>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body_bytes":13,"acceptance_acknowledged":true,"duplicate_accepted":false,"durable":false,"read":false}
 ```
 
 A new acceptance means the authenticated recipient durably recorded a domain-separated SHA-256 fingerprint of the signed semantic payload, queued the volatile body, and durably recorded the delivery transition before signing success. The body itself is never persisted. `duplicate_accepted:true` means the same sender/ID/fingerprint previously reached that confirmed state and was not queued again. Neither result means a person or `listen` client read it or that the body survives process failure.
 
-The direct v2 signed rejection results are mapped to stable daemon errors. `private_message_conflict` means the sender/ID is already bound to different content. `private_recipient_busy` means no record was created because a queue/rate/quota bound rejected it. `private_replay_unavailable` means the persistence worker had already failed. `private_delivery_unknown` means a durable pending record exists but the recipient cannot prove whether the volatile queue insertion happened; it will never redeliver or claim acceptance for that ID. Transport loss remains `private_send_failed` with an unknown outcome. Reuse the same ID only for an exact retry; changing to a new ID can duplicate an uncertain message.
+The direct v2 signed rejection results are mapped to stable daemon errors. `private_message_conflict` means the sender/ID is already bound to different content. `private_recipient_busy` means no record was created because a queue/rate/quota bound rejected it; after that condition changes, a new attempt requires a new ID because the old not-started result is cached. `private_replay_unavailable` similarly requires recovery followed by a new operation. `private_delivery_unknown` means a durable pending record exists but the recipient cannot prove whether the volatile queue insertion happened; it will never redeliver or claim acceptance for that ID. Transport loss remains `private_send_failed` with an unknown outcome. For either uncertain outcome, reconcile or retry only the exact input with the same ID; changing to a new ID can duplicate the message.
 
 `listen` and `chat` subscribers receive accepted messages as `private_message` events containing `private:true`, the canonical `from`, message ID, timestamp, body, and explicit `durable:false`/`read:false` fields. Replay persistence stores only sender, ID, fingerprint, expiration, and pending/confirmed state. Persistence runs on a dedicated blocking worker with a bounded 64-request queue. Live IDs are never pressure-evicted: new admission returns signed `Busy` when the queue, global 8,192-ID quota, per-sender 512-ID quota, per-sender 8/second (burst 16) rate, global 128/second (burst 256) rate, volatile delivery queue, or WAL bound is unavailable. Status exposes these bounds plus `direct_replay_available` and stable `direct_replay_error`; terminal failure makes subsequent direct requests return signed unavailable results.
 
@@ -204,7 +208,7 @@ meshmsg download --offer-file signed-offer.txt --output ./report.pdf
 printf '%s' '<signed-offer>' | meshmsg download --offer-stdin --output ./report.pdf
 ```
 
-IPC input/output paths must be absolute UTF-8 and serialize to at most 32,768 bytes; longer or non-Unicode paths fail closed at the typed boundary. File and stdin flags conflict with each other and with the positional value. Stdin is read through EOF; `-` is a literal filename, not stdin. Invite and attachment-offer input remove one final LF and an optional preceding CR. Message input is preserved exactly. Inputs must be UTF-8. Invite and attachment-offer input are limited to 1 MiB. Broadcast message bodies must be nonempty and are limited to 65,358 UTF-8 bytes for positional, file, stdin, chat, and IPC input alike. Private `send --to` bodies use their separate nonempty 4096-byte contract for positional, file, and stdin input.
+IPC input/output paths must satisfy the [authoritative absolute-path and size contract](contracts.md#ipc); invalid paths fail closed before daemon contact. File and stdin flags conflict with each other and with the positional value. Stdin is read through EOF; `-` is a literal filename, not stdin. Invite and attachment-offer input remove one final LF and an optional preceding CR. Message input is preserved exactly. Inputs must be UTF-8. The exact token, broadcast, private-body, path, and frame limits are centralized in [Stable JSON and IPC contracts](contracts.md#ipc).
 
 These forms prevent argv and history disclosure only. Broadcast messages remain plaintext to every topic participant. Private-message transport is encrypted between the two daemons, but the body is still available to the sender and recipient processes, their owner-only IPC subscribers, and the operators of those machines.
 
@@ -229,7 +233,7 @@ Startup and bootstrap are bounded. If joining configured peers or becoming onlin
 
 ## JSON automation
 
-The global `--json` option produces versioned JSON results for one-shot commands and NDJSON for client streams. A one-shot JSON command writes its result to stdout. On failure it writes exactly one [protocol-v3 error boundary](contracts.md#protocol-v3-error-boundary) to stdout, writes nothing to stderr, and exits 1. IPC success records include `protocol_version:3`, `type`, and their 32-lowercase-hex `request_id`.
+The global `--json` option produces versioned JSON results for one-shot commands and NDJSON for client streams. A one-shot JSON command writes its result to stdout. On failure it writes exactly one [protocol-v4 error boundary](contracts.md#protocol-v4-error-boundary) to stdout, writes nothing to stderr, and exits 1. IPC success records include `protocol_version:4`, `type`, and their 32-lowercase-hex `request_id`.
 
 The `daemon` command is deliberately outside that JSON stdout contract: it emits no stdout event or telemetry records, and routes startup/fatal diagnostics to stderr. Use `meshmsg --json listen` for the authenticated NDJSON event stream.
 

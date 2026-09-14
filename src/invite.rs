@@ -22,6 +22,18 @@ struct InviteWire {
     invite: Invite,
 }
 
+pub(crate) fn configured_details(
+    token: Option<&str>,
+    self_id: PublicKey,
+) -> Result<(bool, usize, bool)> {
+    let Some(token) = token else {
+        return Ok((false, 0, false));
+    };
+    let invite: Invite = token.parse()?;
+    let self_advertised = invite.bootstrap_peers.iter().any(|peer| peer.id == self_id);
+    Ok((true, invite.bootstrap_peers.len(), self_advertised))
+}
+
 impl Invite {
     pub fn deduplicate(&mut self) {
         self.bootstrap_peers.sort_by_key(|peer| peer.id);

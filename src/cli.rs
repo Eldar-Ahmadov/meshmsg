@@ -119,7 +119,7 @@ impl OfferDirection {
 pub enum OffersCommand {
     /// Remove local pins matching one offer ID; shared blob data stays while another tag references it
     Remove {
-        /// Retry-safe 128-bit operation ID (generated when omitted)
+        /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
         #[arg(long, value_parser = parse_operation_id)]
         operation_id: Option<String>,
         #[arg(value_parser = parse_operation_id)]
@@ -132,7 +132,7 @@ pub enum OffersCommand {
     },
     /// Remove oldest pins at or beyond the retention boundary
     Prune {
-        /// Retry-safe 128-bit operation ID (generated when omitted)
+        /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
         #[arg(long, value_parser = parse_operation_id)]
         operation_id: Option<String>,
         /// Override daemon retention age; zero selects every matching tag
@@ -230,7 +230,7 @@ pub enum Command {
     Stop,
     /// Broadcast a message, or send privately with authenticated acceptance acknowledgement
     Send {
-        /// Retry-safe 128-bit operation ID (generated when omitted)
+        /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
         #[arg(long, value_parser = parse_operation_id)]
         operation_id: Option<String>,
         /// Send privately to one canonical public key or uniquely advertised alias
@@ -241,7 +241,7 @@ pub enum Command {
     },
     /// Share a file or a directory snapshot with the topic
     Share {
-        /// Retry-safe 128-bit operation ID (generated when omitted)
+        /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
         #[arg(long, value_parser = parse_operation_id)]
         operation_id: Option<String>,
         /// File or directory to share
@@ -269,7 +269,7 @@ pub enum Command {
     },
     /// Download an explicitly accepted attachment offer
     Download {
-        /// Retry-safe 128-bit operation ID (generated when omitted)
+        /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
         #[arg(long, value_parser = parse_operation_id)]
         operation_id: Option<String>,
         #[command(flatten)]

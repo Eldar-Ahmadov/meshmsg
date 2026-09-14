@@ -3,6 +3,7 @@
 //! This crate is the single serialization boundary between the daemon and all
 //! local clients. It deliberately supports exactly one protocol version.
 
+#[cfg(feature = "attachment-authenticity")]
 pub mod attachment;
 pub mod framing;
 pub mod id;
@@ -22,6 +23,7 @@ pub const MAX_BROADCAST_BODY_BYTES: usize =
 pub const MAX_SIGNED_ATTACHMENT_TOKEN_BYTES: usize =
     (MAX_SIGNED_BROADCAST_ENVELOPE_BYTES * 4).div_ceil(3);
 
+#[cfg(feature = "attachment-authenticity")]
 pub use attachment::{
     validate_attachment_event, AttachmentEventRef, AttachmentValidationError,
     ENVELOPE_ACCEPTANCE_WINDOW_MS, ENVELOPE_FUTURE_SKEW_MS,
@@ -30,6 +32,6 @@ pub use framing::{read_frame, read_json, write_json, FrameLimit, FrameReader, Pr
 pub use id::{ContentDigest, MessageId, OfferId, OperationId, PeerId, RequestId, TopicId};
 pub use model::*;
 
-/// The only local IPC protocol version accepted by this crate. V3 is a hard
-/// break because `BroadcastBody` and signed attachment-token bounds changed.
-pub const PROTOCOL_VERSION: u8 = 3;
+/// The only local IPC protocol version accepted by this crate. V4 deliberately
+/// removes ambiguous and inactive contract surface; there is no negotiation.
+pub const PROTOCOL_VERSION: u8 = 4;

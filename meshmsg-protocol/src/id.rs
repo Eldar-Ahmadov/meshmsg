@@ -38,6 +38,14 @@ macro_rules! hex_id {
             pub fn into_string(self) -> String {
                 self.0
             }
+
+            pub fn to_bytes(&self) -> [u8; $bytes] {
+                let mut bytes = [0_u8; $bytes];
+                data_encoding::HEXLOWER
+                    .decode_mut(self.0.as_bytes(), &mut bytes)
+                    .expect("canonical hexadecimal ID");
+                bytes
+            }
         }
 
         impl fmt::Debug for $name {
@@ -131,5 +139,16 @@ mod tests {
         let id = RequestId::new_random();
         let encoded = serde_json::to_string(&id).unwrap();
         assert_eq!(serde_json::from_str::<RequestId>(&encoded).unwrap(), id);
+    }
+
+    #[test]
+    fn typed_ids_expose_their_validated_bytes_without_reparsing() {
+        let operation: OperationId = "000102030405060708090a0b0c0d0e0f".parse().unwrap();
+        assert_eq!(
+            operation.to_bytes(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        let peer: PeerId = "ab".repeat(32).parse().unwrap();
+        assert_eq!(peer.to_bytes(), [0xab; 32]);
     }
 }

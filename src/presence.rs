@@ -484,13 +484,30 @@ pub(crate) async fn announce(
     }
 }
 
-fn local_peer_online(endpoint: &Endpoint, receiver: &GossipReceiver) -> bool {
-    endpoint
-        .home_relay_status()
-        .get()
-        .iter()
-        .any(|status| status.is_connected())
-        && receiver.is_joined()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LocalConnectivity {
+    pub(crate) endpoint_online: bool,
+    pub(crate) topic_joined: bool,
+}
+
+impl LocalConnectivity {
+    fn peer_online(self) -> bool {
+        self.endpoint_online && self.topic_joined
+    }
+}
+
+pub(crate) fn local_connectivity(
+    endpoint: &Endpoint,
+    receiver: &GossipReceiver,
+) -> LocalConnectivity {
+    LocalConnectivity {
+        endpoint_online: endpoint
+            .home_relay_status()
+            .get()
+            .iter()
+            .any(|status| status.is_connected()),
+        topic_joined: receiver.is_joined(),
+    }
 }
 
 pub(crate) fn snapshot(
@@ -502,10 +519,30 @@ pub(crate) fn snapshot(
     directory_epoch: &str,
     directory_revision: u64,
 ) -> meshmsg_protocol::PeerSnapshot {
+    snapshot_with_connectivity(
+        local_connectivity(local_network.0, local_network.1),
+        directory,
+        self_peer,
+        self_alias,
+        generated_at_ms,
+        directory_epoch,
+        directory_revision,
+    )
+}
+
+pub(crate) fn snapshot_with_connectivity(
+    connectivity: LocalConnectivity,
+    directory: &Directory,
+    self_peer: &str,
+    self_alias: Option<&str>,
+    generated_at_ms: u64,
+    directory_epoch: &str,
+    directory_revision: u64,
+) -> meshmsg_protocol::PeerSnapshot {
     peer_api::snapshot_value(
         self_peer,
         self_alias,
-        local_peer_online(local_network.0, local_network.1),
+        connectivity.peer_online(),
         generated_at_ms,
         directory_epoch,
         directory_revision,

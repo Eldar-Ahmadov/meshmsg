@@ -20,6 +20,7 @@ ruby tests/workflow-contract.rb
 python3 tests/release-contract-tests.py
 python3 tests/release-assets-tests.py --bin target/debug/meshmsg
 python3 tests/github-protection-contract-tests.py
+cargo test --locked --test documentation_contract
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
@@ -32,7 +33,9 @@ bash tests/integration-installer.sh target/debug/meshmsg
 ```
 
 The explicit workspace scope makes both `meshmsg` and `meshmsg-protocol` tests,
-checks, and lint authoritative.
+checks, and lint authoritative. `documentation_contract` compares the structured
+facts and JSON lifecycle examples in `docs/contracts.md` with protocol constants;
+it intentionally does not snapshot prose.
 
 Authoritative verification installs actionlint v1.7.12 from immutable upstream
 commit `914e7df21a07ef503a81201c76d2b11c789d3fca` and runs it over all workflows.
@@ -49,8 +52,8 @@ bash tests/run-linux-integrations.sh target/debug/meshmsg
 
 The driver requires `target/debug/meshmsg` and substitutes its `{BIN}` inventory
 placeholder. The five-peer test retains equal-peer messaging, selective endpoint
-advertising, restart/failover/rejoin, owner-only IPC hardening, and exact V3
-65,358/65,359-byte positional/file/stdin/chat plus subscription-boundary coverage. The
+advertising, restart/failover/rejoin, owner-only protocol-v4 IPC hardening, and exact
+EnvelopeV3 65,358/65,359-byte positional/file/stdin/chat plus subscription-boundary coverage. The
 inventory also includes CLI errors, peer directory, attachments, direct messages,
 idempotency, and a generated-archive/mock-download installer test. The current
 per-command budgets total 3,620 seconds (60 minutes 20 seconds).

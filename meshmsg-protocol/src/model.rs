@@ -160,6 +160,73 @@ impl Request {
             _ => Ok(()),
         }
     }
+
+    /// Validates that a daemon response belongs to this request's response
+    /// family and, for mutations, carries the same operation ID.
+    pub fn validate_response(&self, response: &Response) -> Result<(), &'static str> {
+        response.validate()?;
+        if let Response::Error(error) = response {
+            return self.validate_error_response(error);
+        }
+
+        let family_matches = matches!(
+            (self, response),
+            (Self::Send { .. }, Response::Queued(_))
+                | (Self::PrivateSend { .. }, Response::PrivateAccepted(_))
+                | (Self::Status, Response::Status(_))
+                | (Self::Peers, Response::PeersSnapshot(_))
+                | (Self::Offers, Response::Offers(_))
+                | (Self::OffersRemove { .. }, Response::OfferRemoved(_))
+                | (Self::OffersPrune { .. }, Response::OffersPruned(_))
+                | (Self::Share { .. }, Response::AttachmentShared(_))
+                | (Self::Download { .. }, Response::DownloadComplete(_))
+                | (Self::Stop, Response::Stopping {})
+        );
+        if !family_matches {
+            return Err("daemon response family does not match request");
+        }
+
+        if let Some(expected) = self.operation_id() {
+            let actual = match response {
+                Response::Queued(value) => Some(&value.operation_id),
+                Response::PrivateAccepted(value) => Some(&value.operation_id),
+                Response::OfferRemoved(value) => Some(&value.operation_id),
+                Response::OffersPruned(value) => Some(&value.operation_id),
+                Response::AttachmentShared(value) => Some(&value.operation_id),
+                Response::DownloadComplete(value) => Some(&value.operation_id),
+                _ => None,
+            };
+            if actual != Some(expected) {
+                return Err("daemon response operation ID does not match request");
+            }
+        }
+        Ok(())
+    }
+
+    fn operation_id(&self) -> Option<&OperationId> {
+        match self {
+            Self::Send { operation_id, .. }
+            | Self::PrivateSend { operation_id, .. }
+            | Self::OffersRemove { operation_id, .. }
+            | Self::OffersPrune { operation_id, .. }
+            | Self::Share { operation_id, .. }
+            | Self::Download { operation_id, .. } => Some(operation_id),
+            Self::Subscribe | Self::Status | Self::Peers | Self::Offers | Self::Stop => None,
+        }
+    }
+
+    fn validate_error_response(&self, error: &ProtocolError) -> Result<(), &'static str> {
+        let pre_admission = error.operation_id.is_none()
+            && matches!(
+                error.code,
+                ErrorCode::IpcCapacity | ErrorCode::InitialFrameTimeout
+            );
+        if pre_admission || error.operation_id.as_ref() == self.operation_id() {
+            Ok(())
+        } else {
+            Err("daemon error operation ID does not match request")
+        }
+    }
 }
 
 macro_rules! bounded_text {
@@ -501,12 +568,10 @@ pub enum Response {
     Offers(OffersList),
     AttachmentShared(AttachmentShared),
     #[serde(rename = "offer_removed")]
-    OfferRemoved(LifecycleResult),
-    OffersPruned(LifecycleResult),
+    OfferRemoved(OfferRemoved),
+    OffersPruned(OffersPruned),
     DownloadComplete(DownloadResult),
-    Stopping {
-        outcome: String,
-    },
+    Stopping {},
     Error(ProtocolError),
 }
 
@@ -563,35 +628,11 @@ impl Response {
             Self::PeersSnapshot(value) => value.validate(),
             Self::Offers(value) => value.validate(),
             Self::AttachmentShared(value) => value.validate(),
-            Self::OfferRemoved(value) => value.validate_removed(),
-            Self::OffersPruned(value) => value.validate_pruned(),
+            Self::OfferRemoved(value) => value.validate(),
+            Self::OffersPruned(value) => value.validate(),
             Self::DownloadComplete(value) => value.validate(),
-            Self::Stopping { outcome } if outcome == "stopping" || outcome == "accepted" => Ok(()),
-            Self::Stopping { .. } => Err("invalid stopping outcome"),
+            Self::Stopping {} => Ok(()),
             Self::Error(value) => value.validate(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum DaemonFrame {
-    Response(ResponseFrame),
-    Event(EventFrame),
-}
-
-impl DaemonFrame {
-    pub fn protocol_version(&self) -> ProtocolVersion {
-        match self {
-            Self::Response(frame) => frame.protocol_version,
-            Self::Event(frame) => frame.protocol_version,
-        }
-    }
-
-    pub fn request_id(&self) -> Option<&RequestId> {
-        match self {
-            Self::Response(frame) => frame.request_id.as_ref(),
-            Self::Event(frame) => Some(&frame.request_id),
         }
     }
 }
@@ -648,8 +689,6 @@ pub enum Event {
         dropped: u64,
         message: String,
     },
-    Stopping {},
-    Error(ProtocolError),
 }
 
 #[derive(Deserialize)]
@@ -678,7 +717,7 @@ impl<'de> Deserialize<'de> for EventFrame {
 impl Event {
     fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Connected(_) | Self::Stopping {} => Ok(()),
+            Self::Connected(_) => Ok(()),
             Self::Message(value) => value.validate(),
             Self::PrivateMessage(value) => value.validate(),
             Self::Queued(value) => value.validate(),
@@ -701,7 +740,6 @@ impl Event {
                 Ok(())
             }
             Self::Lagged { .. } => Err("invalid lag event"),
-            Self::Error(value) => value.validate(),
         }
     }
 }
@@ -946,19 +984,31 @@ pub struct AttachmentShared {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LifecycleResult {
+pub struct OfferRemoved {
     pub operation_id: OperationId,
-    pub offer_id: Option<OfferId>,
+    pub offer_id: OfferId,
     pub direction: Option<OfferDirection>,
     pub provider: Option<PeerId>,
-    pub older_than_secs: Option<u64>,
+    pub maximum: usize,
+    pub selected_tags: usize,
+    pub removed_tags: usize,
+    pub released_bytes: u64,
+    pub limited: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OffersPruned {
+    pub operation_id: OperationId,
+    pub direction: Option<OfferDirection>,
+    pub older_than_secs: u64,
     pub maximum: usize,
     pub dry_run: bool,
     pub selected_tags: usize,
     pub removed_tags: usize,
     pub released_bytes: u64,
     pub limited: bool,
-    pub cutoff_ms: Option<u64>,
+    pub cutoff_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1151,38 +1201,49 @@ impl OffersList {
     }
 }
 
-impl LifecycleResult {
-    fn validate_counts(&self) -> Result<(), &'static str> {
-        (self.maximum > 0
-            && self.maximum <= MAX_LIFECYCLE_ITEMS
-            && self.selected_tags <= self.maximum
-            && self.removed_tags <= self.selected_tags
-            && (!self.dry_run || self.removed_tags == 0)
-            && (self.dry_run || self.removed_tags == self.selected_tags)
-            && (!self.limited || self.selected_tags == self.maximum)
-            && (self.selected_tags != 0 || self.released_bytes == 0))
-            .then_some(())
-            .ok_or("invalid lifecycle counts or outcome")
-    }
-
-    fn validate_removed(&self) -> Result<(), &'static str> {
-        self.validate_counts()?;
-        (self.offer_id.is_some()
-            && self.older_than_secs.is_none()
-            && !self.dry_run
-            && self.cutoff_ms.is_none())
+fn validate_lifecycle_counts(
+    maximum: usize,
+    dry_run: bool,
+    selected_tags: usize,
+    removed_tags: usize,
+    released_bytes: u64,
+    limited: bool,
+) -> Result<(), &'static str> {
+    (maximum > 0
+        && maximum <= MAX_LIFECYCLE_ITEMS
+        && selected_tags <= maximum
+        && removed_tags <= selected_tags
+        && (!dry_run || removed_tags == 0)
+        && (dry_run || removed_tags == selected_tags)
+        && (!limited || selected_tags == maximum)
+        && (selected_tags != 0 || released_bytes == 0))
         .then_some(())
-        .ok_or("invalid offer removal selectors")
-    }
+        .ok_or("invalid lifecycle counts or outcome")
+}
 
-    fn validate_pruned(&self) -> Result<(), &'static str> {
-        self.validate_counts()?;
-        (self.offer_id.is_none()
-            && self.provider.is_none()
-            && self.older_than_secs.is_some()
-            && self.cutoff_ms.is_some())
-        .then_some(())
-        .ok_or("invalid offer prune selectors")
+impl OfferRemoved {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_lifecycle_counts(
+            self.maximum,
+            false,
+            self.selected_tags,
+            self.removed_tags,
+            self.released_bytes,
+            self.limited,
+        )
+    }
+}
+
+impl OffersPruned {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_lifecycle_counts(
+            self.maximum,
+            self.dry_run,
+            self.selected_tags,
+            self.removed_tags,
+            self.released_bytes,
+            self.limited,
+        )
     }
 }
 
@@ -1227,10 +1288,10 @@ pub enum EventSource {
     Gossip,
 }
 
-/// Compact protocol-v3 error payload. Correlation and versioning are carried by
-/// the containing [`ResponseFrame`] or [`EventFrame`]; the flattened wire frame
-/// therefore contains exactly protocol version, request ID, optional operation
-/// ID, typed code, and typed outcome (plus the `type` discriminator).
+/// Compact protocol-v4 error payload. Correlation and versioning are carried by
+/// the containing [`ResponseFrame`]; the flattened wire frame therefore contains
+/// exactly protocol version, request ID, optional operation ID, typed code, and
+/// typed outcome (plus the `type` discriminator).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolError {
@@ -1262,8 +1323,57 @@ impl ProtocolError {
     }
 
     /// Retry guidance is a local presentation policy, not transmitted state.
+    pub fn retry_advice(&self) -> RetryAdvice {
+        let advice = self.code.retry_advice(self.outcome);
+        if self.operation_id.is_none()
+            && matches!(
+                advice,
+                RetryAdvice::SameOperationReconciliation
+                    | RetryAdvice::NewOperationAfterConditionsChange
+            )
+        {
+            RetryAdvice::RetrySameRequest
+        } else {
+            advice
+        }
+    }
+
+    /// Compatibility adapter for callers that do not yet consume typed advice.
+    /// Prefer [`Self::retry_advice`] so a fresh operation is not confused with
+    /// reconciliation of an existing operation.
     pub fn retryable(&self) -> bool {
-        self.code.retryable(self.outcome)
+        self.retry_advice() != RetryAdvice::Never
+    }
+}
+
+/// Local guidance for handling a terminal error. This is deliberately not a
+/// protocol-v4 field: the wire carries only the typed code and outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryAdvice {
+    /// Reconcile or repeat the exact operation with its existing operation ID.
+    SameOperationReconciliation,
+    /// Wait for the stated condition to change, then make a fresh attempt with
+    /// a new operation ID. Reusing the old ID can only replay its cached result.
+    NewOperationAfterConditionsChange,
+    /// Retry the request after its transient condition changes. This covers
+    /// non-mutations and mutation failures rejected before cache admission.
+    RetrySameRequest,
+    /// Retrying cannot safely or meaningfully resolve the error.
+    Never,
+}
+
+impl RetryAdvice {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::SameOperationReconciliation => {
+                "reconcile or retry the exact operation with the same operation ID"
+            }
+            Self::NewOperationAfterConditionsChange => {
+                "after conditions change, retry as a new operation with a new operation ID"
+            }
+            Self::RetrySameRequest => "after conditions change, retry the same request",
+            Self::Never => "do not retry",
+        }
     }
 }
 
@@ -1280,8 +1390,6 @@ pub enum Outcome {
 pub enum ErrorCode {
     DaemonOffline,
     DaemonDisconnected,
-    DaemonUnavailable,
-    CapacityOrOffline,
     DaemonStopping,
     CommandTimeout,
     AttachmentCommandTimeout,
@@ -1290,11 +1398,7 @@ pub enum ErrorCode {
     OperationCapacity,
     AttachmentStorageBusy,
     OperationIdConflict,
-    InvalidOperationId,
-    InvalidSourceDigest,
     InvalidAttachmentOffer,
-    InvalidOfferSelector,
-    InvalidPruneRequest,
     ShareFailed,
     DownloadFailed,
     OffersFailed,
@@ -1305,7 +1409,6 @@ pub enum ErrorCode {
     RecipientUnresolved,
     PrivateMessageConflict,
     InvalidRequest,
-    UnsupportedSchema,
     InvalidMessage,
     InitialFrameTimeout,
     PrivateSendBusy,
@@ -1316,27 +1419,8 @@ pub enum ErrorCode {
     AttachmentTagCapacity,
     AttachmentMinFreeSpace,
     AttachmentRemovalPartial,
-    ShareOperationCapacity,
-    DownloadOperationCapacity,
-    DownloadStagingUnavailable,
-    InvalidDaemonResponse,
-    RequestRejected,
     CommandFailed,
-    FeedError,
-    StartupFailed,
     InternalContractError,
-    RequestForbidden,
-    NotFound,
-    PayloadTooLarge,
-    UnsupportedMediaType,
-    InvalidRange,
-    IdempotencyUnsupported,
-    RequestThrottled,
-    SendThrottled,
-    RequestTimeout,
-    RequestFailed,
-    SendOutcomeUnknown,
-    ShareOutcomeUnknown,
 }
 
 impl ErrorCode {
@@ -1353,15 +1437,11 @@ impl ErrorCode {
                 "Local capacity is currently unavailable."
             }
             Self::OperationIdConflict => "The operation ID is bound to different input.",
-            Self::InvalidOperationId => "The operation ID is invalid.",
-            Self::InvalidSourceDigest => "The source digest is invalid.",
             Self::ShareFailed => "Attachment sharing failed.",
             Self::DownloadFailed => "Attachment download failed.",
             Self::SendFailed | Self::PrivateSendFailed => "Message submission failed.",
             Self::RecipientUnresolved => "The recipient could not be resolved.",
-            Self::InvalidRequest | Self::UnsupportedSchema => {
-                "The request contract is invalid or unsupported."
-            }
+            Self::InvalidRequest => "The request contract is invalid or unsupported.",
             Self::InitialFrameTimeout => "The initial local request timed out.",
             Self::InvalidMessage => "The message is invalid.",
             Self::PrivateSendBusy | Self::PrivateRecipientBusy => {
@@ -1373,31 +1453,10 @@ impl ErrorCode {
             Self::AttachmentMinFreeSpace => "The attachment free-space reserve is unavailable.",
             Self::AttachmentTagCapacity => "The attachment pin capacity is exhausted.",
             Self::AttachmentRemovalPartial => "Attachment removal completed only partially.",
-            Self::ShareOperationCapacity => "Attachment sharing capacity is unavailable.",
-            Self::DownloadOperationCapacity => "Attachment download capacity is unavailable.",
-            Self::DownloadStagingUnavailable => "Attachment download staging is unavailable.",
-            Self::InvalidDaemonResponse => "The daemon returned an invalid response.",
             Self::DaemonDisconnected => "The daemon disconnected; the event feed has a gap.",
-            Self::RequestRejected => "The request was rejected.",
-            Self::FeedError => "The event feed failed.",
             Self::CommandFailed => "The command failed.",
-            Self::StartupFailed => "Daemon startup failed.",
             Self::InternalContractError => "An internal contract error occurred.",
-            Self::RequestForbidden => "The request is forbidden.",
-            Self::NotFound => "The requested resource was not found.",
-            Self::RequestThrottled | Self::SendThrottled => "The request was throttled.",
-            Self::RequestTimeout => "The request timed out.",
-            Self::PayloadTooLarge => "The request payload is too large.",
-            Self::UnsupportedMediaType => "The request media type is unsupported.",
-            Self::InvalidRange => "The requested byte range is invalid.",
-            Self::CapacityOrOffline | Self::DaemonUnavailable => "The service is unavailable.",
-            Self::RequestFailed => "The request failed.",
-            Self::IdempotencyUnsupported => "Retry-safe mutations are unsupported by the daemon.",
-            Self::SendOutcomeUnknown => "The message outcome is unknown.",
-            Self::ShareOutcomeUnknown => "The attachment sharing outcome is unknown.",
-            Self::InvalidAttachmentOffer
-            | Self::InvalidOfferSelector
-            | Self::InvalidPruneRequest => "The attachment request is invalid.",
+            Self::InvalidAttachmentOffer => "The attachment request is invalid.",
             Self::OffersBusy => "Attachment listing is currently busy.",
             Self::OffersFailed | Self::AttachmentLifecycleInternal => {
                 "The attachment lifecycle operation failed."
@@ -1406,48 +1465,64 @@ impl ErrorCode {
         }
     }
 
+    pub fn retry_advice(self, outcome: Outcome) -> RetryAdvice {
+        match outcome {
+            Outcome::Partial => {
+                if matches!(
+                    self,
+                    Self::SendFailed | Self::PrivateDeliveryUnknown | Self::InternalContractError
+                ) {
+                    RetryAdvice::Never
+                } else {
+                    RetryAdvice::SameOperationReconciliation
+                }
+            }
+            Outcome::Unknown => {
+                if self == Self::InternalContractError {
+                    RetryAdvice::Never
+                } else {
+                    RetryAdvice::SameOperationReconciliation
+                }
+            }
+            Outcome::NotStarted => {
+                if matches!(
+                    self,
+                    Self::InitialFrameTimeout
+                        | Self::IpcCapacity
+                        | Self::OperationCapacity
+                        | Self::OffersBusy
+                ) {
+                    RetryAdvice::RetrySameRequest
+                } else if matches!(
+                    self,
+                    Self::DaemonOffline
+                        | Self::DaemonDisconnected
+                        | Self::DaemonStopping
+                        | Self::CommandTimeout
+                        | Self::AttachmentCommandTimeout
+                        | Self::AttachmentStorageShutdown
+                        | Self::AttachmentStorageBusy
+                        | Self::PrivateSendBusy
+                        | Self::PrivateRecipientBusy
+                        | Self::PrivateReplayUnavailable
+                        | Self::RecipientUnresolved
+                        | Self::AttachmentQuotaExceeded
+                        | Self::AttachmentTagCapacity
+                        | Self::AttachmentMinFreeSpace
+                        | Self::DownloadFailed
+                ) {
+                    RetryAdvice::NewOperationAfterConditionsChange
+                } else {
+                    RetryAdvice::Never
+                }
+            }
+        }
+    }
+
+    /// Compatibility adapter for callers that do not yet consume typed advice.
+    /// Prefer [`Self::retry_advice`] to retain the retry strategy.
     pub fn retryable(self, outcome: Outcome) -> bool {
-        if outcome == Outcome::Partial {
-            return !matches!(
-                self,
-                Self::SendFailed
-                    | Self::InvalidDaemonResponse
-                    | Self::PrivateDeliveryUnknown
-                    | Self::InternalContractError
-            );
-        }
-        if outcome == Outcome::Unknown {
-            return !matches!(
-                self,
-                Self::PrivateDeliveryUnknown | Self::InternalContractError
-            );
-        }
-        matches!(
-            self,
-            Self::DaemonOffline
-                | Self::DaemonUnavailable
-                | Self::CapacityOrOffline
-                | Self::DaemonDisconnected
-                | Self::DaemonStopping
-                | Self::CommandTimeout
-                | Self::InitialFrameTimeout
-                | Self::IpcCapacity
-                | Self::OperationCapacity
-                | Self::AttachmentStorageBusy
-                | Self::PrivateSendBusy
-                | Self::PrivateRecipientBusy
-                | Self::PrivateReplayUnavailable
-                | Self::AttachmentMinFreeSpace
-                | Self::ShareOperationCapacity
-                | Self::DownloadOperationCapacity
-                | Self::DownloadStagingUnavailable
-                | Self::DownloadFailed
-                | Self::OffersBusy
-                | Self::StartupFailed
-                | Self::RequestThrottled
-                | Self::SendThrottled
-                | Self::RequestTimeout
-        )
+        self.retry_advice(outcome) != RetryAdvice::Never
     }
 }
 
@@ -1474,16 +1549,88 @@ mod tests {
     #[test]
     fn unknown_versions_and_fields_fail_closed() {
         let id = RequestId::new_random();
-        for version in [1, 2, 255] {
+        for version in [1, 2, 3, 255] {
             let wrong = format!(
                 r#"{{"protocol_version":{version},"request_id":"{id}","request":{{"command":"status"}}}}"#
             );
             assert!(serde_json::from_str::<RequestFrame>(&wrong).is_err());
         }
         let extra = format!(
-            r#"{{"protocol_version":3,"request_id":"{id}","request":{{"command":"status"}},"extra":true}}"#
+            r#"{{"protocol_version":4,"request_id":"{id}","request":{{"command":"status"}},"extra":true}}"#
         );
         assert!(serde_json::from_str::<RequestFrame>(&extra).is_err());
+    }
+
+    #[test]
+    fn download_request_keeps_its_string_source_api_and_wire_shape() {
+        let offer = String::from("public-string-token");
+        let request = Request::Download {
+            operation_id: OperationId::new_random(),
+            offer: offer.clone(),
+            output: std::env::temp_dir().join("meshmsg-download-source-api"),
+            mode: DownloadMode::Install,
+        };
+        let Request::Download {
+            offer: source_offer,
+            ..
+        } = &request
+        else {
+            unreachable!()
+        };
+        let _: &String = source_offer;
+        assert_eq!(source_offer, &offer);
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["command"], "download");
+        assert_eq!(wire["offer"], offer);
+        assert_eq!(serde_json::from_value::<Request>(wire).unwrap(), request);
+    }
+
+    #[test]
+    fn request_response_validation_centralizes_family_and_operation_correlation() {
+        let operation_id = OperationId::new_random();
+        let request = Request::Send {
+            operation_id: operation_id.clone(),
+            body: BroadcastBody::new("hello").unwrap(),
+        };
+        let queued = |operation_id: OperationId| {
+            Response::Queued(Queued {
+                message_id: operation_id.as_str().parse().unwrap(),
+                operation_id,
+                from: "1".repeat(64).parse().unwrap(),
+                timestamp_ms: 1,
+                body: BroadcastBody::new("hello").unwrap(),
+                delivery_acknowledged: false,
+            })
+        };
+
+        assert!(request
+            .validate_response(&queued(operation_id.clone()))
+            .is_ok());
+        assert!(request
+            .validate_response(&queued(OperationId::new_random()))
+            .is_err());
+        assert!(request.validate_response(&Response::Stopping {}).is_err());
+        assert!(request
+            .validate_response(&Response::Error(ProtocolError::new(
+                Some(operation_id),
+                ErrorCode::CommandTimeout,
+                Outcome::Unknown,
+            )))
+            .is_ok());
+        assert!(request
+            .validate_response(&Response::Error(ProtocolError::new(
+                Some(OperationId::new_random()),
+                ErrorCode::CommandTimeout,
+                Outcome::Unknown,
+            )))
+            .is_err());
+        assert!(request
+            .validate_response(&Response::Error(ProtocolError::new(
+                None,
+                ErrorCode::IpcCapacity,
+                Outcome::NotStarted,
+            )))
+            .is_ok());
     }
 
     #[test]
@@ -1556,6 +1703,71 @@ mod tests {
     }
 
     #[test]
+    fn retry_advice_covers_cached_pre_admission_and_uncertain_contexts() {
+        let cached_condition_failures = [
+            ErrorCode::AttachmentStorageBusy,
+            ErrorCode::PrivateSendBusy,
+            ErrorCode::PrivateRecipientBusy,
+            ErrorCode::PrivateReplayUnavailable,
+            ErrorCode::RecipientUnresolved,
+            ErrorCode::AttachmentQuotaExceeded,
+            ErrorCode::AttachmentTagCapacity,
+            ErrorCode::AttachmentMinFreeSpace,
+            ErrorCode::DownloadFailed,
+        ];
+        for code in cached_condition_failures {
+            assert_eq!(
+                code.retry_advice(Outcome::NotStarted),
+                RetryAdvice::NewOperationAfterConditionsChange
+            );
+            let error =
+                ProtocolError::new(Some(OperationId::new_random()), code, Outcome::NotStarted);
+            assert_eq!(
+                error.retry_advice(),
+                RetryAdvice::NewOperationAfterConditionsChange
+            );
+            assert!(code.retryable(Outcome::NotStarted));
+            assert!(error.retryable());
+        }
+
+        for code in [
+            ErrorCode::OperationCapacity,
+            ErrorCode::IpcCapacity,
+            ErrorCode::InitialFrameTimeout,
+            ErrorCode::OffersBusy,
+        ] {
+            assert_eq!(
+                code.retry_advice(Outcome::NotStarted),
+                RetryAdvice::RetrySameRequest
+            );
+            assert_eq!(
+                ProtocolError::new(None, code, Outcome::NotStarted).retry_advice(),
+                RetryAdvice::RetrySameRequest
+            );
+        }
+
+        for (code, outcome) in [
+            (ErrorCode::CommandTimeout, Outcome::Unknown),
+            (ErrorCode::AttachmentRemovalPartial, Outcome::Partial),
+            (ErrorCode::PrivateDeliveryUnknown, Outcome::Unknown),
+        ] {
+            assert_eq!(
+                ProtocolError::new(Some(OperationId::new_random()), code, outcome,).retry_advice(),
+                RetryAdvice::SameOperationReconciliation
+            );
+            assert_eq!(
+                ProtocolError::new(None, code, outcome).retry_advice(),
+                RetryAdvice::RetrySameRequest
+            );
+        }
+
+        let invalid = ProtocolError::new(None, ErrorCode::InvalidRequest, Outcome::NotStarted);
+        assert_eq!(invalid.retry_advice(), RetryAdvice::Never);
+        assert!(!invalid.retryable());
+        assert!(!ErrorCode::InvalidRequest.retryable(Outcome::NotStarted));
+    }
+
+    #[test]
     fn protocol_error_wire_is_compact_typed_and_strict() {
         let request_id = RequestId::new_random();
         let operation_id = OperationId::new_random();
@@ -1571,14 +1783,20 @@ mod tests {
         let value = serde_json::to_value(&frame).unwrap();
         let keys = value.as_object().unwrap();
         assert_eq!(keys.len(), 6);
-        for forbidden in ["message", "retryable", "selected_tags", "removed_tags"] {
+        for forbidden in [
+            "message",
+            "retryable",
+            "retry_advice",
+            "selected_tags",
+            "removed_tags",
+        ] {
             assert!(!keys.contains_key(forbidden));
         }
         assert_eq!(
             serde_json::from_value::<ResponseFrame>(value.clone()).unwrap(),
             frame
         );
-        for field in ["message", "retryable", "selected_tags"] {
+        for field in ["message", "retryable", "retry_advice", "selected_tags"] {
             let mut malformed = value.clone();
             malformed[field] = serde_json::Value::Null;
             assert!(serde_json::from_value::<ResponseFrame>(malformed).is_err());
@@ -1588,22 +1806,18 @@ mod tests {
     #[test]
     fn response_and_event_families_reject_schema_versions_and_unknown_fields() {
         let request_id = RequestId::new_random();
-        let response = format!(
-            r#"{{"protocol_version":3,"request_id":"{request_id}","type":"stopping","outcome":"accepted"}}"#
-        );
+        let response =
+            format!(r#"{{"protocol_version":4,"request_id":"{request_id}","type":"stopping"}}"#);
         assert!(serde_json::from_str::<ResponseFrame>(&response).is_ok());
         for malformed in [
             response.replace("\"type\":", "\"schema_version\":1,\"type\":"),
-            response.replace(
-                "\"outcome\":\"accepted\"",
-                "\"outcome\":\"accepted\",\"extra\":true",
-            ),
+            response.replace("\"stopping\"", "\"stopping\",\"extra\":true"),
         ] {
             assert!(serde_json::from_str::<ResponseFrame>(&malformed).is_err());
         }
 
         let event = format!(
-            r#"{{"protocol_version":3,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
+            r#"{{"protocol_version":4,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
             "2".repeat(64)
         );
         assert!(serde_json::from_str::<EventFrame>(&event).is_ok());
@@ -1651,7 +1865,7 @@ mod tests {
         let message_id = MessageId::new_random();
         let decode_event = |kind: &str, body: &str, private_fields: &str| {
             serde_json::from_str::<EventFrame>(&format!(
-                r#"{{"protocol_version":3,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
+                r#"{{"protocol_version":4,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
             ))
         };
         assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES), "").is_ok());
@@ -1677,25 +1891,25 @@ mod tests {
 
         let invalid_responses = [
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"older_than_secs":null,"maximum":1,"dry_run":false,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false,"cutoff_ms":null}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"maximum":1,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","offer_id":null,"direction":null,"provider":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","direction":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
             ),
         ];
         for frame in invalid_responses {
@@ -1707,19 +1921,19 @@ mod tests {
 
         let invalid_events = [
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
             ),
             format!(
-                r#"{{"protocol_version":3,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
+                r#"{{"protocol_version":4,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
             ),
         ];
         for frame in invalid_events {
@@ -1728,6 +1942,90 @@ mod tests {
                 "{frame}"
             );
         }
+    }
+
+    #[test]
+    fn protocol_v4_cleanup_round_trips_only_context_specific_frames() {
+        let request_id = RequestId::new_random();
+        let operation_id = OperationId::new_random();
+        let removed = ResponseFrame::new(
+            Some(request_id.clone()),
+            Response::OfferRemoved(OfferRemoved {
+                operation_id: operation_id.clone(),
+                offer_id: OfferId::new_random(),
+                direction: Some(OfferDirection::Incoming),
+                provider: Some("7".repeat(64).parse().unwrap()),
+                maximum: 8,
+                selected_tags: 1,
+                removed_tags: 1,
+                released_bytes: 12,
+                limited: false,
+            }),
+        );
+        let removed_wire = serde_json::to_value(&removed).unwrap();
+        assert!(removed_wire.get("older_than_secs").is_none());
+        assert!(removed_wire.get("dry_run").is_none());
+        assert!(removed_wire.get("cutoff_ms").is_none());
+        assert_eq!(
+            serde_json::from_value::<ResponseFrame>(removed_wire).unwrap(),
+            removed
+        );
+
+        let pruned = ResponseFrame::new(
+            Some(request_id.clone()),
+            Response::OffersPruned(OffersPruned {
+                operation_id,
+                direction: None,
+                older_than_secs: 60,
+                maximum: 8,
+                dry_run: true,
+                selected_tags: 1,
+                removed_tags: 0,
+                released_bytes: 12,
+                limited: false,
+                cutoff_ms: 1_000,
+            }),
+        );
+        let pruned_wire = serde_json::to_value(&pruned).unwrap();
+        assert!(pruned_wire.get("offer_id").is_none());
+        assert!(pruned_wire.get("provider").is_none());
+        assert_eq!(
+            serde_json::from_value::<ResponseFrame>(pruned_wire).unwrap(),
+            pruned
+        );
+
+        let stopping = ResponseFrame::new(Some(request_id.clone()), Response::Stopping {});
+        let stopping_wire = serde_json::to_value(&stopping).unwrap();
+        assert!(stopping_wire.get("outcome").is_none());
+        assert_eq!(
+            serde_json::from_value::<ResponseFrame>(stopping_wire).unwrap(),
+            stopping
+        );
+
+        for removed_v4_surface in [
+            serde_json::json!({
+                "protocol_version": 4,
+                "request_id": request_id,
+                "type": "stopping"
+            }),
+            serde_json::json!({
+                "protocol_version": 4,
+                "request_id": RequestId::new_random(),
+                "type": "error",
+                "code": "invalid_request",
+                "outcome": "not_started"
+            }),
+        ] {
+            assert!(serde_json::from_value::<EventFrame>(removed_v4_surface).is_err());
+        }
+        let inactive_code = serde_json::json!({
+            "protocol_version": 4,
+            "request_id": RequestId::new_random(),
+            "type": "error",
+            "code": "request_forbidden",
+            "outcome": "not_started"
+        });
+        assert!(serde_json::from_value::<ResponseFrame>(inactive_code).is_err());
     }
 
     #[test]

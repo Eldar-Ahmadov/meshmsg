@@ -1,5 +1,8 @@
 pub(crate) mod protocol;
 pub(crate) mod runtime;
+mod storage;
+mod tags;
+mod transfer;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

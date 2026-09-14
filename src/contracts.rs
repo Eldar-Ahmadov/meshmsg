@@ -1,4 +1,4 @@
-//! Small adapter helpers around the strict protocol-v3 boundary.
+//! Small adapter helpers around the strict protocol-v4 boundary.
 use anyhow::{Context, Result};
 use meshmsg_protocol::{ErrorCode, OperationId, Outcome, ProtocolError};
 
@@ -23,7 +23,7 @@ pub(crate) struct ProtocolErrorAdapter {
     pub(crate) request_id: Option<String>,
     pub(crate) operation_id: Option<String>,
     pub(crate) message: String,
-    pub(crate) retryable: bool,
+    pub(crate) retry_advice: meshmsg_protocol::RetryAdvice,
 }
 
 impl ProtocolErrorAdapter {
@@ -31,7 +31,6 @@ impl ProtocolErrorAdapter {
         code: impl Into<String>,
         _diagnostic: impl AsRef<str>,
         outcome: impl Into<String>,
-        _retryable: bool,
     ) -> Result<Self> {
         let code = code.into();
         let outcome = outcome.into();
@@ -46,9 +45,8 @@ impl ProtocolErrorAdapter {
         code: impl Into<String>,
         diagnostic: impl AsRef<str>,
         outcome: impl Into<String>,
-        retryable: bool,
     ) -> Self {
-        Self::try_new(code, diagnostic, outcome, retryable).unwrap_or_else(|_| {
+        Self::try_new(code, diagnostic, outcome).unwrap_or_else(|_| {
             Self::from_typed(
                 None,
                 ProtocolError::new(None, ErrorCode::InternalContractError, Outcome::Unknown),
@@ -62,7 +60,7 @@ impl ProtocolErrorAdapter {
             request_id,
             operation_id: error.operation_id.as_ref().map(ToString::to_string),
             message: error.message().into(),
-            retryable: error.retryable(),
+            retry_advice: error.retry_advice(),
         }
     }
     pub(crate) fn typed(&self) -> Result<ProtocolError> {
@@ -85,11 +83,7 @@ impl std::fmt::Display for ContractFailure {
             self.0.message,
             self.0.code,
             self.0.outcome,
-            if self.0.retryable {
-                "retryable"
-            } else {
-                "do not retry unchanged"
-            }
+            self.0.retry_advice.message()
         )
     }
 }

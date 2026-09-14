@@ -114,18 +114,17 @@ mod tests {
     }
 
     fn snapshot_frame_value(snapshot: meshmsg_protocol::PeerSnapshot) -> serde_json::Value {
-        serde_json::to_value(meshmsg_protocol::DaemonFrame::Response(
-            meshmsg_protocol::ResponseFrame::new(
-                Some(meshmsg_protocol::RequestId::new_random()),
-                meshmsg_protocol::Response::PeersSnapshot(snapshot),
-            ),
+        serde_json::to_value(meshmsg_protocol::ResponseFrame::new(
+            Some(meshmsg_protocol::RequestId::new_random()),
+            meshmsg_protocol::Response::PeersSnapshot(snapshot),
         ))
         .unwrap()
     }
 
     fn event_frame_value(event: meshmsg_protocol::Event) -> serde_json::Value {
-        serde_json::to_value(meshmsg_protocol::DaemonFrame::Event(
-            meshmsg_protocol::EventFrame::new(meshmsg_protocol::RequestId::new_random(), event),
+        serde_json::to_value(meshmsg_protocol::EventFrame::new(
+            meshmsg_protocol::RequestId::new_random(),
+            event,
         ))
         .unwrap()
     }
@@ -149,7 +148,7 @@ mod tests {
             ],
         ));
         assert_eq!(value["type"], "peers_snapshot");
-        assert_eq!(value["protocol_version"], 3);
+        assert_eq!(value["protocol_version"], 4);
         assert!(value["request_id"].as_str().is_some());
         assert_eq!(value["self"]["public_key"], b);
         assert_eq!(value["self"]["alias"], "local");
@@ -226,7 +225,7 @@ mod tests {
         );
         let discovered = event_frame_value(discovered);
         assert_eq!(discovered["type"], "peer_discovered");
-        assert_eq!(discovered["protocol_version"], 3);
+        assert_eq!(discovered["protocol_version"], 4);
         assert!(discovered["request_id"].as_str().is_some());
         assert_eq!(discovered["directory_revision"], 1);
         assert_eq!(discovered["peer"]["public_key"], "c".repeat(64));

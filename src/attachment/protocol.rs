@@ -133,18 +133,15 @@ pub(crate) fn parse_signed_offer_token(
 pub(crate) fn encode_signed_offer(
     secret: &SecretKey,
     topic: TopicId,
+    operation_id: &meshmsg_protocol::OperationId,
     offer: AttachmentOffer,
     timestamp_ms: u64,
 ) -> Result<EncodedOffer> {
     anyhow::ensure!(
-        crate::contracts::valid_operation_id(&offer.offer_id),
-        "invalid attachment offer ID"
+        operation_id.as_str() == offer.offer_id,
+        "attachment operation ID does not match offer ID"
     );
-    let message_id: [u8; 16] = data_encoding::HEXLOWER
-        .decode(offer.offer_id.as_bytes())
-        .expect("validated operation ID")
-        .try_into()
-        .expect("validated operation ID length");
+    let message_id = operation_id.to_bytes();
     let body = attachment_body(&offer)?;
     validate_offer_binding(secret.public(), message_id, timestamp_ms, &body)?;
     let encoded = Envelope::encode_with_id_at(
@@ -256,8 +253,9 @@ pub(crate) fn validate_attachment_event(
 
 #[cfg(debug_assertions)]
 fn fixture_event_value(event: meshmsg_protocol::Event) -> serde_json::Value {
-    serde_json::to_value(meshmsg_protocol::DaemonFrame::Event(
-        meshmsg_protocol::EventFrame::new(meshmsg_protocol::RequestId::new_random(), event),
+    serde_json::to_value(meshmsg_protocol::EventFrame::new(
+        meshmsg_protocol::RequestId::new_random(),
+        event,
     ))
     .expect("attachment fixture serialization")
 }
@@ -298,7 +296,8 @@ pub(crate) fn signed_attachment_fixture(
         )
         .to_string(),
     };
-    let signed = encode_signed_offer(&secret, topic, offer, timestamp_ms)?;
+    let operation_id = offer_id.parse()?;
+    let signed = encode_signed_offer(&secret, topic, &operation_id, offer, timestamp_ms)?;
     Ok(fixture_event_value(offer_event(
         signed.from,
         signed.message_id,
@@ -330,7 +329,8 @@ pub(crate) fn signed_attachment_event_for_topic_for_test(
         )
         .to_string(),
     };
-    let signed = encode_signed_offer(secret, topic, offer, timestamp_ms)
+    let operation_id = offer_id.parse().unwrap();
+    let signed = encode_signed_offer(secret, topic, &operation_id, offer, timestamp_ms)
         .expect("test signed attachment envelope");
     fixture_event_value(offer_event(
         signed.from,
@@ -339,4 +339,219 @@ pub(crate) fn signed_attachment_event_for_topic_for_test(
         &signed.encoded,
         signed.offer,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attachment::{runtime::download_request_context, AttachmentKind};
+    use serde_byte_array::ByteArray;
+    use std::path::Path;
+
+    fn test_topic() -> TopicId {
+        TopicId::from_bytes([7; 32])
+    }
+
+    fn operation_id_bytes(operation_id: &str) -> [u8; 16] {
+        operation_id
+            .parse::<meshmsg_protocol::OperationId>()
+            .expect("validated operation ID")
+            .to_bytes()
+    }
+
+    fn encode_unchecked_signed_envelope(
+        secret: &SecretKey,
+        kind: EnvelopeKind,
+        body: String,
+        message_id: [u8; 16],
+        timestamp_ms: u64,
+    ) -> Bytes {
+        let topic = test_topic();
+        let signed = postcard::to_stdvec(&crate::gossip::EnvelopeSignaturePayload {
+            domain: crate::gossip::ENVELOPE_DOMAIN,
+            version: crate::gossip::ENVELOPE_VERSION,
+            topic,
+            from: secret.public(),
+            message_id,
+            timestamp_ms,
+            kind,
+            body: &body,
+        })
+        .unwrap();
+        postcard::to_stdvec(&Envelope {
+            domain: crate::gossip::ENVELOPE_DOMAIN.to_owned(),
+            version: crate::gossip::ENVELOPE_VERSION,
+            topic,
+            from: secret.public(),
+            message_id,
+            timestamp_ms,
+            kind,
+            body,
+            signature: ByteArray::new(secret.sign(&signed).to_bytes()),
+        })
+        .unwrap()
+        .into()
+    }
+    fn sample_offer(provider: PublicKey) -> AttachmentOffer {
+        AttachmentOffer {
+            offer_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            kind: AttachmentKind::File,
+            name: "report.txt".to_owned(),
+            size: 6,
+            ticket: BlobTicket::new(
+                iroh::EndpointAddr::new(provider),
+                iroh_blobs::Hash::new(b"report"),
+                BlobFormat::Raw,
+            )
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn signed_attachment_offer_round_trips_and_rejects_tampering() {
+        let secret = SecretKey::generate();
+        let offer = sample_offer(secret.public());
+        let encoded = Envelope::encode_with_id_at(
+            &secret,
+            test_topic(),
+            EnvelopeKind::AttachmentOffer,
+            attachment_body(&offer).unwrap(),
+            operation_id_bytes(&offer.offer_id),
+            42,
+        )
+        .unwrap();
+        let token = BASE64URL_NOPAD.encode(&encoded);
+
+        let (decoded, ticket) = parse_signed_offer_token(&token, test_topic()).unwrap();
+        assert_eq!(decoded, offer);
+        assert_eq!(ticket.addr().id, secret.public());
+        let operation_id: meshmsg_protocol::OperationId =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let context = download_request_context(
+            &operation_id,
+            &token,
+            Path::new("/tmp/report.txt"),
+            test_topic(),
+        )
+        .unwrap();
+        assert_eq!(context.offer_id.to_string(), offer.offer_id);
+        assert_eq!(context.provider.to_string(), secret.public().to_string());
+        assert_eq!(context.kind, meshmsg_protocol::AttachmentKind::File);
+        assert_eq!(context.name.as_str(), "report.txt");
+        assert_eq!(context.declared_size, Some(6));
+        assert_eq!(
+            context.token_digest,
+            crate::ipc::download_token_digest(&token)
+        );
+        validate_attachment_event(
+            Some(test_topic()),
+            Some(42),
+            &secret.public().to_string(),
+            &decoded.offer_id,
+            42,
+            &decoded,
+            &token,
+        )
+        .unwrap();
+        assert!(validate_attachment_event(
+            Some(TopicId::from_bytes([8; 32])),
+            Some(42),
+            &secret.public().to_string(),
+            &decoded.offer_id,
+            42,
+            &decoded,
+            &token,
+        )
+        .is_err());
+        assert!(validate_attachment_event(
+            Some(test_topic()),
+            Some(42 + ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 + 1),
+            &secret.public().to_string(),
+            &decoded.offer_id,
+            42,
+            &decoded,
+            &token,
+        )
+        .is_err());
+        // Saved signed tokens are portable capabilities: their nonzero signed
+        // timestamp remains authenticated but does not expire at download time.
+        assert!(parse_signed_offer_token(&token, test_topic()).is_ok());
+        let zero_time = encode_unchecked_signed_envelope(
+            &secret,
+            EnvelopeKind::AttachmentOffer,
+            attachment_body(&offer).unwrap(),
+            operation_id_bytes(&offer.offer_id),
+            0,
+        );
+        let zero_time_envelope = Envelope::decode(&zero_time, test_topic()).unwrap();
+        assert!(validate_offer_binding(
+            zero_time_envelope.from,
+            zero_time_envelope.message_id,
+            zero_time_envelope.timestamp_ms,
+            &zero_time_envelope.body,
+        )
+        .is_err());
+        assert!(
+            parse_signed_offer_token(&BASE64URL_NOPAD.encode(&zero_time), test_topic()).is_err()
+        );
+
+        let mut tampered = encoded.to_vec();
+        let last = tampered.last_mut().unwrap();
+        *last ^= 1;
+        assert!(
+            parse_signed_offer_token(&BASE64URL_NOPAD.encode(&tampered), test_topic()).is_err()
+        );
+    }
+
+    #[test]
+    fn attachment_wire_rejects_provider_mismatch_version_and_trailing_bytes() {
+        let signer = SecretKey::generate();
+        let other = SecretKey::generate();
+        let mismatched = sample_offer(other.public());
+        let operation_id = mismatched.offer_id.parse().unwrap();
+        assert!(crate::attachment::protocol::encode_signed_offer(
+            &signer,
+            test_topic(),
+            &operation_id,
+            mismatched,
+            42,
+        )
+        .is_err());
+
+        let version = postcard::to_stdvec(&AttachmentWire {
+            version: ATTACHMENT_OFFER_VERSION + 1,
+            offer: sample_offer(signer.public()),
+        })
+        .unwrap();
+        let body = format!("{ATTACHMENT_PREFIX}{}", BASE64URL_NOPAD.encode(&version));
+        assert!(parse_attachment_body(&body).is_err());
+
+        let mut trailing = postcard::to_stdvec(&AttachmentWire {
+            version: ATTACHMENT_OFFER_VERSION,
+            offer: sample_offer(signer.public()),
+        })
+        .unwrap();
+        trailing.push(0);
+        let body = format!("{ATTACHMENT_PREFIX}{}", BASE64URL_NOPAD.encode(&trailing));
+        assert!(parse_attachment_body(&body).is_err());
+    }
+
+    #[test]
+    fn ordinary_and_malformed_prefixed_signed_text_remain_messages() {
+        let secret = SecretKey::generate();
+        for body in ["legacy text", "meshmsg-attachment-v1:not-an-offer"] {
+            let encoded = Envelope::encode_at(
+                &secret,
+                test_topic(),
+                EnvelopeKind::Message,
+                body.to_owned(),
+                42,
+            )
+            .unwrap();
+            let envelope = Envelope::decode(&encoded, test_topic()).unwrap();
+            let event = serde_json::to_value(crate::gossip::message_event(&envelope)).unwrap();
+            assert_eq!(event["type"], "message");
+            assert_eq!(event["body"], body);
+        }
+    }
 }

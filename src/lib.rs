@@ -1,6 +1,7 @@
 mod alias;
 mod attachment;
 mod cli;
+mod client_commands;
 mod config;
 mod contracts;
 mod direct;
@@ -11,6 +12,7 @@ mod invite;
 mod ipc;
 mod message;
 mod node;
+mod output;
 mod peers;
 mod persistent;
 mod presence;
@@ -48,17 +50,16 @@ fn report_failure(error: anyhow::Error, json: bool, daemon: bool) -> ExitCode {
         let authoritative = authoritative_contract_failure(&error);
         let envelope = authoritative.unwrap_or_else(|| {
             let diagnostic = format!("{error:#}");
-            let (code, retryable, outcome) = if diagnostic.contains("connect to local daemon") {
-                ("daemon_offline", true, "not_started")
+            let (code, outcome) = if diagnostic.contains("connect to local daemon") {
+                ("daemon_offline", "not_started")
             } else if diagnostic.contains("timed out")
                 || diagnostic.contains("outcome may be unknown")
             {
-                ("command_timeout", true, "unknown")
+                ("command_timeout", "unknown")
             } else {
-                ("command_failed", false, "not_started")
+                ("command_failed", "not_started")
             };
-            let mut envelope =
-                contracts::ProtocolErrorAdapter::new(code, &diagnostic, outcome, retryable);
+            let mut envelope = contracts::ProtocolErrorAdapter::new(code, &diagnostic, outcome);
             envelope.request_id = Some(contracts::new_request_id());
             envelope
         });
@@ -213,7 +214,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("{token}");
             }
         }
-        Command::Stop => node::stop(&dir, cli.json).await?,
+        Command::Stop => client_commands::stop(&dir, cli.json).await?,
         Command::Send {
             operation_id,
             to,
@@ -221,7 +222,10 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             // Allocate or preserve the retry identity before local body
             // validation, but do not contact the daemon or admit its cache.
-            let operation_id = operation_id.unwrap_or_else(ipc::new_operation_id);
+            let operation_id = operation_id
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or_else(ipc::new_operation_id);
             let private = to.is_some();
             let maximum = if private {
                 message::MAX_PRIVATE_BODY_BYTES
@@ -239,10 +243,11 @@ async fn run(cli: Cli) -> Result<()> {
                     Ok(body)
                 })
                 .map_err(|error| message::invalid_local_message(&operation_id, error))?;
-            node::send_once(&dir, Some(operation_id), to.as_deref(), &message, cli.json).await?
+            client_commands::send_once(&dir, operation_id, to.as_deref(), &message, cli.json)
+                .await?
         }
         Command::Share { operation_id, path } => {
-            node::share(&dir, operation_id, &path, cli.json).await?
+            client_commands::share(&dir, operation_id, &path, cli.json).await?
         }
         #[cfg(debug_assertions)]
         Command::TestSignAttachmentFixture {
@@ -268,14 +273,14 @@ async fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Offers { command } => match command {
-            None => node::offers(&dir, cli.json).await?,
+            None => client_commands::offers(&dir, cli.json).await?,
             Some(OffersCommand::Remove {
                 operation_id,
                 offer_id,
                 direction,
                 provider,
             }) => {
-                node::offers_remove(
+                client_commands::offers_remove(
                     &dir,
                     operation_id,
                     &offer_id,
@@ -292,7 +297,7 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 max_delete,
             }) => {
-                node::offers_prune(
+                client_commands::offers_prune(
                     &dir,
                     operation_id,
                     older_than_secs,
@@ -304,19 +309,19 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?
             }
         },
-        Command::Peers => node::peers(&dir, cli.json).await?,
+        Command::Peers => client_commands::peers(&dir, cli.json).await?,
         Command::Download {
             operation_id,
             input,
             output,
         } => {
             let offer = input.into_offer()?;
-            node::download(&dir, operation_id, &offer, &output, cli.json).await?
+            client_commands::download(&dir, operation_id, &offer, &output, cli.json).await?
         }
-        Command::Listen => node::listen(&dir, cli.json).await?,
-        Command::Chat => node::chat(&dir, cli.json).await?,
-        Command::Status => node::status(&dir, cli.json).await?,
-        Command::Doctor => node::doctor(&dir, cli.json).await?,
+        Command::Listen => client_commands::listen(&dir, cli.json).await?,
+        Command::Chat => client_commands::chat(&dir, cli.json).await?,
+        Command::Status => client_commands::status(&dir, cli.json).await?,
+        Command::Doctor => client_commands::doctor(&dir, cli.json).await?,
     }
     Ok(())
 }
@@ -347,7 +352,7 @@ mod tests {
     #[test]
     fn contextual_contract_failure_remains_authoritative() {
         let mut expected =
-            contracts::ProtocolErrorAdapter::new("daemon_disconnected", "", "partial", true);
+            contracts::ProtocolErrorAdapter::new("daemon_disconnected", "", "partial");
         expected.request_id = Some("11111111111111111111111111111111".into());
         let error = anyhow::anyhow!("private transport diagnostic")
             .context(contracts::ContractFailure(expected.clone()));
