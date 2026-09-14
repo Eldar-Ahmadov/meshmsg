@@ -24,8 +24,11 @@ fn contract_facts(document: &str) -> BTreeMap<&str, u64> {
 }
 
 fn json_examples(document: &str) -> Vec<serde_json::Value> {
+    // Git may check documentation out with CRLF on Windows. Normalize only the
+    // parser input; JSON examples still pass through strict serde_json parsing.
+    let normalized = document.replace("\r\n", "\n");
     let mut examples = Vec::new();
-    let mut remainder = document;
+    let mut remainder = normalized.as_str();
     while let Some((_, after_open)) = remainder.split_once("```json\n") {
         let (json, after_close) = after_open
             .split_once("\n```")
@@ -34,6 +37,19 @@ fn json_examples(document: &str) -> Vec<serde_json::Value> {
         remainder = after_close;
     }
     examples
+}
+
+#[test]
+fn json_examples_accept_crlf_fenced_blocks() {
+    let document =
+        "before\r\n```json\r\n{\"protocol_version\":4,\"type\":\"stopping\"}\r\n```\r\nafter\r\n";
+    assert_eq!(
+        json_examples(document),
+        vec![serde_json::json!({
+            "protocol_version": 4,
+            "type": "stopping"
+        })]
+    );
 }
 
 #[test]
