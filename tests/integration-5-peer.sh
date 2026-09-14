@@ -3,6 +3,9 @@ set -euo pipefail
 
 BIN=${1:-target/debug/meshmsg}
 BIN=$(realpath "$BIN")
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CHAT_NDJSON_VALIDATOR="$SCRIPT_DIR/validate-chat-error-ndjson.py"
+python3 "$CHAT_NDJSON_VALIDATOR" --self-test >/dev/null
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/meshmsg-integration.XXXXXX")
 declare -A PIDS=()
 
@@ -197,7 +200,11 @@ done
 if printf '%s\n' "$OVERSIZED" | timeout 30 "$BIN" --state-dir "$ROOT/c1" --json chat >"$ROOT/oversized-chat.out" 2>"$ROOT/oversized-chat.err"; then
   fail "oversized chat message unexpectedly succeeded"
 fi
-python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["type"] == "error" and v["protocol_version"] == 4' "$ROOT/oversized-chat.out" || fail "oversized chat rejection was not machine-readable"
+# Chat is a streaming command: connected/snapshot or other valid events may win
+# the select race before local input validation fails. Validate the complete
+# NDJSON stream and require its sole error to be the final record.
+python3 "$CHAT_NDJSON_VALIDATOR" "$ROOT/oversized-chat.out" \
+  || fail "oversized chat rejection had the wrong terminal NDJSON contract"
 test ! -s "$ROOT/oversized-chat.err" || fail "oversized chat JSON failure wrote to stderr"
 
 # Stale socket recovery and peer daemon restart.

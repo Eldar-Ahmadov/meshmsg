@@ -276,6 +276,11 @@ pub(crate) async fn listen(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn invalid_chat_input(diagnostic: &'static str) -> anyhow::Error {
+    let operation_id = ipc::new_operation_id();
+    crate::message::invalid_local_message(&operation_id, anyhow::anyhow!(diagnostic))
+}
+
 pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
     let mut reader = subscribe(dir).await?;
     let (tx, mut rx) = mpsc::channel::<std::result::Result<String, &'static str>>(8);
@@ -330,7 +335,7 @@ pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
                     )
                     .await?;
                 }
-                Some(Err(error)) => anyhow::bail!(error),
+                Some(Err(error)) => return Err(invalid_chat_input(error)),
                 None => break,
             },
             value = reader.read() => match value? {
@@ -377,6 +382,26 @@ mod tests {
     use super::*;
     use crate::invite::Invite;
     use iroh::SecretKey;
+
+    #[test]
+    fn invalid_chat_input_uses_the_canonical_message_error_contract() {
+        let error = invalid_chat_input("chat message exceeds the broadcast UTF-8 byte limit");
+        let failure = error
+            .downcast_ref::<crate::contracts::ContractFailure>()
+            .expect("chat input failure must retain its typed contract");
+        assert_eq!(failure.0.code, "invalid_message");
+        assert_eq!(failure.0.outcome, "not_started");
+        assert!(failure
+            .0
+            .operation_id
+            .as_deref()
+            .is_some_and(crate::contracts::valid_operation_id));
+        assert!(failure
+            .0
+            .request_id
+            .as_deref()
+            .is_some_and(crate::contracts::valid_request_id));
+    }
 
     #[test]
     fn caller_share_path_preserves_representation_and_rejects_oversize_before_ipc() {
