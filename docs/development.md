@@ -61,7 +61,11 @@ The workflow allows 130 minutes,
 including setup/build/cleanup, while the driver rejects an inventory above its
 115-minute command budget.
 
-The networking harnesses require working Iroh networking.
+The networking harnesses require working Iroh networking. Native Windows
+verification also runs `tests/integration-attachments-windows.ps1` against two
+isolated daemons. It shares and downloads a signed file offer in a local temporary
+NTFS directory, checks the durable completion fields and content hash, and rejects
+leftover download staging files.
 
 ### Lean release verification
 

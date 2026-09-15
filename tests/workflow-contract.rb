@@ -117,10 +117,12 @@ def validate(ci, verification, release, inventory)
   assert_run(windows, "windows-tests", "cargo test --locked --workspace --all-targets")
   assert_run(windows, "windows-clippy", "cargo clippy --locked --workspace --all-targets -- -D warnings")
   assert_run(windows, "windows-build", "cargo build --locked")
+  assert_run(windows, "windows-attachment-integration",
+             "./tests/integration-attachments-windows.ps1 -Binary target/debug/meshmsg.exe")
   assert_run(windows, "windows-resolve-dumpbin", "./tests/resolve-dumpbin.ps1")
   assert(step_by_id(windows, "windows-exercise-dumpbin").fetch("run").include?("/headers target/debug/meshmsg.exe"),
          "regular Windows verification must exercise the resolved dumpbin")
-  assert_order(windows, %w[windows-tests windows-clippy windows-build windows-resolve-dumpbin windows-exercise-dumpbin])
+  assert_order(windows, %w[windows-tests windows-clippy windows-build windows-attachment-integration windows-resolve-dumpbin windows-exercise-dumpbin])
   policy = jobs["dependency-policy"]
   assert_run(policy, "cargo-audit", "cargo audit")
   assert_run(policy, "cargo-deny", "cargo deny check advisories bans licenses sources")

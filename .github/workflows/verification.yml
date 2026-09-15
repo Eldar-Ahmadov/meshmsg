@@ -82,6 +82,11 @@ jobs:
         id: windows-build
         shell: pwsh
         run: cargo build --locked
+      - name: Exercise native Windows attachment download and installation
+        id: windows-attachment-integration
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./tests/integration-attachments-windows.ps1 -Binary target/debug/meshmsg.exe
       - name: Resolve dumpbin from the canonical x64 MSVC environment
         id: windows-resolve-dumpbin
         shell: pwsh
