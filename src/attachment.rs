@@ -666,8 +666,27 @@ impl Drop for StagedFile {
 }
 
 /// Flushes an exported file before it participates in the durable commit.
+#[cfg(not(windows))]
 pub fn sync_staged_file(staging: &Path) -> Result<()> {
     File::open(staging)
+        .with_context(|| format!("open staged output {}", staging.display()))?
+        .sync_all()
+        .with_context(|| format!("sync staged output {}", staging.display()))
+}
+
+#[cfg(windows)]
+pub fn sync_staged_file(staging: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    // FlushFileBuffers requires a handle with write access on Windows. A
+    // read-only File::open handle fails with ERROR_ACCESS_DENIED after the
+    // attachment has downloaded but before it can be installed.
+    OpenOptions::new()
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(staging)
         .with_context(|| format!("open staged output {}", staging.display()))?
         .sync_all()
         .with_context(|| format!("sync staged output {}", staging.display()))
@@ -1244,6 +1263,18 @@ mod tests {
                 .is_err()
         );
         assert!(!destination.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_output_can_be_flushed_before_installation() {
+        let root = temp_dir("staged-file-sync");
+        let staging = root.join("part.download");
+        fs::write(&staging, b"downloaded").unwrap();
+
+        sync_staged_file(&staging).unwrap();
+
+        assert_eq!(fs::read(&staging).unwrap(), b"downloaded");
         let _ = fs::remove_dir_all(root);
     }
 
