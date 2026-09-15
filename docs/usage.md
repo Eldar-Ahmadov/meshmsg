@@ -219,11 +219,10 @@ meshmsg --json status
 meshmsg --json doctor
 ```
 
-Representative status:
-
-```json
-{"type":"status","running":true,"alias":"build-node-2","alias_enabled":true,"captured_hostname":"laptop","custom_alias":"build-node-2","advertised_aliases":2,"advertises_self":false,"has_invite":true,"bootstrap_peer_count":3,"self_advertised":false,"endpoint_online":true,"topic_joined":true,"neighbors":2}
-```
+The strict status frame includes local identity/topic and connectivity fields, alias
+state, operation-cache and direct-replay bounds/health, attachment limits and storage
+pressure, plus its protocol version and request correlation. See
+[`Status`](../meshmsg-protocol/src/model.rs) for the complete typed field inventory.
 
 `neighbors` is the current direct broadcast-Gossip-neighbor count. `advertised_aliases` is the number of currently unexpired directory entries carrying an alias, not a trusted contact count or reachability guarantee. `topic_joined` becomes false when no direct neighbors remain, including for a lone first peer. These are local observations, not delivery guarantees.
 

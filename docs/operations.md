@@ -138,6 +138,13 @@ Startup timeouts exit nonzero, so `Restart=on-failure` retries temporary connect
 
 ## Compatibility
 
-The local IPC accepts only strict protocol-v4 request envelopes and rejects unknown versions or fields. The broadcast wire protocol uses the topic-bound V3 envelope and `/meshmsg/broadcast-gossip/3`; pre-V3 peers cannot exchange broadcasts or attachment offers with V3 peers. Private sends use the distinct `private_send` command. The daemon rejects an ambiguous `send` request containing `to`, and the CLI never retries or falls back to broadcast.
+Local IPC accepts only strict protocol-v4 request envelopes and rejects unknown
+versions or fields. Broadcasts and signed attachment offers require the topic-bound
+V3 envelope and `/meshmsg/broadcast-gossip/3`; pre-V3 peers cannot exchange them with
+current peers. Raw Iroh `BlobTicket` downloads remain supported.
 
-Current clients use a separate derived presence topic, direct-message protocol `/meshmsg/direct/2`, and the topic-bound `/meshmsg/broadcast-gossip/3` protocol. Pre-V3 peers do not exchange broadcasts or attachment offers with V3 peers; this deliberate protocol separation prevents topic-unbound envelopes from entering the V3 receive path. Only current topic-bound signed attachment offers are decoded, while raw Iroh `BlobTicket` downloads remain supported. Older peers may still publish presence, but they do not accept `/meshmsg/direct/2` or its signed result semantics. A private send to an old peer therefore fails rather than falling back to plaintext broadcast.
+Presence uses a separate derived Gossip topic, and private sends use the distinct
+`private_send` IPC command and `/meshmsg/direct/2` wire protocol. Older peers may
+still publish presence but do not accept the current direct protocol. Such a private
+send fails; the daemon rejects an ambiguous broadcast `send` request containing
+`to`, and the CLI never retries or falls back to plaintext broadcast.

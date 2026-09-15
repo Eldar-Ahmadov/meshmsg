@@ -7,10 +7,10 @@ branch and release quality gates. `ci.yml` and `release.yml` call it; release
 packaging cannot start until verification succeeds for the exact event SHA.
 The reusable aggregate appears in Actions as
 `verification / Reusable verification aggregate`. CI deliberately follows it
-with a tiny caller-owned aggregate named **`Required verification`**. That stable,
-prefix-free caller name is the only status configured in main branch protection,
-so reusable-workflow display-name changes cannot silently weaken or deadlock the
-repository rule.
+with a tiny caller-owned aggregate named **`Required verification`**. The stable,
+prefix-free caller name gives pull requests one unambiguous overall result even
+though `main` is intentionally unprotected; reusable-workflow display-name changes
+do not change that caller-owned result.
 
 The pinned toolchain in `rust-toolchain.toml` is used locally and in Actions. Run
 the non-networked/static and Rust portions with:
@@ -148,8 +148,8 @@ lookup during regular Windows verification, and uses the resolved executable's
 `/dependents` output to reject dynamic MSVC runtime dependencies. The
 publisher downloads only `release-linux` and `release-windows` by exact name,
 rejects unexpected files, validates one archive root and every member, requires
-the binary, complete docs, README, and both licenses, and checks that packaged
-binaries equal the final runner builds. It then generates the unchanged three-
+the binary, README, and both licenses, and checks that packaged binaries equal the
+final runner builds. It then generates the unchanged three-
 archive `SHA256SUMS` layout. Published releases are never overwritten; reruns may
 replace only a draft.
 
