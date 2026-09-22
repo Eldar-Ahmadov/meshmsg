@@ -11,8 +11,27 @@ The canonical top-level commands are:
 - `invite`
 - `send [--to <recipient>]`, `listen`, `chat`, `status`, `peers`, `stop`, and `doctor`
 - `share <path>`, `offers [remove|prune]`, and `download <offer source> --output <path>`
+- `skill install [--agent shared|claude|codex|pi] [--force]`
 
 Run `meshmsg <command> --help` for command-specific options. meshmsg has no built-in web UI or HTTP bridge; use the CLI or generic owner-only IPC.
+
+## AI agent skill
+
+`meshmsg skill install` writes the bundled `meshmsg` Agent Skill to the current user's shared skill directory:
+
+```sh
+meshmsg skill install
+```
+
+The default `shared` target is `~/.agents/skills/meshmsg/SKILL.md`, discovered by Codex, Pi, and other compatible agents. Select an agent-specific user directory when needed:
+
+```sh
+meshmsg skill install --agent claude # ~/.claude/skills/meshmsg/SKILL.md
+meshmsg skill install --agent codex  # ~/.agents/skills/meshmsg/SKILL.md
+meshmsg skill install --agent pi     # ~/.pi/agent/skills/meshmsg/SKILL.md
+```
+
+Installing identical content succeeds without rewriting it. Different existing content fails closed to preserve local edits; pass `--force` to replace only the existing `SKILL.md`. In JSON mode, success returns `type:"skill_installed"` with `agent`, `path`, and a `changed` boolean. Restart the agent session if it does not watch skill-directory changes.
 
 ## Starting and joining a topic
 

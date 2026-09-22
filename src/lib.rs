@@ -1,3 +1,4 @@
+mod agent_skill;
 mod alias;
 mod attachment;
 mod cli;
@@ -20,7 +21,7 @@ mod presence;
 use alias::AliasConfig;
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{AliasCommand, Cli, Command, OffersCommand};
+use cli::{AliasCommand, Cli, Command, OffersCommand, SkillCommand};
 use config::State;
 use invite::Invite;
 use std::process::ExitCode;
@@ -322,6 +323,25 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Chat => client_commands::chat(&dir, cli.json).await?,
         Command::Status => client_commands::status(&dir, cli.json).await?,
         Command::Doctor => client_commands::doctor(&dir, cli.json).await?,
+        Command::Skill { command } => match command {
+            SkillCommand::Install { agent, force } => {
+                let installed = agent_skill::install(agent, force)?;
+                let path = installed.path.to_string_lossy();
+                let status = if installed.changed {
+                    "installed"
+                } else {
+                    "unchanged"
+                };
+                cli::print_result(
+                    cli.json,
+                    &format!("{status} meshmsg skill at {path}"),
+                    serde_json::json!({
+                        "type":"skill_installed", "name":"meshmsg",
+                        "agent":agent.as_str(), "path":path, "changed":installed.changed
+                    }),
+                );
+            }
+        },
     }
     Ok(())
 }

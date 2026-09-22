@@ -71,6 +71,18 @@ See the [Usage reference](docs/usage.md) for all commands, invite behavior, inpu
 
 meshmsg has no built-in web UI or HTTP bridge. Use the CLI or the owner-only local IPC protocol.
 
+## AI agent skill
+
+Install the bundled [meshmsg skill](skills/meshmsg/SKILL.md), which follows the [Agent Skills](https://agentskills.io/) standard, so an AI coding agent can discover how to use meshmsg safely:
+
+```sh
+meshmsg skill install                  # ~/.agents/skills/meshmsg (Codex, Pi, and compatible agents)
+meshmsg skill install --agent claude  # ~/.claude/skills/meshmsg
+meshmsg skill install --agent pi      # ~/.pi/agent/skills/meshmsg
+```
+
+An identical installation is idempotent. A locally modified `SKILL.md` is preserved unless `--force` is supplied. Start a new agent session if the agent does not detect the installed skill automatically.
+
 ## Attachments
 
 Files and deterministic directory snapshots are announced through signed Gossip offers and transferred with Iroh Blobs. Receiving an offer never downloads it automatically.

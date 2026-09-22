@@ -161,6 +161,50 @@ pub enum AliasCommand {
     ResetHostname,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum SkillAgent {
+    /// Shared Agent Skills location used by Codex, Pi, and compatible agents
+    Shared,
+    /// Claude Code's user skill location
+    Claude,
+    /// Codex's user skill location
+    Codex,
+    /// Pi's native user skill location
+    Pi,
+}
+
+impl SkillAgent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+        }
+    }
+
+    pub fn skills_dir(self, home: &std::path::Path) -> PathBuf {
+        match self {
+            Self::Shared | Self::Codex => home.join(".agents").join("skills"),
+            Self::Claude => home.join(".claude").join("skills"),
+            Self::Pi => home.join(".pi").join("agent").join("skills"),
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillCommand {
+    /// Install the bundled meshmsg Agent Skill for the current user
+    Install {
+        /// Agent-specific user skill location
+        #[arg(long, value_enum, default_value = "shared")]
+        agent: SkillAgent,
+        /// Replace a different existing meshmsg SKILL.md
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Generate a persistent identity and fresh topic
@@ -286,6 +330,11 @@ pub enum Command {
     Status,
     /// Validate local state, including the expected public identity
     Doctor,
+    /// Install meshmsg instructions for an AI agent
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
 }
 
 impl InviteInput {
@@ -481,6 +530,20 @@ mod tests {
         ])
         .is_ok());
         assert!(parse(&["download", "--offer-stdin", "--output", "file.txt"]).is_ok());
+        let skill = parse(&["skill", "install"]).unwrap();
+        assert!(matches!(
+            skill.command,
+            Command::Skill {
+                command: SkillCommand::Install {
+                    agent: SkillAgent::Shared,
+                    force: false
+                }
+            }
+        ));
+        for agent in ["shared", "claude", "codex", "pi"] {
+            assert!(parse(&["skill", "install", "--agent", agent]).is_ok());
+        }
+        assert!(parse(&["skill", "install", "--force"]).is_ok());
     }
 
     #[test]
