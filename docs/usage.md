@@ -9,7 +9,7 @@ The canonical top-level commands are:
 - `alias show|set <name>|clear|reset-hostname`
 - `daemon`
 - `invite`
-- `send [--to <recipient>]`, `listen`, `chat`, `status`, `peers`, `stop`, and `doctor`
+- `send [--to <recipient>]`, `send-stream [--to <recipient>]`, `listen`, `chat`, `status`, `peers`, `stop`, and `doctor`
 - `share <path>`, `offers [remove|prune]`, and `download <offer source> --output <path>`
 - `skill install [--agent shared|claude|codex|pi] [--force]`
 
@@ -206,9 +206,58 @@ The direct v2 signed rejection results are mapped to stable daemon errors. `priv
 
 Nonempty lines entered in `chat` are still broadcasts; blank lines are ignored without allocating an operation ID or contacting the daemon. It has no direct-reply mode. Private bodies are suppressed from unattended daemon logs and replay persistence.
 
+### Streaming sends
+
+`send-stream` reads stdin continuously and sends each nonempty line as a separate
+message, without waiting for EOF:
+
+```sh
+# Private: prefer a full public key for a long-lived stream.
+tail -n 0 -f app.log | meshmsg --json send-stream --to '<full-peer-key>'
+
+# Broadcast: every topic participant may read these lines.
+printf 'first\nsecond\n' | meshmsg --json send-stream
+```
+
+Unlike `send --message-stdin`, which reads one complete body through EOF,
+`send-stream` uses LF as its only record delimiter. It removes the terminating LF
+and one immediately preceding CR, skips empty records, and preserves all other
+whitespace. EOF sends a final nonempty unterminated record (including a trailing
+bare CR). Input must be UTF-8. Each stripped record must fit the existing body
+limit: 4,096 bytes privately or 65,358 bytes for broadcast. Oversized or invalid
+records fail rather than being split, truncated, or skipped. To send structured
+multiline content, encode it into a single JSON line with escaped newlines.
+
+Each message gets a fresh cryptographically random operation ID. The CLI waits
+for its result before submitting the next message and uses bounded input buffering
+so a slow recipient applies backpressure to the producer. It does not batch,
+pace, retry, or fall back from private send to broadcast. Existing rate and replay
+quotas still apply; a busy recipient stops the stream. An alias is resolved on
+each private send and can change owners; use a full public key for continuity.
+
+With `--json`, stdout is NDJSON: one ordinary `queued` or `private_accepted` frame
+per successful send, followed by at most one terminal error frame. Human mode
+prints the usual per-message acknowledgement. The first input or send error exits
+1 without submitting further records; earlier sends are not rolled back.
+Authoritative daemon errors retain their code, outcome, and IDs. Lost/malformed
+send replies are conservatively reported as `send_failed` or `private_send_failed`
+with `outcome:"unknown"` and the affected operation ID. Keep the original input
+alongside results if reconciliation is needed; private acknowledgements omit bodies.
+Do not blindly restart the source, which would allocate new IDs and may duplicate
+previous work. This command does not provide durable stream recovery.
+
+EOF exits 0 after the last result. Ctrl-C while waiting for input exits 0 and
+abandons buffered/partial records. Ctrl-C during an outstanding send exits 1 with
+that operation ID and an unknown outcome; it does not undo remote acceptance.
+The command sends only; run `listen` separately for incoming messages. There is
+no stream-wide `--operation-id`, positional message, or `--message-*` input flag.
+
+Success semantics are unchanged: `queued` is local broadcast acceptance and
+`private_accepted` is recipient-daemon acceptance, not durable delivery or reading.
+
 ## Input sources
 
-Join, send, and download each require exactly one input source. Positional values are convenient but visible in shell history and potentially process listings:
+Join, one-shot send, and download each require exactly one input source. Positional values are convenient but visible in shell history and potentially process listings:
 
 ```sh
 meshmsg join '<invite>'
@@ -263,6 +312,7 @@ meshmsg --json alias show
 meshmsg --json listen
 meshmsg --json send 'hello'
 meshmsg --json send --to build-node-2 'private hello'
+meshmsg --json send-stream --to '<full-peer-key>' < messages.ndjson
 meshmsg --json share ./report.pdf
 meshmsg --json offers
 meshmsg --json offers prune --dry-run

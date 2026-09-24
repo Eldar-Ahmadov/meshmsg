@@ -49,6 +49,7 @@ Send and receive messages through the local daemon:
 meshmsg send 'hello'                  # unchanged topic-wide broadcast
 meshmsg send --to laptop 'private'   # unique advertised alias
 meshmsg send --to '<full-peer-key>' 'private'
+tail -n 0 -f app.log | meshmsg send-stream --to '<full-peer-key>'
 meshmsg listen
 meshmsg chat
 meshmsg status

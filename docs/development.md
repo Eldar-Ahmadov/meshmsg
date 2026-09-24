@@ -54,9 +54,10 @@ The driver requires `target/debug/meshmsg` and substitutes its `{BIN}` inventory
 placeholder. The five-peer test retains equal-peer messaging, selective endpoint
 advertising, restart/failover/rejoin, owner-only protocol-v4 IPC hardening, and exact
 EnvelopeV3 65,358/65,359-byte positional/file/stdin/chat plus subscription-boundary coverage. The
-inventory also includes CLI errors, peer directory, attachments, direct messages,
+inventory also includes CLI errors, streaming-send framing/failure/interruption
+checks against fake local IPC, peer directory, attachments, direct messages,
 idempotency, and a generated-archive/mock-download installer test. The current
-per-command budgets total 3,620 seconds (60 minutes 20 seconds).
+per-command budgets total 3,680 seconds (61 minutes 20 seconds).
 The workflow allows 130 minutes,
 including setup/build/cleanup, while the driver rejects an inventory above its
 115-minute command budget.

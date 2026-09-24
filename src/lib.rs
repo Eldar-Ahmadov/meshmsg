@@ -247,6 +247,9 @@ async fn run(cli: Cli) -> Result<()> {
             client_commands::send_once(&dir, operation_id, to.as_deref(), &message, cli.json)
                 .await?
         }
+        Command::SendStream { to } => {
+            client_commands::send_stream(&dir, to.as_deref(), cli.json).await?
+        }
         Command::Share { operation_id, path } => {
             client_commands::share(&dir, operation_id, &path, cli.json).await?
         }

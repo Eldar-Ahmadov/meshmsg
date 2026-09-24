@@ -283,6 +283,12 @@ pub enum Command {
         #[command(flatten)]
         input: MessageInput,
     },
+    /// Send each nonempty stdin line as a separate message; stop on the first error
+    SendStream {
+        /// Send privately (prefer a full public key to avoid alias reassignment)
+        #[arg(long, value_name = "RECIPIENT")]
+        to: Option<String>,
+    },
     /// Share a file or a directory snapshot with the topic
     Share {
         /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
@@ -544,6 +550,31 @@ mod tests {
             assert!(parse(&["skill", "install", "--agent", agent]).is_ok());
         }
         assert!(parse(&["skill", "install", "--force"]).is_ok());
+    }
+
+    #[test]
+    fn send_stream_uses_stdin_and_per_record_operation_ids() {
+        assert!(matches!(
+            parse(&["send-stream"]).unwrap().command,
+            Command::SendStream { to: None }
+        ));
+        assert!(matches!(
+            parse(&["--json", "send-stream", "--to", "node-1"]).unwrap().command,
+            Command::SendStream { to: Some(to) } if to == "node-1"
+        ));
+        for arguments in [
+            vec!["send-stream", "message"],
+            vec!["send-stream", "--message-stdin"],
+            vec!["send-stream", "--message-file", "messages.txt"],
+            vec![
+                "send-stream",
+                "--operation-id",
+                "0123456789abcdef0123456789abcdef",
+            ],
+            vec!["send-stream", "--to"],
+        ] {
+            assert!(parse(&arguments).is_err(), "{arguments:?}");
+        }
     }
 
     #[test]

@@ -223,6 +223,39 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "queued
 wait_for 30 "receiver broadcast" grep -Fq "\"body\":\"$BROADCAST\"" "$ROOT/receiver.listen.log"
 wait_for 30 "spy broadcast" grep -Fq "\"body\":\"$BROADCAST\"" "$ROOT/spy.listen.log"
 
+# Streaming sends reuse the same private and broadcast transport, one operation
+# per line, including a final unterminated record. Empty records are skipped.
+STREAM_PRIVATE="private-stream-$(date +%s%N)"
+printf '\n%s-1\r\n%s-2' "$STREAM_PRIVATE" "$STREAM_PRIVATE" |
+  "$BIN" --state-dir "$ROOT/sender" --json send-stream --to "$RECEIVER_PEER" >"$ROOT/private-stream.out"
+python3 - "$ROOT/private-stream.out" "$RECEIVER_PEER" <<'PY'
+import json, sys
+frames = [json.loads(line) for line in open(sys.argv[1])]
+assert len(frames) == 2
+assert len({frame["operation_id"] for frame in frames}) == 2
+assert all(frame["type"] == "private_accepted" and frame["to"] == sys.argv[2]
+           and "body" not in frame for frame in frames)
+PY
+for suffix in 1 2; do
+  wait_for 30 "streamed private delivery $suffix" grep -Fq "\"body\":\"$STREAM_PRIVATE-$suffix\"" "$ROOT/receiver.listen.log"
+done
+! grep -Fq "$STREAM_PRIVATE" "$ROOT/spy.listen.log" || fail "streamed private body reached a third peer"
+
+STREAM_PUBLIC="broadcast-stream-$(date +%s%N)"
+printf '%s-1\n%s-2\n' "$STREAM_PUBLIC" "$STREAM_PUBLIC" |
+  "$BIN" --state-dir "$ROOT/sender" --json send-stream >"$ROOT/broadcast-stream.out"
+python3 - "$ROOT/broadcast-stream.out" "$STREAM_PUBLIC" <<'PY'
+import json, sys
+frames = [json.loads(line) for line in open(sys.argv[1])]
+assert len(frames) == 2
+assert len({frame["operation_id"] for frame in frames}) == 2
+assert all(frame["type"] == "queued" and not frame["delivery_acknowledged"] for frame in frames)
+assert [frame["body"] for frame in frames] == [sys.argv[2] + "-1", sys.argv[2] + "-2"]
+PY
+for suffix in 1 2; do
+  wait_for 30 "streamed broadcast delivery $suffix" grep -Fq "\"body\":\"$STREAM_PUBLIC-$suffix\"" "$ROOT/spy.listen.log"
+done
+
 # Change one signed claim so two distinct canonical identities advertise the
 # same alias. The sender must forget the superseded claim and fail closed.
 kill "$RECEIVER_LISTEN" >/dev/null 2>&1 || true
@@ -254,7 +287,7 @@ sleep 2
 
 # Private contents may appear only in the explicit owner CLI subscription, not
 # daemon output or sender responses.
-for secret in "$PINNED" "$PRIVATE" "$CANONICAL" "$COLLISION"; do
+for secret in "$PINNED" "$PRIVATE" "$CANONICAL" "$COLLISION" "$STREAM_PRIVATE"; do
   for output in "$ROOT"/*.daemon.log "$ROOT"/*.daemon.err "$ROOT"/collision.out "$ROOT"/collision.err; do
     [[ -e "$output" ]] || continue
     ! grep -Fq "$secret" "$output" || fail "private body leaked to $output"
@@ -268,4 +301,4 @@ done
 
 kill "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
 wait "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
-echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/4096/4097 boundaries, authenticated private acknowledgements, broadcast interoperability, and DM log privacy"
+echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/4096/4097 boundaries, authenticated private acknowledgements, private/broadcast streaming sends, broadcast interoperability, and DM log privacy"

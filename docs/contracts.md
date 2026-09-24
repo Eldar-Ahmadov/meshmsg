@@ -48,7 +48,12 @@ and never retrying. Lifecycle counts remain only on typed lifecycle success reco
 
 With `--json`, one-shot failures write exactly one error object to **stdout**, write
 nothing to stderr, and exit 1. Success exits 0. Streaming client commands use stdout
-NDJSON. Human one-shot failures use stderr. The daemon is different: it never mirrors
+NDJSON. Human one-shot failures use stderr. `send-stream` reuses the existing send/private-send
+contracts without a new IPC command: JSON stdout contains one success frame per
+nonempty input record and at most one terminal error frame. Every record has its
+own operation ID; the first failure stops further sends. See
+[Streaming sends](usage.md#streaming-sends) for framing and interruption semantics.
+The daemon is different: it never mirrors
 events to stdout, even with `--json`; clients receive events through authenticated,
 bounded `subscribe` IPC (`meshmsg listen`). Daemon startup and fatal errors use
 stderr. There is no process diagnostic queue, output telemetry, bounded terminal

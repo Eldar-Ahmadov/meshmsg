@@ -1,6 +1,6 @@
 ---
 name: meshmsg
-description: Use the meshmsg CLI for peer-to-peer coordination between people, machines, and AI agents. Use when an agent must initialize or join a meshmsg topic, inspect online peers, send or receive broadcast/private messages, share files, download an explicitly accepted attachment, or diagnose a meshmsg node.
+description: Use the meshmsg CLI for peer-to-peer coordination between people, machines, and AI agents. Use when an agent must initialize or join a meshmsg topic, inspect online peers, send or receive broadcast/private messages, stream lines from stdin or logs, share files, download an explicitly accepted attachment, or diagnose a meshmsg node.
 ---
 
 # Use meshmsg
@@ -64,6 +64,27 @@ Interpret outcomes conservatively:
 - Never claim durable delivery or a read receipt.
 - Never silently fall back from private send to broadcast.
 
+## Stream messages from stdin
+
+Use `send --message-stdin` for one complete message read through EOF; it does not send lines as they arrive. For a continuous producer, first check `meshmsg send-stream --help` because older installed binaries may not support it.
+
+Stream only user-authorized content and use a canonical full public key for private streams; aliases are resolved on each send and can change owners:
+
+```sh
+tail -n 0 -f ./authorized.log | meshmsg --json send-stream --to "$RECIPIENT_PUBLIC_KEY"
+```
+
+Omit `--to` only when every topic participant may read the stream. Apply these rules:
+
+- Treat each LF-delimited record as a separate message. The command strips LF/CRLF, skips empty records, preserves other whitespace, and sends a final nonempty unterminated record at EOF. Encode multiline payloads as single-line JSON with escaped newlines.
+- Keep records within 4,096 UTF-8 bytes privately or 65,358 bytes for broadcast after delimiter removal. Invalid UTF-8 or oversized records stop the stream; there is no automatic splitting.
+- Read stdout as NDJSON: one ordinary send result per successful message and at most one terminal error. Each message gets a fresh operation ID; there is no stream-wide `--operation-id` or `--message-*` flag.
+- Expect sequential sends with bounded buffering, not automatic pacing or batching. Existing rate/replay limits still apply. The first failure exits 1 without retries or broadcast fallback; earlier sends are not undone.
+- Retain results and the corresponding exact input when reconciliation matters; private acknowledgements omit bodies. Never blindly restart the source: new operation IDs can duplicate prior sends. Prefer one-shot sends with caller-retained IDs when explicit retry control is required; transport replay protection remains bounded and is not restart-persistent.
+- EOF exits 0 after the last result. Ctrl-C while waiting for input exits 0 and discards buffered/partial records; during an outstanding send it exits 1 with that operation ID and an unknown outcome. Preserve ambiguous outcomes rather than assuming cancellation prevented acceptance.
+
+Success still means only local broadcast acceptance or recipient-daemon private acceptance, not durable delivery or reading. Run `listen` separately to receive messages.
+
 ## Receive messages
 
 Start the listener before expecting messages because meshmsg provides no offline mailbox:
@@ -97,4 +118,4 @@ Never overwrite an existing path, open or execute downloaded content automatical
 
 Use `meshmsg --json status` for live state, `meshmsg --json doctor` for offline state validation, and `meshmsg --help` or `meshmsg <command> --help` for the installed version's exact interface.
 
-On a JSON command failure, parse the single stdout error frame and preserve its `code`, `outcome`, and `operation_id` when present. Report ambiguous outcomes instead of guessing or changing the operation ID. Do not scrape human diagnostics when structured output is available.
+On a JSON command failure, parse the stdout error frame and preserve its `code`, `outcome`, and `operation_id` when present. A one-shot failure emits one frame; a `send-stream` failure may follow earlier success frames. Report ambiguous outcomes instead of guessing or changing the operation ID. Do not scrape human diagnostics when structured output is available.

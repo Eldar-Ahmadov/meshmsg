@@ -281,36 +281,51 @@ fn invalid_chat_input(diagnostic: &'static str) -> anyhow::Error {
     crate::message::invalid_local_message(&operation_id, anyhow::anyhow!(diagnostic))
 }
 
-pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
-    let mut reader = subscribe(dir).await?;
-    let (tx, mut rx) = mpsc::channel::<std::result::Result<String, &'static str>>(8);
+// LF is the only delimiter. Bound allocation even for an unterminated record;
+// two extra bytes allow an exact-limit body followed by CRLF.
+fn read_message_line(
+    input: &mut impl std::io::BufRead,
+    maximum: usize,
+) -> std::result::Result<Option<String>, &'static str> {
+    let read_limit = maximum
+        .checked_add(2)
+        .and_then(|value| u64::try_from(value).ok())
+        .expect("message input bound is representable");
+    let mut bytes = Vec::with_capacity(maximum.min(8 * 1024));
+    let mut bounded = std::io::Read::take(input, read_limit);
+    if std::io::BufRead::read_until(&mut bounded, b'\n', &mut bytes)
+        .map_err(|_| "failed to read message input")?
+        == 0
+    {
+        return Ok(None);
+    }
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+        if bytes.ends_with(b"\r") {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > maximum {
+        return Err("message exceeds the UTF-8 byte limit");
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "message is not valid UTF-8")
+}
+
+fn stdin_message_lines(
+    maximum: usize,
+) -> mpsc::Receiver<std::result::Result<String, &'static str>> {
+    let (tx, rx) = mpsc::channel(1);
+    // Use a detached OS thread, not Tokio's blocking pool: an open stdin must
+    // not prevent runtime shutdown after Ctrl-C or a send failure.
     std::thread::spawn(move || {
         let mut input = std::io::stdin().lock();
-        let read_limit = crate::message::MAX_BROADCAST_BODY_BYTES
-            .checked_add(2)
-            .and_then(|value| u64::try_from(value).ok())
-            .expect("broadcast chat input bound is representable");
         loop {
-            let mut bytes =
-                Vec::with_capacity(crate::message::MAX_BROADCAST_BODY_BYTES.min(8 * 1024));
-            let mut bounded = std::io::Read::take(&mut input, read_limit);
-            let read = std::io::BufRead::read_until(&mut bounded, b'\n', &mut bytes);
-            let value = match read {
-                Ok(0) => break,
-                Err(_) => Err("failed to read chat input"),
-                Ok(_) => {
-                    if bytes.ends_with(b"\n") {
-                        bytes.pop();
-                        if bytes.ends_with(b"\r") {
-                            bytes.pop();
-                        }
-                    }
-                    if bytes.len() > crate::message::MAX_BROADCAST_BODY_BYTES {
-                        Err("chat message exceeds the broadcast UTF-8 byte limit")
-                    } else {
-                        String::from_utf8(bytes).map_err(|_| "chat message is not valid UTF-8")
-                    }
-                }
+            let value = match read_message_line(&mut input, maximum) {
+                Ok(Some(body)) => Ok(body),
+                Ok(None) => break,
+                Err(error) => Err(error),
             };
             let failed = value.is_err();
             if tx.blocking_send(value).is_err() || failed {
@@ -318,6 +333,83 @@ pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
             }
         }
     });
+    rx
+}
+
+fn stream_send_failure(
+    error: anyhow::Error,
+    operation_id: &meshmsg_protocol::OperationId,
+    private: bool,
+) -> anyhow::Error {
+    // Preserve authoritative daemon errors, including their exact correlation.
+    if error.downcast_ref::<contracts::ContractFailure>().is_some() {
+        return error.context(format!("operation {operation_id}"));
+    }
+    // A lost/malformed IPC reply or interruption cannot prove non-execution.
+    let failure = meshmsg_protocol::ProtocolError::new(
+        Some(operation_id.clone()),
+        if private {
+            meshmsg_protocol::ErrorCode::PrivateSendFailed
+        } else {
+            meshmsg_protocol::ErrorCode::SendFailed
+        },
+        meshmsg_protocol::Outcome::Unknown,
+    );
+    anyhow::Error::new(contracts::ContractFailure(
+        contracts::ProtocolErrorAdapter::from_typed(Some(contracts::new_request_id()), failure),
+    ))
+    .context(error)
+    .context(format!("operation {operation_id}"))
+}
+
+pub(crate) async fn send_stream(dir: &Path, to: Option<&str>, json: bool) -> Result<()> {
+    // Reject invalid recipient syntax before reading any input.
+    if let Some(to) = to {
+        let _: meshmsg_protocol::Recipient = to.parse()?;
+    }
+    let maximum = if to.is_some() {
+        crate::message::MAX_PRIVATE_BODY_BYTES
+    } else {
+        crate::message::MAX_BROADCAST_BODY_BYTES
+    };
+    let mut rx = stdin_message_lines(maximum);
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        let line = tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                signal.context("listen for Ctrl-C")?;
+                return Ok(());
+            }
+            line = rx.recv() => match line {
+                Some(Ok(body)) if body.is_empty() => continue,
+                Some(line) => line,
+                None => return Ok(()),
+            },
+        };
+        let operation_id = ipc::new_operation_id();
+        let body = line.map_err(|diagnostic| {
+            crate::message::invalid_local_message(&operation_id, anyhow::anyhow!(diagnostic))
+                .context(format!("operation {operation_id}"))
+        })?;
+        // One outstanding operation, no retries. Cancelling an in-flight send
+        // reports its ID and unknown outcome rather than silently losing it.
+        let result = tokio::select! {
+            biased;
+            result = send_once(dir, operation_id.clone(), to, &body, json) => result,
+            signal = &mut shutdown => match signal {
+                Ok(()) => Err(anyhow::anyhow!("send interrupted; outcome may be unknown")),
+                Err(error) => Err(error.into()),
+            },
+        };
+        result.map_err(|error| stream_send_failure(error, &operation_id, to.is_some()))?;
+    }
+}
+
+pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
+    let mut reader = subscribe(dir).await?;
+    let mut rx = stdin_message_lines(crate::message::MAX_BROADCAST_BODY_BYTES);
     loop {
         tokio::select! {
             line = rx.recv() => match line {
@@ -382,6 +474,101 @@ mod tests {
     use super::*;
     use crate::invite::Invite;
     use iroh::SecretKey;
+
+    #[test]
+    fn message_lines_preserve_content_and_strip_only_delimiters() {
+        let mut input = std::io::Cursor::new("\n\r\n hello \r\n界\u{2028}x\nlast\r");
+        for expected in ["", "", " hello ", "界\u{2028}x", "last\r"] {
+            assert_eq!(
+                read_message_line(&mut input, 32).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(read_message_line(&mut input, 32).unwrap(), None);
+    }
+
+    #[test]
+    fn message_lines_enforce_byte_limits_without_unbounded_reads() {
+        for maximum in [
+            crate::message::MAX_PRIVATE_BODY_BYTES,
+            crate::message::MAX_BROADCAST_BODY_BYTES,
+        ] {
+            for ending in ["", "\n", "\r\n"] {
+                let body = "a".repeat(maximum);
+                let mut input = std::io::Cursor::new(format!("{body}{ending}"));
+                assert_eq!(read_message_line(&mut input, maximum).unwrap(), Some(body));
+                assert_eq!(read_message_line(&mut input, maximum).unwrap(), None);
+
+                let mut input =
+                    std::io::Cursor::new(format!("{}{ending}", "a".repeat(maximum + 1)));
+                assert!(read_message_line(&mut input, maximum).is_err());
+                assert!(input.position() <= (maximum + 2) as u64);
+            }
+            let mut input = std::io::Cursor::new(vec![b'x'; maximum * 10]);
+            assert!(read_message_line(&mut input, maximum).is_err());
+            assert_eq!(input.position(), (maximum + 2) as u64);
+        }
+        assert!(read_message_line(&mut std::io::Cursor::new("界\n"), 2).is_err());
+        assert!(read_message_line(&mut std::io::Cursor::new(b"\xff\n"), 10).is_err());
+        assert!(read_message_line(&mut std::io::Cursor::new(b"a\r"), 1).is_err());
+    }
+
+    #[test]
+    fn message_lines_propagate_read_failures() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken input"))
+            }
+        }
+        let mut input = std::io::BufReader::new(Broken);
+        assert_eq!(
+            read_message_line(&mut input, 10),
+            Err("failed to read message input")
+        );
+    }
+
+    #[test]
+    fn stream_failures_preserve_identity_and_ambiguous_outcomes() {
+        let operation_id = ipc::new_operation_id();
+        for private in [false, true] {
+            let error = stream_send_failure(anyhow::anyhow!("lost reply"), &operation_id, private);
+            let failure = &error
+                .downcast_ref::<contracts::ContractFailure>()
+                .unwrap()
+                .0;
+            assert_eq!(failure.operation_id.as_deref(), Some(operation_id.as_str()));
+            assert_eq!(failure.outcome, "unknown");
+            assert_eq!(
+                failure.code,
+                if private {
+                    "private_send_failed"
+                } else {
+                    "send_failed"
+                }
+            );
+        }
+        let original = contracts::ProtocolErrorAdapter::from_typed(
+            Some(contracts::new_request_id()),
+            meshmsg_protocol::ProtocolError::new(
+                Some(operation_id.clone()),
+                meshmsg_protocol::ErrorCode::PrivateRecipientBusy,
+                meshmsg_protocol::Outcome::NotStarted,
+            ),
+        );
+        let error = stream_send_failure(
+            anyhow::Error::new(contracts::ContractFailure(original.clone())),
+            &operation_id,
+            true,
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<contracts::ContractFailure>()
+                .unwrap()
+                .0,
+            original
+        );
+    }
 
     #[test]
     fn invalid_chat_input_uses_the_canonical_message_error_contract() {

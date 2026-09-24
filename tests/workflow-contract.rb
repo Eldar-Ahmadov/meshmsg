@@ -138,6 +138,7 @@ def validate(ci, verification, release, inventory)
 
   expected_inventory = [
     [60, "python3", "tests/integration-cli-errors.py", "{BIN}"],
+    [60, "python3", "tests/integration-send-stream.py", "{BIN}"],
     [600, "python3", "tests/integration-peer-directory.py", "{BIN}"],
     [1100, "bash", "tests/integration-5-peer.sh", "{BIN}"],
     [600, "bash", "tests/integration-attachments.sh", "{BIN}"],
