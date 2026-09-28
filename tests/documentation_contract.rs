@@ -74,6 +74,10 @@ fn authoritative_contract_facts_match_protocol_constants() {
             meshmsg_protocol::MAX_BROADCAST_BODY_BYTES as u64,
         ),
         (
+            "max_private_body_bytes",
+            meshmsg_protocol::MAX_PRIVATE_BODY_BYTES as u64,
+        ),
+        (
             "max_signed_attachment_token_bytes",
             meshmsg_protocol::MAX_SIGNED_ATTACHMENT_TOKEN_BYTES as u64,
         ),

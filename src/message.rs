@@ -3,9 +3,9 @@ use anyhow::Result;
 /// Conservative limit shared by every broadcast producer/consumer. The value
 /// is derived from the complete worst-case signed V3 postcard envelope.
 pub(crate) const MAX_BROADCAST_BODY_BYTES: usize = meshmsg_protocol::MAX_BROADCAST_BODY_BYTES;
-/// Direct/private messages use a separate bounded transport and retain their
-/// 4096-byte body contract.
-pub(crate) const MAX_PRIVATE_BODY_BYTES: usize = 4096;
+/// Direct/private messages use a separate bounded transport but share the
+/// broadcast body bound.
+pub(crate) const MAX_PRIVATE_BODY_BYTES: usize = meshmsg_protocol::MAX_PRIVATE_BODY_BYTES;
 
 pub(crate) fn validate_broadcast_body(body: &str) -> Result<()> {
     validate_nonempty_bounded(body, MAX_BROADCAST_BODY_BYTES, "broadcast message")

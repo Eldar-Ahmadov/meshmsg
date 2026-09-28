@@ -69,7 +69,7 @@ The exact bounded values are:
 | Signed broadcast envelope version | 3 | `signed_broadcast_envelope_version` |
 | Signed broadcast envelope | 65,536 bytes | `max_signed_broadcast_envelope_bytes` |
 | Broadcast body (minimum is one byte) | 65,358 bytes | `max_broadcast_body_bytes` |
-| Private/direct body (minimum is one byte) | 4,096 bytes | — |
+| Private/direct body (minimum is one byte) | 65,358 bytes | `max_private_body_bytes` |
 | Signed attachment token | 87,382 bytes | `max_signed_attachment_token_bytes` |
 | Serialized IPC path | 32,768 bytes | `max_ipc_path_bytes` |
 | Peer snapshot entries | 1,024 | `max_peers` |
@@ -110,8 +110,8 @@ Broadcast producers, EnvelopeV3 receivers, and event consumers accept 1 through
 65,358 UTF-8 bytes. This single conservative limit subtracts the 178-byte
 worst-case postcard metadata/signature overhead (including maximum-width timestamp
 and body-length varints) from the complete 65,536-byte signed-envelope bound.
-Private/direct sends retain their separate 1 through 4,096-byte body and 6 KiB
-transport-frame contract. The complete 65,536-byte broadcast envelope bound is
+Private/direct sends accept the same 1 through 65,358-byte body over a separate
+direct transport frame bounded to the body maximum plus 2 KiB. The complete 65,536-byte broadcast envelope bound is
 checked before decoding. Local rejection occurs
 before throttle/operation-cache admission, has `code:"invalid_message"` and
 `outcome:"not_started"`, and preserves the operation ID. Invalid signed remote text or attachment semantics are rejected before accepted-traffic

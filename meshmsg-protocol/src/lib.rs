@@ -19,6 +19,9 @@ pub const MAX_SIGNED_BROADCAST_ENVELOPE_OVERHEAD_BYTES: usize = 178;
 /// Largest UTF-8 broadcast body proven to fit the complete worst-case envelope.
 pub const MAX_BROADCAST_BODY_BYTES: usize =
     MAX_SIGNED_BROADCAST_ENVELOPE_BYTES - MAX_SIGNED_BROADCAST_ENVELOPE_OVERHEAD_BYTES;
+/// Largest UTF-8 private/direct body. Deliberately equal to the broadcast body
+/// bound so the shared IPC request/event frame budgets remain valid.
+pub const MAX_PRIVATE_BODY_BYTES: usize = MAX_BROADCAST_BODY_BYTES;
 /// Largest unpadded base64url representation of one complete signed envelope.
 pub const MAX_SIGNED_ATTACHMENT_TOKEN_BYTES: usize =
     (MAX_SIGNED_BROADCAST_ENVELOPE_BYTES * 4).div_ceil(3);

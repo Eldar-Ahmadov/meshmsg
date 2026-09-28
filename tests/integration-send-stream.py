@@ -154,7 +154,7 @@ with tempfile.TemporaryDirectory() as state, Client(state) as client:
 
 # Exact private/broadcast bounds, UTF-8 byte counting, over-limit and invalid
 # records. A failure leaves earlier results intact and prevents later sends.
-for private, maximum in [(False, 65358), (True, 4096)]:
+for private, maximum in [(False, 65358), (True, 65358)]:
     for ending in [b"", b"\n", b"\r\n"]:
         with daemon() as (state, requests), Client(state, private) as client:
             client.send(b"x" * maximum + ending)
@@ -173,7 +173,7 @@ for private, maximum in [(False, 65358), (True, 4096)]:
             assert ID.fullmatch(frames[-1]["operation_id"])
 
 # An oversized record fails without waiting for a delimiter or closing stdin.
-for private, maximum in [(False, 65358), (True, 4096)]:
+for private, maximum in [(False, 65358), (True, 65358)]:
     with tempfile.TemporaryDirectory() as state, Client(state, private) as client:
         client.send(b"x" * (maximum + 2))
         error = client.next()

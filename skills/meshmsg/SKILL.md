@@ -77,7 +77,7 @@ tail -n 0 -f ./authorized.log | meshmsg --json send-stream --to "$RECIPIENT_PUBL
 Omit `--to` only when every topic participant may read the stream. Apply these rules:
 
 - Treat each LF-delimited record as a separate message. The command strips LF/CRLF, skips empty records, preserves other whitespace, and sends a final nonempty unterminated record at EOF. Encode multiline payloads as single-line JSON with escaped newlines.
-- Keep records within 4,096 UTF-8 bytes privately or 65,358 bytes for broadcast after delimiter removal. Invalid UTF-8 or oversized records stop the stream; there is no automatic splitting.
+- Keep records within 65,358 UTF-8 bytes (private or broadcast) after delimiter removal. Invalid UTF-8 or oversized records stop the stream; there is no automatic splitting.
 - Read stdout as NDJSON: one ordinary send result per successful message and at most one terminal error. Each message gets a fresh operation ID; there is no stream-wide `--operation-id` or `--message-*` flag.
 - Expect sequential sends with bounded buffering, not automatic pacing or batching. Existing rate/replay limits still apply. The first failure exits 1 without retries or broadcast fallback; earlier sends are not undone.
 - Retain results and the corresponding exact input when reconciliation matters; private acknowledgements omit bodies. Never blindly restart the source: new operation IDs can duplicate prior sends. Prefer one-shot sends with caller-retained IDs when explicit retry control is required; transport replay protection remains bounded and is not restart-persistent.

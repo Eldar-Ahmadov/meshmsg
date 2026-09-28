@@ -373,10 +373,14 @@ message_body!(
     crate::MAX_BROADCAST_BODY_BYTES,
     "broadcast message body"
 );
-// Private/direct traffic deliberately retains its independent 4096-byte body
-// and 6 KiB transport-frame contract.
-message_body!(PrivateBody, 4096, "private message body");
-message_body!(MessageBody, 4096, "message body");
+// Private/direct traffic shares the broadcast body bound but uses its own
+// bounded direct transport frame.
+message_body!(
+    PrivateBody,
+    crate::MAX_PRIVATE_BODY_BYTES,
+    "private message body"
+);
+message_body!(MessageBody, crate::MAX_PRIVATE_BODY_BYTES, "message body");
 bounded_text!(
     AttachmentToken,
     crate::MAX_SIGNED_ATTACHMENT_TOKEN_BYTES,

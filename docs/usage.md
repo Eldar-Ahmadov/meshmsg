@@ -224,7 +224,7 @@ Unlike `send --message-stdin`, which reads one complete body through EOF,
 and one immediately preceding CR, skips empty records, and preserves all other
 whitespace. EOF sends a final nonempty unterminated record (including a trailing
 bare CR). Input must be UTF-8. Each stripped record must fit the existing body
-limit: 4,096 bytes privately or 65,358 bytes for broadcast. Oversized or invalid
+limit: 65,358 bytes for both private and broadcast messages. Oversized or invalid
 records fail rather than being split, truncated, or skipped. To send structured
 multiline content, encode it into a single JSON line with escaped newlines.
 

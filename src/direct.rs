@@ -25,7 +25,9 @@ pub(crate) use crate::direct_replay::ReplayWorker;
 pub(crate) const DIRECT_ALPN: &[u8] = b"/meshmsg/direct/2";
 const DIRECT_VERSION: u8 = 2;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
-const MAX_DIRECT_FRAME: usize = 6 * 1024;
+/// Maximum private body plus generous headroom for postcard framing, keys,
+/// topic, ID, timestamp, and signature (measured worst case is under 256 bytes).
+const MAX_DIRECT_FRAME: usize = crate::message::MAX_PRIVATE_BODY_BYTES + 2 * 1024;
 const INCOMING_QUEUE_CAPACITY: usize = 256;
 pub(crate) const SEND_CONCURRENCY: usize = 8;
 const DIRECT_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -826,5 +828,28 @@ mod tests {
         let mut tampered = bytes;
         *tampered.last_mut().unwrap() ^= 1;
         assert!(DirectFrame::decode(&tampered).is_err());
+    }
+
+    #[test]
+    fn maximum_private_body_fits_direct_frame() {
+        let sender = SecretKey::generate();
+        let receiver = SecretKey::generate();
+        let topic = TopicId::from_bytes([4; 32]);
+        let body = "界".repeat(crate::message::MAX_PRIVATE_BODY_BYTES / 3);
+        let frame = DirectFrame::new(&sender, receiver.public(), topic, body.clone()).unwrap();
+        let bytes = frame.encode().unwrap();
+        assert!(bytes.len() <= MAX_DIRECT_FRAME);
+        assert_eq!(DirectFrame::decode(&bytes).unwrap().payload.body, body);
+        let body = "a".repeat(crate::message::MAX_PRIVATE_BODY_BYTES);
+        let frame = DirectFrame::new(&sender, receiver.public(), topic, body).unwrap();
+        assert!(frame.encode().unwrap().len() <= MAX_DIRECT_FRAME);
+        assert!(DirectFrame::new(
+            &sender,
+            receiver.public(),
+            topic,
+            "a".repeat(crate::message::MAX_PRIVATE_BODY_BYTES + 1)
+        )
+        .and_then(|frame| DirectFrame::decode(&frame.encode()?))
+        .is_err());
     }
 }

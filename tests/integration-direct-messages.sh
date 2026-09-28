@@ -150,9 +150,8 @@ SENDER_PEER=$(python3 -c \
   'import json,sys; print(json.load(sys.stdin)["peer"])' \
   <<<"$SENDER_STATUS") || fail "current daemon did not advertise safe private-send IPC"
 
-# Private positional/file/stdin inputs retain their independent 4096-byte
-# contract; broadcast bounds are enforced separately by the current protocol.
-for size in 3900 3901 4096 4097; do
+# Private positional/file/stdin inputs share the 65358-byte body contract.
+for size in 3900 3901 65358 65359; do
   python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_text("p" * int(sys.argv[2]))' \
     "$ROOT/private-$size.txt" "$size"
 done
@@ -161,7 +160,7 @@ assert_private_result() {
   python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["type"] == "private_accepted" and v["body_bytes"] == int(sys.argv[2])' \
     "$path" "$size" || fail "$form private $size-byte input was not accepted"
 }
-for size in 3900 3901 4096; do
+for size in 3900 3901 65358; do
   body=$(python3 -c 'print("p" * int(__import__("sys").argv[1]), end="")' "$size")
   "$BIN" --state-dir "$ROOT/sender" --json send --to target-node "$body" >"$ROOT/private-positional-$size.out"
   assert_private_result "$ROOT/private-positional-$size.out" "$size" positional
@@ -171,16 +170,16 @@ for size in 3900 3901 4096; do
   assert_private_result "$ROOT/private-stdin-$size.out" "$size" stdin
 done
 for form in positional file stdin; do
-  output="$ROOT/private-$form-4097.out"
+  output="$ROOT/private-$form-65359.out"
   case "$form" in
-    positional) body=$(python3 -c 'print("p" * 4097, end="")'); command=("$BIN" --state-dir "$ROOT/sender" --json send --to target-node "$body") ;;
-    file) command=("$BIN" --state-dir "$ROOT/sender" --json send --to target-node --message-file "$ROOT/private-4097.txt") ;;
+    positional) body=$(python3 -c 'print("p" * 65359, end="")'); command=("$BIN" --state-dir "$ROOT/sender" --json send --to target-node "$body") ;;
+    file) command=("$BIN" --state-dir "$ROOT/sender" --json send --to target-node --message-file "$ROOT/private-65359.txt") ;;
     stdin) command=("$BIN" --state-dir "$ROOT/sender" --json send --to target-node --message-stdin) ;;
   esac
   if [[ "$form" == stdin ]]; then
-    if cat "$ROOT/private-4097.txt" | "${command[@]}" >"$output" 2>"$output.err"; then fail "stdin private 4097-byte input was accepted"; fi
+    if cat "$ROOT/private-65359.txt" | "${command[@]}" >"$output" 2>"$output.err"; then fail "stdin private 65359-byte input was accepted"; fi
   elif "${command[@]}" >"$output" 2>"$output.err"; then
-    fail "$form private 4097-byte input was accepted"
+    fail "$form private 65359-byte input was accepted"
   fi
   python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "invalid_message" and v["outcome"] == "not_started" and len(v["operation_id"]) == 32' \
     "$output" || fail "$form private oversized error was not canonical"
@@ -301,4 +300,4 @@ done
 
 kill "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
 wait "$SENDER_LISTEN" "$RECEIVER_LISTEN" "$SPY_LISTEN" >/dev/null 2>&1 || true
-echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/4096/4097 boundaries, authenticated private acknowledgements, private/broadcast streaming sends, broadcast interoperability, and DM log privacy"
+echo "PASS: persistent hostname aliases, opt-out/override/clear, signed unique resolution, collision fail-closed, positional/file/stdin private 3900/3901/65358/65359 boundaries, authenticated private acknowledgements, private/broadcast streaming sends, broadcast interoperability, and DM log privacy"
