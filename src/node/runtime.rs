@@ -56,6 +56,12 @@ const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection attempt, so repeating it also covers attempts made while the
 /// network interface is still unavailable.
 const REJOIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Every live peer re-announces presence each `ANNOUNCE_INTERVAL`. If the
+/// broadcast topic has neighbors but no presence record has arrived for this
+/// long, the separate presence swarm is treated as partitioned from the mesh.
+const PRESENCE_STALE_AFTER: Duration = Duration::from_secs(90);
+/// Minimum spacing between presence repair joins while the swarm stays silent.
+const PRESENCE_REPAIR_INTERVAL: Duration = Duration::from_secs(90);
 const ATTACHMENT_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const ATTACHMENT_SPACE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 fn shutdown_signals() -> Result<mpsc::Receiver<()>> {
@@ -83,6 +89,56 @@ fn shutdown_signals() -> Result<mpsc::Receiver<()>> {
         }
     });
     Ok(receiver)
+}
+
+/// Tracks liveness of the presence gossip swarm independently of its own
+/// neighbor bookkeeping, which can report stale neighbors indefinitely after
+/// suspend/resume or network changes while the broadcast swarm recovers.
+struct PresenceHealth {
+    last_received: tokio::time::Instant,
+    last_repair: Option<tokio::time::Instant>,
+}
+
+impl PresenceHealth {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            last_received: now,
+            last_repair: None,
+        }
+    }
+
+    fn received(&mut self, now: tokio::time::Instant) {
+        self.last_received = now;
+        self.last_repair = None;
+    }
+
+    /// Returns true (and records the attempt) when a repair join is due.
+    fn take_repair(&mut self, broadcast_joined: bool, now: tokio::time::Instant) -> bool {
+        let stale = now.duration_since(self.last_received) >= PRESENCE_STALE_AFTER;
+        let spaced = self
+            .last_repair
+            .is_none_or(|last| now.duration_since(last) >= PRESENCE_REPAIR_INTERVAL);
+        let due = broadcast_joined && stale && spaced;
+        if due {
+            self.last_repair = Some(now);
+        }
+        due
+    }
+}
+
+fn presence_join_candidates(
+    bootstrap: &[iroh::PublicKey],
+    broadcast_neighbors: impl IntoIterator<Item = iroh::PublicKey>,
+    me: iroh::PublicKey,
+) -> Vec<iroh::PublicKey> {
+    let mut candidates = bootstrap.to_vec();
+    for peer in broadcast_neighbors {
+        if !candidates.contains(&peer) {
+            candidates.push(peer);
+        }
+    }
+    candidates.retain(|peer| *peer != me);
+    candidates
 }
 
 fn spawn_neighbor_presence_announcement(
@@ -235,6 +291,7 @@ pub(super) async fn run_daemon(
     let mut attachment_space_refresh_active = false;
     let mut rejoin = tokio::time::interval(REJOIN_INTERVAL);
     rejoin.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut presence_health = PresenceHealth::new(tokio::time::Instant::now());
     let mut retention_check = tokio::time::interval(ATTACHMENT_RETENTION_CHECK_INTERVAL);
     retention_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Do not run a retention pass immediately at startup.
@@ -344,8 +401,11 @@ pub(super) async fn run_daemon(
                         // Never let receive-time cleanup swallow an expiry. The
                         // explicit cleanup transition is emitted first.
                         presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
-                        if let Ok(Some(transition)) = directory.receive(&message.content, topic) {
-                            presence::emit_transitions([transition], &event_tx, &directory_epoch, &mut directory_revision);
+                        if let Ok(transition) = directory.receive(&message.content, topic) {
+                            presence_health.received(tokio::time::Instant::now());
+                            if let Some(transition) = transition {
+                                presence::emit_transitions([transition], &event_tx, &directory_epoch, &mut directory_revision);
+                            }
                         }
                     }
                 }
@@ -414,18 +474,35 @@ pub(super) async fn run_daemon(
                     },
                 );
             }
-            _ = rejoin.tick(), if !node.bootstrap_peers.is_empty() => {
-                if !node.receiver.is_joined() {
+            _ = rejoin.tick() => {
+                if !node.bootstrap_peers.is_empty() && !node.receiver.is_joined() {
                     node.sender
                         .join_peers(node.bootstrap_peers.clone())
                         .await
                         .context("retry gossip bootstrap peers after connectivity loss")?;
                 }
-                if !node.presence_receiver.is_joined() {
-                    node.presence_sender
-                        .join_peers(node.bootstrap_peers.clone())
-                        .await
-                        .context("retry presence bootstrap peers after connectivity loss")?;
+                // The presence swarm is separate from the broadcast swarm, so it
+                // can stay partitioned (or hold stale neighbors) while broadcast
+                // traffic still flows. Live broadcast neighbors are reachable
+                // members of the same topic: use them as additional contacts.
+                let presence_lost = !node.presence_receiver.is_joined();
+                if presence_lost
+                    || presence_health.take_repair(
+                        node.receiver.is_joined(),
+                        tokio::time::Instant::now(),
+                    )
+                {
+                    let candidates = presence_join_candidates(
+                        &node.bootstrap_peers,
+                        node.receiver.neighbors(),
+                        node.endpoint.id(),
+                    );
+                    if !candidates.is_empty() {
+                        node.presence_sender
+                            .join_peers(candidates)
+                            .await
+                            .context("retry presence peers after connectivity loss")?;
+                    }
                 }
             },
             _ = ipc_server.join_next(), if ipc_server.has_sessions() => {},
@@ -527,6 +604,36 @@ mod tests {
             );
         }
         assert_eq!(announcements, 1);
+    }
+
+    #[test]
+    fn presence_repair_requires_live_broadcast_and_silent_presence() {
+        let start = tokio::time::Instant::now();
+        let mut health = PresenceHealth::new(start);
+        assert!(!health.take_repair(true, start + Duration::from_secs(89)));
+        let stale = start + PRESENCE_STALE_AFTER;
+        assert!(!health.take_repair(false, stale));
+        assert!(health.take_repair(true, stale));
+        // Repairs are spaced while presence stays silent.
+        assert!(!health.take_repair(true, stale + Duration::from_secs(5)));
+        assert!(health.take_repair(true, stale + PRESENCE_REPAIR_INTERVAL));
+        // Any accepted record resets staleness and spacing.
+        let fresh = stale + PRESENCE_REPAIR_INTERVAL + Duration::from_secs(1);
+        health.received(fresh);
+        assert!(!health.take_repair(true, fresh + Duration::from_secs(60)));
+        assert!(health.take_repair(true, fresh + PRESENCE_STALE_AFTER));
+    }
+
+    #[test]
+    fn presence_join_candidates_merge_bootstrap_and_broadcast_neighbors() {
+        let me = SecretKey::generate().public();
+        let a = SecretKey::generate().public();
+        let b = SecretKey::generate().public();
+        assert_eq!(
+            presence_join_candidates(&[a, me], [a, b, me], me),
+            vec![a, b]
+        );
+        assert!(presence_join_candidates(&[], [], me).is_empty());
     }
 
     #[test]
