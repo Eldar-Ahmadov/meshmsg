@@ -18,7 +18,7 @@ attachment-authenticity = [
 [dependencies]
 data-encoding = "2"
 iroh = { version = "1", optional = true }
-iroh-blobs = { version = "=0.103.0", default-features = false, optional = true }
+iroh-blobs = { version = "=0.103.1", default-features = false, optional = true }
 iroh-gossip = { version = "0.101", optional = true }
 postcard = { version = "1", features = ["alloc", "use-std"], optional = true }
 rand = "0.10"
