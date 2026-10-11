@@ -60,7 +60,7 @@ fn report_failure(error: anyhow::Error, json: bool, daemon: bool) -> ExitCode {
             } else {
                 ("command_failed", "not_started")
             };
-            let mut envelope = contracts::ProtocolErrorAdapter::new(code, &diagnostic, outcome);
+            let mut envelope = contracts::ProtocolErrorAdapter::new(code, outcome);
             envelope.request_id = Some(contracts::new_request_id());
             envelope
         });
@@ -288,7 +288,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &dir,
                     operation_id,
                     &offer_id,
-                    direction.map(|value| value.as_str()),
+                    direction.map(|value| value.to_string()).as_deref(),
                     provider.as_deref(),
                     cli.json,
                 )
@@ -305,7 +305,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &dir,
                     operation_id,
                     older_than_secs,
-                    direction.map(|value| value.as_str()),
+                    direction.map(|value| value.to_string()).as_deref(),
                     dry_run,
                     max_delete,
                     cli.json,
@@ -374,8 +374,7 @@ mod tests {
 
     #[test]
     fn contextual_contract_failure_remains_authoritative() {
-        let mut expected =
-            contracts::ProtocolErrorAdapter::new("daemon_disconnected", "", "partial");
+        let mut expected = contracts::ProtocolErrorAdapter::new("daemon_disconnected", "partial");
         expected.request_id = Some("11111111111111111111111111111111".into());
         let error = anyhow::anyhow!("private transport diagnostic")
             .context(contracts::ContractFailure(expected.clone()));

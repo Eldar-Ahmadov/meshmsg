@@ -313,11 +313,8 @@ mod tests {
         let removal_fp = operation_fingerprint("offers_remove", &[b"selector"]);
         let (removal_reply, removal_response) = oneshot::channel();
         assert!(partial_cache.admit(removal_id.clone(), removal_fp, removal_reply, now));
-        let removal_error = contracts::ProtocolErrorAdapter::new(
-            "attachment_removal_partial",
-            "private",
-            "partial",
-        );
+        let removal_error =
+            contracts::ProtocolErrorAdapter::new("attachment_removal_partial", "partial");
         let removal = partial_cache.complete(
             &removal_id,
             meshmsg_protocol::Response::Error(removal_error.typed().unwrap()),
@@ -450,11 +447,8 @@ mod tests {
     fn lifecycle_partial_errors_are_compact_across_operation_cache() {
         let operation: meshmsg_protocol::OperationId =
             "11111111111111111111111111111111".parse().unwrap();
-        let mut producer = contracts::ProtocolErrorAdapter::new(
-            "attachment_removal_partial",
-            "private store failure",
-            "partial",
-        );
+        let mut producer =
+            contracts::ProtocolErrorAdapter::new("attachment_removal_partial", "partial");
         producer.operation_id = Some(operation.to_string());
         let mut cache = OperationCache::new(2, Duration::from_secs(60));
         let now = StdInstant::now();

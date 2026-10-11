@@ -27,11 +27,7 @@ pub(crate) struct ProtocolErrorAdapter {
 }
 
 impl ProtocolErrorAdapter {
-    pub(crate) fn try_new(
-        code: impl Into<String>,
-        _diagnostic: impl AsRef<str>,
-        outcome: impl Into<String>,
-    ) -> Result<Self> {
+    pub(crate) fn try_new(code: impl Into<String>, outcome: impl Into<String>) -> Result<Self> {
         let code = code.into();
         let outcome = outcome.into();
         let typed = protocol_error(
@@ -41,12 +37,8 @@ impl ProtocolErrorAdapter {
         )?;
         Ok(Self::from_typed(None, typed))
     }
-    pub(crate) fn new(
-        code: impl Into<String>,
-        diagnostic: impl AsRef<str>,
-        outcome: impl Into<String>,
-    ) -> Self {
-        Self::try_new(code, diagnostic, outcome).unwrap_or_else(|_| {
+    pub(crate) fn new(code: impl Into<String>, outcome: impl Into<String>) -> Self {
+        Self::try_new(code, outcome).unwrap_or_else(|_| {
             Self::from_typed(
                 None,
                 ProtocolError::new(None, ErrorCode::InternalContractError, Outcome::Unknown),

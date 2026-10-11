@@ -1,6 +1,9 @@
 use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
 use anyhow::{bail, Context, Result};
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    builder::{PossibleValuesParser, TypedValueParser},
+    ArgGroup, Args, Parser, Subcommand, ValueEnum,
+};
 use std::{
     fs,
     io::{self, Read},
@@ -93,26 +96,19 @@ fn parse_prune_limit(value: &str) -> std::result::Result<usize, String> {
     let value = value
         .parse::<usize>()
         .map_err(|_| "prune limit must be an integer".to_owned())?;
-    if (1..=512).contains(&value) {
+    if (1..=meshmsg_protocol::MAX_LIFECYCLE_ITEMS).contains(&value) {
         Ok(value)
     } else {
-        Err("prune limit must be between 1 and 512".into())
+        Err(format!(
+            "prune limit must be between 1 and {}",
+            meshmsg_protocol::MAX_LIFECYCLE_ITEMS
+        ))
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum OfferDirection {
-    Incoming,
-    Outgoing,
-}
-
-impl OfferDirection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Incoming => "incoming",
-            Self::Outgoing => "outgoing",
-        }
-    }
+fn offer_direction_parser() -> impl TypedValueParser<Value = meshmsg_protocol::OfferDirection> {
+    PossibleValuesParser::new(["incoming", "outgoing"])
+        .try_map(|value| value.parse::<meshmsg_protocol::OfferDirection>())
 }
 
 #[derive(Subcommand, Debug)]
@@ -124,8 +120,8 @@ pub enum OffersCommand {
         operation_id: Option<String>,
         #[arg(value_parser = parse_operation_id)]
         offer_id: String,
-        #[arg(long, value_enum)]
-        direction: Option<OfferDirection>,
+        #[arg(long, value_parser = offer_direction_parser())]
+        direction: Option<meshmsg_protocol::OfferDirection>,
         /// Canonical provider public key, useful to disambiguate incoming offers
         #[arg(long)]
         provider: Option<String>,
@@ -138,13 +134,13 @@ pub enum OffersCommand {
         /// Override daemon retention age; zero selects every matching tag
         #[arg(long)]
         older_than_secs: Option<u64>,
-        #[arg(long, value_enum)]
-        direction: Option<OfferDirection>,
+        #[arg(long, value_parser = offer_direction_parser())]
+        direction: Option<meshmsg_protocol::OfferDirection>,
         /// Select and report without deleting
         #[arg(long)]
         dry_run: bool,
         /// Maximum tags selected in this invocation
-        #[arg(long, default_value_t = 512, value_parser = parse_prune_limit)]
+        #[arg(long, default_value_t = meshmsg_protocol::MAX_LIFECYCLE_ITEMS, value_parser = parse_prune_limit)]
         max_delete: usize,
     },
 }

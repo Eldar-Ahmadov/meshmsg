@@ -259,7 +259,7 @@ fn incoming_event(msg: IncomingDirect) -> meshmsg_protocol::Event {
             .expect("public key is canonical"),
         message_id: id_string(&msg.id).parse().expect("message ID is canonical"),
         timestamp_ms: msg.timestamp_ms,
-        body: meshmsg_protocol::MessageBody::new(msg.body).expect("validated direct body"),
+        body: meshmsg_protocol::PrivateBody::new(msg.body).expect("validated direct body"),
         acceptance_acknowledged: true,
         durable: false,
         read: false,

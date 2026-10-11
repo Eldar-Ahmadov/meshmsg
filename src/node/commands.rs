@@ -195,13 +195,6 @@ pub(super) fn optional_text_fingerprint(value: Option<&str>) -> Vec<u8> {
     }
 }
 
-fn direction_text(direction: meshmsg_protocol::OfferDirection) -> &'static str {
-    match direction {
-        meshmsg_protocol::OfferDirection::Incoming => "incoming",
-        meshmsg_protocol::OfferDirection::Outgoing => "outgoing",
-    }
-}
-
 pub(super) async fn execute(
     command: Option<DaemonCommand>,
     context: ExecutionContext<'_>,
@@ -469,7 +462,8 @@ pub(super) async fn execute(
                 }),
             reply,
         }) => {
-            let direction_fingerprint = optional_text_fingerprint(direction.map(direction_text));
+            let direction_fingerprint =
+                optional_text_fingerprint(direction.map(|value| value.to_string()).as_deref());
             let provider_fingerprint =
                 optional_text_fingerprint(provider.as_ref().map(|value| value.as_str()));
             let fingerprint = operation_fingerprint(
@@ -529,7 +523,8 @@ pub(super) async fn execute(
             reply,
         }) => {
             let age_fingerprint = older_than_secs.to_le_bytes();
-            let direction_fingerprint = optional_text_fingerprint(direction.map(direction_text));
+            let direction_fingerprint =
+                optional_text_fingerprint(direction.map(|value| value.to_string()).as_deref());
             let dry_run_fingerprint = [u8::from(dry_run)];
             let maximum_fingerprint = max_delete.to_le_bytes();
             let fingerprint = operation_fingerprint(
@@ -613,11 +608,7 @@ pub(super) async fn execute(
             {
                 return Ok(CommandAction::Continue);
             }
-            let permit = match try_admit_transfer(
-                transfer_limit,
-                "share_busy",
-                "attachment transfer capacity reached",
-            ) {
+            let permit = match try_admit_transfer(transfer_limit) {
                 Ok(permit) => permit,
                 Err(_) => {
                     let error = meshmsg_protocol::ProtocolError::new(
@@ -708,11 +699,7 @@ pub(super) async fn execute(
             {
                 return Ok(CommandAction::Continue);
             }
-            let permit = match try_admit_transfer(
-                transfer_limit,
-                "download_busy",
-                "attachment transfer capacity reached",
-            ) {
+            let permit = match try_admit_transfer(transfer_limit) {
                 Ok(permit) => permit,
                 Err(_) => {
                     let error = meshmsg_protocol::ProtocolError::new(
@@ -765,7 +752,6 @@ pub(super) async fn execute(
                         offer,
                         output,
                         max_attachment_bytes,
-                        mode,
                     )
                     .await;
                     AttachmentTaskCompletion::Operation {

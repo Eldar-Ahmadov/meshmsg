@@ -380,7 +380,6 @@ message_body!(
     crate::MAX_PRIVATE_BODY_BYTES,
     "private message body"
 );
-message_body!(MessageBody, crate::MAX_PRIVATE_BODY_BYTES, "message body");
 bounded_text!(
     AttachmentToken,
     crate::MAX_SIGNED_ATTACHMENT_TOKEN_BYTES,
@@ -865,7 +864,7 @@ pub struct PrivateMessage {
     pub from: PeerId,
     pub message_id: MessageId,
     pub timestamp_ms: u64,
-    pub body: MessageBody,
+    pub body: PrivateBody,
     pub acceptance_acknowledged: bool,
     pub durable: bool,
     pub read: bool,
@@ -1878,7 +1877,7 @@ mod tests {
             r#","private":true,"acceptance_acknowledged":true,"durable":false,"read":false"#;
         assert!(decode_event(
             "private_message",
-            &"x".repeat(MessageBody::MAX_BYTES),
+            &"x".repeat(PrivateBody::MAX_BYTES),
             private_fields
         )
         .is_ok());

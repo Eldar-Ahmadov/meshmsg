@@ -13,7 +13,6 @@ fn storage_operation_error(
     error: &anyhow::Error,
     share: bool,
     operation_id: Option<&meshmsg_protocol::OperationId>,
-    _offer_id: Option<&str>,
 ) -> meshmsg_protocol::Response {
     let has_code = |expected: &str| {
         error
@@ -65,11 +64,7 @@ fn storage_operation_error(
     ))
 }
 
-pub(crate) fn try_admit_transfer(
-    limit: &Arc<Semaphore>,
-    _busy_code: &'static str,
-    _busy_message: &'static str,
-) -> Result<OwnedSemaphorePermit, ()> {
+pub(crate) fn try_admit_transfer(limit: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ()> {
     limit.clone().try_acquire_owned().map_err(|_| ())
 }
 
@@ -109,15 +104,12 @@ pub(crate) async fn remove_offer_request(
     direction: Option<meshmsg_protocol::OfferDirection>,
     provider: Option<&meshmsg_protocol::PeerId>,
 ) -> meshmsg_protocol::Response {
-    let direction = direction.map(|value| match value {
-        meshmsg_protocol::OfferDirection::Incoming => "incoming",
-        meshmsg_protocol::OfferDirection::Outgoing => "outgoing",
-    });
+    let direction = direction.map(|value| value.to_string());
     match storage
         .remove_at_cutoff(
             operation_id,
             Some(offer_id.as_str()),
-            direction,
+            direction.as_deref(),
             provider.map(meshmsg_protocol::PeerId::as_str),
             None,
             None,
@@ -127,13 +119,9 @@ pub(crate) async fn remove_offer_request(
         .await
     {
         Ok(value) => value,
-        Err(error) => storage_operation_error(
-            "offers_remove_failed",
-            &error,
-            false,
-            Some(operation_id),
-            None,
-        ),
+        Err(error) => {
+            storage_operation_error("offers_remove_failed", &error, false, Some(operation_id))
+        }
     }
 }
 
@@ -146,15 +134,12 @@ pub(crate) async fn prune_offers_request(
     dry_run: bool,
     max_delete: usize,
 ) -> meshmsg_protocol::Response {
-    let direction = direction.map(|value| match value {
-        meshmsg_protocol::OfferDirection::Incoming => "incoming",
-        meshmsg_protocol::OfferDirection::Outgoing => "outgoing",
-    });
+    let direction = direction.map(|value| value.to_string());
     match storage
         .remove_at_cutoff(
             operation_id,
             None,
-            direction,
+            direction.as_deref(),
             None,
             Some(older_than_secs),
             Some(cutoff_ms),
@@ -164,13 +149,9 @@ pub(crate) async fn prune_offers_request(
         .await
     {
         Ok(value) => value,
-        Err(error) => storage_operation_error(
-            "offers_prune_failed",
-            &error,
-            false,
-            Some(operation_id),
-            None,
-        ),
+        Err(error) => {
+            storage_operation_error("offers_prune_failed", &error, false, Some(operation_id))
+        }
     }
 }
 
@@ -194,7 +175,7 @@ pub(crate) async fn share_request(
         {
             Ok(value) => value,
             Err(error) => {
-                storage_operation_error("share_failed", &error, true, Some(&operation_id), None)
+                storage_operation_error("share_failed", &error, true, Some(&operation_id))
             }
         },
         Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
@@ -205,7 +186,6 @@ pub(crate) async fn share_request(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_request(
     resources: DownloadResources,
     events: broadcast::Sender<meshmsg_protocol::Event>,
@@ -213,7 +193,6 @@ pub(crate) async fn download_request(
     offer: meshmsg_protocol::AttachmentToken,
     output: PathBuf,
     max_attachment_bytes: u64,
-    _mode: meshmsg_protocol::DownloadMode,
 ) -> meshmsg_protocol::Response {
     if transfer::validate_raw_ticket_request_name(offer.as_str(), &output, resources.topic).is_err()
     {
@@ -241,13 +220,9 @@ pub(crate) async fn download_request(
             .await
             {
                 Ok(value) => value,
-                Err(error) => storage_operation_error(
-                    "download_failed",
-                    &error,
-                    false,
-                    Some(&operation_id),
-                    None,
-                ),
+                Err(error) => {
+                    storage_operation_error("download_failed", &error, false, Some(&operation_id))
+                }
             }
         }
         Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
@@ -348,7 +323,6 @@ mod tests {
             meshmsg_protocol::AttachmentToken::new(ticket.to_string()).unwrap(),
             output.clone(),
             DEFAULT_MAX_ATTACHMENT_BYTES,
-            meshmsg_protocol::DownloadMode::Install,
         )
         .await;
 

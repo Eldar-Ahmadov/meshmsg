@@ -94,7 +94,7 @@ pub(crate) async fn share(
         tokio::task::spawn_blocking(move || attachment::share_source_digest(&digest_path, maximum))
             .await
             .context("attachment digest task failed")??;
-    let frame = send_lifecycle_request(
+    let frame = send_request_checked(
         dir,
         &IpcRequest::Share {
             operation_id: operation_id.clone(),
@@ -129,13 +129,6 @@ pub(crate) async fn offers(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn send_lifecycle_request(
-    dir: &Path,
-    request: &IpcRequest,
-) -> Result<meshmsg_protocol::ResponseFrame> {
-    send_request_checked(dir, request).await
-}
-
 pub(crate) async fn offers_remove(
     dir: &Path,
     operation_id: Option<String>,
@@ -145,7 +138,7 @@ pub(crate) async fn offers_remove(
     json: bool,
 ) -> Result<()> {
     let operation_id = parse_operation_id(operation_id)?;
-    let frame = send_lifecycle_request(
+    let frame = send_request_checked(
         dir,
         &IpcRequest::OffersRemove {
             operation_id: operation_id.clone(),
@@ -190,7 +183,7 @@ pub(crate) async fn offers_prune(
         _ => unreachable!("checked response family"),
     };
     let effective_age = older_than_secs.unwrap_or(retention);
-    let frame = send_lifecycle_request(
+    let frame = send_request_checked(
         dir,
         &IpcRequest::OffersPrune {
             operation_id: operation_id.clone(),
@@ -242,7 +235,7 @@ pub(crate) async fn download(
         TopicId::from_bytes(topic_bytes),
     )
     .context("validate submitted attachment offer")?;
-    let frame = send_lifecycle_request(
+    let frame = send_request_checked(
         dir,
         &IpcRequest::Download {
             operation_id: operation_id.clone(),
