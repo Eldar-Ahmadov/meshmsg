@@ -348,8 +348,9 @@ fn stream_send_failure(
         },
         meshmsg_protocol::Outcome::Unknown,
     );
-    anyhow::Error::new(contracts::ContractFailure(
-        contracts::ProtocolErrorAdapter::from_typed(Some(contracts::new_request_id()), failure),
+    anyhow::Error::new(contracts::ContractFailure::new(
+        Some(contracts::new_request_id()),
+        failure,
     ))
     .context(error)
     .context(format!("operation {operation_id}"))
@@ -451,7 +452,7 @@ pub(crate) async fn doctor(dir: &Path, json: bool) -> Result<()> {
     let (has_invite, bootstrap_peer_count, self_advertised) =
         configured_details(state.invite.as_deref(), secret.public())?;
     let value = serde_json::json!({
-        "type":"doctor", "request_id":contracts::new_request_id(),
+        "type":"doctor", "request_id":contracts::new_request_id().into_string(),
         "ok":true, "peer":secret.public().to_string(), "topic":state.topic,
         "advertises_self":state.advertise_self, "has_invite":has_invite,
         "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
@@ -523,43 +524,32 @@ mod tests {
 
     #[test]
     fn stream_failures_preserve_identity_and_ambiguous_outcomes() {
+        use meshmsg_protocol::{ErrorCode, Outcome, ProtocolError};
         let operation_id = ipc::new_operation_id();
-        for private in [false, true] {
+        for (private, code) in [
+            (false, ErrorCode::SendFailed),
+            (true, ErrorCode::PrivateSendFailed),
+        ] {
             let error = stream_send_failure(anyhow::anyhow!("lost reply"), &operation_id, private);
-            let failure = &error
+            let failure = error
                 .downcast_ref::<contracts::ContractFailure>()
-                .unwrap()
-                .0;
-            assert_eq!(failure.operation_id.as_deref(), Some(operation_id.as_str()));
-            assert_eq!(failure.outcome, "unknown");
-            assert_eq!(
-                failure.code,
-                if private {
-                    "private_send_failed"
-                } else {
-                    "send_failed"
-                }
-            );
+                .expect("stream failure is typed");
+            assert_eq!(failure.error.operation_id.as_ref(), Some(&operation_id));
+            assert_eq!(failure.error.outcome, Outcome::Unknown);
+            assert_eq!(failure.error.code, code);
         }
-        let original = contracts::ProtocolErrorAdapter::from_typed(
+        let original = contracts::ContractFailure::new(
             Some(contracts::new_request_id()),
-            meshmsg_protocol::ProtocolError::new(
+            ProtocolError::new(
                 Some(operation_id.clone()),
-                meshmsg_protocol::ErrorCode::PrivateRecipientBusy,
-                meshmsg_protocol::Outcome::NotStarted,
+                ErrorCode::PrivateRecipientBusy,
+                Outcome::NotStarted,
             ),
         );
-        let error = stream_send_failure(
-            anyhow::Error::new(contracts::ContractFailure(original.clone())),
-            &operation_id,
-            true,
-        );
+        let error = stream_send_failure(anyhow::Error::new(original.clone()), &operation_id, true);
         assert_eq!(
-            error
-                .downcast_ref::<contracts::ContractFailure>()
-                .unwrap()
-                .0,
-            original
+            error.downcast_ref::<contracts::ContractFailure>(),
+            Some(&original)
         );
     }
 
@@ -569,18 +559,13 @@ mod tests {
         let failure = error
             .downcast_ref::<crate::contracts::ContractFailure>()
             .expect("chat input failure must retain its typed contract");
-        assert_eq!(failure.0.code, "invalid_message");
-        assert_eq!(failure.0.outcome, "not_started");
-        assert!(failure
-            .0
-            .operation_id
-            .as_deref()
-            .is_some_and(crate::contracts::valid_operation_id));
-        assert!(failure
-            .0
-            .request_id
-            .as_deref()
-            .is_some_and(crate::contracts::valid_request_id));
+        assert_eq!(
+            failure.error.code,
+            meshmsg_protocol::ErrorCode::InvalidMessage
+        );
+        assert_eq!(failure.error.outcome, meshmsg_protocol::Outcome::NotStarted);
+        assert!(failure.error.operation_id.is_some());
+        assert!(failure.request_id.is_some());
     }
 
     #[test]

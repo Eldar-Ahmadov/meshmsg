@@ -8,57 +8,45 @@ use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 pub(crate) use storage::{AttachmentStorage, MAX_PRUNE_TAGS};
 pub(crate) use transfer::{download_request_context, DownloadResources, ShareResources};
 
-fn storage_operation_error(
-    default_code: &str,
-    error: &anyhow::Error,
-    share: bool,
-    operation_id: Option<&meshmsg_protocol::OperationId>,
-) -> meshmsg_protocol::Response {
-    let has_code = |expected: &str| {
-        error
-            .chain()
-            .any(|cause| cause.to_string().starts_with(expected))
-    };
-    let (code, outcome) = if has_code("attachment_quota_exceeded:") {
-        (
-            meshmsg_protocol::ErrorCode::AttachmentQuotaExceeded,
-            meshmsg_protocol::Outcome::NotStarted,
-        )
-    } else if has_code("attachment_min_free_space:") {
-        (
-            meshmsg_protocol::ErrorCode::AttachmentMinFreeSpace,
-            meshmsg_protocol::Outcome::NotStarted,
-        )
-    } else if has_code("attachment_tag_capacity:") {
-        (
-            meshmsg_protocol::ErrorCode::AttachmentTagCapacity,
-            meshmsg_protocol::Outcome::NotStarted,
-        )
-    } else if has_code("attachment_storage_busy:") {
-        (
-            meshmsg_protocol::ErrorCode::AttachmentStorageBusy,
-            meshmsg_protocol::Outcome::NotStarted,
-        )
-    } else {
-        let code = match default_code {
-            "share_failed" => meshmsg_protocol::ErrorCode::ShareFailed,
-            "download_failed" => meshmsg_protocol::ErrorCode::DownloadFailed,
-            value if value.starts_with("offers_") => {
-                meshmsg_protocol::ErrorCode::AttachmentLifecycleInternal
+/// The operation whose storage failure is being reported.
+#[derive(Clone, Copy)]
+enum StorageOperation {
+    Share,
+    Download,
+    OffersRemove,
+    OffersPrune,
+}
+
+impl StorageOperation {
+    /// Code and outcome for storage failures that carry no typed protocol code.
+    fn fallback(self) -> (meshmsg_protocol::ErrorCode, meshmsg_protocol::Outcome) {
+        use meshmsg_protocol::{ErrorCode, Outcome};
+        match self {
+            Self::Share => (ErrorCode::ShareFailed, Outcome::Unknown),
+            Self::Download => (ErrorCode::DownloadFailed, Outcome::NotStarted),
+            Self::OffersRemove | Self::OffersPrune => {
+                (ErrorCode::AttachmentLifecycleInternal, Outcome::Unknown)
             }
-            _ => unreachable!("storage error code is canonical"),
-        };
-        (
-            code,
-            if share || default_code.starts_with("offers_") {
-                meshmsg_protocol::Outcome::Unknown
-            } else {
-                meshmsg_protocol::Outcome::NotStarted
-            },
-        )
+        }
+    }
+}
+
+fn storage_operation_error(
+    operation: StorageOperation,
+    error: &anyhow::Error,
+    operation_id: &meshmsg_protocol::OperationId,
+) -> meshmsg_protocol::Response {
+    // Typed admission failures always bind to NotStarted; everything else is
+    // the operation's fallback.
+    let (code, outcome) = match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<storage::AttachmentFailure>())
+    {
+        Some(failure) => (failure.code(), meshmsg_protocol::Outcome::NotStarted),
+        None => operation.fallback(),
     };
     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-        operation_id.cloned(),
+        Some(operation_id.clone()),
         code,
         outcome,
     ))
@@ -119,9 +107,7 @@ pub(crate) async fn remove_offer_request(
         .await
     {
         Ok(value) => value,
-        Err(error) => {
-            storage_operation_error("offers_remove_failed", &error, false, Some(operation_id))
-        }
+        Err(error) => storage_operation_error(StorageOperation::OffersRemove, &error, operation_id),
     }
 }
 
@@ -149,9 +135,7 @@ pub(crate) async fn prune_offers_request(
         .await
     {
         Ok(value) => value,
-        Err(error) => {
-            storage_operation_error("offers_prune_failed", &error, false, Some(operation_id))
-        }
+        Err(error) => storage_operation_error(StorageOperation::OffersPrune, &error, operation_id),
     }
 }
 
@@ -174,9 +158,7 @@ pub(crate) async fn share_request(
         .await
         {
             Ok(value) => value,
-            Err(error) => {
-                storage_operation_error("share_failed", &error, true, Some(&operation_id))
-            }
+            Err(error) => storage_operation_error(StorageOperation::Share, &error, &operation_id),
         },
         Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
             Some(operation_id),
@@ -221,7 +203,7 @@ pub(crate) async fn download_request(
             {
                 Ok(value) => value,
                 Err(error) => {
-                    storage_operation_error("download_failed", &error, false, Some(&operation_id))
+                    storage_operation_error(StorageOperation::Download, &error, &operation_id)
                 }
             }
         }
@@ -341,5 +323,53 @@ mod tests {
         drop(storage);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    use meshmsg_protocol::{ErrorCode, OperationId, Outcome, Response};
+
+    fn classify(operation: StorageOperation, error: &anyhow::Error) -> (ErrorCode, Outcome) {
+        let operation_id: OperationId = "22222222222222222222222222222222".parse().unwrap();
+        let Response::Error(error) = storage_operation_error(operation, error, &operation_id)
+        else {
+            panic!("storage failures are always protocol errors");
+        };
+        assert_eq!(error.operation_id.as_ref(), Some(&operation_id));
+        (error.code, error.outcome)
+    }
+
+    #[test]
+    fn typed_storage_failures_keep_their_code_even_when_wrapped() {
+        let typed = storage::AttachmentFailure::error(ErrorCode::AttachmentQuotaExceeded, "quota");
+        assert_eq!(
+            classify(StorageOperation::Share, &typed),
+            (ErrorCode::AttachmentQuotaExceeded, Outcome::NotStarted)
+        );
+        let wrapped = typed.context("while pinning");
+        assert_eq!(
+            classify(StorageOperation::OffersPrune, &wrapped),
+            (ErrorCode::AttachmentQuotaExceeded, Outcome::NotStarted)
+        );
+    }
+
+    #[test]
+    fn message_text_never_selects_a_protocol_code() {
+        // A diagnostic that merely spells a code must fall back to the operation.
+        let spoofed = anyhow::anyhow!("attachment_quota_exceeded: not a typed failure");
+        assert_eq!(
+            classify(StorageOperation::Share, &spoofed),
+            (ErrorCode::ShareFailed, Outcome::Unknown)
+        );
+        assert_eq!(
+            classify(StorageOperation::Download, &spoofed),
+            (ErrorCode::DownloadFailed, Outcome::NotStarted)
+        );
+        assert_eq!(
+            classify(StorageOperation::OffersRemove, &spoofed),
+            (ErrorCode::AttachmentLifecycleInternal, Outcome::Unknown)
+        );
     }
 }

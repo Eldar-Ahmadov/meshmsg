@@ -4,7 +4,7 @@ mod transport;
 
 use crate::{
     config::State,
-    contracts::{self, ProtocolErrorAdapter},
+    contracts::{self, ContractFailure},
 };
 use anyhow::{Context, Result};
 use iroh_gossip::proto::TopicId;
@@ -225,8 +225,9 @@ pub(crate) async fn send_request_checked(
 ) -> Result<meshmsg_protocol::ResponseFrame> {
     let frame = send_request(dir, request).await?;
     if let meshmsg_protocol::Response::Error(error) = frame.response.clone() {
-        return Err(anyhow::Error::new(contracts::ContractFailure(
-            ProtocolErrorAdapter::from_typed(frame.request_id.map(|id| id.to_string()), error),
+        return Err(anyhow::Error::new(ContractFailure::new(
+            frame.request_id,
+            error,
         )));
     }
     Ok(frame)
@@ -237,7 +238,7 @@ pub(crate) async fn write_request<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request: &IpcRequest,
 ) -> Result<()> {
-    write_request_with_id(stream, request, &contracts::new_request_id()).await
+    write_request_with_id(stream, request, &contracts::new_request_id().into_string()).await
 }
 
 pub(crate) async fn write_request_with_id<S: AsyncWrite + Unpin>(
@@ -296,7 +297,7 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
 }
 
 pub(crate) async fn subscribe(dir: &Path) -> Result<SubscriptionReader<LocalClientStream>> {
-    subscribe_with_id(dir, &contracts::new_request_id()).await
+    subscribe_with_id(dir, &contracts::new_request_id().into_string()).await
 }
 
 pub(crate) async fn subscribe_with_id(

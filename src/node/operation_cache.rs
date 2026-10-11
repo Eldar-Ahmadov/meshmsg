@@ -313,11 +313,13 @@ mod tests {
         let removal_fp = operation_fingerprint("offers_remove", &[b"selector"]);
         let (removal_reply, removal_response) = oneshot::channel();
         assert!(partial_cache.admit(removal_id.clone(), removal_fp, removal_reply, now));
-        let removal_error =
-            contracts::ProtocolErrorAdapter::new("attachment_removal_partial", "partial");
         let removal = partial_cache.complete(
             &removal_id,
-            meshmsg_protocol::Response::Error(removal_error.typed().unwrap()),
+            meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                None,
+                meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
+                meshmsg_protocol::Outcome::Partial,
+            )),
             now,
         );
         assert_eq!(removal_response.await.unwrap(), removal);
@@ -447,18 +449,16 @@ mod tests {
     fn lifecycle_partial_errors_are_compact_across_operation_cache() {
         let operation: meshmsg_protocol::OperationId =
             "11111111111111111111111111111111".parse().unwrap();
-        let mut producer =
-            contracts::ProtocolErrorAdapter::new("attachment_removal_partial", "partial");
-        producer.operation_id = Some(operation.to_string());
+        let producer = meshmsg_protocol::ProtocolError::new(
+            Some(operation.clone()),
+            meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
+            meshmsg_protocol::Outcome::Partial,
+        );
         let mut cache = OperationCache::new(2, Duration::from_secs(60));
         let now = StdInstant::now();
         let (reply, _receiver) = oneshot::channel();
         assert!(cache.admit(operation.clone(), [7; 32], reply, now));
-        let value = cache.complete(
-            &operation,
-            meshmsg_protocol::Response::Error(producer.typed().unwrap()),
-            now,
-        );
+        let value = cache.complete(&operation, meshmsg_protocol::Response::Error(producer), now);
         let error = response_error(&value);
         assert_eq!(error.operation_id.as_ref(), Some(&operation));
         assert_eq!(error.outcome, meshmsg_protocol::Outcome::Partial);

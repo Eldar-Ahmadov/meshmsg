@@ -1,9 +1,15 @@
-//! Small adapter helpers around the strict protocol-v4 boundary.
-use anyhow::{Context, Result};
-use meshmsg_protocol::{ErrorCode, OperationId, Outcome, ProtocolError};
+//! Typed local failure envelope for the strict protocol-v4 error boundary.
+//!
+//! Failures travel through `anyhow` chains as [`ContractFailure`] values and
+//! become a protocol frame only at the CLI boundary. Diagnostic text is local
+//! presentation and never part of the wire contract.
+use meshmsg_protocol::{
+    ErrorCode, OperationId, Outcome, ProtocolError, RequestId, Response, ResponseFrame,
+};
+use std::fmt;
 
-pub(crate) fn new_request_id() -> String {
-    meshmsg_protocol::RequestId::new_random().into_string()
+pub(crate) fn new_request_id() -> RequestId {
+    RequestId::new_random()
 }
 
 pub(crate) fn valid_operation_id(value: &str) -> bool {
@@ -11,85 +17,49 @@ pub(crate) fn valid_operation_id(value: &str) -> bool {
 }
 
 pub(crate) fn valid_request_id(value: &str) -> bool {
-    value.parse::<meshmsg_protocol::RequestId>().is_ok()
+    value.parse::<RequestId>().is_ok()
 }
 
-/// In-process adapter between operation workers and the strict protocol DTO.
-/// Diagnostics and presentation fields never cross IPC.
+/// An authoritative protocol error, optionally correlated with its request.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProtocolErrorAdapter {
-    pub(crate) code: String,
-    pub(crate) outcome: String,
-    pub(crate) request_id: Option<String>,
-    pub(crate) operation_id: Option<String>,
-    pub(crate) message: String,
-    pub(crate) retry_advice: meshmsg_protocol::RetryAdvice,
+pub(crate) struct ContractFailure {
+    pub(crate) request_id: Option<RequestId>,
+    pub(crate) error: ProtocolError,
 }
 
-impl ProtocolErrorAdapter {
-    pub(crate) fn try_new(code: impl Into<String>, outcome: impl Into<String>) -> Result<Self> {
-        let code = code.into();
-        let outcome = outcome.into();
-        let typed = protocol_error(
-            error_code(&code)?,
-            crate::contracts::outcome(&outcome)?,
-            None,
-        )?;
-        Ok(Self::from_typed(None, typed))
+impl ContractFailure {
+    pub(crate) fn new(request_id: Option<RequestId>, error: ProtocolError) -> Self {
+        Self { request_id, error }
     }
-    pub(crate) fn new(code: impl Into<String>, outcome: impl Into<String>) -> Self {
-        Self::try_new(code, outcome).unwrap_or_else(|_| {
-            Self::from_typed(
-                None,
-                ProtocolError::new(None, ErrorCode::InternalContractError, Outcome::Unknown),
-            )
-        })
+
+    /// A failure detected locally before any daemon operation exists.
+    pub(crate) fn local(code: ErrorCode, outcome: Outcome) -> Self {
+        Self::new(None, ProtocolError::new(None, code, outcome))
     }
-    pub(crate) fn from_typed(request_id: Option<String>, error: ProtocolError) -> Self {
-        Self {
-            code: error.code.to_string(),
-            outcome: outcome_name(error.outcome).into(),
-            request_id,
-            operation_id: error.operation_id.as_ref().map(ToString::to_string),
-            message: error.message().into(),
-            retry_advice: error.retry_advice(),
-        }
-    }
-    pub(crate) fn typed(&self) -> Result<ProtocolError> {
-        protocol_error(
-            error_code(&self.code)?,
-            outcome(&self.outcome)?,
-            self.operation_id.as_deref(),
+
+    /// The single JSON frame printed for a failed CLI command.
+    pub(crate) fn into_frame(self) -> ResponseFrame {
+        ResponseFrame::new(
+            Some(self.request_id.unwrap_or_else(new_request_id)),
+            Response::Error(self.error),
         )
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ContractFailure(pub(crate) ProtocolErrorAdapter);
-
-impl std::fmt::Display for ContractFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ContractFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
             "{} [{}; {}; {}]",
-            self.0.message,
-            self.0.code,
-            self.0.outcome,
-            self.0.retry_advice.message()
+            self.error.message(),
+            self.error.code,
+            outcome_name(self.error.outcome),
+            self.error.retry_advice().message()
         )
     }
 }
+
 impl std::error::Error for ContractFailure {}
-
-pub(crate) fn error_code(name: &str) -> Result<ErrorCode> {
-    serde_json::from_value(serde_json::Value::String(name.to_owned()))
-        .context("unknown protocol error code")
-}
-
-pub(crate) fn outcome(name: &str) -> Result<Outcome> {
-    serde_json::from_value(serde_json::Value::String(name.to_owned()))
-        .context("unknown protocol outcome")
-}
 
 pub(crate) fn outcome_name(value: Outcome) -> &'static str {
     match value {
@@ -103,18 +73,6 @@ pub(crate) fn protocol_error_response(
     code: ErrorCode,
     outcome: Outcome,
     operation_id: Option<OperationId>,
-) -> meshmsg_protocol::Response {
-    meshmsg_protocol::Response::Error(ProtocolError::new(operation_id, code, outcome))
-}
-
-pub(crate) fn protocol_error(
-    code: ErrorCode,
-    outcome: Outcome,
-    operation_id: Option<&str>,
-) -> Result<ProtocolError> {
-    Ok(ProtocolError::new(
-        operation_id.map(str::parse).transpose()?,
-        code,
-        outcome,
-    ))
+) -> Response {
+    Response::Error(ProtocolError::new(operation_id, code, outcome))
 }

@@ -34,50 +34,27 @@ fn json_mode_requested(arguments: impl IntoIterator<Item = std::ffi::OsString>) 
         .any(|argument| argument == "--json")
 }
 
-fn authoritative_contract_failure(
-    error: &anyhow::Error,
-) -> Option<contracts::ProtocolErrorAdapter> {
-    error
-        .downcast_ref::<contracts::ContractFailure>()
-        .map(|failure| failure.0.clone())
-}
-
 fn daemon_mode(cli: &Cli) -> bool {
     matches!(&cli.command, Command::Daemon { .. })
 }
 
 fn report_failure(error: anyhow::Error, json: bool, daemon: bool) -> ExitCode {
     if json && !daemon {
-        let authoritative = authoritative_contract_failure(&error);
-        let envelope = authoritative.unwrap_or_else(|| {
-            let diagnostic = format!("{error:#}");
-            let (code, outcome) = if diagnostic.contains("connect to local daemon") {
-                ("daemon_offline", "not_started")
-            } else if diagnostic.contains("timed out")
-                || diagnostic.contains("outcome may be unknown")
-            {
-                ("command_timeout", "unknown")
-            } else {
-                ("command_failed", "not_started")
-            };
-            let mut envelope = contracts::ProtocolErrorAdapter::new(code, outcome);
-            envelope.request_id = Some(contracts::new_request_id());
-            envelope
-        });
-        let request_id = envelope
-            .request_id
-            .as_deref()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(meshmsg_protocol::RequestId::new_random);
-        let frame = meshmsg_protocol::ResponseFrame::new(
-            Some(request_id),
-            meshmsg_protocol::Response::Error(
-                envelope.typed().expect("validated CLI protocol error"),
-            ),
-        );
+        // Typed failures carry their authoritative protocol error. Anything
+        // else is an unclassified local failure: nothing was submitted to the
+        // daemon, so the outcome is known not to have started.
+        let failure = error
+            .downcast_ref::<contracts::ContractFailure>()
+            .cloned()
+            .unwrap_or_else(|| {
+                contracts::ContractFailure::local(
+                    meshmsg_protocol::ErrorCode::CommandFailed,
+                    meshmsg_protocol::Outcome::NotStarted,
+                )
+            });
         println!(
             "{}",
-            serde_json::to_string(&frame).expect("protocol error serialization")
+            serde_json::to_string(&failure.into_frame()).expect("protocol error serialization")
         );
     } else {
         eprintln!("error: {error:#}");
@@ -374,11 +351,19 @@ mod tests {
 
     #[test]
     fn contextual_contract_failure_remains_authoritative() {
-        let mut expected = contracts::ProtocolErrorAdapter::new("daemon_disconnected", "partial");
-        expected.request_id = Some("11111111111111111111111111111111".into());
-        let error = anyhow::anyhow!("private transport diagnostic")
-            .context(contracts::ContractFailure(expected.clone()));
-        assert_eq!(authoritative_contract_failure(&error), Some(expected));
+        let expected = contracts::ContractFailure::new(
+            Some("11111111111111111111111111111111".parse().unwrap()),
+            meshmsg_protocol::ProtocolError::new(
+                None,
+                meshmsg_protocol::ErrorCode::DaemonDisconnected,
+                meshmsg_protocol::Outcome::Partial,
+            ),
+        );
+        let error = anyhow::anyhow!("private transport diagnostic").context(expected.clone());
+        assert_eq!(
+            error.downcast_ref::<contracts::ContractFailure>(),
+            Some(&expected)
+        );
     }
 
     #[test]

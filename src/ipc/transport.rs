@@ -1,7 +1,9 @@
 //! Platform-specific local IPC endpoints and streams.
 
 use crate::config::{prepare_state_dir, StateLock};
+use crate::contracts::ContractFailure;
 use anyhow::{Context, Result};
+use meshmsg_protocol::{ErrorCode, Outcome};
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -414,16 +416,22 @@ pub(crate) async fn bind_local_endpoint(
     ))
 }
 
+/// Typed `daemon_offline`: no daemon operation was submitted, so nothing started.
+fn daemon_offline(endpoint: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(ContractFailure::local(
+        ErrorCode::DaemonOffline,
+        Outcome::NotStarted,
+    ))
+    .context(format!(
+        "connect to local daemon at {endpoint}; start it with `meshmsg daemon`"
+    ))
+}
+
 #[cfg(unix)]
 pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
     UnixStream::connect(dir.join(SOCKET_NAME))
         .await
-        .with_context(|| {
-            format!(
-                "connect to local daemon at {}; start it with `meshmsg daemon`",
-                local_endpoint(dir)
-            )
-        })
+        .map_err(|_| daemon_offline(local_endpoint(dir)))
 }
 
 #[cfg(windows)]
@@ -439,11 +447,7 @@ pub(crate) async fn connect_daemon(dir: &Path) -> Result<LocalClientStream> {
             Err(error) if attempt < 19 && matches!(error.raw_os_error(), Some(2 | 231)) => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("connect to local daemon at {endpoint}; start it with `meshmsg daemon`")
-                });
-            }
+            Err(_) => return Err(daemon_offline(&endpoint)),
         }
     }
     unreachable!("named pipe connection retry loop always returns")
@@ -641,5 +645,28 @@ mod tests {
 
         drop(state_lock);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod offline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn absent_daemon_is_a_typed_not_started_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("meshmsg-offline-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = connect_daemon(&dir)
+            .await
+            .expect_err("no daemon is listening");
+        std::fs::remove_dir_all(&dir).unwrap();
+        let failure = error
+            .downcast_ref::<ContractFailure>()
+            .expect("offline daemon must keep its typed contract");
+        assert_eq!(failure.error.code, ErrorCode::DaemonOffline);
+        assert_eq!(failure.error.outcome, Outcome::NotStarted);
+        assert!(failure.error.operation_id.is_none());
+        assert!(format!("{error:#}").contains("start it with `meshmsg daemon`"));
     }
 }

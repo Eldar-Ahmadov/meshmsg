@@ -135,7 +135,7 @@ pub(super) async fn share_attachment(
     drop(staged);
     anyhow::ensure!(
         imported.format() == BlobFormat::Raw && imported.hash() == content_hash,
-        "attachment_lifecycle_internal: imported attachment identity is unsupported or changed"
+        "imported attachment identity is unsupported or changed"
     );
 
     let publish_result = async {

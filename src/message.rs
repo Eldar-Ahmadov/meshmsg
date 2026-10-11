@@ -24,11 +24,9 @@ pub(crate) fn invalid_local_message(
         meshmsg_protocol::ErrorCode::InvalidMessage,
         meshmsg_protocol::Outcome::NotStarted,
     );
-    let envelope = crate::contracts::ProtocolErrorAdapter::from_typed(
-        Some(crate::contracts::new_request_id()),
-        error,
-    );
-    anyhow::Error::new(crate::contracts::ContractFailure(envelope)).context(diagnostic)
+    let failure =
+        crate::contracts::ContractFailure::new(Some(crate::contracts::new_request_id()), error);
+    anyhow::Error::new(failure).context(diagnostic)
 }
 
 fn validate_nonempty_bounded(body: &str, maximum: usize, operation: &str) -> Result<()> {

@@ -5,6 +5,7 @@ use crate::ipc::LifecycleRequestContext;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use iroh_blobs::{api::Store, BlobFormat};
+use meshmsg_protocol::ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -20,6 +21,36 @@ const MAX_ATTACHMENT_TAG_SCAN: usize = MAX_ATTACHMENT_TAGS * 2 + 1;
 const MAX_ATTACHMENT_INDEX_BYTES: usize = 8 * 1024 * 1024;
 const ATTACHMENT_INDEX_NAME: &str = "attachment-retention-v1.json";
 pub(crate) const MAX_PRUNE_TAGS: usize = meshmsg_protocol::MAX_LIFECYCLE_ITEMS;
+
+/// A storage failure whose protocol code is decided here rather than inferred
+/// from its message. The operation boundary classifies it by downcasting, so
+/// message text stays free to change without altering the contract.
+#[derive(Debug)]
+pub(crate) struct AttachmentFailure {
+    code: ErrorCode,
+    message: String,
+}
+
+impl AttachmentFailure {
+    pub(crate) fn error(code: ErrorCode, message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            code,
+            message: message.into(),
+        })
+    }
+
+    pub(crate) fn code(&self) -> ErrorCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for AttachmentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AttachmentFailure {}
 
 fn unix_timestamp_ms() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
@@ -354,11 +385,15 @@ impl AttachmentStorage {
                 now,
             );
         }
-        anyhow::ensure!(
-            available >= required,
-            "attachment_min_free_space: attachment needs {additional_bytes} bytes while preserving {} free bytes ({} available)",
-            self.min_free_bytes, available
-        );
+        if available < required {
+            return Err(AttachmentFailure::error(
+                ErrorCode::AttachmentMinFreeSpace,
+                format!(
+                    "attachment needs {additional_bytes} bytes while preserving {} free bytes ({} available)",
+                    self.min_free_bytes, available
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -370,7 +405,7 @@ impl AttachmentStorage {
     ) -> Result<()> {
         anyhow::ensure!(
             hash_and_format.format == BlobFormat::Raw,
-            "attachment_lifecycle_internal: unsupported hash_seq attachment format"
+            "unsupported hash_seq attachment format"
         );
         let state = self
             .state
@@ -378,30 +413,39 @@ impl AttachmentStorage {
             .expect("attachment storage state poisoned");
         anyhow::ensure!(
             state.accounting_healthy,
-            "attachment_lifecycle_internal: attachment accounting requires reconciliation"
+            "attachment accounting requires reconciliation"
         );
         if let Some(existing) = state.tags.get(tag_name) {
             anyhow::ensure!(
                 existing.hash_and_format == hash_and_format,
-                "attachment_lifecycle_internal: attachment tag is bound to different content"
+                "attachment tag is bound to different content"
             );
             return Ok(());
         }
-        anyhow::ensure!(
-            state.tags.len() + state.reservations.len() < MAX_ATTACHMENT_TAGS,
-            "attachment_tag_capacity: attachment pin capacity of {MAX_ATTACHMENT_TAGS} reached"
-        );
+        if state.tags.len() + state.reservations.len() >= MAX_ATTACHMENT_TAGS {
+            return Err(AttachmentFailure::error(
+                ErrorCode::AttachmentTagCapacity,
+                format!("attachment pin capacity of {MAX_ATTACHMENT_TAGS} reached"),
+            ));
+        }
         let used = state.status.tagged_bytes;
         let deduplicated = state
             .tags
             .values()
             .any(|tag| tag.hash_and_format == hash_and_format);
         let additional = if deduplicated { 0 } else { size };
-        anyhow::ensure!(
-            used.checked_add(additional).is_some_and(|total| total <= self.quota_bytes),
-            "attachment_quota_exceeded: pinning this blob would exceed the {}-byte attachment quota ({} used, {} additional)",
-            self.quota_bytes, used, additional
-        );
+        if used
+            .checked_add(additional)
+            .is_none_or(|total| total > self.quota_bytes)
+        {
+            return Err(AttachmentFailure::error(
+                ErrorCode::AttachmentQuotaExceeded,
+                format!(
+                    "pinning this blob would exceed the {}-byte attachment quota ({} used, {} additional)",
+                    self.quota_bytes, used, additional
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -416,7 +460,7 @@ impl AttachmentStorage {
         let authoritative_size = complete_blob_size(&self.store, hash_and_format).await?;
         anyhow::ensure!(
             authoritative_size == size,
-            "attachment_lifecycle_internal: complete blob size {authoritative_size} differs from expected {size}"
+            "complete blob size {authoritative_size} differs from expected {size}"
         );
         self.admit_pin(tag_name, hash_and_format, authoritative_size)?;
         {
@@ -429,7 +473,7 @@ impl AttachmentStorage {
             }
             anyhow::ensure!(
                 state.reservations.insert(tag_name.to_owned()),
-                "attachment_lifecycle_internal: duplicate attachment reservation"
+                "duplicate attachment reservation"
             );
         }
         let result = async {
@@ -660,9 +704,10 @@ impl AttachmentStorage {
                 drop(state);
                 drop(temporary);
                 guard.restore_before_deletion();
-                anyhow::bail!(
-                    "attachment_storage_busy: active-transfer GC protection capacity reached"
-                );
+                return Err(AttachmentFailure::error(
+                    ErrorCode::AttachmentStorageBusy,
+                    "active-transfer GC protection capacity reached",
+                ));
             }
             let previous = match state.gc_protections.entry(value) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -780,8 +825,9 @@ impl AttachmentStorage {
             dry_run,
         } = spec;
         let _permit = self.gate.clone().try_acquire_owned().map_err(|_| {
-            anyhow::anyhow!(
-                "attachment_storage_busy: an attachment transfer or lifecycle operation is active"
+            AttachmentFailure::error(
+                ErrorCode::AttachmentStorageBusy,
+                "an attachment transfer or lifecycle operation is active",
             )
         })?;
         let now = unix_timestamp_ms()?;
@@ -1093,18 +1139,17 @@ async fn complete_blob_size(
 ) -> Result<u64> {
     anyhow::ensure!(
         hash_and_format.format == BlobFormat::Raw,
-        "attachment_lifecycle_internal: unsupported hash_seq attachment format"
+        "unsupported hash_seq attachment format"
     );
     match store.blobs().status(hash_and_format.hash).await {
         Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => Ok(size),
-        Ok(iroh_blobs::api::proto::BlobStatus::Partial { size }) => anyhow::bail!(
-            "attachment_lifecycle_internal: attachment blob is incomplete (reported size {size:?})"
-        ),
-        Ok(iroh_blobs::api::proto::BlobStatus::NotFound) => {
-            anyhow::bail!("attachment_lifecycle_internal: attachment blob is missing")
+        Ok(iroh_blobs::api::proto::BlobStatus::Partial { size }) => {
+            anyhow::bail!("attachment blob is incomplete (reported size {size:?})")
         }
-        Err(error) => Err(anyhow::Error::new(error)
-            .context("attachment_lifecycle_internal: query attachment blob completeness")),
+        Ok(iroh_blobs::api::proto::BlobStatus::NotFound) => {
+            anyhow::bail!("attachment blob is missing")
+        }
+        Err(error) => Err(anyhow::Error::new(error).context("query attachment blob completeness")),
     }
 }
 
@@ -1878,15 +1923,18 @@ mod tests {
                 u64::MAX,
             )
             .unwrap();
-        assert!(storage
-            .admit_pin(
-                "meshmsg/out/v1/other/file/b3RoZXI",
-                iroh_blobs::HashAndFormat::raw(iroh_blobs::Hash::new(b"other")),
-                1,
-            )
-            .unwrap_err()
-            .to_string()
-            .starts_with("attachment_quota_exceeded:"));
+        assert!(
+            storage
+                .admit_pin(
+                    "meshmsg/out/v1/other/file/b3RoZXI",
+                    iroh_blobs::HashAndFormat::raw(iroh_blobs::Hash::new(b"other")),
+                    1,
+                )
+                .unwrap_err()
+                .downcast_ref::<AttachmentFailure>()
+                .map(AttachmentFailure::code)
+                == Some(ErrorCode::AttachmentQuotaExceeded)
+        );
 
         let removed = storage
             .remove(
@@ -2097,7 +2145,11 @@ mod tests {
             .remove(&TEST_OPERATION_ID, None, None, None, Some(0), 1, false)
             .await
             .unwrap_err();
-        assert!(busy.to_string().starts_with("attachment_storage_busy:"));
+        assert_eq!(
+            busy.downcast_ref::<AttachmentFailure>()
+                .map(AttachmentFailure::code),
+            Some(ErrorCode::AttachmentStorageBusy)
+        );
         drop(held);
 
         drop(storage);
