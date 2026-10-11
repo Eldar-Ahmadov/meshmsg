@@ -1,0 +1,26 @@
+.copy,.pin,.lamp,#staged,#existing,#installed,.chunk{transition:none}
+.toggles{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:18px 0 4px}
+.toggle{display:flex;align-items:center;gap:10px;text-align:left}
+.toggle i{flex:none;width:26px;height:14px;border-radius:8px;border:1px solid var(--anatomy-mid);position:relative;transition:background .2s}
+.toggle i::after{content:"";position:absolute;top:2px;left:2px;width:8px;height:8px;border-radius:50%;background:var(--anatomy-mid);transition:transform .2s,background .2s}
+.toggle[aria-pressed=true]{border-color:var(--anatomy-hi)}
+.toggle[aria-pressed=true] i{background:var(--anatomy-strong);border-color:var(--anatomy-strong)}
+.toggle[aria-pressed=true] i::after{transform:translateX(12px);background:var(--anatomy-page)}
+button.accept{border-color:var(--anatomy-mid)}
+button.accept.ready{background:var(--anatomy-strong);color:var(--anatomy-page);border-color:var(--anatomy-strong);animation:ready 1.6s ease-in-out infinite}
+@keyframes ready{50%{box-shadow:0 0 0 5px color-mix(in srgb,var(--anatomy-strong) 18%,transparent)}}
+.steps{list-style:none;margin:0;padding:24px 0 6px;display:grid;grid-template-columns:repeat(6,1fr);gap:6px}
+.steps li{border-top:2px solid var(--anatomy-faint);padding-top:10px;transition:border-color .25s,opacity .25s}
+.steps span{display:block;font:9px ui-monospace,monospace;letter-spacing:.1em;color:var(--anatomy-muted)}
+.steps b{display:block;font-weight:500;font-size:13px;color:var(--anatomy-strong);margin:4px 0 2px}
+.steps em{display:block;font-style:normal;font-size:11px;line-height:1.5;color:var(--anatomy-muted)}
+.steps [data-state=active]{border-color:var(--anatomy-strong)}
+.steps [data-state=done]{border-color:var(--anatomy-mid)}
+.steps [data-state=done] span::after{content:" ✓"}
+.steps [data-state=fail]{border-color:var(--anatomy-strong);border-top-style:dashed}
+.steps [data-state=fail] span::after{content:" ✕ FAILED";color:var(--anatomy-strong)}
+.steps [data-state=skip]{opacity:.5}.steps [data-state=skip] span::after{content:" · SKIPPED"}
+.steps [data-state=never]{opacity:.35}
+.controls{border-bottom:0;padding-bottom:0}
+@media(max-width:650px){.toggles{grid-template-columns:1fr 1fr}.toggle{font-size:11px;gap:7px;padding:9px}.steps{grid-template-columns:repeat(3,1fr);row-gap:14px}.buttons{flex-wrap:wrap}}
+@media(prefers-reduced-motion:reduce){button.accept.ready{animation:none}.toggle i,.toggle i::after{transition:none}}

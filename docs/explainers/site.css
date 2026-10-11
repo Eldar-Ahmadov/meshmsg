@@ -1,0 +1,42 @@
+/* Site chrome shared by the index and every concept page. */
+.iso .lit-fill .iso-solid[data-lit] .iso-top{fill:var(--anatomy-lit)}.iso .lit-fill .iso-solid[data-lit] .iso-shade{fill:var(--anatomy-hi)}
+.crumbs{font:10px/1.5 ui-monospace,monospace;letter-spacing:.16em;color:var(--anatomy-muted);display:flex;gap:24px;align-items:center}
+.crumbs>:first-child{color:var(--anatomy-strong)}
+.crumbs a{color:var(--anatomy-strong);text-decoration:none;border-bottom:1px solid transparent}
+.crumbs a:hover{border-color:var(--anatomy-mid)}
+.intro a,.order a,.explanation a{color:var(--anatomy-strong);text-decoration:underline;text-decoration-color:var(--anatomy-lo);text-underline-offset:3px}
+.intro a:hover,.order a:hover{text-decoration-color:var(--anatomy-strong)}
+a:focus-visible{outline:2px solid var(--anatomy-hi);outline-offset:4px;border-radius:4px}
+
+.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:20px}
+.card{display:flex;flex-direction:column;color:inherit;text-decoration:none;border-radius:12px;box-shadow:0 0 0 1px var(--anatomy-faint);background:var(--anatomy-card);overflow:hidden;transition:box-shadow .2s,transform .2s}
+.card:hover{box-shadow:0 0 0 1px var(--anatomy-mid);transform:translateY(-2px)}
+.card:focus-visible{outline:2px solid var(--anatomy-hi);outline-offset:4px}
+.card .thumb{padding:6px 4px 0;border-radius:0;box-shadow:none;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center}
+.card .thumb svg{width:100%;height:auto;max-height:100%}
+.card .meta{padding:18px 22px 22px;border-top:1px solid var(--anatomy-faint);display:flex;flex-direction:column;gap:6px;flex:1}
+.card .meta span{font:9px ui-monospace,monospace;letter-spacing:.1em;color:var(--anatomy-muted)}
+.card .meta h2{margin:4px 0 0}
+.card .meta p{font-size:12px;line-height:1.7;margin:0;flex:1}
+.card .meta b{font:500 12px ui-sans-serif,system-ui,sans-serif;color:var(--anatomy-strong);margin-top:8px}
+.card:hover .meta b{text-decoration:underline;text-underline-offset:3px}
+
+.order{padding:34px 0 26px;display:grid;grid-template-columns:180px 1fr;gap:20px}
+.order span{font:9px/2 ui-monospace,monospace;letter-spacing:.1em;color:var(--anatomy-muted)}
+.order p{margin:0;font-size:13px;line-height:1.8;max-width:620px}
+
+.pager{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:34px}
+.pager a{display:flex;flex-direction:column;gap:4px;padding:16px 18px;border-radius:10px;box-shadow:0 0 0 1px var(--anatomy-faint);color:inherit;text-decoration:none;transition:box-shadow .2s}
+.pager a:hover{box-shadow:0 0 0 1px var(--anatomy-mid)}
+.pager .next{text-align:right}
+.pager span{font:9px ui-monospace,monospace;letter-spacing:.1em;color:var(--anatomy-muted);text-transform:uppercase}
+.pager b{font-weight:500;color:var(--anatomy-strong);font-size:14px}
+
+@media(max-width:650px){
+  .intro br{display:none}
+  .crumbs{font-size:8px;gap:12px}
+  .cards{grid-template-columns:1fr}
+  .order{grid-template-columns:1fr;gap:6px}
+  .pager{grid-template-columns:1fr}.pager .next{text-align:left}
+}
+@media(prefers-reduced-motion:reduce){.card,.card:hover{transition:none;transform:none}}

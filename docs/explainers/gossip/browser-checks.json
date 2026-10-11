@@ -1,0 +1,22 @@
+[
+  ["click", "#reset"],
+  ["eval", "if(document.querySelector('#reached').textContent!=='1 / 8') throw Error('reset'); 'reset passed'"],
+  ["click", "#step"],
+  ["until", "!document.querySelector('#step').disabled"],
+  ["eval", "if(document.querySelector('#sent').textContent!=='1'||document.querySelector('#reached').textContent!=='2 / 8') throw Error('step'); 'step passed'"],
+  ["click", "#reset"],
+  ["click", "#bridge"],
+  ["eval", "const f=document.querySelector('#fanout'); f.value='3'; f.dispatchEvent(new Event('change')); for(let i=0;i<5;i++)document.querySelector('#step').click(); if(document.querySelector('#reached').textContent!=='4 / 8') throw Error('partition'); 'partition passed'"],
+  ["lines"],
+  ["click", "#bridge"],
+  ["eval", "for(let i=0;i<5;i++)document.querySelector('#step').click(); if(document.querySelector('#reached').textContent!=='8 / 8') throw Error('repair'); 'repair passed'"],
+  ["key", "Enter", "[data-peer='0']"],
+  ["eval", "if(document.querySelector('#reached').textContent!=='7 / 7') throw Error('offline'); 'keyboard passed'"],
+  ["lines"],
+  ["click", "#theme"],
+  ["eval", "if(document.body.dataset.theme!=='light') throw Error('theme'); if(document.documentElement.scrollWidth>innerWidth) throw Error('overflow'); 'theme and layout passed'"],
+  ["click", "#reset"],
+  ["eval", "if(document.querySelector('#reached').textContent!=='1 / 8') throw Error('source should return online'); document.querySelectorAll('[data-toggle]').forEach(b=>b.click()); document.querySelector('#step').click(); if(document.querySelector('#reached').textContent!=='0 / 0') throw Error('all offline'); 'all-offline passed'"],
+  ["click", "#reset"],
+  ["shot", "/tmp/gossip-checked.png", "main", 1]
+]

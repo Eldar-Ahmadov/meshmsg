@@ -1,0 +1,20 @@
+[
+  ["click", "#reset"],
+  ["click", "#step"],
+  ["sheet", "/tmp/gossip-motion.png", 160, 4, ".iso-plate", 1, null, 2],
+  ["until", "!document.querySelector('#step').disabled"],
+  ["eval", "if(document.querySelector('#sent').textContent!=='1') throw Error('animated delivery'); 'animated delivery passed'"],
+  ["click", "#reset"],
+  ["eval", "const f=document.querySelector('#fanout'); f.value='3'; f.dispatchEvent(new Event('change'));"],
+  ["click", "#play"],
+  ["until", "document.querySelector('#reached').textContent==='8 / 8'", 20000],
+  ["eval", "if(document.querySelector('#play').textContent!=='Play') throw Error('convergence did not pause'); 'autoplay convergence passed'"],
+  ["move", "[data-peer='2']", 0.5, 0.5],
+  ["shot", "/tmp/gossip-hover.png"],
+  ["lines"],
+  ["click", "#reset"],
+  ["click", "#step"],
+  ["eval", "window.savedReadout=document.querySelector('[data-readout]').textContent; document.querySelector('header').scrollIntoView();"],
+  ["until", "!document.querySelector('#step').disabled"],
+  ["eval", "if(document.querySelector('#reached').textContent!=='3 / 8') throw Error('fanout-three round'); 'fanout control passed'" ]
+]
