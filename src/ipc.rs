@@ -23,38 +23,8 @@ pub(crate) use meshmsg_protocol::framing::MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT
 #[cfg(test)]
 pub(crate) use meshmsg_protocol::framing::MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE;
 
-pub(crate) fn prune_cutoff_upper_bound(now_ms: u64, older_than_secs: u64) -> u64 {
-    now_ms.saturating_sub(older_than_secs.saturating_mul(1000))
-}
-
 pub(crate) fn new_operation_id() -> meshmsg_protocol::OperationId {
     meshmsg_protocol::OperationId::new_random()
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum LifecycleRequestContext<'a> {
-    Remove {
-        operation_id: &'a meshmsg_protocol::OperationId,
-        offer_id: &'a str,
-        direction: Option<&'a str>,
-        provider: Option<&'a str>,
-        maximum: usize,
-    },
-    Prune {
-        operation_id: &'a meshmsg_protocol::OperationId,
-        older_than_secs: u64,
-        direction: Option<&'a str>,
-        dry_run: bool,
-        maximum: usize,
-    },
-}
-
-impl LifecycleRequestContext<'_> {
-    pub(crate) fn operation_id(&self) -> &meshmsg_protocol::OperationId {
-        match self {
-            Self::Remove { operation_id, .. } | Self::Prune { operation_id, .. } => operation_id,
-        }
-    }
 }
 
 pub(crate) use meshmsg_protocol::DownloadRequestContext;

@@ -133,18 +133,20 @@ pub(crate) async fn offers_remove(
     dir: &Path,
     operation_id: Option<String>,
     offer_id: &str,
-    direction: Option<&str>,
+    direction: Option<meshmsg_protocol::OfferDirection>,
     provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let operation_id = parse_operation_id(operation_id)?;
+    let offer_id: meshmsg_protocol::OfferId = offer_id.parse()?;
+    let provider: Option<meshmsg_protocol::PeerId> = provider.map(str::parse).transpose()?;
     let frame = send_request_checked(
         dir,
         &IpcRequest::OffersRemove {
             operation_id: operation_id.clone(),
-            offer_id: offer_id.parse()?,
-            direction: direction.map(str::parse).transpose()?,
-            provider: provider.map(str::parse).transpose()?,
+            offer_id: offer_id.clone(),
+            direction,
+            provider: provider.clone(),
         },
     )
     .await?;
@@ -152,14 +154,9 @@ pub(crate) async fn offers_remove(
         unreachable!("checked lifecycle family")
     };
     anyhow::ensure!(
-        result.offer_id.to_string() == offer_id
-            && result
-                .direction
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref()
-                == direction
-            && result.provider.as_ref().map(ToString::to_string).as_deref() == provider
+        result.offer_id == offer_id
+            && result.direction == direction
+            && result.provider == provider
             && result.maximum == MAX_PRUNE_TAGS,
         "lifecycle response does not match its request"
     );
@@ -171,7 +168,7 @@ pub(crate) async fn offers_prune(
     dir: &Path,
     operation_id: Option<String>,
     older_than_secs: Option<u64>,
-    direction: Option<&str>,
+    direction: Option<meshmsg_protocol::OfferDirection>,
     dry_run: bool,
     max_delete: usize,
     json: bool,
@@ -188,7 +185,7 @@ pub(crate) async fn offers_prune(
         &IpcRequest::OffersPrune {
             operation_id: operation_id.clone(),
             older_than_secs: effective_age,
-            direction: direction.map(str::parse).transpose()?,
+            direction,
             dry_run,
             max_delete,
         },
@@ -199,12 +196,7 @@ pub(crate) async fn offers_prune(
     };
     anyhow::ensure!(
         result.older_than_secs == effective_age
-            && result
-                .direction
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref()
-                == direction
+            && result.direction == direction
             && result.dry_run == dry_run
             && result.maximum == max_delete,
         "lifecycle response does not match its request"

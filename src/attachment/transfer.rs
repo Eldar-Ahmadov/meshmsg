@@ -159,8 +159,8 @@ pub(super) async fn share_attachment(
             .commit_pin(
                 &tag_name,
                 PinnedBlobTag {
-                    direction: "outgoing",
-                    offer_id: offer.offer_id.clone(),
+                    direction: meshmsg_protocol::OfferDirection::Outgoing,
+                    offer_id: offer.offer_id.parse()?,
                     provider: None,
                     name: offer.name.clone(),
                     kind: offer.kind,
@@ -1036,8 +1036,11 @@ mod tests {
             assert_eq!(std::fs::read(&output).unwrap(), b"blob");
             store.sync_db().await.unwrap();
             let parsed = parse_pinned_blob_tag(tag.as_bytes()).unwrap();
-            assert_eq!(parsed.direction, "incoming");
-            assert_eq!(parsed.provider.as_deref(), Some(provider_text.as_str()));
+            assert_eq!(parsed.direction, meshmsg_protocol::OfferDirection::Incoming);
+            assert_eq!(
+                parsed.provider.as_ref().map(ToString::to_string).as_deref(),
+                Some(provider_text.as_str())
+            );
             assert_eq!(
                 store
                     .tags()
@@ -1113,8 +1116,11 @@ mod tests {
             assert_eq!(outcome.warnings.len(), 1);
             assert!(!staging.exists(), "drop recovery did not remove staging");
             let parsed = parse_pinned_blob_tag(tag.as_bytes()).unwrap();
-            assert_eq!(parsed.direction, "incoming");
-            assert_eq!(parsed.provider.as_deref(), Some(provider_text.as_str()));
+            assert_eq!(parsed.direction, meshmsg_protocol::OfferDirection::Incoming);
+            assert_eq!(
+                parsed.provider.as_ref().map(ToString::to_string).as_deref(),
+                Some(provider_text.as_str())
+            );
             assert_eq!(
                 store
                     .tags()
@@ -1186,8 +1192,8 @@ mod tests {
             b"directory payload"
         );
         let parsed = parse_pinned_blob_tag(tag.as_bytes()).unwrap();
-        assert_eq!(parsed.direction, "incoming");
-        assert_eq!(parsed.offer_id, offer_id);
+        assert_eq!(parsed.direction, meshmsg_protocol::OfferDirection::Incoming);
+        assert_eq!(parsed.offer_id.to_string(), offer_id);
         assert_eq!(
             store
                 .tags()

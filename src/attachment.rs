@@ -1,6 +1,7 @@
 pub(crate) mod protocol;
 pub(crate) mod runtime;
 mod storage;
+pub(crate) use storage::prune_cutoff_upper_bound;
 mod tags;
 mod transfer;
 

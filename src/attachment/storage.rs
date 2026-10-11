@@ -1,11 +1,10 @@
 use super::tags::{
     parse_pinned_blob_tag, PinnedBlobTag, BLOB_TAG_PREFIX, MAX_ATTACHMENT_INDEX_TAG_BYTES,
 };
-use crate::ipc::LifecycleRequestContext;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use iroh_blobs::{api::Store, BlobFormat};
-use meshmsg_protocol::ErrorCode;
+use meshmsg_protocol::{ErrorCode, OfferDirection, OfferId, PeerId};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -233,14 +232,22 @@ struct StorageTag {
     size: u64,
 }
 
-struct RemovalSpec<'a> {
-    operation_id: &'a meshmsg_protocol::OperationId,
-    offer_id: Option<&'a str>,
-    direction: Option<&'a str>,
-    provider: Option<&'a str>,
-    older_than_secs: Option<u64>,
-    maximum: usize,
-    dry_run: bool,
+/// Typed selector for one offer removal (`offer_id` present) or prune (absent).
+/// The response shape follows from `offer_id`, so no separate context is needed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RemovalSpec<'a> {
+    pub(crate) operation_id: &'a meshmsg_protocol::OperationId,
+    pub(crate) offer_id: Option<&'a OfferId>,
+    pub(crate) direction: Option<OfferDirection>,
+    pub(crate) provider: Option<&'a PeerId>,
+    pub(crate) older_than_secs: Option<u64>,
+    pub(crate) maximum: usize,
+    pub(crate) dry_run: bool,
+}
+
+/// The retention cutoff implied by an age: everything at or before it qualifies.
+pub(crate) fn prune_cutoff_upper_bound(now_ms: u64, older_than_secs: u64) -> u64 {
+    now_ms.saturating_sub(older_than_secs.saturating_mul(1000))
 }
 
 impl AttachmentStorage {
@@ -652,15 +659,15 @@ impl AttachmentStorage {
             return Ok(None);
         }
         let operation_id = crate::ipc::new_operation_id();
-        self.remove(
-            &operation_id,
-            None,
-            None,
-            None,
-            Some(self.retention_secs),
-            MAX_PRUNE_TAGS,
-            false,
-        )
+        self.remove(RemovalSpec {
+            operation_id: &operation_id,
+            offer_id: None,
+            direction: None,
+            provider: None,
+            older_than_secs: Some(self.retention_secs),
+            maximum: MAX_PRUNE_TAGS,
+            dry_run: false,
+        })
         .await
         .map(Some)
     }
@@ -731,64 +738,30 @@ impl AttachmentStorage {
         Ok(guard)
     }
 
-    #[allow(clippy::too_many_arguments)] // Internal selector wrapper used outside strict IPC.
-    async fn remove(
-        &self,
-        operation_id: &meshmsg_protocol::OperationId,
-        offer_id: Option<&str>,
-        direction: Option<&str>,
-        provider: Option<&str>,
-        older_than_secs: Option<u64>,
-        maximum: usize,
-        dry_run: bool,
-    ) -> Result<meshmsg_protocol::Response> {
-        let cutoff_ms = match older_than_secs {
-            Some(age) => Some(crate::ipc::prune_cutoff_upper_bound(
-                unix_timestamp_ms()?,
-                age,
-            )),
-            None if offer_id.is_none() => Some(unix_timestamp_ms()?),
+    /// Resolves the cutoff an unanchored selector implies: an age-based prune
+    /// uses that age, and a selector-free prune covers every tag up to now.
+    fn resolve_cutoff(spec: &RemovalSpec<'_>) -> Result<Option<u64>> {
+        Ok(match spec.older_than_secs {
+            Some(age) => Some(prune_cutoff_upper_bound(unix_timestamp_ms()?, age)),
+            None if spec.offer_id.is_none() => Some(unix_timestamp_ms()?),
             None => None,
-        };
-        self.remove_at_cutoff(
-            operation_id,
-            offer_id,
-            direction,
-            provider,
-            older_than_secs,
-            cutoff_ms,
-            maximum,
-            dry_run,
-        )
-        .await
+        })
     }
 
-    #[allow(clippy::too_many_arguments)] // Mirrors the complete lifecycle selector contract.
+    async fn remove(&self, spec: RemovalSpec<'_>) -> Result<meshmsg_protocol::Response> {
+        let cutoff_ms = Self::resolve_cutoff(&spec)?;
+        self.remove_with_fault_at_cutoff(spec, cutoff_ms, &|_| Ok(()))
+            .await
+    }
+
+    /// Removes the selection against a cutoff the daemon resolved at admission.
     pub(super) async fn remove_at_cutoff(
         &self,
-        operation_id: &meshmsg_protocol::OperationId,
-        offer_id: Option<&str>,
-        direction: Option<&str>,
-        provider: Option<&str>,
-        older_than_secs: Option<u64>,
+        spec: RemovalSpec<'_>,
         cutoff_ms: Option<u64>,
-        maximum: usize,
-        dry_run: bool,
     ) -> Result<meshmsg_protocol::Response> {
-        self.remove_with_fault_at_cutoff(
-            RemovalSpec {
-                operation_id,
-                offer_id,
-                direction,
-                provider,
-                older_than_secs,
-                maximum,
-                dry_run,
-            },
-            cutoff_ms,
-            &|_| Ok(()),
-        )
-        .await
+        self.remove_with_fault_at_cutoff(spec, cutoff_ms, &|_| Ok(()))
+            .await
     }
 
     #[cfg(test)]
@@ -797,14 +770,7 @@ impl AttachmentStorage {
         spec: RemovalSpec<'_>,
         fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
     ) -> Result<meshmsg_protocol::Response> {
-        let cutoff_ms = match spec.older_than_secs {
-            Some(age) => Some(crate::ipc::prune_cutoff_upper_bound(
-                unix_timestamp_ms()?,
-                age,
-            )),
-            None if spec.offer_id.is_none() => Some(unix_timestamp_ms()?),
-            None => None,
-        };
+        let cutoff_ms = Self::resolve_cutoff(&spec)?;
         self.remove_with_fault_at_cutoff(spec, cutoff_ms, fault)
             .await
     }
@@ -836,26 +802,13 @@ impl AttachmentStorage {
             "invalid internal lifecycle cutoff context"
         );
         let cutoff = cutoff_ms;
-        let lifecycle_context = match (offer_id, older_than_secs) {
-            (Some(offer_id), None) => LifecycleRequestContext::Remove {
-                operation_id,
-                offer_id,
-                direction,
-                provider,
-                maximum,
-            },
-            (None, older_than_secs) => {
+        match (offer_id, older_than_secs) {
+            (Some(_), Some(_)) => anyhow::bail!("invalid internal lifecycle request context"),
+            (None, _) => {
                 let _ = cutoff.context("prune cutoff missing")?;
-                LifecycleRequestContext::Prune {
-                    operation_id,
-                    older_than_secs: older_than_secs.unwrap_or(0),
-                    direction,
-                    dry_run,
-                    maximum,
-                }
             }
-            _ => anyhow::bail!("invalid internal lifecycle request context"),
-        };
+            (Some(_), None) => {}
+        }
         let (before, mut selected, tags) = {
             let state = self
                 .state
@@ -865,10 +818,9 @@ impl AttachmentStorage {
                 .tags
                 .values()
                 .filter(|tag| {
-                    offer_id.is_none_or(|id| tag.parsed.offer_id == id)
+                    offer_id.is_none_or(|id| tag.parsed.offer_id == *id)
                         && direction.is_none_or(|value| tag.parsed.direction == value)
-                        && provider
-                            .is_none_or(|value| tag.parsed.provider.as_deref() == Some(value))
+                        && provider.is_none_or(|value| tag.parsed.provider.as_ref() == Some(value))
                         && cutoff.is_none_or(|boundary| {
                             state
                                 .index
@@ -907,7 +859,7 @@ impl AttachmentStorage {
         let projected_usage = unique_storage_usage(projected).0;
         if dry_run {
             return lifecycle_response(
-                &lifecycle_context,
+                &spec,
                 selected_names.len(),
                 0,
                 before.saturating_sub(projected_usage),
@@ -958,7 +910,7 @@ impl AttachmentStorage {
             let _ = sync_error;
             return Ok(meshmsg_protocol::Response::Error(
                 meshmsg_protocol::ProtocolError::new(
-                    Some(lifecycle_context.operation_id().clone()),
+                    Some(operation_id.clone()),
                     meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
                     if removed.is_empty() {
                         meshmsg_protocol::Outcome::Unknown
@@ -990,7 +942,7 @@ impl AttachmentStorage {
             self.recalculate_cached_status().await?;
             return Ok(meshmsg_protocol::Response::Error(
                 meshmsg_protocol::ProtocolError::new(
-                    Some(lifecycle_context.operation_id().clone()),
+                    Some(operation_id.clone()),
                     meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
                     if removed.is_empty() {
                         meshmsg_protocol::Outcome::Unknown
@@ -1002,7 +954,7 @@ impl AttachmentStorage {
         }
         self.recalculate_cached_status().await?;
         lifecycle_response(
-            &lifecycle_context,
+            &spec,
             selected_names.len(),
             removed.len(),
             before.saturating_sub(self.status().tagged_bytes),
@@ -1013,46 +965,34 @@ impl AttachmentStorage {
 }
 
 fn lifecycle_response(
-    context: &LifecycleRequestContext<'_>,
+    spec: &RemovalSpec<'_>,
     selected_tags: usize,
     removed_tags: usize,
     released_bytes: u64,
     limited: bool,
     cutoff_ms: Option<u64>,
 ) -> Result<meshmsg_protocol::Response> {
-    let response = match context {
-        LifecycleRequestContext::Remove {
-            offer_id,
-            direction,
-            provider,
-            maximum,
-            ..
-        } => {
+    let response = match spec.offer_id {
+        Some(offer_id) => {
             anyhow::ensure!(cutoff_ms.is_none(), "remove unexpectedly resolved a cutoff");
             meshmsg_protocol::Response::OfferRemoved(meshmsg_protocol::OfferRemoved {
-                operation_id: context.operation_id().clone(),
-                offer_id: (*offer_id).parse()?,
-                direction: direction.map(str::parse).transpose()?,
-                provider: provider.map(str::parse).transpose()?,
-                maximum: *maximum,
+                operation_id: spec.operation_id.clone(),
+                offer_id: offer_id.clone(),
+                direction: spec.direction,
+                provider: spec.provider.cloned(),
+                maximum: spec.maximum,
                 selected_tags,
                 removed_tags,
                 released_bytes,
                 limited,
             })
         }
-        LifecycleRequestContext::Prune {
-            older_than_secs,
-            direction,
-            dry_run,
-            maximum,
-            ..
-        } => meshmsg_protocol::Response::OffersPruned(meshmsg_protocol::OffersPruned {
-            operation_id: context.operation_id().clone(),
-            direction: direction.map(str::parse).transpose()?,
-            older_than_secs: *older_than_secs,
-            maximum: *maximum,
-            dry_run: *dry_run,
+        None => meshmsg_protocol::Response::OffersPruned(meshmsg_protocol::OffersPruned {
+            operation_id: spec.operation_id.clone(),
+            direction: spec.direction,
+            older_than_secs: spec.older_than_secs.unwrap_or(0),
+            maximum: spec.maximum,
+            dry_run: spec.dry_run,
             selected_tags,
             removed_tags,
             released_bytes,
@@ -1622,7 +1562,7 @@ mod tests {
                 .remove_with_fault(
                     RemovalSpec {
                         operation_id: &TEST_OPERATION_ID,
-                        offer_id: Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                        offer_id: Some(&"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap()),
                         direction: None,
                         provider: None,
                         older_than_secs: None,
@@ -1852,15 +1792,15 @@ mod tests {
         reader.read_exact(&mut prefix).await.unwrap();
         assert_eq!(prefix, data[..prefix.len()]);
         storage
-            .remove(
-                &TEST_OPERATION_ID,
-                Some("fffffffffffffffffffffffffffffff1"),
-                None,
-                None,
-                None,
-                1,
-                false,
-            )
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: Some(&"fffffffffffffffffffffffffffffff1".parse().unwrap()),
+                direction: None,
+                provider: None,
+                older_than_secs: None,
+                maximum: 1,
+                dry_run: false,
+            })
             .await
             .unwrap();
         assert_eq!(storage.status().tags, 0);
@@ -1937,29 +1877,29 @@ mod tests {
         );
 
         let removed = storage
-            .remove(
-                &TEST_OPERATION_ID,
-                Some("00000000000000000000000000000001"),
-                None,
-                None,
-                None,
-                512,
-                false,
-            )
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: Some(&"00000000000000000000000000000001".parse().unwrap()),
+                direction: None,
+                provider: None,
+                older_than_secs: None,
+                maximum: 512,
+                dry_run: false,
+            })
             .await
             .unwrap();
         assert_eq!(lifecycle_result(&removed).removed_tags, 1);
         assert_eq!(lifecycle_result(&removed).released_bytes, 0);
         let removed = storage
-            .remove(
-                &TEST_OPERATION_ID,
-                Some("00000000000000000000000000000002"),
-                None,
-                None,
-                None,
-                512,
-                false,
-            )
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: Some(&"00000000000000000000000000000002".parse().unwrap()),
+                direction: None,
+                provider: None,
+                older_than_secs: None,
+                maximum: 512,
+                dry_run: false,
+            })
             .await
             .unwrap();
         assert_eq!(lifecycle_result(&removed).released_bytes, 10);
@@ -2123,7 +2063,15 @@ mod tests {
             persist_attachment_index(&state, &lifecycle.index).unwrap();
         }
         let dry = storage
-            .remove(&TEST_OPERATION_ID, None, None, None, Some(10), 1, true)
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: None,
+                direction: None,
+                provider: None,
+                older_than_secs: Some(10),
+                maximum: 1,
+                dry_run: true,
+            })
             .await
             .unwrap();
         assert_eq!(lifecycle_result(&dry).selected_tags, 1);
@@ -2131,7 +2079,15 @@ mod tests {
         assert!(lifecycle_result(&dry).limited);
         assert_eq!(storage.status().tags, 3);
         let pruned = storage
-            .remove(&TEST_OPERATION_ID, None, None, None, Some(10), 2, false)
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: None,
+                direction: None,
+                provider: None,
+                older_than_secs: Some(10),
+                maximum: 2,
+                dry_run: false,
+            })
             .await
             .unwrap();
         assert_eq!(
@@ -2142,7 +2098,15 @@ mod tests {
         assert_eq!(storage.status().tags, 1);
         let held = storage.gate.clone().acquire_owned().await.unwrap();
         let busy = storage
-            .remove(&TEST_OPERATION_ID, None, None, None, Some(0), 1, false)
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: None,
+                direction: None,
+                provider: None,
+                older_than_secs: Some(0),
+                maximum: 1,
+                dry_run: false,
+            })
             .await
             .unwrap_err();
         assert_eq!(
@@ -2238,15 +2202,15 @@ mod tests {
             .to_string()
             .contains("hash_seq"));
         storage
-            .remove(
-                &TEST_OPERATION_ID,
-                Some("11111111111111111111111111111111"),
-                None,
-                None,
-                None,
-                1,
-                false,
-            )
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: Some(&"11111111111111111111111111111111".parse().unwrap()),
+                direction: None,
+                provider: None,
+                older_than_secs: None,
+                maximum: 1,
+                dry_run: false,
+            })
             .await
             .unwrap();
         assert!(store.tags().get(b"foreign/keep").await.unwrap().is_some());
@@ -2414,15 +2378,15 @@ mod tests {
                 assert!(lifecycle.reservations.is_empty());
             }
             storage
-                .remove(
-                    &TEST_OPERATION_ID,
-                    Some("dddddddddddddddddddddddddddddddd"),
-                    None,
-                    None,
-                    None,
-                    1,
-                    false,
-                )
+                .remove(RemovalSpec {
+                    operation_id: &TEST_OPERATION_ID,
+                    offer_id: Some(&"dddddddddddddddddddddddddddddddd".parse().unwrap()),
+                    direction: None,
+                    provider: None,
+                    older_than_secs: None,
+                    maximum: 1,
+                    dry_run: false,
+                })
                 .await
                 .unwrap();
             assert_eq!(storage.status().tags, 0);
@@ -2463,15 +2427,15 @@ mod tests {
         assert_eq!(storage.status().tags, 1, "authoritative tag was hidden");
         assert!(storage.state.lock().unwrap().reservations.is_empty());
         storage
-            .remove(
-                &TEST_OPERATION_ID,
-                Some("44444444444444444444444444444444"),
-                None,
-                None,
-                None,
-                1,
-                false,
-            )
+            .remove(RemovalSpec {
+                operation_id: &TEST_OPERATION_ID,
+                offer_id: Some(&"44444444444444444444444444444444".parse().unwrap()),
+                direction: None,
+                provider: None,
+                older_than_secs: None,
+                maximum: 1,
+                dry_run: false,
+            })
             .await
             .unwrap();
         assert_eq!(storage.status().tags, 0);
@@ -2500,7 +2464,7 @@ mod tests {
                 .remove_with_fault(
                     RemovalSpec {
                         operation_id: &TEST_OPERATION_ID,
-                        offer_id: Some("66666666666666666666666666666666"),
+                        offer_id: Some(&"66666666666666666666666666666666".parse().unwrap()),
                         direction: None,
                         provider: None,
                         older_than_secs: None,

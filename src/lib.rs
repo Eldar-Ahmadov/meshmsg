@@ -265,7 +265,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &dir,
                     operation_id,
                     &offer_id,
-                    direction.map(|value| value.to_string()).as_deref(),
+                    direction,
                     provider.as_deref(),
                     cli.json,
                 )
@@ -282,7 +282,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &dir,
                     operation_id,
                     older_than_secs,
-                    direction.map(|value| value.to_string()).as_deref(),
+                    direction,
                     dry_run,
                     max_delete,
                     cli.json,

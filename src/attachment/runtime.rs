@@ -5,7 +5,7 @@ use iroh_blobs::api::Store;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 
-pub(crate) use storage::{AttachmentStorage, MAX_PRUNE_TAGS};
+pub(crate) use storage::{AttachmentStorage, RemovalSpec, MAX_PRUNE_TAGS};
 pub(crate) use transfer::{download_request_context, DownloadResources, ShareResources};
 
 /// The operation whose storage failure is being reported.
@@ -92,17 +92,18 @@ pub(crate) async fn remove_offer_request(
     direction: Option<meshmsg_protocol::OfferDirection>,
     provider: Option<&meshmsg_protocol::PeerId>,
 ) -> meshmsg_protocol::Response {
-    let direction = direction.map(|value| value.to_string());
     match storage
         .remove_at_cutoff(
-            operation_id,
-            Some(offer_id.as_str()),
-            direction.as_deref(),
-            provider.map(meshmsg_protocol::PeerId::as_str),
+            RemovalSpec {
+                operation_id,
+                offer_id: Some(offer_id),
+                direction,
+                provider,
+                older_than_secs: None,
+                maximum: MAX_PRUNE_TAGS,
+                dry_run: false,
+            },
             None,
-            None,
-            MAX_PRUNE_TAGS,
-            false,
         )
         .await
     {
@@ -120,17 +121,18 @@ pub(crate) async fn prune_offers_request(
     dry_run: bool,
     max_delete: usize,
 ) -> meshmsg_protocol::Response {
-    let direction = direction.map(|value| value.to_string());
     match storage
         .remove_at_cutoff(
-            operation_id,
-            None,
-            direction.as_deref(),
-            None,
-            Some(older_than_secs),
+            RemovalSpec {
+                operation_id,
+                offer_id: None,
+                direction,
+                provider: None,
+                older_than_secs: Some(older_than_secs),
+                maximum: max_delete,
+                dry_run,
+            },
             Some(cutoff_ms),
-            max_delete,
-            dry_run,
         )
         .await
     {

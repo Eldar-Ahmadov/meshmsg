@@ -8,6 +8,7 @@ use data_encoding::BASE64URL_NOPAD;
 use futures_util::StreamExt;
 use iroh::PublicKey;
 use iroh_blobs::{api::Store, BlobFormat};
+use meshmsg_protocol::{OfferDirection, OfferId, PeerId};
 
 const MAX_ENCODED_TAG_NAME_BYTES: usize = 134;
 const MAX_ENCODED_PUBLIC_KEY_BYTES: usize = 64;
@@ -25,9 +26,9 @@ pub(super) const MAX_ATTACHMENT_INDEX_TAG_BYTES: usize = INBOUND_BLOB_TAG_PREFIX
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PinnedBlobTag {
-    pub(super) direction: &'static str,
-    pub(super) offer_id: String,
-    pub(super) provider: Option<String>,
+    pub(super) direction: OfferDirection,
+    pub(super) offer_id: OfferId,
+    pub(super) provider: Option<PeerId>,
     pub(super) name: String,
     pub(super) kind: AttachmentKind,
 }
@@ -105,7 +106,7 @@ pub(super) fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
     let name = std::str::from_utf8(name).ok()?;
     let (direction, provider, remainder) =
         if let Some(remainder) = name.strip_prefix(OUTBOUND_BLOB_TAG_PREFIX) {
-            ("outgoing", None, remainder)
+            (OfferDirection::Outgoing, None, remainder)
         } else {
             let remainder = name.strip_prefix(INBOUND_BLOB_TAG_PREFIX)?;
             let (provider, remainder) = remainder.split_once('/')?;
@@ -116,18 +117,22 @@ pub(super) fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
             if canonical_provider != provider {
                 return None;
             }
-            ("incoming", Some(canonical_provider), remainder)
+            (
+                OfferDirection::Incoming,
+                Some(canonical_provider.parse::<PeerId>().ok()?),
+                remainder,
+            )
         };
     let mut parts = remainder.split('/');
     let offer_id = parts.next()?;
     let kind = parse_attachment_kind(parts.next()?)?;
     let name = decode_tag_name(parts.next()?)?;
-    if parts.next().is_some() || !contracts::valid_operation_id(offer_id) {
+    if parts.next().is_some() {
         return None;
     }
     Some(PinnedBlobTag {
         direction,
-        offer_id: offer_id.to_owned(),
+        offer_id: offer_id.parse().ok()?,
         provider,
         name,
         kind,
@@ -178,9 +183,9 @@ pub(super) async fn list_pinned_blobs(
             truncated = true;
         } else {
             blobs.push(meshmsg_protocol::OfferListItem {
-                direction: parsed.direction.parse()?,
-                offer_id: parsed.offer_id.parse()?,
-                provider: parsed.provider.map(|value| value.parse()).transpose()?,
+                direction: parsed.direction,
+                offer_id: parsed.offer_id,
+                provider: parsed.provider,
                 name: meshmsg_protocol::AttachmentName::new(parsed.name)?,
                 kind: match parsed.kind {
                     AttachmentKind::File => meshmsg_protocol::AttachmentKind::File,
@@ -217,8 +222,8 @@ mod tests {
         assert_eq!(
             parse_pinned_blob_tag(outbound_blob_tag(id, AttachmentKind::File, name).as_bytes()),
             Some(PinnedBlobTag {
-                direction: "outgoing",
-                offer_id: id.to_owned(),
+                direction: OfferDirection::Outgoing,
+                offer_id: id.parse().unwrap(),
                 provider: None,
                 name: name.to_owned(),
                 kind: AttachmentKind::File,
@@ -230,9 +235,9 @@ mod tests {
                     .as_bytes()
             ),
             Some(PinnedBlobTag {
-                direction: "incoming",
-                offer_id: id.to_owned(),
-                provider: Some(provider.to_string()),
+                direction: OfferDirection::Incoming,
+                offer_id: id.parse().unwrap(),
+                provider: Some(provider.to_string().parse().unwrap()),
                 name: "results.tar".to_owned(),
                 kind: AttachmentKind::DirectoryTarV1,
             })

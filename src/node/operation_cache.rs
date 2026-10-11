@@ -132,7 +132,7 @@ impl OperationCache {
             .expect("newly admitted prune is in flight");
         let resolution = *entry.prune_resolution.get_or_insert(PruneResolution {
             older_than_secs,
-            cutoff_ms: crate::ipc::prune_cutoff_upper_bound(now_ms, older_than_secs),
+            cutoff_ms: crate::attachment::prune_cutoff_upper_bound(now_ms, older_than_secs),
         });
         debug_assert_eq!(resolution.older_than_secs, older_than_secs);
         resolution
