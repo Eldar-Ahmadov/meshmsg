@@ -3,6 +3,7 @@ mod alias;
 mod attachment;
 mod cli;
 mod client_commands;
+mod clock;
 mod config;
 mod contracts;
 mod direct;
@@ -151,21 +152,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("alias disabled");
             }
         }
-        Command::Daemon {
-            max_attachment_bytes,
-            max_attachment_storage_bytes,
-            min_attachment_free_bytes,
-            attachment_retention_secs,
-        } => {
-            node::run_daemon(
-                &dir,
-                max_attachment_bytes,
-                max_attachment_storage_bytes,
-                min_attachment_free_bytes,
-                attachment_retention_secs,
-            )
-            .await?
-        }
+        Command::Daemon { options } => node::run_daemon(&dir, options).await?,
         Command::Invite => {
             let (state, secret) = State::load_for_doctor(&dir)?;
             state.validate()?;
@@ -200,15 +187,13 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             // Allocate or preserve the retry identity before local body
             // validation, but do not contact the daemon or admit its cache.
-            let operation_id = operation_id
-                .map(|value| value.parse())
-                .transpose()?
-                .unwrap_or_else(ipc::new_operation_id);
+            let operation_id =
+                operation_id.unwrap_or_else(meshmsg_protocol::OperationId::new_random);
             let private = to.is_some();
             let maximum = if private {
-                message::MAX_PRIVATE_BODY_BYTES
+                meshmsg_protocol::MAX_PRIVATE_BODY_BYTES
             } else {
-                message::MAX_BROADCAST_BODY_BYTES
+                meshmsg_protocol::MAX_BROADCAST_BODY_BYTES
             };
             let message = input
                 .into_message(maximum)
@@ -264,7 +249,7 @@ async fn run(cli: Cli) -> Result<()> {
                 client_commands::offers_remove(
                     &dir,
                     operation_id,
-                    &offer_id,
+                    offer_id,
                     direction,
                     provider.as_deref(),
                     cli.json,

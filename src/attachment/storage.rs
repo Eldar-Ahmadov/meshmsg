@@ -1,6 +1,7 @@
 use super::tags::{
     parse_pinned_blob_tag, PinnedBlobTag, BLOB_TAG_PREFIX, MAX_ATTACHMENT_INDEX_TAG_BYTES,
 };
+use crate::clock::unix_timestamp_ms;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use iroh_blobs::{api::Store, BlobFormat};
@@ -10,7 +11,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant as StdInstant},
 };
 use tokio::sync::Semaphore;
 
@@ -50,10 +51,6 @@ impl std::fmt::Display for AttachmentFailure {
 }
 
 impl std::error::Error for AttachmentFailure {}
-
-fn unix_timestamp_ms() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -658,7 +655,7 @@ impl AttachmentStorage {
         if self.retention_secs == 0 {
             return Ok(None);
         }
-        let operation_id = crate::ipc::new_operation_id();
+        let operation_id = meshmsg_protocol::OperationId::new_random();
         self.remove(RemovalSpec {
             operation_id: &operation_id,
             offer_id: None,

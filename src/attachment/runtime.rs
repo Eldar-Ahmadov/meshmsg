@@ -1,5 +1,4 @@
 use super::{storage, tags, transfer};
-use crate::contracts;
 use anyhow::Result;
 use iroh_blobs::api::Store;
 use std::{path::PathBuf, sync::Arc};
@@ -77,11 +76,11 @@ pub(crate) async fn list_offers_request(store: Store) -> meshmsg_protocol::Respo
                 item_errors,
             })
         }
-        Err(_error) => contracts::protocol_error_response(
+        Err(_error) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            None,
             meshmsg_protocol::ErrorCode::OffersFailed,
             meshmsg_protocol::Outcome::Unknown,
-            None,
-        ),
+        )),
     }
 }
 

@@ -4,6 +4,7 @@ use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
     ArgGroup, Args, Parser, Subcommand, ValueEnum,
 };
+use meshmsg_protocol::{OfferId, OperationId};
 use std::{
     fs,
     io::{self, Read},
@@ -84,12 +85,11 @@ pub struct OfferInput {
     pub offer_stdin: bool,
 }
 
-fn parse_operation_id(value: &str) -> std::result::Result<String, String> {
-    if crate::ipc::valid_operation_id(value) {
-        Ok(value.to_owned())
-    } else {
-        Err("operation ID must contain exactly 32 lowercase hexadecimal characters".into())
-    }
+/// Offer IDs share the operation-ID format and its diagnostic.
+fn parse_operation_id<T: std::str::FromStr>(value: &str) -> std::result::Result<T, String> {
+    value.parse().map_err(|_| {
+        "operation ID must contain exactly 32 lowercase hexadecimal characters".to_owned()
+    })
 }
 
 fn parse_prune_limit(value: &str) -> std::result::Result<usize, String> {
@@ -116,10 +116,10 @@ pub enum OffersCommand {
     /// Remove local pins matching one offer ID; shared blob data stays while another tag references it
     Remove {
         /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
-        #[arg(long, value_parser = parse_operation_id)]
-        operation_id: Option<String>,
-        #[arg(value_parser = parse_operation_id)]
-        offer_id: String,
+        #[arg(long, value_parser = parse_operation_id::<OperationId>)]
+        operation_id: Option<OperationId>,
+        #[arg(value_parser = parse_operation_id::<OfferId>)]
+        offer_id: OfferId,
         #[arg(long, value_parser = offer_direction_parser())]
         direction: Option<meshmsg_protocol::OfferDirection>,
         /// Canonical provider public key, useful to disambiguate incoming offers
@@ -129,8 +129,8 @@ pub enum OffersCommand {
     /// Remove oldest pins at or beyond the retention boundary
     Prune {
         /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
-        #[arg(long, value_parser = parse_operation_id)]
-        operation_id: Option<String>,
+        #[arg(long, value_parser = parse_operation_id::<OperationId>)]
+        operation_id: Option<OperationId>,
         /// Override daemon retention age; zero selects every matching tag
         #[arg(long)]
         older_than_secs: Option<u64>,
@@ -201,6 +201,40 @@ pub enum SkillCommand {
     },
 }
 
+#[derive(Args, Debug)]
+pub struct DaemonOptions {
+    /// Maximum size of a shared or downloaded attachment, in bytes
+    #[arg(
+        long,
+        env = "MESHMSG_MAX_ATTACHMENT_BYTES",
+        default_value_t = DEFAULT_MAX_ATTACHMENT_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub max_attachment_bytes: u64,
+    /// Maximum total bytes retained by unique pinned attachment blobs
+    #[arg(
+        long,
+        env = "MESHMSG_MAX_ATTACHMENT_STORAGE_BYTES",
+        default_value_t = crate::node::DEFAULT_MAX_ATTACHMENT_STORAGE_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub max_attachment_storage_bytes: u64,
+    /// Free bytes that must remain on the attachment store filesystem
+    #[arg(
+        long,
+        env = "MESHMSG_MIN_ATTACHMENT_FREE_BYTES",
+        default_value_t = crate::node::DEFAULT_MIN_FREE_SPACE_BYTES
+    )]
+    pub min_attachment_free_bytes: u64,
+    /// Automatically prune pins this old; zero disables automatic pruning
+    #[arg(
+        long,
+        env = "MESHMSG_ATTACHMENT_RETENTION_SECS",
+        default_value_t = crate::node::DEFAULT_ATTACHMENT_RETENTION_SECS
+    )]
+    pub attachment_retention_secs: u64,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Generate a persistent identity and fresh topic
@@ -233,36 +267,8 @@ pub enum Command {
     },
     /// Run the local network daemon in the foreground
     Daemon {
-        /// Maximum size of a shared or downloaded attachment, in bytes
-        #[arg(
-            long,
-            env = "MESHMSG_MAX_ATTACHMENT_BYTES",
-            default_value_t = DEFAULT_MAX_ATTACHMENT_BYTES,
-            value_parser = clap::value_parser!(u64).range(1..)
-        )]
-        max_attachment_bytes: u64,
-        /// Maximum total bytes retained by unique pinned attachment blobs
-        #[arg(
-            long,
-            env = "MESHMSG_MAX_ATTACHMENT_STORAGE_BYTES",
-            default_value_t = crate::node::DEFAULT_MAX_ATTACHMENT_STORAGE_BYTES,
-            value_parser = clap::value_parser!(u64).range(1..)
-        )]
-        max_attachment_storage_bytes: u64,
-        /// Free bytes that must remain on the attachment store filesystem
-        #[arg(
-            long,
-            env = "MESHMSG_MIN_ATTACHMENT_FREE_BYTES",
-            default_value_t = crate::node::DEFAULT_MIN_FREE_SPACE_BYTES
-        )]
-        min_attachment_free_bytes: u64,
-        /// Automatically prune pins this old; zero disables automatic pruning
-        #[arg(
-            long,
-            env = "MESHMSG_ATTACHMENT_RETENTION_SECS",
-            default_value_t = crate::node::DEFAULT_ATTACHMENT_RETENTION_SECS
-        )]
-        attachment_retention_secs: u64,
+        #[command(flatten)]
+        options: DaemonOptions,
     },
     /// Print the stored invite token
     Invite,
@@ -271,8 +277,8 @@ pub enum Command {
     /// Broadcast a message, or send privately with authenticated acceptance acknowledgement
     Send {
         /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
-        #[arg(long, value_parser = parse_operation_id)]
-        operation_id: Option<String>,
+        #[arg(long, value_parser = parse_operation_id::<OperationId>)]
+        operation_id: Option<OperationId>,
         /// Send privately to one canonical public key or uniquely advertised alias
         #[arg(long, value_name = "RECIPIENT")]
         to: Option<String>,
@@ -288,8 +294,8 @@ pub enum Command {
     /// Share a file or a directory snapshot with the topic
     Share {
         /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
-        #[arg(long, value_parser = parse_operation_id)]
-        operation_id: Option<String>,
+        #[arg(long, value_parser = parse_operation_id::<OperationId>)]
+        operation_id: Option<OperationId>,
         /// File or directory to share
         path: PathBuf,
     },
@@ -297,8 +303,8 @@ pub enum Command {
     #[cfg(debug_assertions)]
     #[command(hide = true)]
     TestSignAttachmentFixture {
-        #[arg(long, value_parser = parse_operation_id)]
-        operation_id: String,
+        #[arg(long, value_parser = parse_operation_id::<OperationId>)]
+        operation_id: OperationId,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -316,8 +322,8 @@ pub enum Command {
     /// Download an explicitly accepted attachment offer
     Download {
         /// Idempotency ID; retain for reconciliation or a pre-admission retry (generated when omitted)
-        #[arg(long, value_parser = parse_operation_id)]
-        operation_id: Option<String>,
+        #[arg(long, value_parser = parse_operation_id::<OperationId>)]
+        operation_id: Option<OperationId>,
         #[command(flatten)]
         input: OfferInput,
         /// Destination path; existing paths are never overwritten
@@ -341,73 +347,65 @@ pub enum Command {
 
 impl InviteInput {
     pub fn into_token(self) -> Result<String> {
-        let mut token = match (self.token, self.token_file, self.token_stdin) {
-            (Some(token), None, false) => {
-                anyhow::ensure!(
-                    token.len() <= MAX_CAPABILITY_INPUT_BYTES,
-                    "invite token exceeds the input limit"
-                );
-                token
-            }
-            (None, Some(path), false) => {
-                read_file(&path, "invite token", MAX_CAPABILITY_INPUT_BYTES)?
-            }
-            (None, None, true) => read_stdin("invite token", MAX_CAPABILITY_INPUT_BYTES)?,
-            _ => bail!("exactly one invite token input source is required"),
-        };
-        if token.ends_with('\n') {
-            token.pop();
-            if token.ends_with('\r') {
-                token.pop();
-            }
-        }
-        anyhow::ensure!(!token.is_empty(), "invite token input is empty");
-        Ok(token)
+        resolve_input(
+            (self.token, self.token_file, self.token_stdin),
+            "invite token",
+            MAX_CAPABILITY_INPUT_BYTES,
+            true,
+        )
     }
 }
 
 impl MessageInput {
     pub fn into_message(self, maximum: usize) -> Result<String> {
-        match (self.message, self.message_file, self.message_stdin) {
-            (Some(message), None, false) => {
-                anyhow::ensure!(
-                    message.len() <= maximum,
-                    "message body exceeds {maximum} bytes"
-                );
-                Ok(message)
-            }
-            (None, Some(path), false) => read_file(&path, "message body", maximum),
-            (None, None, true) => read_stdin("message body", maximum),
-            _ => bail!("exactly one message input source is required"),
-        }
+        resolve_input(
+            (self.message, self.message_file, self.message_stdin),
+            "message body",
+            maximum,
+            false,
+        )
     }
 }
 
 impl OfferInput {
     pub fn into_offer(self) -> Result<String> {
-        let mut offer = match (self.offer, self.offer_file, self.offer_stdin) {
-            (Some(offer), None, false) => {
-                anyhow::ensure!(
-                    offer.len() <= MAX_CAPABILITY_INPUT_BYTES,
-                    "attachment offer exceeds the input limit"
-                );
-                offer
-            }
-            (None, Some(path), false) => {
-                read_file(&path, "attachment offer", MAX_CAPABILITY_INPUT_BYTES)?
-            }
-            (None, None, true) => read_stdin("attachment offer", MAX_CAPABILITY_INPUT_BYTES)?,
-            _ => bail!("exactly one attachment offer input source is required"),
-        };
-        if offer.ends_with('\n') {
-            offer.pop();
-            if offer.ends_with('\r') {
-                offer.pop();
+        resolve_input(
+            (self.offer, self.offer_file, self.offer_stdin),
+            "attachment offer",
+            MAX_CAPABILITY_INPUT_BYTES,
+            true,
+        )
+    }
+}
+
+/// Resolves the positional, file, or stdin source selected for one input.
+/// A capability is a single line: one trailing LF or CRLF is stripped and an
+/// empty result is rejected. A message body is preserved byte for byte.
+fn resolve_input(
+    source: (Option<String>, Option<PathBuf>, bool),
+    description: &str,
+    limit: usize,
+    capability: bool,
+) -> Result<String> {
+    let mut value = match source {
+        (Some(value), None, false) if value.len() <= limit => value,
+        (Some(_), None, false) if capability => bail!("{description} exceeds the input limit"),
+        (Some(_), None, false) => bail!("{description} exceeds {limit} bytes"),
+        (None, Some(path), false) => read_file(&path, description, limit)?,
+        (None, None, true) => read_stdin(description, limit)?,
+        _ if capability => bail!("exactly one {description} input source is required"),
+        _ => bail!("exactly one message input source is required"),
+    };
+    if capability {
+        if value.ends_with('\n') {
+            value.pop();
+            if value.ends_with('\r') {
+                value.pop();
             }
         }
-        anyhow::ensure!(!offer.is_empty(), "attachment offer input is empty");
-        Ok(offer)
+        anyhow::ensure!(!value.is_empty(), "{description} input is empty");
     }
+    Ok(value)
 }
 
 fn read_file(path: &std::path::Path, description: &str, limit: usize) -> Result<String> {
@@ -576,29 +574,22 @@ mod tests {
     #[test]
     fn daemon_attachment_limit_defaults_to_four_gib_and_is_configurable() {
         let cli = parse(&["daemon"]).unwrap();
-        let Command::Daemon {
-            max_attachment_bytes,
-            max_attachment_storage_bytes,
-            min_attachment_free_bytes,
-            attachment_retention_secs,
-        } = cli.command
-        else {
+        let Command::Daemon { options } = cli.command else {
             panic!("wrong command")
         };
-        assert_eq!(max_attachment_bytes, 4 * 1024 * 1024 * 1024);
-        assert_eq!(max_attachment_storage_bytes, 16 * 1024 * 1024 * 1024);
-        assert_eq!(min_attachment_free_bytes, 1024 * 1024 * 1024);
-        assert_eq!(attachment_retention_secs, 0);
+        assert_eq!(options.max_attachment_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(
+            options.max_attachment_storage_bytes,
+            16 * 1024 * 1024 * 1024
+        );
+        assert_eq!(options.min_attachment_free_bytes, 1024 * 1024 * 1024);
+        assert_eq!(options.attachment_retention_secs, 0);
 
         let cli = parse(&["daemon", "--max-attachment-bytes", "12345"]).unwrap();
-        let Command::Daemon {
-            max_attachment_bytes,
-            ..
-        } = cli.command
-        else {
+        let Command::Daemon { options } = cli.command else {
             panic!("wrong command")
         };
-        assert_eq!(max_attachment_bytes, 12_345);
+        assert_eq!(options.max_attachment_bytes, 12_345);
         assert!(parse(&["daemon", "--max-attachment-bytes", "0"]).is_err());
         assert!(parse(&["daemon", "--max-attachment-storage-bytes", "0"]).is_err());
         assert!(parse(&[
@@ -779,17 +770,17 @@ mod tests {
             message_stdin: false,
         };
         let empty = input(String::new())
-            .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+            .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
             .unwrap();
         assert!(crate::message::validate_broadcast_body(&empty).is_err());
         assert!(
-            input("界".repeat(crate::message::MAX_BROADCAST_BODY_BYTES / 3))
-                .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+            input("界".repeat(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES / 3))
+                .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
                 .is_ok()
         );
         assert!(
-            input("界".repeat(crate::message::MAX_BROADCAST_BODY_BYTES / 3 + 1))
-                .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+            input("界".repeat(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES / 3 + 1))
+                .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
                 .is_err()
         );
     }
@@ -806,7 +797,7 @@ mod tests {
             message_file: Some(path),
             message_stdin: false,
         }
-        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+        .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
         .unwrap();
         assert_eq!(message.as_bytes(), bytes);
 
@@ -817,14 +808,14 @@ mod tests {
             message_file: Some(empty_path),
             message_stdin: false,
         }
-        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+        .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
         .unwrap();
         assert!(crate::message::validate_broadcast_body(&empty).is_err());
 
         let oversized_path = dir.join("oversized");
         fs::write(
             &oversized_path,
-            vec![b'x'; crate::message::MAX_BROADCAST_BODY_BYTES + 1],
+            vec![b'x'; meshmsg_protocol::MAX_BROADCAST_BODY_BYTES + 1],
         )
         .unwrap();
         let error = MessageInput {
@@ -832,11 +823,11 @@ mod tests {
             message_file: Some(oversized_path),
             message_stdin: false,
         }
-        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+        .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
         .unwrap_err();
         assert!(error.to_string().contains(&format!(
             "{}-byte input limit",
-            crate::message::MAX_BROADCAST_BODY_BYTES
+            meshmsg_protocol::MAX_BROADCAST_BODY_BYTES
         )));
 
         let path = dir.join("invalid");
@@ -846,7 +837,7 @@ mod tests {
             message_file: Some(path),
             message_stdin: false,
         }
-        .into_message(crate::message::MAX_BROADCAST_BODY_BYTES)
+        .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
         .unwrap_err();
         assert!(error.to_string().contains("UTF-8"));
         fs::remove_dir_all(dir).unwrap();

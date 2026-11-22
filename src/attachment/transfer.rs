@@ -7,7 +7,7 @@ use super::{
     },
     AttachmentKind, AttachmentOffer,
 };
-use crate::{attachment, ids::id_string};
+use crate::{attachment, clock::unix_timestamp_ms, ids::id_string};
 use anyhow::{Context, Result};
 use data_encoding::BASE64URL_NOPAD;
 use futures_util::StreamExt;
@@ -25,17 +25,13 @@ use iroh_gossip::{api::GossipSender, proto::TopicId};
 use std::{
     io::Read as _,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::sync::broadcast;
 
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DOWNLOAD_PROGRESS_STEP: u64 = 8 * 1024 * 1024;
-
-fn unix_timestamp_ms() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
-}
 
 fn hash_file(path: &Path) -> Result<iroh_blobs::Hash> {
     let mut file = std::fs::File::open(path)?;
@@ -263,7 +259,7 @@ pub(crate) fn download_request_context(
     token: &str,
     output: &Path,
     topic: TopicId,
-) -> Result<crate::ipc::DownloadRequestContext> {
+) -> Result<meshmsg_protocol::DownloadRequestContext> {
     let (offer_id, provider, kind, name, declared_size) =
         match protocol::parse_signed_offer_token(token, topic) {
             Ok((offer, ticket)) => (
@@ -291,7 +287,7 @@ pub(crate) fn download_request_context(
                 )
             }
         };
-    Ok(crate::ipc::DownloadRequestContext {
+    Ok(meshmsg_protocol::DownloadRequestContext {
         operation_id: operation_id.clone(),
         token_digest: crate::ipc::download_token_digest(token),
         offer_id: offer_id.parse()?,
@@ -785,7 +781,6 @@ mod tests {
     use super::super::tags;
     use super::*;
     use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
-    use crate::contracts;
     use iroh::SecretKey;
     use iroh_blobs::store::fs::{options::Options as FsStoreOptions, FsStore};
     #[test]
@@ -873,7 +868,7 @@ mod tests {
                 BlobFormat::Raw,
             );
             let offer_id = raw_ticket_offer_id(&ticket);
-            assert!(contracts::valid_operation_id(&offer_id));
+            assert!(offer_id.parse::<meshmsg_protocol::OfferId>().is_ok());
             assert_eq!(offer_id, raw_ticket_offer_id(&ticket));
             let tag = raw_ticket_blob_tag(&ticket);
             let options = FsStoreOptions::new(&root.join("store"));

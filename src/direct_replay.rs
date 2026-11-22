@@ -1,4 +1,4 @@
-use crate::{config::atomic_write, persistent};
+use crate::{clock::unix_timestamp_ms, config::atomic_write, persistent};
 use anyhow::{Context, Result};
 use iroh::PublicKey;
 use iroh_gossip::proto::TopicId;
@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -442,7 +442,7 @@ impl ReplayStore {
         recipient: PublicKey,
         topic: TopicId,
     ) -> Result<Self> {
-        let now_wall = wall_ms()?;
+        let now_wall = unix_timestamp_ms()?;
         let now_mono = Instant::now();
         let (mut entries, snapshot_present) =
             match load_snapshot(&snapshot_path, recipient, topic, now_wall)? {
@@ -506,7 +506,7 @@ impl ReplayStore {
                         delivery,
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let now = wall_ms().map_err(AdmissionFailure::unavailable)?;
+                        let now = unix_timestamp_ms().map_err(AdmissionFailure::unavailable)?;
                         self.admit_transaction(admission, now, Instant::now())
                     }));
                     let result = match result {
@@ -554,7 +554,7 @@ impl ReplayStore {
                             }
                         }
                     }
-                    let result = self.compact(wall_ms()?);
+                    let result = self.compact(unix_timestamp_ms()?);
                     if result.is_err() {
                         let _ = health.send(ReplayHealth::failed());
                     }
@@ -568,7 +568,7 @@ impl ReplayStore {
         }
         // Every completed admission is already represented in a synced WAL.
         // Compact on an unexpected owner drop and publish any terminal failure.
-        let result = self.compact(wall_ms()?);
+        let result = self.compact(unix_timestamp_ms()?);
         if result.is_err() {
             let _ = health.send(ReplayHealth::failed());
         }
@@ -1228,10 +1228,6 @@ fn test_crash_point(point: &str) {
 #[cfg(not(test))]
 fn test_crash_point(_point: &str) {}
 
-fn wall_ms() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
-}
-
 fn file_name(path: &Path) -> Result<&str> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1286,7 +1282,7 @@ mod tests {
         let old_bytes = format!(
             "{{\"version\":1,\"recipient\":\"{recipient}\",\"topic\":\"{topic}\",\"entries\":[{{\"sender\":\"{sender}\",\"id\":\"{}\",\"expires_at_ms\":{}}}]}}",
             id_string(&[3; 16]),
-            wall_ms().unwrap() + 60_000
+            unix_timestamp_ms().unwrap() + 60_000
         );
         fs::write(&old_path, &old_bytes).unwrap();
 
@@ -1297,7 +1293,7 @@ mod tests {
                     sender,
                     [3; 16],
                     fingerprint([3; 16]),
-                    wall_ms().unwrap() + 60_000,
+                    unix_timestamp_ms().unwrap() + 60_000,
                     delivery(true),
                 )
                 .await
@@ -1545,7 +1541,7 @@ mod tests {
                     _ => fs::write(&wal_for_delivery, replacement_for_delivery.unwrap()).unwrap(),
                 }
             });
-            let now = wall_ms().unwrap();
+            let now = unix_timestamp_ms().unwrap();
             let failure = store
                 .admit_transaction(
                     Admission {
@@ -1611,7 +1607,7 @@ mod tests {
             file.write_all(b"!").unwrap();
             file.sync_all().unwrap();
         });
-        let now = wall_ms().unwrap();
+        let now = unix_timestamp_ms().unwrap();
         let failure = store
             .admit_transaction(
                 Admission {
@@ -1666,7 +1662,7 @@ mod tests {
             fs::rename(&wal_for_delivery, &saved).unwrap();
             symlink_file(&target, &wal_for_delivery).unwrap();
         });
-        let now = wall_ms().unwrap();
+        let now = unix_timestamp_ms().unwrap();
         let failure = store
             .admit_transaction(
                 Admission {
@@ -1691,7 +1687,7 @@ mod tests {
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([31; 32]);
         let (snapshot, wal, dir) = test_paths();
-        let now = wall_ms().unwrap();
+        let now = unix_timestamp_ms().unwrap();
         let mut store = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         assert_eq!(
             store
@@ -1763,7 +1759,7 @@ mod tests {
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([32; 32]);
         let (snapshot, wal, dir) = test_paths();
-        let now = wall_ms().unwrap();
+        let now = unix_timestamp_ms().unwrap();
         let mut store = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         store
             .admit(sender, [2; 16], now + 60_000, true, now, Instant::now())
@@ -1793,7 +1789,7 @@ mod tests {
         let honest = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([33; 32]);
         let (snapshot, wal, dir) = test_paths();
-        let now_wall = wall_ms().unwrap();
+        let now_wall = unix_timestamp_ms().unwrap();
         let now_mono = Instant::now();
         let mut store = loaded_store(snapshot, wal, recipient, topic);
         // Isolate quota behavior from token timing in this structural test.
@@ -1885,7 +1881,7 @@ mod tests {
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([37; 32]);
         let (snapshot, wal, dir) = test_paths();
-        let now = wall_ms().unwrap();
+        let now = unix_timestamp_ms().unwrap();
         let mut store = loaded_store(snapshot.clone(), wal.clone(), recipient, topic);
         let wal_saved = dir.join("wal.saved");
         fs::rename(&wal, &wal_saved).unwrap();
@@ -1924,7 +1920,7 @@ mod tests {
         let sender = iroh::SecretKey::generate().public();
         let topic = TopicId::from_bytes([34; 32]);
         let (snapshot, wal, dir) = test_paths();
-        let now_wall = wall_ms().unwrap();
+        let now_wall = unix_timestamp_ms().unwrap();
         let start = Instant::now();
         let mut store = loaded_store(snapshot, wal, recipient, topic);
         for index in 0..SENDER_RATE_BURST as usize {
@@ -2006,7 +2002,7 @@ mod tests {
         let (requests, mut receiver) = mpsc::channel(REPLAY_QUEUE_CAPACITY);
         let client = ReplayClient { requests };
         let sender = iroh::SecretKey::generate().public();
-        let expires = wall_ms().unwrap() + 60_000;
+        let expires = unix_timestamp_ms().unwrap() + 60_000;
         let mut waiting = Vec::new();
         for index in 0..REPLAY_QUEUE_CAPACITY {
             let client = client.clone();
@@ -2054,7 +2050,7 @@ mod tests {
                 sender,
                 id: [8; 16],
                 fingerprint: fingerprint([8; 16]),
-                expires_at_ms: wall_ms().unwrap() + 60_000,
+                expires_at_ms: unix_timestamp_ms().unwrap() + 60_000,
                 delivery: Some(Box::new(move || delivered_tx.send(()).unwrap())),
                 reply,
             })
@@ -2075,7 +2071,7 @@ mod tests {
         let topic = TopicId::from_bytes([40; 32]);
         let (snapshot, wal, dir) = test_paths();
         let (client, mut worker) = start_paths(snapshot, wal.clone(), recipient, topic).unwrap();
-        let expires = wall_ms().unwrap() + 60_000;
+        let expires = unix_timestamp_ms().unwrap() + 60_000;
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let (first_reply, first_response) = oneshot::channel();
@@ -2157,7 +2153,7 @@ mod tests {
                     sender,
                     [14; 16],
                     fingerprint([14; 16]),
-                    wall_ms().unwrap() + 60_000,
+                    unix_timestamp_ms().unwrap() + 60_000,
                     Some(Box::new(|| panic!("injected delivery panic"))),
                 )
                 .await
@@ -2171,7 +2167,7 @@ mod tests {
                     sender,
                     [15; 16],
                     fingerprint([15; 16]),
-                    wall_ms().unwrap() + 60_000,
+                    unix_timestamp_ms().unwrap() + 60_000,
                     delivery(true),
                 )
                 .await
@@ -2205,7 +2201,7 @@ mod tests {
                 sender,
                 [6; 16],
                 fingerprint([6; 16]),
-                wall_ms().unwrap() + 60_000,
+                unix_timestamp_ms().unwrap() + 60_000,
                 Some(Box::new(move || {
                     let mut file = fs::File::create(marker).unwrap();
                     file.write_all(b"queued").unwrap();
@@ -2268,7 +2264,7 @@ mod tests {
                         sender,
                         [6; 16],
                         fingerprint([6; 16]),
-                        wall_ms().unwrap() + 60_000,
+                        unix_timestamp_ms().unwrap() + 60_000,
                         Some(Box::new(move || fs::write(second_marker, b"bad").unwrap())),
                     )
                     .await
@@ -2282,7 +2278,7 @@ mod tests {
                         sender,
                         [6; 16],
                         [99; 32],
-                        wall_ms().unwrap() + 60_000,
+                        unix_timestamp_ms().unwrap() + 60_000,
                         delivery(false),
                     )
                     .await
@@ -2302,7 +2298,7 @@ mod tests {
         let (snapshot, wal, dir) = test_paths();
         let (client, mut worker) =
             start_paths(snapshot.clone(), wal.clone(), recipient, topic).unwrap();
-        let expires = wall_ms().unwrap() + 60_000;
+        let expires = unix_timestamp_ms().unwrap() + 60_000;
         let first = {
             let client = client.clone();
             tokio::spawn(async move {
@@ -2365,7 +2361,7 @@ mod tests {
         let (snapshot, wal, dir) = test_paths();
         let (client, mut worker) =
             start_paths(snapshot.clone(), wal.clone(), recipient, topic).unwrap();
-        let expires = wall_ms().unwrap() + 60_000;
+        let expires = unix_timestamp_ms().unwrap() + 60_000;
         let mut tasks = Vec::new();
         for index in 0..SENDER_RATE_BURST as usize {
             let client = client.clone();

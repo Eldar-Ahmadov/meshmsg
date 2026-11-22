@@ -3,22 +3,8 @@
 //! Failures travel through `anyhow` chains as [`ContractFailure`] values and
 //! become a protocol frame only at the CLI boundary. Diagnostic text is local
 //! presentation and never part of the wire contract.
-use meshmsg_protocol::{
-    ErrorCode, OperationId, Outcome, ProtocolError, RequestId, Response, ResponseFrame,
-};
+use meshmsg_protocol::{ErrorCode, Outcome, ProtocolError, RequestId, Response, ResponseFrame};
 use std::fmt;
-
-pub(crate) fn new_request_id() -> RequestId {
-    RequestId::new_random()
-}
-
-pub(crate) fn valid_operation_id(value: &str) -> bool {
-    value.parse::<OperationId>().is_ok()
-}
-
-pub(crate) fn valid_request_id(value: &str) -> bool {
-    value.parse::<RequestId>().is_ok()
-}
 
 /// An authoritative protocol error, optionally correlated with its request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +26,7 @@ impl ContractFailure {
     /// The single JSON frame printed for a failed CLI command.
     pub(crate) fn into_frame(self) -> ResponseFrame {
         ResponseFrame::new(
-            Some(self.request_id.unwrap_or_else(new_request_id)),
+            Some(self.request_id.unwrap_or_else(RequestId::new_random)),
             Response::Error(self.error),
         )
     }
@@ -53,26 +39,10 @@ impl fmt::Display for ContractFailure {
             "{} [{}; {}; {}]",
             self.error.message(),
             self.error.code,
-            outcome_name(self.error.outcome),
+            self.error.outcome,
             self.error.retry_advice().message()
         )
     }
 }
 
 impl std::error::Error for ContractFailure {}
-
-pub(crate) fn outcome_name(value: Outcome) -> &'static str {
-    match value {
-        Outcome::NotStarted => "not_started",
-        Outcome::Partial => "partial",
-        Outcome::Unknown => "unknown",
-    }
-}
-
-pub(crate) fn protocol_error_response(
-    code: ErrorCode,
-    outcome: Outcome,
-    operation_id: Option<OperationId>,
-) -> Response {
-    Response::Error(ProtocolError::new(operation_id, code, outcome))
-}

@@ -1,7 +1,7 @@
 use super::{
     bootstrap::start,
     commands::{self, CommandAction, ExecutionContext},
-    common::{unix_timestamp_ms, OPERATION_CACHE_CAPACITY, OPERATION_CACHE_TTL},
+    common::{OPERATION_CACHE_CAPACITY, OPERATION_CACHE_TTL},
     operation_cache::OperationCache,
     supervisor::{self, AttachmentTaskCompletion, AttachmentTaskMetadata},
 };
@@ -12,6 +12,8 @@ use crate::{
         protocol::{offer_event as attachment_offer_event, validate_offer_binding},
         runtime::*,
     },
+    cli::DaemonOptions,
+    clock::unix_timestamp_ms,
     config::{State, StateLock},
     direct,
     gossip::EventHandler as GossipEventHandler,
@@ -158,13 +160,13 @@ fn spawn_neighbor_presence_announcement(
     });
 }
 
-pub(super) async fn run_daemon(
-    dir: &Path,
-    max_attachment_bytes: u64,
-    max_attachment_storage_bytes: u64,
-    min_attachment_free_bytes: u64,
-    attachment_retention_secs: u64,
-) -> Result<()> {
+pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()> {
+    let DaemonOptions {
+        max_attachment_bytes,
+        max_attachment_storage_bytes,
+        min_attachment_free_bytes,
+        attachment_retention_secs,
+    } = options;
     anyhow::ensure!(
         max_attachment_bytes > 0,
         "maximum attachment size must be greater than zero"
@@ -327,12 +329,12 @@ pub(super) async fn run_daemon(
                             &directory_epoch,
                             directory_revision,
                         )?;
-                        Ok(LocalClientSession::new(
-                            command_tx.clone(),
-                            event_tx.subscribe(),
+                        Ok(LocalClientSession {
+                            commands: command_tx.clone(),
+                            events: event_tx.subscribe(),
                             connected,
-                            Some(startup_peers),
-                        ))
+                            startup_peers: Some(startup_peers),
+                        })
                     },
                 ).await?;
             }

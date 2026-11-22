@@ -1,6 +1,6 @@
 //! Local IPC admission, sessions, deadlines, and subscriptions.
 
-use super::{IpcRequest, IpcRequestFrame, SubscriptionStream};
+use super::SubscriptionStream;
 use crate::{
     node::{
         request_operation_id, CommandPolicy, CommandTimeouts, DaemonCommand, ExecutableRequest,
@@ -8,10 +8,11 @@ use crate::{
     presence::{self, Directory},
 };
 use anyhow::{Context, Result};
+use meshmsg_protocol::{Request, RequestFrame};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::AsyncWrite,
-    sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
+    sync::{broadcast, mpsc, oneshot, Semaphore},
 };
 
 /// At the maximum broadcast size, the shared subscriber ring retains at most
@@ -33,7 +34,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
-struct LocalIpcTimeouts {
+pub(crate) struct LocalIpcTimeouts {
     initial_frame: Duration,
     response_write: Duration,
     ordinary_command: Duration,
@@ -141,53 +142,28 @@ async fn send_command(
     Ok(response.await?)
 }
 
-#[cfg(test)]
+/// Per-client state prepared once the client owns a connection permit.
+pub(crate) struct LocalClientSession {
+    pub(crate) commands: mpsc::Sender<DaemonCommand>,
+    pub(crate) events: broadcast::Receiver<meshmsg_protocol::Event>,
+    pub(crate) connected: meshmsg_protocol::Event,
+    pub(crate) startup_peers: Option<meshmsg_protocol::Event>,
+}
+
 pub(crate) async fn handle_local_client<S>(
     stream: S,
-    commands: mpsc::Sender<DaemonCommand>,
-    events: broadcast::Receiver<meshmsg_protocol::Event>,
-    connected: meshmsg_protocol::Event,
-    startup_peers: Option<meshmsg_protocol::Event>,
+    session: LocalClientSession,
+    timeouts: LocalIpcTimeouts,
 ) -> Result<()>
 where
     S: SubscriptionStream,
 {
-    handle_local_client_with_timeouts(
-        stream,
+    let LocalClientSession {
         commands,
-        events,
+        mut events,
         connected,
         startup_peers,
-        LocalIpcTimeouts::default(),
-    )
-    .await
-}
-
-async fn handle_local_client_with_timeouts<S>(
-    stream: S,
-    commands: mpsc::Sender<DaemonCommand>,
-    events: broadcast::Receiver<meshmsg_protocol::Event>,
-    connected: meshmsg_protocol::Event,
-    startup_peers: Option<meshmsg_protocol::Event>,
-    timeouts: LocalIpcTimeouts,
-) -> Result<()>
-where
-    S: SubscriptionStream,
-{
-    handle_local_client_inner(stream, commands, events, connected, startup_peers, timeouts).await
-}
-
-async fn handle_local_client_inner<S>(
-    stream: S,
-    commands: mpsc::Sender<DaemonCommand>,
-    mut events: broadcast::Receiver<meshmsg_protocol::Event>,
-    connected: meshmsg_protocol::Event,
-    startup_peers: Option<meshmsg_protocol::Event>,
-    timeouts: LocalIpcTimeouts,
-) -> Result<()>
-where
-    S: SubscriptionStream,
-{
+    } = session;
     let mut stream = meshmsg_protocol::FrameReader::new(stream);
     let frame = match tokio::time::timeout(
         timeouts.initial_frame,
@@ -211,7 +187,7 @@ where
             return Ok(());
         }
     };
-    let request_frame: IpcRequestFrame = match serde_json::from_slice(&frame) {
+    let request_frame: RequestFrame = match serde_json::from_slice(&frame) {
         Ok(frame) => frame,
         Err(_) => {
             let _ = write_local_response(
@@ -231,7 +207,7 @@ where
     let request_id = request_frame.request_id;
     let request = request_frame.request;
     match request {
-        IpcRequest::Subscribe => {
+        Request::Subscribe => {
             write_local_event(
                 &mut stream,
                 request_id.clone(),
@@ -291,15 +267,15 @@ where
                 }
             }
         }
-        request @ (IpcRequest::Send { .. }
-        | IpcRequest::PrivateSend { .. }
-        | IpcRequest::Status
-        | IpcRequest::Peers
-        | IpcRequest::Offers
-        | IpcRequest::OffersRemove { .. }
-        | IpcRequest::OffersPrune { .. }
-        | IpcRequest::Share { .. }
-        | IpcRequest::Download { .. }) => {
+        request @ (Request::Send { .. }
+        | Request::PrivateSend { .. }
+        | Request::Status
+        | Request::Peers
+        | Request::Offers
+        | Request::OffersRemove { .. }
+        | Request::OffersPrune { .. }
+        | Request::Share { .. }
+        | Request::Download { .. }) => {
             let policy = CommandPolicy::for_request(&request, timeouts.command_timeouts())
                 .expect("executable requests have a command policy");
             let operation_id = request_operation_id(&request);
@@ -324,7 +300,7 @@ where
             )
             .await?;
         }
-        IpcRequest::Stop => {
+        Request::Stop => {
             // Reserve bounded queue capacity before acknowledging. Once `send`
             // succeeds the daemon will stop even if the client disappears before
             // reading the acknowledgement; before it succeeds, report not_started.
@@ -404,81 +380,6 @@ pub(crate) fn subscription_startup_events(
     Ok((connected, meshmsg_protocol::Event::PeersSnapshot(snapshot)))
 }
 
-pub(crate) struct LocalClientSession {
-    commands: mpsc::Sender<DaemonCommand>,
-    events: broadcast::Receiver<meshmsg_protocol::Event>,
-    connected: meshmsg_protocol::Event,
-    startup_peers: Option<meshmsg_protocol::Event>,
-}
-
-impl LocalClientSession {
-    pub(crate) fn new(
-        commands: mpsc::Sender<DaemonCommand>,
-        events: broadcast::Receiver<meshmsg_protocol::Event>,
-        connected: meshmsg_protocol::Event,
-        startup_peers: Option<meshmsg_protocol::Event>,
-    ) -> Self {
-        Self {
-            commands,
-            events,
-            connected,
-            startup_peers,
-        }
-    }
-}
-
-async fn handle_admitted_local_client<S>(
-    stream: S,
-    session: LocalClientSession,
-    timeouts: LocalIpcTimeouts,
-    permit: OwnedSemaphorePermit,
-) -> Result<()>
-where
-    S: SubscriptionStream,
-{
-    let _permit = permit;
-    handle_local_client_with_timeouts(
-        stream,
-        session.commands,
-        session.events,
-        session.connected,
-        session.startup_peers,
-        timeouts,
-    )
-    .await
-}
-
-/// Admit immediately after the platform listener has accepted/authenticated the
-/// stream. The preparation closure is deliberately invoked only after a permit
-/// is owned, so saturated clients cannot trigger snapshots, subscriptions, or
-/// other per-client state work.
-async fn admit_local_client<S, F>(
-    stream: S,
-    connection_limit: &Arc<Semaphore>,
-    tasks: &mut tokio::task::JoinSet<Result<()>>,
-    timeouts: LocalIpcTimeouts,
-    prepare: F,
-) -> Result<bool>
-where
-    S: SubscriptionStream + Send + 'static,
-    F: FnOnce() -> Result<LocalClientSession>,
-{
-    let permit = match connection_limit.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            // Accept before rejecting so cooperative clients receive an
-            // explicit retryable result instead of an opaque connect error.
-            reject_local_client_at_capacity(stream, timeouts.rejection_write).await;
-            return Ok(false);
-        }
-    };
-    let session = prepare()?;
-    tasks.spawn(
-        async move { handle_admitted_local_client(stream, session, timeouts, permit).await },
-    );
-    Ok(true)
-}
-
 async fn drain_local_client_tasks(tasks: &mut tokio::task::JoinSet<Result<()>>, grace: Duration) {
     let deadline = tokio::time::Instant::now() + grace;
     while !tasks.is_empty() {
@@ -505,6 +406,7 @@ fn report_session_completion(completed: std::result::Result<Result<()>, tokio::t
 pub(crate) struct Server {
     connection_limit: Arc<Semaphore>,
     tasks: tokio::task::JoinSet<Result<()>>,
+    timeouts: LocalIpcTimeouts,
 }
 
 impl Server {
@@ -512,22 +414,36 @@ impl Server {
         Self {
             connection_limit: Arc::new(Semaphore::new(CONNECTION_CAPACITY)),
             tasks: tokio::task::JoinSet::new(),
+            timeouts: LocalIpcTimeouts::default(),
         }
     }
 
+    /// Admit immediately after the platform listener has accepted/authenticated the
+    /// stream. The preparation closure is deliberately invoked only after a permit
+    /// is owned, so saturated clients cannot trigger snapshots, subscriptions, or
+    /// other per-client state work.
     pub(crate) async fn admit<S, F>(&mut self, stream: S, prepare: F) -> Result<bool>
     where
         S: SubscriptionStream + Send + 'static,
         F: FnOnce() -> Result<LocalClientSession>,
     {
-        admit_local_client(
-            stream,
-            &self.connection_limit,
-            &mut self.tasks,
-            LocalIpcTimeouts::default(),
-            prepare,
-        )
-        .await
+        let timeouts = self.timeouts;
+        let permit = match self.connection_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Accept before rejecting so cooperative clients receive an
+                // explicit retryable result instead of an opaque connect error.
+                reject_local_client_at_capacity(stream, timeouts.rejection_write).await;
+                return Ok(false);
+            }
+        };
+        let session = prepare()?;
+        self.tasks.spawn(async move {
+            // Held until the handler returns so capacity tracks live sessions.
+            let _permit = permit;
+            handle_local_client(stream, session, timeouts).await
+        });
+        Ok(true)
     }
 
     pub(crate) fn has_sessions(&self) -> bool {
@@ -554,13 +470,13 @@ mod tests {
     use super::*;
     use crate::{
         config::StateLock,
-        contracts,
         ipc::{
-            bind_local_endpoint, connect_daemon, read_frame, write_request, write_request_with_id,
-            LocalClientStream, LocalListener, MAX_IPC_EVENT_SIZE,
+            bind_local_endpoint, connect_daemon, read_frame, write_request, LocalClientStream,
+            LocalListener, MAX_IPC_EVENT_SIZE,
         },
     };
     use iroh::{address_lookup::memory::MemoryLookup, SecretKey};
+    use meshmsg_protocol::RequestId;
     use std::{
         path::{Path, PathBuf},
         sync::atomic::Ordering,
@@ -576,6 +492,26 @@ mod tests {
             topic_joined: true,
             alias: None,
         })
+    }
+
+    fn session(
+        commands: mpsc::Sender<DaemonCommand>,
+        events: broadcast::Receiver<meshmsg_protocol::Event>,
+    ) -> LocalClientSession {
+        LocalClientSession {
+            commands,
+            events,
+            connected: connected_fixture(),
+            startup_peers: None,
+        }
+    }
+
+    fn server_with(capacity: usize, timeouts: LocalIpcTimeouts) -> Server {
+        Server {
+            connection_limit: Arc::new(Semaphore::new(capacity)),
+            tasks: tokio::task::JoinSet::new(),
+            timeouts,
+        }
     }
 
     fn peer_discovered_fixture(revision: u64) -> meshmsg_protocol::Event {
@@ -600,10 +536,8 @@ mod tests {
             let (events, _) = broadcast::channel(1);
             let task = tokio::spawn(handle_local_client(
                 server,
-                commands,
-                events.subscribe(),
-                connected_fixture(),
-                None,
+                session(commands, events.subscribe()),
+                LocalIpcTimeouts::default(),
             ));
             client.write_all(&request).await.unwrap();
             let frame = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
@@ -617,10 +551,10 @@ mod tests {
         };
 
         let mut request = Vec::new();
-        write_request_with_id(
+        write_request(
             &mut request,
-            &IpcRequest::Stop,
-            "11111111111111111111111111111111",
+            &Request::Stop,
+            "11111111111111111111111111111111".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -647,15 +581,13 @@ mod tests {
         let (events, _) = broadcast::channel(1);
         let subscriber = tokio::spawn(handle_local_client(
             server,
-            commands,
-            events.subscribe(),
-            connected_fixture(),
-            None,
+            session(commands, events.subscribe()),
+            LocalIpcTimeouts::default(),
         ));
-        write_request_with_id(
+        write_request(
             &mut client,
-            &IpcRequest::Subscribe,
-            "33333333333333333333333333333333",
+            &Request::Subscribe,
+            "33333333333333333333333333333333".parse().unwrap(),
         )
         .await
         .unwrap();
@@ -696,7 +628,7 @@ mod tests {
             "request": {
                 "command": "send",
                 "operation_id": "55555555555555555555555555555555",
-                "body": "x".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1),
+                "body": "x".repeat(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES + 1),
             }
         });
         let mut request = serde_json::to_vec(&oversized_send).unwrap();
@@ -715,12 +647,10 @@ mod tests {
         let (events, receiver) = broadcast::channel(1);
         let mut task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
+            LocalIpcTimeouts::default(),
         ));
-        write_request(&mut client, &IpcRequest::Subscribe)
+        write_request(&mut client, &Request::Subscribe, RequestId::new_random())
             .await
             .unwrap();
         client.shutdown().await.unwrap();
@@ -751,9 +681,11 @@ mod tests {
         assert_eq!(received["type"], "peer_discovered");
         assert_eq!(received["peer"]["public_key"], "3".repeat(64));
         assert_eq!(received["protocol_version"], 4);
-        assert!(contracts::valid_request_id(
-            received["request_id"].as_str().unwrap()
-        ));
+        assert!(received["request_id"]
+            .as_str()
+            .unwrap()
+            .parse::<RequestId>()
+            .is_ok());
         drop(client);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -771,13 +703,11 @@ mod tests {
         let (events, receiver) = broadcast::channel(1);
         let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
+            LocalIpcTimeouts::default(),
         ));
         let mut coalesced = Vec::new();
-        write_request(&mut coalesced, &IpcRequest::Subscribe)
+        write_request(&mut coalesced, &Request::Subscribe, RequestId::new_random())
             .await
             .unwrap();
         coalesced.extend_from_slice(b"trailing");
@@ -809,12 +739,10 @@ mod tests {
         let (events, receiver) = broadcast::channel(1);
         let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
+            LocalIpcTimeouts::default(),
         ));
-        write_request(&mut client, &IpcRequest::Subscribe)
+        write_request(&mut client, &Request::Subscribe, RequestId::new_random())
             .await
             .unwrap();
         read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
@@ -845,12 +773,13 @@ mod tests {
         });
         let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            Some(startup.clone()),
+            LocalClientSession {
+                startup_peers: Some(startup.clone()),
+                ..session(commands, receiver)
+            },
+            LocalIpcTimeouts::default(),
         ));
-        write_request(&mut client, &IpcRequest::Subscribe)
+        write_request(&mut client, &Request::Subscribe, RequestId::new_random())
             .await
             .unwrap();
         let mut client = meshmsg_protocol::FrameReader::new(client);
@@ -869,9 +798,11 @@ mod tests {
         let snapshot: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
         assert_eq!(snapshot["type"], "peers_snapshot");
         assert_eq!(snapshot["peers"], serde_json::json!([]));
-        assert!(contracts::valid_request_id(
-            snapshot["request_id"].as_str().unwrap()
-        ));
+        assert!(snapshot["request_id"]
+            .as_str()
+            .unwrap()
+            .parse::<RequestId>()
+            .is_ok());
 
         drop(events);
         task.await.unwrap().unwrap();
@@ -886,15 +817,10 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, _) = broadcast::channel(1);
-        let limit = Arc::new(Semaphore::new(1));
-        let mut tasks = tokio::task::JoinSet::new();
+        let mut ipc_server = server_with(1, LocalIpcTimeouts::default());
         let current = connectivity.clone();
-        assert!(admit_local_client(
-            server,
-            &limit,
-            &mut tasks,
-            LocalIpcTimeouts::default(),
-            || {
+        assert!(ipc_server
+            .admit(server, || {
                 let connectivity = presence::LocalConnectivity {
                     endpoint_online: current.load(Ordering::SeqCst),
                     topic_joined: true,
@@ -914,12 +840,11 @@ mod tests {
                     connected,
                     startup_peers: Some(startup_peers),
                 })
-            },
-        )
-        .await
-        .unwrap());
+            })
+            .await
+            .unwrap());
 
-        write_request(&mut client, &IpcRequest::Subscribe)
+        write_request(&mut client, &Request::Subscribe, RequestId::new_random())
             .await
             .unwrap();
         let mut client = meshmsg_protocol::FrameReader::new(client);
@@ -942,8 +867,14 @@ mod tests {
         assert!(!snapshot.self_peer.online);
 
         drop(client);
-        tasks.join_next().await.unwrap().unwrap().unwrap();
-        assert_eq!(limit.available_permits(), 1);
+        ipc_server
+            .tasks
+            .join_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ipc_server.connection_limit.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -955,12 +886,10 @@ mod tests {
         events.send(peer_discovered_fixture(2)).unwrap();
         let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
+            LocalIpcTimeouts::default(),
         ));
-        write_request(&mut client, &IpcRequest::Subscribe)
+        write_request(&mut client, &Request::Subscribe, RequestId::new_random())
             .await
             .unwrap();
         let mut client = meshmsg_protocol::FrameReader::new(client);
@@ -994,31 +923,24 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
-    #[allow(clippy::too_many_arguments)]
     async fn accept_and_admit_test_client(
         listener: &mut LocalListener,
         dir: &Path,
-        limit: &Arc<Semaphore>,
-        tasks: &mut tokio::task::JoinSet<Result<()>>,
+        ipc_server: &mut Server,
         commands: &mpsc::Sender<DaemonCommand>,
         events: &broadcast::Sender<meshmsg_protocol::Event>,
         preparations: &Arc<std::sync::atomic::AtomicUsize>,
-        timeouts: LocalIpcTimeouts,
     ) -> (LocalClientStream, bool) {
         // Named pipes require the server connect future to be polled while the
         // client opens; Unix sockets exercise the same production listener API.
         let (server, client) = tokio::join!(listener.accept(), connect_daemon(dir));
-        let admitted = admit_local_client(server.unwrap(), limit, tasks, timeouts, || {
-            preparations.fetch_add(1, Ordering::SeqCst);
-            Ok(LocalClientSession {
-                commands: commands.clone(),
-                events: events.subscribe(),
-                connected: connected_fixture(),
-                startup_peers: None,
+        let admitted = ipc_server
+            .admit(server.unwrap(), || {
+                preparations.fetch_add(1, Ordering::SeqCst);
+                Ok(session(commands.clone(), events.subscribe()))
             })
-        })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         (client.unwrap(), admitted)
     }
 
@@ -1029,41 +951,36 @@ mod tests {
             std::env::temp_dir().join(format!("meshmsg-ipc-capacity-{}", rand::random::<u64>()));
         let state_lock = StateLock::acquire(&dir).unwrap();
         let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
-        let limit = Arc::new(Semaphore::new(CONNECTION_CAPACITY));
         let (commands, mut command_rx) = mpsc::channel(1);
         let (events, _) = broadcast::channel(1);
         let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut tasks = tokio::task::JoinSet::new();
         let mut timeouts = short_ipc_timeouts();
         timeouts.initial_frame = Duration::from_secs(5);
+        let mut ipc_server = server_with(CONNECTION_CAPACITY, timeouts);
         let mut clients = Vec::new();
 
         for _ in 0..CONNECTION_CAPACITY {
             let (client, admitted) = accept_and_admit_test_client(
                 &mut listener,
                 &dir,
-                &limit,
-                &mut tasks,
+                &mut ipc_server,
                 &commands,
                 &events,
                 &preparations,
-                timeouts,
             )
             .await;
             assert!(admitted);
             clients.push(client);
         }
-        assert_eq!(limit.available_permits(), 0);
+        assert_eq!(ipc_server.connection_limit.available_permits(), 0);
 
         let (mut rejected, admitted) = accept_and_admit_test_client(
             &mut listener,
             &dir,
-            &limit,
-            &mut tasks,
+            &mut ipc_server,
             &commands,
             &events,
             &preparations,
-            timeouts,
         )
         .await;
         assert!(!admitted);
@@ -1088,39 +1005,39 @@ mod tests {
             meshmsg_protocol::RetryAdvice::RetrySameRequest
         );
         assert!(rejection.request_id.is_none());
-        assert_eq!(tasks.len(), CONNECTION_CAPACITY);
+        assert_eq!(ipc_server.tasks.len(), CONNECTION_CAPACITY);
 
         let operation: meshmsg_protocol::OperationId =
             "11111111111111111111111111111111".parse().unwrap();
         let mutations = vec![
-            IpcRequest::Send {
+            Request::Send {
                 operation_id: operation.clone(),
                 body: meshmsg_protocol::BroadcastBody::new("x").unwrap(),
             },
-            IpcRequest::PrivateSend {
+            Request::PrivateSend {
                 operation_id: operation.clone(),
                 to: "2".repeat(64).parse().unwrap(),
                 body: meshmsg_protocol::PrivateBody::new("x").unwrap(),
             },
-            IpcRequest::Share {
+            Request::Share {
                 operation_id: operation.clone(),
                 source_digest: "3".repeat(64).parse().unwrap(),
                 path: PathBuf::from("x"),
             },
-            IpcRequest::OffersRemove {
+            Request::OffersRemove {
                 operation_id: operation.clone(),
                 offer_id: "4".repeat(32).parse().unwrap(),
                 direction: None,
                 provider: None,
             },
-            IpcRequest::OffersPrune {
+            Request::OffersPrune {
                 operation_id: operation.clone(),
                 older_than_secs: 1,
                 direction: None,
                 dry_run: false,
                 max_delete: 1,
             },
-            IpcRequest::Download {
+            Request::Download {
                 operation_id: operation,
                 offer: "x".into(),
                 output: PathBuf::from("x"),
@@ -1131,12 +1048,10 @@ mod tests {
             let (mut client, admitted) = accept_and_admit_test_client(
                 &mut listener,
                 &dir,
-                &limit,
-                &mut tasks,
+                &mut ipc_server,
                 &commands,
                 &events,
                 &preparations,
-                timeouts,
             )
             .await;
             assert!(!admitted);
@@ -1149,13 +1064,22 @@ mod tests {
         }
 
         tokio::time::timeout(Duration::from_secs(7), async {
-            while !tasks.is_empty() {
-                tasks.join_next().await.unwrap().unwrap().unwrap();
+            while !ipc_server.tasks.is_empty() {
+                ipc_server
+                    .tasks
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
             }
         })
         .await
         .unwrap();
-        assert_eq!(limit.available_permits(), CONNECTION_CAPACITY);
+        assert_eq!(
+            ipc_server.connection_limit.available_permits(),
+            CONNECTION_CAPACITY
+        );
         let timeout_frame = read_frame(&mut clients[0], MAX_IPC_EVENT_SIZE)
             .await
             .unwrap();
@@ -1172,24 +1096,23 @@ mod tests {
         );
         assert!(timeout_error.request_id.is_none());
 
+        ipc_server.timeouts = short_ipc_timeouts();
         let (mut recovered, admitted) = accept_and_admit_test_client(
             &mut listener,
             &dir,
-            &limit,
-            &mut tasks,
+            &mut ipc_server,
             &commands,
             &events,
             &preparations,
-            short_ipc_timeouts(),
         )
         .await;
         assert!(admitted);
         assert_eq!(preparations.load(Ordering::SeqCst), CONNECTION_CAPACITY + 1);
-        write_request(&mut recovered, &IpcRequest::Status)
+        write_request(&mut recovered, &Request::Status, RequestId::new_random())
             .await
             .unwrap();
         let DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(IpcRequest::Status),
+            request: ExecutableRequest::Protocol(Request::Status),
             reply,
         } = command_rx.recv().await.unwrap()
         else {
@@ -1199,7 +1122,13 @@ mod tests {
         read_frame(&mut recovered, MAX_IPC_EVENT_SIZE)
             .await
             .unwrap();
-        tasks.join_next().await.unwrap().unwrap().unwrap();
+        ipc_server
+            .tasks
+            .join_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
         drop(clients);
         drop(rejected);
@@ -1215,15 +1144,14 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1024);
         let (commands, mut command_rx) = mpsc::channel(1);
         let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client_with_timeouts(
+        let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
             short_ipc_timeouts(),
         ));
-        write_request(&mut client, &IpcRequest::Stop).await.unwrap();
+        write_request(&mut client, &Request::Stop, RequestId::new_random())
+            .await
+            .unwrap();
         assert!(matches!(command_rx.recv().await, Some(DaemonCommand::Stop)));
         let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
@@ -1238,15 +1166,14 @@ mod tests {
         let (commands, mut command_rx) = mpsc::channel(1);
         commands.send(DaemonCommand::Stop).await.unwrap();
         let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client_with_timeouts(
+        let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
             short_ipc_timeouts(),
         ));
-        write_request(&mut client, &IpcRequest::Stop).await.unwrap();
+        write_request(&mut client, &Request::Stop, RequestId::new_random())
+            .await
+            .unwrap();
         let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["type"], "error");
@@ -1263,15 +1190,14 @@ mod tests {
         let (commands, command_rx) = mpsc::channel(1);
         drop(command_rx);
         let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client_with_timeouts(
+        let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
             short_ipc_timeouts(),
         ));
-        write_request(&mut client, &IpcRequest::Stop).await.unwrap();
+        write_request(&mut client, &Request::Stop, RequestId::new_random())
+            .await
+            .unwrap();
         let response = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
         let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["type"], "error");
@@ -1320,15 +1246,12 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1024);
         let (commands, mut command_rx) = mpsc::channel(1);
         let (_events, receiver) = broadcast::channel(1);
-        let task = tokio::spawn(handle_local_client_with_timeouts(
+        let task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            session(commands, receiver),
             short_ipc_timeouts(),
         ));
-        write_request(&mut client, &IpcRequest::Status)
+        write_request(&mut client, &Request::Status, RequestId::new_random())
             .await
             .unwrap();
         let pending = command_rx.recv().await.unwrap();
@@ -1347,52 +1270,52 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("meshmsg-ipc-drain-{}", rand::random::<u64>()));
         let state_lock = StateLock::acquire(&dir).unwrap();
         let (mut listener, guard) = bind_local_endpoint(&dir, &state_lock).await.unwrap();
-        let limit = Arc::new(Semaphore::new(2));
         let (commands, mut command_rx) = mpsc::channel(1);
         let (events, _) = broadcast::channel(1);
         let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut tasks = tokio::task::JoinSet::new();
         let mut long_timeouts = short_ipc_timeouts();
         long_timeouts.initial_frame = Duration::from_secs(60);
+        let mut ipc_server = server_with(2, long_timeouts);
 
         let (mut subscriber, admitted) = accept_and_admit_test_client(
             &mut listener,
             &dir,
-            &limit,
-            &mut tasks,
+            &mut ipc_server,
             &commands,
             &events,
             &preparations,
-            long_timeouts,
         )
         .await;
         assert!(admitted);
-        write_request(&mut subscriber, &IpcRequest::Subscribe)
-            .await
-            .unwrap();
+        write_request(
+            &mut subscriber,
+            &Request::Subscribe,
+            RequestId::new_random(),
+        )
+        .await
+        .unwrap();
         read_frame(&mut subscriber, MAX_IPC_EVENT_SIZE)
             .await
             .unwrap();
         let (idle, admitted) = accept_and_admit_test_client(
             &mut listener,
             &dir,
-            &limit,
-            &mut tasks,
+            &mut ipc_server,
             &commands,
             &events,
             &preparations,
-            long_timeouts,
         )
         .await;
         assert!(admitted);
 
-        limit.close();
+        ipc_server.close_admission();
         command_rx.close();
         drop(events);
-        drain_local_client_tasks(&mut tasks, Duration::from_millis(50)).await;
-        assert!(tasks.is_empty());
+        drain_local_client_tasks(&mut ipc_server.tasks, Duration::from_millis(50)).await;
+        assert!(ipc_server.tasks.is_empty());
+        let limit = &ipc_server.connection_limit;
         assert!(limit.clone().try_acquire_owned().is_err());
-        assert_eq!(Arc::strong_count(&limit), 1);
+        assert_eq!(Arc::strong_count(limit), 1);
 
         drop(idle);
         drop(subscriber);

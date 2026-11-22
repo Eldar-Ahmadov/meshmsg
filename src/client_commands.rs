@@ -7,24 +7,18 @@ use crate::{
     config::State,
     contracts,
     invite::configured_details,
-    ipc::{self, send_request_checked, subscribe, IpcRequest},
+    ipc::{send_request_checked, subscribe},
     output,
 };
 use anyhow::{Context, Result};
 use iroh_gossip::proto::TopicId;
+use meshmsg_protocol::{OfferId, OperationId, Request, RequestId};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-fn parse_operation_id(value: Option<String>) -> Result<meshmsg_protocol::OperationId> {
-    value.map_or_else(
-        || Ok(meshmsg_protocol::OperationId::new_random()),
-        |value| value.parse().map_err(anyhow::Error::from),
-    )
-}
-
 pub(crate) async fn send_once(
     dir: &Path,
-    operation_id: meshmsg_protocol::OperationId,
+    operation_id: OperationId,
     to: Option<&str>,
     body: &str,
     json: bool,
@@ -32,7 +26,7 @@ pub(crate) async fn send_once(
     let value = if let Some(to) = to {
         let value = send_request_checked(
             dir,
-            &IpcRequest::PrivateSend {
+            &Request::PrivateSend {
                 operation_id: operation_id.clone(),
                 to: to.parse()?,
                 body: meshmsg_protocol::PrivateBody::new(body)?,
@@ -51,7 +45,7 @@ pub(crate) async fn send_once(
     } else {
         let value = send_request_checked(
             dir,
-            &IpcRequest::Send {
+            &Request::Send {
                 operation_id: operation_id.clone(),
                 body: meshmsg_protocol::BroadcastBody::new(body)?,
             },
@@ -78,13 +72,13 @@ fn caller_path(path: &Path) -> Result<PathBuf> {
 
 pub(crate) async fn share(
     dir: &Path,
-    operation_id: Option<String>,
+    operation_id: Option<OperationId>,
     path: &Path,
     json: bool,
 ) -> Result<()> {
-    let operation_id = parse_operation_id(operation_id)?;
+    let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
     let path = caller_path(path)?;
-    let status = send_request_checked(dir, &IpcRequest::Status).await?;
+    let status = send_request_checked(dir, &Request::Status).await?;
     let maximum = match &status.response {
         meshmsg_protocol::Response::Status(status) => status.max_attachment_bytes,
         _ => unreachable!("checked response family"),
@@ -96,7 +90,7 @@ pub(crate) async fn share(
             .context("attachment digest task failed")??;
     let frame = send_request_checked(
         dir,
-        &IpcRequest::Share {
+        &Request::Share {
             operation_id: operation_id.clone(),
             source_digest: source_digest.parse()?,
             path,
@@ -116,7 +110,7 @@ pub(crate) async fn share(
 }
 
 pub(crate) async fn peers(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request_checked(dir, &IpcRequest::Peers)
+    let value = send_request_checked(dir, &Request::Peers)
         .await
         .context("request peer directory; the daemon may need to be upgraded and restarted")?;
     output::response(json, &value)?;
@@ -124,25 +118,24 @@ pub(crate) async fn peers(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub(crate) async fn offers(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request_checked(dir, &IpcRequest::Offers).await?;
+    let value = send_request_checked(dir, &Request::Offers).await?;
     output::response(json, &value)?;
     Ok(())
 }
 
 pub(crate) async fn offers_remove(
     dir: &Path,
-    operation_id: Option<String>,
-    offer_id: &str,
+    operation_id: Option<OperationId>,
+    offer_id: OfferId,
     direction: Option<meshmsg_protocol::OfferDirection>,
     provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let operation_id = parse_operation_id(operation_id)?;
-    let offer_id: meshmsg_protocol::OfferId = offer_id.parse()?;
+    let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
     let provider: Option<meshmsg_protocol::PeerId> = provider.map(str::parse).transpose()?;
     let frame = send_request_checked(
         dir,
-        &IpcRequest::OffersRemove {
+        &Request::OffersRemove {
             operation_id: operation_id.clone(),
             offer_id: offer_id.clone(),
             direction,
@@ -166,15 +159,15 @@ pub(crate) async fn offers_remove(
 
 pub(crate) async fn offers_prune(
     dir: &Path,
-    operation_id: Option<String>,
+    operation_id: Option<OperationId>,
     older_than_secs: Option<u64>,
     direction: Option<meshmsg_protocol::OfferDirection>,
     dry_run: bool,
     max_delete: usize,
     json: bool,
 ) -> Result<()> {
-    let operation_id = parse_operation_id(operation_id)?;
-    let status = send_request_checked(dir, &IpcRequest::Status).await?;
+    let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
+    let status = send_request_checked(dir, &Request::Status).await?;
     let retention = match &status.response {
         meshmsg_protocol::Response::Status(status) => status.attachment_retention_secs,
         _ => unreachable!("checked response family"),
@@ -182,7 +175,7 @@ pub(crate) async fn offers_prune(
     let effective_age = older_than_secs.unwrap_or(retention);
     let frame = send_request_checked(
         dir,
-        &IpcRequest::OffersPrune {
+        &Request::OffersPrune {
             operation_id: operation_id.clone(),
             older_than_secs: effective_age,
             direction,
@@ -207,14 +200,14 @@ pub(crate) async fn offers_prune(
 
 pub(crate) async fn download(
     dir: &Path,
-    operation_id: Option<String>,
+    operation_id: Option<OperationId>,
     offer: &str,
     output_path: &Path,
     json: bool,
 ) -> Result<()> {
-    let operation_id = parse_operation_id(operation_id)?;
+    let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
     let requested_output = caller_path(output_path)?;
-    let status = send_request_checked(dir, &IpcRequest::Status).await?;
+    let status = send_request_checked(dir, &Request::Status).await?;
     let status = match &status.response {
         meshmsg_protocol::Response::Status(status) => status,
         _ => unreachable!("checked response family"),
@@ -229,7 +222,7 @@ pub(crate) async fn download(
     .context("validate submitted attachment offer")?;
     let frame = send_request_checked(
         dir,
-        &IpcRequest::Download {
+        &Request::Download {
             operation_id: operation_id.clone(),
             offer: offer.to_owned(),
             output: requested_output.clone(),
@@ -262,7 +255,7 @@ pub(crate) async fn listen(dir: &Path, json: bool) -> Result<()> {
 }
 
 fn invalid_chat_input(diagnostic: &'static str) -> anyhow::Error {
-    let operation_id = ipc::new_operation_id();
+    let operation_id = OperationId::new_random();
     crate::message::invalid_local_message(&operation_id, anyhow::anyhow!(diagnostic))
 }
 
@@ -323,7 +316,7 @@ fn stdin_message_lines(
 
 fn stream_send_failure(
     error: anyhow::Error,
-    operation_id: &meshmsg_protocol::OperationId,
+    operation_id: &OperationId,
     private: bool,
 ) -> anyhow::Error {
     // Preserve authoritative daemon errors, including their exact correlation.
@@ -341,7 +334,7 @@ fn stream_send_failure(
         meshmsg_protocol::Outcome::Unknown,
     );
     anyhow::Error::new(contracts::ContractFailure::new(
-        Some(contracts::new_request_id()),
+        Some(RequestId::new_random()),
         failure,
     ))
     .context(error)
@@ -354,9 +347,9 @@ pub(crate) async fn send_stream(dir: &Path, to: Option<&str>, json: bool) -> Res
         let _: meshmsg_protocol::Recipient = to.parse()?;
     }
     let maximum = if to.is_some() {
-        crate::message::MAX_PRIVATE_BODY_BYTES
+        meshmsg_protocol::MAX_PRIVATE_BODY_BYTES
     } else {
-        crate::message::MAX_BROADCAST_BODY_BYTES
+        meshmsg_protocol::MAX_BROADCAST_BODY_BYTES
     };
     let mut rx = stdin_message_lines(maximum);
     let shutdown = tokio::signal::ctrl_c();
@@ -374,7 +367,7 @@ pub(crate) async fn send_stream(dir: &Path, to: Option<&str>, json: bool) -> Res
                 None => return Ok(()),
             },
         };
-        let operation_id = ipc::new_operation_id();
+        let operation_id = OperationId::new_random();
         let body = line.map_err(|diagnostic| {
             crate::message::invalid_local_message(&operation_id, anyhow::anyhow!(diagnostic))
                 .context(format!("operation {operation_id}"))
@@ -395,7 +388,7 @@ pub(crate) async fn send_stream(dir: &Path, to: Option<&str>, json: bool) -> Res
 
 pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
     let mut reader = subscribe(dir).await?;
-    let mut rx = stdin_message_lines(crate::message::MAX_BROADCAST_BODY_BYTES);
+    let mut rx = stdin_message_lines(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES);
     loop {
         tokio::select! {
             line = rx.recv() => match line {
@@ -406,8 +399,8 @@ pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
                     crate::message::validate_broadcast_body(&body)?;
                     send_request_checked(
                         dir,
-                        &IpcRequest::Send {
-                            operation_id: ipc::new_operation_id(),
+                        &Request::Send {
+                            operation_id: OperationId::new_random(),
                             body: meshmsg_protocol::BroadcastBody::new(body)?,
                         },
                     )
@@ -427,12 +420,12 @@ pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
 }
 
 pub(crate) async fn status(dir: &Path, json: bool) -> Result<()> {
-    let frame = send_request_checked(dir, &IpcRequest::Status).await?;
+    let frame = send_request_checked(dir, &Request::Status).await?;
     output::status(json, &frame)
 }
 
 pub(crate) async fn stop(dir: &Path, json: bool) -> Result<()> {
-    let value = send_request_checked(dir, &IpcRequest::Stop).await?;
+    let value = send_request_checked(dir, &Request::Stop).await?;
     output::response(json, &value)?;
     Ok(())
 }
@@ -444,7 +437,7 @@ pub(crate) async fn doctor(dir: &Path, json: bool) -> Result<()> {
     let (has_invite, bootstrap_peer_count, self_advertised) =
         configured_details(state.invite.as_deref(), secret.public())?;
     let value = serde_json::json!({
-        "type":"doctor", "request_id":contracts::new_request_id().into_string(),
+        "type":"doctor", "request_id":RequestId::new_random().into_string(),
         "ok":true, "peer":secret.public().to_string(), "topic":state.topic,
         "advertises_self":state.advertise_self, "has_invite":has_invite,
         "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
@@ -476,8 +469,8 @@ mod tests {
     #[test]
     fn message_lines_enforce_byte_limits_without_unbounded_reads() {
         for maximum in [
-            crate::message::MAX_PRIVATE_BODY_BYTES,
-            crate::message::MAX_BROADCAST_BODY_BYTES,
+            meshmsg_protocol::MAX_PRIVATE_BODY_BYTES,
+            meshmsg_protocol::MAX_BROADCAST_BODY_BYTES,
         ] {
             for ending in ["", "\n", "\r\n"] {
                 let body = "a".repeat(maximum);
@@ -517,7 +510,7 @@ mod tests {
     #[test]
     fn stream_failures_preserve_identity_and_ambiguous_outcomes() {
         use meshmsg_protocol::{ErrorCode, Outcome, ProtocolError};
-        let operation_id = ipc::new_operation_id();
+        let operation_id = OperationId::new_random();
         for (private, code) in [
             (false, ErrorCode::SendFailed),
             (true, ErrorCode::PrivateSendFailed),
@@ -531,7 +524,7 @@ mod tests {
             assert_eq!(failure.error.code, code);
         }
         let original = contracts::ContractFailure::new(
-            Some(contracts::new_request_id()),
+            Some(RequestId::new_random()),
             ProtocolError::new(
                 Some(operation_id.clone()),
                 ErrorCode::PrivateRecipientBusy,

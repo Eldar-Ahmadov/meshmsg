@@ -1,4 +1,5 @@
 use crate::{
+    clock::unix_timestamp_ms,
     direct_replay::{self, ReplayClient, ReplayDecision},
     ids::id_string,
     presence::validate_endpoint_addr,
@@ -13,11 +14,7 @@ use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 use sha2::{Digest, Sha256};
-use std::{
-    path::Path,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
 pub(crate) use crate::direct_replay::ReplayWorker;
@@ -27,7 +24,7 @@ const DIRECT_VERSION: u8 = 2;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 /// Maximum private body plus generous headroom for postcard framing, keys,
 /// topic, ID, timestamp, and signature (measured worst case is under 256 bytes).
-const MAX_DIRECT_FRAME: usize = crate::message::MAX_PRIVATE_BODY_BYTES + 2 * 1024;
+const MAX_DIRECT_FRAME: usize = meshmsg_protocol::MAX_PRIVATE_BODY_BYTES + 2 * 1024;
 const INCOMING_QUEUE_CAPACITY: usize = 256;
 pub(crate) const SEND_CONCURRENCY: usize = 8;
 const DIRECT_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -41,10 +38,6 @@ const REPLAY_FINGERPRINT_DOMAIN: &[u8] = b"meshmsg-direct-replay-fingerprint-v2"
 type Signature = ByteArray<SIGNATURE_LENGTH>;
 
 const _: () = assert!(REPLAY_LIFETIME.as_secs() >= DIRECT_ACCEPTANCE_WINDOW.as_secs() * 2);
-
-fn now_ms() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DirectPayload {
@@ -98,7 +91,7 @@ impl DirectFrame {
             recipient,
             topic,
             id,
-            timestamp_ms: now_ms()?,
+            timestamp_ms: unix_timestamp_ms()?,
             body,
         };
         let signed = postcard::to_stdvec(&(MESSAGE_DOMAIN, &payload))?;
@@ -139,7 +132,7 @@ impl DirectFrame {
             .sender
             .verify(&signed, &iroh::Signature::from_bytes(&frame.signature))
             .context("verify private message signature")?;
-        let at_ms = now_ms()?;
+        let at_ms = unix_timestamp_ms()?;
         let skew_ms = DIRECT_ACCEPTANCE_WINDOW.as_millis() as u64;
         anyhow::ensure!(
             frame.payload.timestamp_ms <= at_ms.saturating_add(skew_ms),
@@ -332,7 +325,7 @@ impl DirectHandler {
                     }));
                 }) as Box<dyn FnOnce() + Send + 'static>
             });
-        let expires_at_ms = now_ms()?.saturating_add(REPLAY_LIFETIME.as_millis() as u64);
+        let expires_at_ms = unix_timestamp_ms()?.saturating_add(REPLAY_LIFETIME.as_millis() as u64);
         let fingerprint = replay_fingerprint(&frame.payload)?;
         let decision = self
             .replay
@@ -808,7 +801,7 @@ mod tests {
                 panic!("expected error response");
             };
             assert_eq!(error.code.to_string(), code);
-            assert_eq!(crate::contracts::outcome_name(error.outcome), outcome);
+            assert_eq!(error.outcome.to_string(), outcome);
             assert_eq!(error.retry_advice(), retry_advice);
         }
     }
@@ -835,19 +828,19 @@ mod tests {
         let sender = SecretKey::generate();
         let receiver = SecretKey::generate();
         let topic = TopicId::from_bytes([4; 32]);
-        let body = "界".repeat(crate::message::MAX_PRIVATE_BODY_BYTES / 3);
+        let body = "界".repeat(meshmsg_protocol::MAX_PRIVATE_BODY_BYTES / 3);
         let frame = DirectFrame::new(&sender, receiver.public(), topic, body.clone()).unwrap();
         let bytes = frame.encode().unwrap();
         assert!(bytes.len() <= MAX_DIRECT_FRAME);
         assert_eq!(DirectFrame::decode(&bytes).unwrap().payload.body, body);
-        let body = "a".repeat(crate::message::MAX_PRIVATE_BODY_BYTES);
+        let body = "a".repeat(meshmsg_protocol::MAX_PRIVATE_BODY_BYTES);
         let frame = DirectFrame::new(&sender, receiver.public(), topic, body).unwrap();
         assert!(frame.encode().unwrap().len() <= MAX_DIRECT_FRAME);
         assert!(DirectFrame::new(
             &sender,
             receiver.public(),
             topic,
-            "a".repeat(crate::message::MAX_PRIVATE_BODY_BYTES + 1)
+            "a".repeat(meshmsg_protocol::MAX_PRIVATE_BODY_BYTES + 1)
         )
         .and_then(|frame| DirectFrame::decode(&frame.encode()?))
         .is_err());

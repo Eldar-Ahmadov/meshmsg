@@ -1,4 +1,3 @@
-use crate::contracts;
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant as StdInstant},
@@ -44,11 +43,11 @@ impl OperationCache {
         operation_id: &meshmsg_protocol::OperationId,
         code: meshmsg_protocol::ErrorCode,
     ) -> meshmsg_protocol::Response {
-        contracts::protocol_error_response(
+        meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id.clone()),
             code,
             meshmsg_protocol::Outcome::NotStarted,
-            Some(operation_id.clone()),
-        )
+        ))
     }
 
     /// Returns true only for the first caller that must execute the operation.
@@ -139,9 +138,9 @@ impl OperationCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{
-        commands::{operation_fingerprint, optional_text_fingerprint},
-        common::unix_timestamp_ms_saturating,
+    use crate::{
+        clock::unix_timestamp_ms_saturating,
+        node::commands::{operation_fingerprint, optional_text_fingerprint},
     };
     use std::time::UNIX_EPOCH;
 
@@ -235,11 +234,11 @@ mod tests {
             meshmsg_protocol::ErrorCode::OperationIdConflict,
         );
 
-        let terminal = contracts::protocol_error_response(
+        let terminal = meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(id1.clone()),
             meshmsg_protocol::ErrorCode::SendFailed,
             meshmsg_protocol::Outcome::Unknown,
-            Some(id1.clone()),
-        );
+        ));
         let stored = cache.complete(&id1, terminal, now);
         assert_eq!(
             response_error(&stored)
@@ -255,11 +254,11 @@ mod tests {
         assert!(!cache.admit(id1.clone(), fp1, cached, now));
         assert_eq!(cached_response.await.unwrap(), stored);
 
-        let partial = contracts::protocol_error_response(
+        let partial = meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap()),
             meshmsg_protocol::ErrorCode::DownloadFailed,
             meshmsg_protocol::Outcome::Partial,
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap()),
-        );
+        ));
         let partial_id: meshmsg_protocol::OperationId =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
         let partial_fp = operation_fingerprint("download", &[b"token", b"output"]);
@@ -296,11 +295,11 @@ mod tests {
         assert!(cache.admit(id2.clone(), fp2, reply2, now));
         cache.complete(
             &id2,
-            contracts::protocol_error_response(
+            meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                Some(id2.clone()),
                 meshmsg_protocol::ErrorCode::SendFailed,
                 meshmsg_protocol::Outcome::Unknown,
-                Some(id2.clone()),
-            ),
+            )),
             now,
         );
         let fp3 = operation_fingerprint("send", &[b"three"]);
@@ -316,11 +315,11 @@ mod tests {
         assert!(expired.admit(id1.clone(), fp1, reply, now));
         expired.complete(
             &id1,
-            contracts::protocol_error_response(
+            meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                Some(id1.clone()),
                 meshmsg_protocol::ErrorCode::SendFailed,
                 meshmsg_protocol::Outcome::Unknown,
-                Some(id1.clone()),
-            ),
+            )),
             now,
         );
         let (retry, _retry_response) = oneshot::channel();
@@ -362,11 +361,11 @@ mod tests {
 
         cache.complete(
             &active_id,
-            contracts::protocol_error_response(
+            meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                Some(active_id.clone()),
                 meshmsg_protocol::ErrorCode::SendFailed,
                 meshmsg_protocol::Outcome::Unknown,
-                Some(active_id.clone()),
-            ),
+            )),
             now,
         );
         let (retry, _retry_response) = oneshot::channel();
@@ -384,11 +383,11 @@ mod tests {
 
         let (owner, _owner_response) = oneshot::channel();
         assert!(cache.admit(operation_id.clone(), fingerprint, owner, now));
-        let terminal = contracts::protocol_error_response(
+        let terminal = meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id.clone()),
             meshmsg_protocol::ErrorCode::DownloadFailed,
             meshmsg_protocol::Outcome::NotStarted,
-            Some(operation_id.clone()),
-        );
+        ));
         cache.complete(&operation_id, terminal.clone(), now);
 
         let (same, same_response) = oneshot::channel();

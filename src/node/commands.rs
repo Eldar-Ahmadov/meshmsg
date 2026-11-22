@@ -2,10 +2,7 @@
 
 use super::{
     bootstrap::RunningNode,
-    common::{
-        unix_timestamp_ms, unix_timestamp_ms_saturating, OPERATION_CACHE_CAPACITY,
-        OPERATION_CACHE_TTL,
-    },
+    common::{OPERATION_CACHE_CAPACITY, OPERATION_CACHE_TTL},
     operation_cache::OperationCache,
     supervisor::{
         spawn_attachment_task, AttachmentTaskCompletion, AttachmentTaskMetadata, OperationEventKind,
@@ -14,13 +11,14 @@ use super::{
 use crate::{
     alias::AliasConfig,
     attachment::runtime::*,
+    clock::{unix_timestamp_ms, unix_timestamp_ms_saturating},
     config::State,
-    contracts, direct, gossip,
-    ipc::IpcRequest,
+    direct, gossip,
     presence::{self, Directory},
 };
 use anyhow::Result;
 use iroh_gossip::proto::TopicId;
+use meshmsg_protocol::Request;
 use std::{
     collections::HashMap,
     path::Path,
@@ -38,7 +36,7 @@ pub(crate) enum DaemonCommand {
 }
 
 pub(crate) enum ExecutableRequest {
-    Protocol(meshmsg_protocol::Request),
+    Protocol(Request),
     Download {
         operation_id: meshmsg_protocol::OperationId,
         offer: meshmsg_protocol::AttachmentToken,
@@ -47,12 +45,12 @@ pub(crate) enum ExecutableRequest {
     },
 }
 
-impl TryFrom<meshmsg_protocol::Request> for ExecutableRequest {
+impl TryFrom<Request> for ExecutableRequest {
     type Error = meshmsg_protocol::TextError;
 
-    fn try_from(request: meshmsg_protocol::Request) -> Result<Self, Self::Error> {
+    fn try_from(request: Request) -> Result<Self, Self::Error> {
         match request {
-            meshmsg_protocol::Request::Download {
+            Request::Download {
                 operation_id,
                 offer,
                 output,
@@ -84,11 +82,8 @@ pub(crate) struct CommandTimeouts {
 }
 
 impl CommandPolicy {
-    pub(crate) fn for_request(
-        request: &meshmsg_protocol::Request,
-        timeouts: CommandTimeouts,
-    ) -> Option<Self> {
-        use meshmsg_protocol::{ErrorCode, Request};
+    pub(crate) fn for_request(request: &Request, timeouts: CommandTimeouts) -> Option<Self> {
+        use meshmsg_protocol::ErrorCode;
 
         let (deadline, timeout_code, unavailable_code) = match request {
             Request::Send { .. } | Request::Status | Request::Peers => (
@@ -126,10 +121,7 @@ impl CommandPolicy {
     }
 }
 
-pub(crate) fn request_operation_id(
-    request: &meshmsg_protocol::Request,
-) -> Option<meshmsg_protocol::OperationId> {
-    use meshmsg_protocol::Request;
+pub(crate) fn request_operation_id(request: &Request) -> Option<meshmsg_protocol::OperationId> {
     match request {
         Request::Send { operation_id, .. }
         | Request::PrivateSend { operation_id, .. }
@@ -226,7 +218,7 @@ pub(super) async fn execute(
     } = context;
     match command {
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(IpcRequest::Send { operation_id, body }),
+            request: ExecutableRequest::Protocol(Request::Send { operation_id, body }),
             reply,
         }) => {
             let fingerprint = operation_fingerprint("send", &[body.as_bytes()]);
@@ -252,23 +244,29 @@ pub(super) async fn execute(
                             body.into_string(),
                             timestamp_ms,
                         )),
-                        Err(_error) => contracts::protocol_error_response(
-                            meshmsg_protocol::ErrorCode::SendFailed,
-                            meshmsg_protocol::Outcome::Unknown,
-                            Some(operation_id.clone()),
-                        ),
+                        Err(_error) => {
+                            meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                                Some(operation_id.clone()),
+                                meshmsg_protocol::ErrorCode::SendFailed,
+                                meshmsg_protocol::Outcome::Unknown,
+                            ))
+                        }
                     },
-                    Err(_error) => contracts::protocol_error_response(
+                    Err(_error) => {
+                        meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                            Some(operation_id.clone()),
+                            meshmsg_protocol::ErrorCode::InvalidMessage,
+                            meshmsg_protocol::Outcome::NotStarted,
+                        ))
+                    }
+                },
+                Err(_error) => {
+                    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                        Some(operation_id.clone()),
                         meshmsg_protocol::ErrorCode::InvalidMessage,
                         meshmsg_protocol::Outcome::NotStarted,
-                        Some(operation_id.clone()),
-                    ),
-                },
-                Err(_error) => contracts::protocol_error_response(
-                    meshmsg_protocol::ErrorCode::InvalidMessage,
-                    meshmsg_protocol::Outcome::NotStarted,
-                    Some(operation_id.clone()),
-                ),
+                    ))
+                }
             };
             let response = operation_cache
                 .lock()
@@ -280,7 +278,7 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(IpcRequest::PrivateSend {
+                ExecutableRequest::Protocol(Request::PrivateSend {
                     operation_id,
                     to,
                     body,
@@ -310,10 +308,12 @@ pub(super) async fn execute(
                         .expect("operation cache poisoned")
                         .complete(
                             &operation_id,
-                            contracts::protocol_error_response(
-                                meshmsg_protocol::ErrorCode::RecipientUnresolved,
-                                meshmsg_protocol::Outcome::NotStarted,
-                                Some(operation_id.clone()),
+                            meshmsg_protocol::Response::Error(
+                                meshmsg_protocol::ProtocolError::new(
+                                    Some(operation_id.clone()),
+                                    meshmsg_protocol::ErrorCode::RecipientUnresolved,
+                                    meshmsg_protocol::Outcome::NotStarted,
+                                ),
                             ),
                             StdInstant::now(),
                         );
@@ -359,7 +359,7 @@ pub(super) async fn execute(
             );
         }
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(IpcRequest::Status),
+            request: ExecutableRequest::Protocol(Request::Status),
             reply,
         }) => {
             let connectivity = presence::local_connectivity(&node.endpoint, &node.receiver);
@@ -401,7 +401,7 @@ pub(super) async fn execute(
             let _ = reply.send(meshmsg_protocol::Response::Status(status));
         }
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(IpcRequest::Peers),
+            request: ExecutableRequest::Protocol(Request::Peers),
             reply,
         }) => {
             presence::emit_transitions(
@@ -424,7 +424,7 @@ pub(super) async fn execute(
             ));
         }
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(IpcRequest::Offers),
+            request: ExecutableRequest::Protocol(Request::Offers),
             reply,
         }) => {
             let permit = match try_admit_offer_listing(offer_list_limit) {
@@ -454,7 +454,7 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(IpcRequest::OffersRemove {
+                ExecutableRequest::Protocol(Request::OffersRemove {
                     operation_id,
                     offer_id,
                     direction,
@@ -513,7 +513,7 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(IpcRequest::OffersPrune {
+                ExecutableRequest::Protocol(Request::OffersPrune {
                     operation_id,
                     older_than_secs,
                     direction,
@@ -584,7 +584,7 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(IpcRequest::Share {
+                ExecutableRequest::Protocol(Request::Share {
                     operation_id,
                     source_digest,
                     path,
@@ -762,14 +762,16 @@ pub(super) async fn execute(
         Some(DaemonCommand::Execute {
             request:
                 ExecutableRequest::Protocol(
-                    IpcRequest::Subscribe | IpcRequest::Stop | IpcRequest::Download { .. },
+                    Request::Subscribe | Request::Stop | Request::Download { .. },
                 ),
             reply,
         }) => {
-            let _ = reply.send(contracts::protocol_error_response(
-                meshmsg_protocol::ErrorCode::InvalidRequest,
-                meshmsg_protocol::Outcome::NotStarted,
-                None,
+            let _ = reply.send(meshmsg_protocol::Response::Error(
+                meshmsg_protocol::ProtocolError::new(
+                    None,
+                    meshmsg_protocol::ErrorCode::InvalidRequest,
+                    meshmsg_protocol::Outcome::NotStarted,
+                ),
             ));
         }
         Some(DaemonCommand::Stop) | None => return Ok(CommandAction::Stop),
@@ -782,7 +784,11 @@ mod tests {
     use super::*;
     use crate::{
         config::State,
-        ipc::{read_frame, server::handle_local_client, write_request, MAX_IPC_EVENT_SIZE},
+        ipc::{
+            read_frame,
+            server::{handle_local_client, LocalClientSession, LocalIpcTimeouts},
+            write_request, MAX_IPC_EVENT_SIZE,
+        },
         node::bootstrap,
     };
     use iroh::{EndpointAddr, SecretKey};
@@ -839,18 +845,27 @@ mod tests {
         let (events, receiver) = broadcast::channel(2);
         let client_task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            LocalClientSession {
+                commands,
+                events: receiver,
+                connected: connected_fixture(),
+                startup_peers: None,
+            },
+            LocalIpcTimeouts::default(),
         ));
         let operation_id = meshmsg_protocol::OperationId::new_random();
-        let request = IpcRequest::PrivateSend {
+        let request = Request::PrivateSend {
             operation_id: operation_id.clone(),
             to: recipient.to_string().parse().unwrap(),
             body: meshmsg_protocol::PrivateBody::new("saturated").unwrap(),
         };
-        write_request(&mut client, &request).await.unwrap();
+        write_request(
+            &mut client,
+            &request,
+            meshmsg_protocol::RequestId::new_random(),
+        )
+        .await
+        .unwrap();
 
         let operation_cache = Arc::new(Mutex::new(OperationCache::new(
             OPERATION_CACHE_CAPACITY,
@@ -919,7 +934,7 @@ mod tests {
     fn download_is_typed_once_when_it_becomes_executable() {
         let operation_id = meshmsg_protocol::OperationId::new_random();
         let output = std::env::temp_dir().join("meshmsg-typed-download");
-        let executable = ExecutableRequest::try_from(IpcRequest::Download {
+        let executable = ExecutableRequest::try_from(Request::Download {
             operation_id: operation_id.clone(),
             offer: String::from("typed-on-admission"),
             output: output.clone(),
@@ -943,7 +958,7 @@ mod tests {
 
     #[test]
     fn command_policy_covers_each_request_family_and_preserves_correlation() {
-        use meshmsg_protocol::{ErrorCode, OfferDirection, Request};
+        use meshmsg_protocol::{ErrorCode, OfferDirection};
 
         let timeouts = CommandTimeouts {
             ordinary: Duration::from_millis(40),

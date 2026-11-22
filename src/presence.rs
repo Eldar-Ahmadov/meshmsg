@@ -1,5 +1,6 @@
 use crate::{
     alias::{normalize_alias, validate_alias},
+    clock::unix_timestamp_ms,
     peers::{self as peer_api, PeerTransition, PeerTransitionKind, RemotePeer, PEER_LEASE_MS},
 };
 use anyhow::{Context, Result};
@@ -18,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     str::FromStr,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::broadcast;
 
@@ -39,10 +40,6 @@ const MAX_RECORDS_PER_SOURCE: usize = 128;
 const SOURCE_WINDOW: Duration = Duration::from_secs(1);
 const PRESENCE_DOMAIN: &[u8] = b"meshmsg-presence-v1";
 type Signature = ByteArray<SIGNATURE_LENGTH>;
-
-fn now_ms() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
-}
 
 pub(crate) fn presence_topic(topic: TopicId) -> TopicId {
     let mut hasher = Sha256::new();
@@ -111,7 +108,14 @@ impl SignedPresence {
         alias: Option<&str>,
         endpoint: EndpointAddr,
     ) -> Result<Bytes> {
-        Self::encode_at(secret, topic, alias, endpoint, now_ms()?, rand::random())
+        Self::encode_at(
+            secret,
+            topic,
+            alias,
+            endpoint,
+            unix_timestamp_ms()?,
+            rand::random(),
+        )
     }
 
     fn encode_at(
@@ -259,7 +263,7 @@ impl Directory {
         bytes: &[u8],
         topic: TopicId,
     ) -> Result<Option<PeerTransition>> {
-        self.receive_at(bytes, topic, now_ms()?, Instant::now())
+        self.receive_at(bytes, topic, unix_timestamp_ms()?, Instant::now())
     }
 
     fn receive_at(
@@ -583,16 +587,18 @@ mod tests {
         let topic = TopicId::from_bytes([7; 32]);
         let bytes = SignedPresence::encode(&secret, topic, Some("node-1"), endpoint(&secret, 7777))
             .unwrap();
-        let decoded = SignedPresence::decode(&bytes, topic, now_ms().unwrap()).unwrap();
+        let decoded = SignedPresence::decode(&bytes, topic, unix_timestamp_ms().unwrap()).unwrap();
         assert_eq!(decoded.sender, secret.public());
         assert_eq!(decoded.alias.as_deref(), Some("node-1"));
-        assert!(
-            SignedPresence::decode(&bytes, TopicId::from_bytes([8; 32]), now_ms().unwrap())
-                .is_err()
-        );
+        assert!(SignedPresence::decode(
+            &bytes,
+            TopicId::from_bytes([8; 32]),
+            unix_timestamp_ms().unwrap()
+        )
+        .is_err());
         let mut tampered = bytes.to_vec();
         *tampered.last_mut().unwrap() ^= 1;
-        assert!(SignedPresence::decode(&tampered, topic, now_ms().unwrap()).is_err());
+        assert!(SignedPresence::decode(&tampered, topic, unix_timestamp_ms().unwrap()).is_err());
 
         let mut directory = Directory::new(MemoryLookup::new());
         directory.receive(&bytes, topic).unwrap();
@@ -603,7 +609,7 @@ mod tests {
     fn presence_order_is_total_and_future_skew_is_tightly_bounded() {
         let secret = SecretKey::generate();
         let topic = TopicId::from_bytes([12; 32]);
-        let wall = now_ms().unwrap();
+        let wall = unix_timestamp_ms().unwrap();
         let monotonic = Instant::now();
         let mut directory = Directory::new(MemoryLookup::new());
 
@@ -702,7 +708,7 @@ mod tests {
     #[test]
     fn dynamic_directory_has_a_hard_fail_closed_identity_cap() {
         let topic = TopicId::from_bytes([5; 32]);
-        let wall = now_ms().unwrap();
+        let wall = unix_timestamp_ms().unwrap();
         let monotonic = Instant::now();
         let lookup = MemoryLookup::new();
         let mut directory = Directory::new(lookup.clone());
@@ -755,7 +761,7 @@ mod tests {
     fn newer_presence_replaces_rotating_addresses_in_directory_and_lookup() {
         let secret = SecretKey::generate();
         let topic = TopicId::from_bytes([6; 32]);
-        let wall = now_ms().unwrap();
+        let wall = unix_timestamp_ms().unwrap();
         let monotonic = Instant::now();
         let lookup = MemoryLookup::new();
         let mut directory = Directory::new(lookup.clone());
@@ -793,7 +799,7 @@ mod tests {
     fn periodic_expiry_removes_only_dynamic_route_preserves_pin_and_rejects_replay() {
         let secret = SecretKey::generate();
         let topic = TopicId::from_bytes([10; 32]);
-        let wall = now_ms().unwrap();
+        let wall = unix_timestamp_ms().unwrap();
         let monotonic = Instant::now();
         let pinned = endpoint(&secret, 40_001);
         let dynamic = endpoint(&secret, 40_002);
@@ -845,7 +851,7 @@ mod tests {
     fn directory_transitions_coalesce_refresh_update_expire_and_rediscover() {
         let secret = SecretKey::generate();
         let topic = TopicId::from_bytes([11; 32]);
-        let wall = now_ms().unwrap();
+        let wall = unix_timestamp_ms().unwrap();
         let monotonic = Instant::now();
         let first_endpoint = endpoint(&secret, 41_001);
 

@@ -717,11 +717,8 @@ mod tests {
         assert_eq!(PROTOCOL_HEADROOM, 512);
         assert_eq!(MAX_MESSAGE_SIZE, 66_048);
     }
-    use crate::{
-        attachment::protocol::{
-            attachment_body, offer_event, validate_offer_binding, ATTACHMENT_PREFIX,
-        },
-        contracts,
+    use crate::attachment::protocol::{
+        attachment_body, offer_event, validate_offer_binding, ATTACHMENT_PREFIX,
     };
     use iroh_blobs::{ticket::BlobTicket, BlobFormat};
 
@@ -960,7 +957,7 @@ mod tests {
 
         for body in [
             String::new(),
-            "x".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1),
+            "x".repeat(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES + 1),
         ] {
             let rejected = network_event(
                 Event::Received(iroh_gossip::api::Message {
@@ -1573,7 +1570,7 @@ mod tests {
     fn envelope_boundary_matches_single_message_transport_headroom() {
         assert_eq!(MAX_MESSAGE_SIZE - MAX_ENVELOPE_SIZE, PROTOCOL_HEADROOM);
         assert_eq!(MAX_ENVELOPE_SIZE, 65_536);
-        assert_eq!(crate::message::MAX_BROADCAST_BODY_BYTES, 65_358);
+        assert_eq!(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES, 65_358);
         let secret = SecretKey::generate();
         // Every postcard u64 varint-width transition, including both sides of
         // each boundary, is exercised against every relevant string-length
@@ -1611,7 +1608,7 @@ mod tests {
                 )
                 .unwrap();
                 assert!(encoded.len() <= MAX_ENVELOPE_SIZE);
-                if body_len == crate::message::MAX_BROADCAST_BODY_BYTES && timestamp == u64::MAX {
+                if body_len == meshmsg_protocol::MAX_BROADCAST_BODY_BYTES && timestamp == u64::MAX {
                     assert_eq!(encoded.len(), MAX_ENVELOPE_SIZE);
                 }
             }
@@ -1621,7 +1618,7 @@ mod tests {
     #[test]
     fn decode_rejects_exactly_65537_byte_envelope_and_v2() {
         let secret = SecretKey::generate();
-        let body = "a".repeat(crate::message::MAX_BROADCAST_BODY_BYTES + 1);
+        let body = "a".repeat(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES + 1);
         let envelope = unsigned_test_envelope(secret.public(), body, u64::MAX);
         let encoded = postcard::to_stdvec(&envelope).unwrap();
         assert_eq!(encoded.len(), MAX_ENVELOPE_SIZE + 1);
@@ -1660,9 +1657,11 @@ mod tests {
 
         assert_eq!(value["type"], "queued");
         assert_eq!(value["protocol_version"], 4);
-        assert!(contracts::valid_request_id(
-            value["request_id"].as_str().unwrap()
-        ));
+        assert!(value["request_id"]
+            .as_str()
+            .unwrap()
+            .parse::<meshmsg_protocol::RequestId>()
+            .is_ok());
         assert_eq!(value["operation_id"], "04040404040404040404040404040404");
         assert_eq!(value["message_id"], "04040404040404040404040404040404");
         assert_eq!(value["from"], "1".repeat(64));

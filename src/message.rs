@@ -1,11 +1,5 @@
 use anyhow::Result;
-
-/// Conservative limit shared by every broadcast producer/consumer. The value
-/// is derived from the complete worst-case signed V3 postcard envelope.
-pub(crate) const MAX_BROADCAST_BODY_BYTES: usize = meshmsg_protocol::MAX_BROADCAST_BODY_BYTES;
-/// Direct/private messages use a separate bounded transport but share the
-/// broadcast body bound.
-pub(crate) const MAX_PRIVATE_BODY_BYTES: usize = meshmsg_protocol::MAX_PRIVATE_BODY_BYTES;
+use meshmsg_protocol::{MAX_BROADCAST_BODY_BYTES, MAX_PRIVATE_BODY_BYTES};
 
 pub(crate) fn validate_broadcast_body(body: &str) -> Result<()> {
     validate_nonempty_bounded(body, MAX_BROADCAST_BODY_BYTES, "broadcast message")
@@ -24,8 +18,10 @@ pub(crate) fn invalid_local_message(
         meshmsg_protocol::ErrorCode::InvalidMessage,
         meshmsg_protocol::Outcome::NotStarted,
     );
-    let failure =
-        crate::contracts::ContractFailure::new(Some(crate::contracts::new_request_id()), error);
+    let failure = crate::contracts::ContractFailure::new(
+        Some(meshmsg_protocol::RequestId::new_random()),
+        error,
+    );
     anyhow::Error::new(failure).context(diagnostic)
 }
 

@@ -1381,6 +1381,16 @@ pub enum Outcome {
     Unknown,
 }
 
+impl fmt::Display for Outcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotStarted => "not_started",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {

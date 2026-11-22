@@ -64,7 +64,10 @@ pub(crate) fn parse_attachment_body(body: &str) -> Result<Option<AttachmentOffer
     );
     validate_display_name(&wire.offer.name)?;
     anyhow::ensure!(
-        crate::contracts::valid_operation_id(&wire.offer.offer_id),
+        wire.offer
+            .offer_id
+            .parse::<meshmsg_protocol::OfferId>()
+            .is_ok(),
         "invalid attachment offer ID"
     );
     let ticket: BlobTicket = wire
@@ -201,7 +204,7 @@ pub(crate) fn validate_attachment_event(
     token: &str,
 ) -> Result<()> {
     anyhow::ensure!(
-        crate::contracts::valid_operation_id(message_id),
+        message_id.parse::<meshmsg_protocol::MessageId>().is_ok(),
         "invalid attachment message ID"
     );
     anyhow::ensure!(
@@ -263,15 +266,11 @@ fn fixture_event_value(event: meshmsg_protocol::Event) -> serde_json::Value {
 #[cfg(debug_assertions)]
 pub(crate) fn signed_attachment_fixture(
     dir: &std::path::Path,
-    offer_id: &str,
+    operation_id: &meshmsg_protocol::OperationId,
     kind: &str,
     name: &str,
     size: u64,
 ) -> Result<serde_json::Value> {
-    anyhow::ensure!(
-        crate::contracts::valid_operation_id(offer_id),
-        "invalid fixture offer ID"
-    );
     validate_display_name(name)?;
     let kind = match kind {
         "file" => super::AttachmentKind::File,
@@ -280,24 +279,21 @@ pub(crate) fn signed_attachment_fixture(
     };
     let (state, secret) = crate::config::State::load_for_doctor(dir)?;
     let topic = state.topic_id()?;
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_millis() as u64;
+    let timestamp_ms =
+        crate::clock::unix_timestamp_ms().context("system clock is before the Unix epoch")?;
     let offer = AttachmentOffer {
-        offer_id: offer_id.to_owned(),
+        offer_id: operation_id.to_string(),
         kind,
         name: name.to_owned(),
         size,
         ticket: BlobTicket::new(
             iroh::EndpointAddr::new(secret.public()),
-            iroh_blobs::Hash::new(format!("{offer_id}:{kind:?}:{name}:{size}").as_bytes()),
+            iroh_blobs::Hash::new(format!("{operation_id}:{kind:?}:{name}:{size}").as_bytes()),
             BlobFormat::Raw,
         )
         .to_string(),
     };
-    let operation_id = offer_id.parse()?;
-    let signed = encode_signed_offer(&secret, topic, &operation_id, offer, timestamp_ms)?;
+    let signed = encode_signed_offer(&secret, topic, operation_id, offer, timestamp_ms)?;
     Ok(fixture_event_value(offer_event(
         signed.from,
         signed.message_id,

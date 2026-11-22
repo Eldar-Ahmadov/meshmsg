@@ -1,14 +1,11 @@
 use super::AttachmentKind;
-use crate::{
-    attachment, contracts,
-    ipc::{MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED},
-};
+use crate::attachment;
 use anyhow::{Context, Result};
 use data_encoding::BASE64URL_NOPAD;
 use futures_util::StreamExt;
 use iroh::PublicKey;
 use iroh_blobs::{api::Store, BlobFormat};
-use meshmsg_protocol::{OfferDirection, OfferId, PeerId};
+use meshmsg_protocol::{OfferDirection, OfferId, PeerId, MAX_OFFERS, MAX_OFFER_SCAN};
 
 const MAX_ENCODED_TAG_NAME_BYTES: usize = 134;
 const MAX_ENCODED_PUBLIC_KEY_BYTES: usize = 64;
@@ -73,7 +70,7 @@ fn encode_tag_name(value: &str) -> String {
 
 pub(super) fn outbound_blob_tag(offer_id: &str, kind: AttachmentKind, name: &str) -> String {
     assert!(
-        contracts::valid_operation_id(offer_id),
+        offer_id.parse::<OfferId>().is_ok(),
         "invalid attachment offer ID before tag generation"
     );
     attachment::validate_display_name(name).expect("invalid attachment name before tag generation");
@@ -91,7 +88,7 @@ pub(super) fn inbound_blob_tag(
     name: &str,
 ) -> String {
     assert!(
-        contracts::valid_operation_id(offer_id),
+        offer_id.parse::<OfferId>().is_ok(),
         "invalid attachment offer ID before tag generation"
     );
     attachment::validate_display_name(name).expect("invalid attachment name before tag generation");
@@ -154,7 +151,7 @@ pub(super) async fn list_pinned_blobs(
     let mut scanned = 0_usize;
     let mut item_errors = 0_usize;
     let mut truncated = false;
-    while scanned < MAX_OFFER_LIST_SCANNED {
+    while scanned < MAX_OFFER_SCAN {
         let Some(item) = tags.next().await else { break };
         scanned += 1;
         let tag = match item {
@@ -179,7 +176,7 @@ pub(super) async fn list_pinned_blobs(
                 continue;
             }
         };
-        if blobs.len() == MAX_OFFER_LIST_ENTRIES {
+        if blobs.len() == MAX_OFFERS {
             truncated = true;
         } else {
             blobs.push(meshmsg_protocol::OfferListItem {
@@ -200,7 +197,7 @@ pub(super) async fn list_pinned_blobs(
             });
         }
     }
-    if scanned == MAX_OFFER_LIST_SCANNED {
+    if scanned == MAX_OFFER_SCAN {
         truncated |= tags.next().await.is_some();
     }
     truncated |= item_errors != 0;
@@ -211,7 +208,7 @@ pub(super) async fn list_pinned_blobs(
 mod tests {
     use super::*;
     use crate::attachment::AttachmentKind;
-    use crate::ipc::{MAX_IPC_EVENT_SIZE, MAX_OFFER_LIST_ENTRIES, MAX_OFFER_LIST_SCANNED};
+    use crate::ipc::MAX_IPC_EVENT_SIZE;
     use iroh::SecretKey;
     use iroh_blobs::store::fs::{options::Options as FsStoreOptions, FsStore};
     #[test]
@@ -302,7 +299,7 @@ mod tests {
         std::fs::write(&source, b"listing test").unwrap();
         let imported = store.blobs().add_path(&source).temp_tag().await.unwrap();
         let hash = imported.hash();
-        for index in (0..=MAX_OFFER_LIST_ENTRIES).rev() {
+        for index in (0..=MAX_OFFERS).rev() {
             let tag = outbound_blob_tag(
                 &format!("{index:032x}"),
                 AttachmentKind::File,
@@ -325,13 +322,13 @@ mod tests {
             .unwrap();
 
         let (blobs, truncated, item_errors) = list_pinned_blobs(&store).await.unwrap();
-        assert_eq!(blobs.len(), MAX_OFFER_LIST_ENTRIES);
+        assert_eq!(blobs.len(), MAX_OFFERS);
         assert!(truncated);
         assert_eq!(item_errors, 1);
         assert_eq!(blobs[0].offer_id.to_string(), format!("{:032x}", 0));
         assert_eq!(
             blobs.last().unwrap().offer_id.to_string(),
-            format!("{:032x}", MAX_OFFER_LIST_ENTRIES - 1)
+            format!("{:032x}", MAX_OFFERS - 1)
         );
         let frame = meshmsg_protocol::ResponseFrame::new(
             Some(meshmsg_protocol::RequestId::new_random()),
@@ -377,7 +374,7 @@ mod tests {
             let (listed, truncated, item_errors) = list_pinned_blobs(&store).await.unwrap();
             assert!(listed.is_empty());
             assert!(truncated);
-            assert_eq!(item_errors, count.min(MAX_OFFER_LIST_SCANNED));
+            assert_eq!(item_errors, count.min(MAX_OFFER_SCAN));
             drop(store);
             let _ = std::fs::remove_dir_all(dir);
         }

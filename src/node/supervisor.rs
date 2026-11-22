@@ -1,7 +1,6 @@
 //! Supervision for daemon-owned attachment background tasks.
 
 use super::operation_cache::OperationCache;
-use crate::contracts;
 use anyhow::Result;
 use std::{
     collections::HashMap,
@@ -153,11 +152,12 @@ pub(super) fn complete_attachment_task(
         Err(error) => {
             eprintln!("{} exited unexpectedly: {error}", task_metadata.kind);
             if let Some((operation_id, code)) = task_metadata.unexpected_operation {
-                let response = contracts::protocol_error_response(
-                    code,
-                    meshmsg_protocol::Outcome::Unknown,
-                    Some(operation_id.clone()),
-                );
+                let response =
+                    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                        Some(operation_id.clone()),
+                        code,
+                        meshmsg_protocol::Outcome::Unknown,
+                    ));
                 operation_cache
                     .lock()
                     .expect("operation cache poisoned")
@@ -207,11 +207,12 @@ pub(super) async fn abort_and_drain_attachment_tasks(
                 *space_refresh_active = false;
             }
             if let Some((operation_id, code)) = task_metadata.unexpected_operation {
-                let response = contracts::protocol_error_response(
-                    code,
-                    meshmsg_protocol::Outcome::Unknown,
-                    Some(operation_id.clone()),
-                );
+                let response =
+                    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+                        Some(operation_id.clone()),
+                        code,
+                        meshmsg_protocol::Outcome::Unknown,
+                    ));
                 operation_cache
                     .lock()
                     .expect("operation cache poisoned")
@@ -226,11 +227,14 @@ mod tests {
     use super::*;
     use crate::{
         ipc::{
-            read_frame, server::handle_local_client, write_request, IpcRequest, MAX_IPC_EVENT_SIZE,
+            read_frame,
+            server::{handle_local_client, LocalClientSession, LocalIpcTimeouts},
+            write_request, MAX_IPC_EVENT_SIZE,
         },
         node::{commands::operation_fingerprint, DaemonCommand, ExecutableRequest},
     };
     use iroh::SecretKey;
+    use meshmsg_protocol::Request;
     use std::{sync::atomic::Ordering, time::Duration};
     use tokio::sync::mpsc;
 
@@ -363,21 +367,30 @@ mod tests {
         let (events, receiver) = broadcast::channel(2);
         let client_task = tokio::spawn(handle_local_client(
             server,
-            commands,
-            receiver,
-            connected_fixture(),
-            None,
+            LocalClientSession {
+                commands,
+                events: receiver,
+                connected: connected_fixture(),
+                startup_peers: None,
+            },
+            LocalIpcTimeouts::default(),
         ));
         let operation_id = meshmsg_protocol::OperationId::new_random();
-        let request = IpcRequest::PrivateSend {
+        let request = Request::PrivateSend {
             operation_id: operation_id.clone(),
             to: SecretKey::generate().public().to_string().parse().unwrap(),
             body: meshmsg_protocol::PrivateBody::new("shutdown in flight").unwrap(),
         };
-        write_request(&mut client, &request).await.unwrap();
+        write_request(
+            &mut client,
+            &request,
+            meshmsg_protocol::RequestId::new_random(),
+        )
+        .await
+        .unwrap();
         let DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(IpcRequest::PrivateSend {
+                ExecutableRequest::Protocol(Request::PrivateSend {
                     operation_id: command_operation_id,
                     to,
                     body,
