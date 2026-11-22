@@ -47,20 +47,6 @@ impl<'de, const MAX: usize> Deserialize<'de> for BoundedString<MAX> {
     }
 }
 
-fn deserialize_bounded_string<'de, D: Deserializer<'de>, const MAX: usize>(
-    deserializer: D,
-) -> Result<String, D::Error> {
-    BoundedString::<MAX>::deserialize(deserializer).map(BoundedString::into_string)
-}
-
-pub(crate) fn string_32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    deserialize_bounded_string::<D, 32>(deserializer)
-}
-
-pub(crate) fn string_64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    deserialize_bounded_string::<D, 64>(deserializer)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PersistentErrorKind {
     Missing,
@@ -160,15 +146,9 @@ impl Error for PersistentError {
     }
 }
 
-fn open_existing(
-    path: &Path,
-    label: &'static str,
-    read: bool,
-    write: bool,
-    append: bool,
-) -> Result<fs::File, PersistentError> {
+fn open_existing(path: &Path, label: &'static str) -> Result<fs::File, PersistentError> {
     let mut options = fs::OpenOptions::new();
-    options.read(read).write(write).append(append);
+    options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -206,73 +186,12 @@ fn open_existing(
     Ok(file)
 }
 
-pub(crate) fn open_read_write(
-    path: &Path,
-    label: &'static str,
-) -> Result<fs::File, PersistentError> {
-    open_existing(path, label, true, true, false)
-}
-
-pub(crate) fn open_read_append(
-    path: &Path,
-    label: &'static str,
-) -> Result<fs::File, PersistentError> {
-    open_existing(path, label, true, true, true)
-}
-
-pub(crate) fn opened_file_is_current_path(
-    file: &fs::File,
-    path: &Path,
-    label: &'static str,
-) -> Result<bool, PersistentError> {
-    let current = open_existing(path, label, true, false, false)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let original_metadata = file.metadata().map_err(|error| {
-            PersistentError::new(PersistentErrorKind::Io, label).with_source(error)
-        })?;
-        let current_metadata = current.metadata().map_err(|error| {
-            PersistentError::new(PersistentErrorKind::Io, label).with_source(error)
-        })?;
-        Ok(original_metadata.dev() == current_metadata.dev()
-            && original_metadata.ino() == current_metadata.ino())
-    }
-    #[cfg(windows)]
-    {
-        fn identity(file: &fs::File, label: &'static str) -> Result<(u32, u64), PersistentError> {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::{
-                Foundation::HANDLE,
-                Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
-            };
-
-            let mut information = BY_HANDLE_FILE_INFORMATION::default();
-            let succeeded = unsafe {
-                GetFileInformationByHandle(
-                    file.as_raw_handle() as HANDLE,
-                    std::ptr::addr_of_mut!(information),
-                )
-            };
-            if succeeded == 0 {
-                return Err(PersistentError::new(PersistentErrorKind::Io, label)
-                    .with_source(io::Error::last_os_error()));
-            }
-            let index = (u64::from(information.nFileIndexHigh) << 32)
-                | u64::from(information.nFileIndexLow);
-            Ok((information.dwVolumeSerialNumber, index))
-        }
-
-        Ok(identity(file, label)? == identity(&current, label)?)
-    }
-}
-
 pub(crate) fn read_file_bounded(
     path: &Path,
     label: &'static str,
     limit: usize,
 ) -> Result<Vec<u8>, PersistentError> {
-    let mut file = open_existing(path, label, true, false, false)?;
+    let mut file = open_existing(path, label)?;
     let metadata = file
         .metadata()
         .map_err(|error| PersistentError::new(PersistentErrorKind::Io, label).with_source(error))?;
@@ -287,19 +206,7 @@ pub(crate) fn read_file_bounded(
     )
 }
 
-pub(crate) fn read_optional_file_bounded(
-    path: &Path,
-    label: &'static str,
-    limit: usize,
-) -> Result<Option<Vec<u8>>, PersistentError> {
-    match read_file_bounded(path, label, limit) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == PersistentErrorKind::Missing => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-pub(crate) fn read_bounded(
+fn read_bounded(
     reader: &mut impl Read,
     label: &'static str,
     limit: usize,
@@ -548,7 +455,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn optional_reader_rejects_dangling_links_instead_of_treating_them_as_absent() {
+    fn reader_rejects_dangling_links_instead_of_treating_them_as_absent() {
         use std::os::unix::fs::symlink;
         let dir = std::env::temp_dir().join(format!(
             "meshmsg-persistent-link-test-{}",
@@ -557,14 +464,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state");
         symlink(dir.join("missing-target"), &path).unwrap();
-        let error = read_optional_file_bounded(&path, "test state", 8).unwrap_err();
+        let error = read_file_bounded(&path, "test state", 8).unwrap_err();
         assert_ne!(error.kind(), PersistentErrorKind::Missing);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(windows)]
     #[test]
-    fn optional_reader_rejects_dangling_reparse_points_instead_of_absence() {
+    fn reader_rejects_dangling_reparse_points_instead_of_absence() {
         use std::os::windows::fs::symlink_file;
         let dir = std::env::temp_dir().join(format!(
             "meshmsg-persistent-link-test-{}",
@@ -573,7 +480,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state");
         symlink_file(dir.join("missing-target"), &path).unwrap();
-        let error = read_optional_file_bounded(&path, "test state", 8).unwrap_err();
+        let error = read_file_bounded(&path, "test state", 8).unwrap_err();
         assert_ne!(error.kind(), PersistentErrorKind::Missing);
         fs::remove_dir_all(dir).unwrap();
     }

@@ -55,7 +55,7 @@ Broadcast only when every topic participant may read the content:
 printf '%s' "$MESSAGE" | meshmsg --json send --message-stdin
 ```
 
-Before retry-sensitive sends, generate and retain a cryptographically random 32-character lowercase hexadecimal operation ID, then pass `--operation-id`. Do not retry automatically. For an unknown or partial outcome, reconcile or retry only the exact same operation and input with that ID. A daemon restart or cache expiry removes same-ID replay protection.
+Before retry-sensitive sends, generate and retain a cryptographically random 32-character lowercase hexadecimal operation ID, then pass `--operation-id`. Do not retry automatically. For an unknown or partial outcome, reconcile or retry only the exact same operation and input with that ID. A sender or recipient daemon restart, or cache expiry, removes same-ID replay protection.
 
 Interpret outcomes conservatively:
 

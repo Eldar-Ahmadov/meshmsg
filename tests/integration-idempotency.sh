@@ -323,11 +323,12 @@ stop_node sender
 # deadline remains below the daemon's startup-relative 30-second refresh.
 RESTART_DISCOVERY_DEADLINE=$((SECONDS + 25))
 start_node sender
-"$BIN" --state-dir "$ROOT/sender" --json status | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_cache_persistent"] is False and v["operation_cache_capacity"] == 1024 and v["operation_cache_ttl_ms"] == 600000; assert v["direct_replay_available"] is True and v["direct_replay_error"] is None; assert v["direct_replay_capacity"] == 8192 and v["direct_replay_per_sender_capacity"] == 512 and v["direct_replay_queue_capacity"] == 64' \
-  || fail "status omitted operation/replay cache bounds"
+"$BIN" --state-dir "$ROOT/sender" --json status | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_cache_persistent"] is False and v["operation_cache_capacity"] == 1024 and v["operation_cache_ttl_ms"] == 600000; assert not any(key.startswith("direct_replay") for key in v)' \
+  || fail "status omitted operation cache bounds or still reports direct replay fields"
 
 # The sender cache was cleared by restart, so this retry reaches the recipient.
-# Its durable replay WAL must acknowledge the same wire ID without redelivery.
+# The recipient has not restarted, so its in-memory replay store must
+# acknowledge the same wire ID without redelivery.
 # Presence must arrive from the neighbor-up announcement; the deadline cannot
 # slide with daemon startup or overlap the periodic refresh.
 wait_until "$RESTART_DISCOVERY_DEADLINE" "immediate receiver presence after sender restart" knows_peer sender
@@ -336,23 +337,46 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_id"] ==
   <<<"$PRIVATE_RETRY" || fail "post-restart private retry was not identified as a duplicate acceptance"
 sleep 1
 grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
-  || fail "recipient replay persistence redelivered after sender restart"
+  || fail "recipient replay suppression redelivered after sender restart"
 
 # Clear the sender's volatile outcome again, then change the body under the same
-# wire ID. The recipient's persisted fingerprint must return a signed conflict.
+# wire ID. The recipient's recorded fingerprint must return a signed conflict.
 stop_node sender
 CONFLICT_DISCOVERY_DEADLINE=$((SECONDS + 25))
 start_node sender
 wait_until "$CONFLICT_DISCOVERY_DEADLINE" "immediate receiver presence before conflict retry" knows_peer sender
 PRIVATE_CONFLICT=$(ipc sender "{\"command\":\"private_send\",\"operation_id\":\"$PRIVATE_ID\",\"to\":\"$RECEIVER\",\"body\":\"changed-private-body\"}")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "private_message_conflict" and v["outcome"] == "not_started" and "retryable" not in v and "message" not in v' \
-  <<<"$PRIVATE_CONFLICT" || fail "recipient did not reject changed content under a persisted private ID"
+  <<<"$PRIVATE_CONFLICT" || fail "recipient did not reject changed content under a recorded private ID"
 sleep 1
 grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
   || fail "private conflict altered original delivery count"
 ! grep -q '"body":"changed-private-body"' "$ROOT/receiver.listen" \
   || fail "private conflict delivered changed content"
 
+# Recipient replay suppression is memory-only. Restart the recipient so it
+# forgets the ID, then the sender so its cached conflict for that ID is cleared
+# and the retry reaches the recipient. The original input under the same wire ID
+# is now accepted and delivered again as a new message.
 kill "$LISTENER" >/dev/null 2>&1 || true
 wait "$LISTENER" >/dev/null 2>&1 || true
-echo "PASS: empty rejection; send/private/share joins and replay; daemon-resolved prune cutoff age/saturation/raw-rejection/real-CLI-response-loss replay/conflict and selection stability; authoritative remove replay; download response-loss replay/no-extra-install and changed-input conflicts; terminal failures; bounded-cache expiry/eviction/restart semantics; recipient WAL replay persistence"
+stop_node receiver
+start_node receiver
+timeout 240 "$BIN" --state-dir "$ROOT/receiver" --json listen >"$ROOT/receiver-restarted.listen" 2>"$ROOT/receiver-restarted.listen.err" &
+LISTENER=$!
+wait_for 10 "restarted receiver listener" grep -q '"type":"connected"' "$ROOT/receiver-restarted.listen"
+stop_node sender
+FORGOTTEN_DISCOVERY_DEADLINE=$((SECONDS + 25))
+start_node sender
+wait_until "$FORGOTTEN_DISCOVERY_DEADLINE" "immediate receiver presence after recipient restart" knows_peer sender
+PRIVATE_FORGOTTEN=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$PRIVATE_ID" --to "$RECEIVER" private-idempotent)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["operation_id"] == v["message_id"] == sys.argv[1] and v["duplicate_accepted"] is False' "$PRIVATE_ID" \
+  <<<"$PRIVATE_FORGOTTEN" || fail "same-ID private send after recipient restart was not accepted as new"
+wait_for 30 "private redelivery after recipient restart" grep -q '"body":"private-idempotent"' "$ROOT/receiver-restarted.listen"
+sleep 1
+grep -c '"body":"private-idempotent"' "$ROOT/receiver-restarted.listen" | grep -qx 1 \
+  || fail "restarted recipient did not deliver the same-ID private send exactly once"
+
+kill "$LISTENER" >/dev/null 2>&1 || true
+wait "$LISTENER" >/dev/null 2>&1 || true
+echo "PASS: empty rejection; send/private/share joins and replay; daemon-resolved prune cutoff age/saturation/raw-rejection/real-CLI-response-loss replay/conflict and selection stability; authoritative remove replay; download response-loss replay/no-extra-install and changed-input conflicts; terminal failures; bounded-cache expiry/eviction/restart semantics; recipient in-memory replay suppression and reset on recipient restart"

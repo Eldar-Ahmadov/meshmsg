@@ -106,7 +106,7 @@ struct ReplayBucket {
     entries: HashSet<ReplayKey>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TokenBucket {
     milli_tokens: u64,
     burst: u64,
@@ -124,7 +124,7 @@ impl TokenBucket {
         }
     }
 
-    fn refill(&mut self, now_ms: u64) {
+    pub(crate) fn refill(&mut self, now_ms: u64) {
         let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms);
         self.milli_tokens = self
             .milli_tokens

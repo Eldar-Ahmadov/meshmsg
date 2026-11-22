@@ -175,7 +175,7 @@ Once admitted to the operation cache, a terminal result remains terminal for its
 
 Some failures happen before cache admission and therefore have no cached terminal result. `operation_capacity` rejects the operation before binding its ID, so the exact request may be retried with the same ID after capacity becomes available. `ipc_capacity`, `initial_frame_timeout`, and `offers_busy` likewise advise retrying the same request and do not require an operation ID. Errors on non-mutating requests use this neutral same-request advice rather than operation-ID wording.
 
-The cache is bounded, memory-only, and cleared by daemon restart. Therefore same-ID retry protection applies only while the ID remains in the current daemon's cache. After expiry, eviction, or restart, do not reuse an old ID unless repeating the side effect is acceptable. Private receiver replay suppression does not make sender outcomes restart-persistent. See [Operation retries and cache](contracts.md#operation-retries-and-cache) for the exact capacity, retention, fingerprint, retry-advice, and lifecycle replay rules.
+The cache is bounded, memory-only, and cleared by daemon restart. Therefore same-ID retry protection applies only while the ID remains in the current daemon's cache. After expiry, eviction, or restart, do not reuse an old ID unless repeating the side effect is acceptable. Private receiver replay suppression is likewise memory-only and does not make sender outcomes restart-persistent. See [Operation retries and cache](contracts.md#operation-retries-and-cache) for the exact capacity, retention, fingerprint, retry-advice, and lifecycle replay rules.
 
 Mutation request requirements and protocol-v5 compatibility rules are defined by the [authoritative contract](contracts.md#compatibility-and-migration). Current components submit strict protocol-v5 commands directly; there is no capability negotiation or fallback.
 
@@ -198,13 +198,15 @@ A private message travels over a separate authenticated, encrypted Iroh connecti
 {"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"private_accepted","operation_id":"<32-lowercase-hex>","to":"<full-peer-key>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body_bytes":13,"acceptance_acknowledged":true,"duplicate_accepted":false,"durable":false,"read":false}
 ```
 
-A new acceptance means the authenticated recipient durably recorded a domain-separated SHA-256 fingerprint of the signed semantic payload, queued the volatile body, and durably recorded the delivery transition before signing success. The body itself is never persisted. `duplicate_accepted:true` means the same sender/ID/fingerprint previously reached that confirmed state and was not queued again. Neither result means a person or `listen` client read it or that the body survives process failure.
+A new acceptance means the authenticated recipient recorded a domain-separated SHA-256 fingerprint of the signed semantic payload and queued the volatile body before signing success. `duplicate_accepted:true` means the running recipient daemon had already accepted the same sender/ID/fingerprint and did not queue it again. Neither result means a person or `listen` client read it or that the body survives process failure.
 
-The direct v2 signed rejection results are mapped to stable daemon errors. `private_message_conflict` means the sender/ID is already bound to different content. `private_recipient_busy` means no record was created because a queue/rate/quota bound rejected it; after that condition changes, a new attempt requires a new ID because the old not-started result is cached. `private_replay_unavailable` similarly requires recovery followed by a new operation. `private_delivery_unknown` means a durable pending record exists but the recipient cannot prove whether the volatile queue insertion happened; it will never redeliver or claim acceptance for that ID. Transport loss remains `private_send_failed` with an unknown outcome. For either uncertain outcome, reconcile or retry only the exact input with the same ID; changing to a new ID can duplicate the message.
+Replay suppression lives only in the recipient daemon's memory, for about 10.5 minutes (630 seconds) per ID. A recipient restart clears it: a same-ID retry that arrives afterwards is delivered again as a new message and reports `duplicate_accepted:false`.
 
-`listen` and `chat` subscribers receive accepted messages as `private_message` events containing `private:true`, the canonical `from`, message ID, timestamp, body, and explicit `durable:false`/`read:false` fields. Replay persistence stores only sender, ID, fingerprint, expiration, and pending/confirmed state. Persistence runs on a dedicated blocking worker with a bounded 64-request queue. Live IDs are never pressure-evicted: new admission returns signed `Busy` when the queue, global 8,192-ID quota, per-sender 512-ID quota, per-sender 8/second (burst 16) rate, global 128/second (burst 256) rate, volatile delivery queue, or WAL bound is unavailable. Status exposes these bounds plus `direct_replay_available` and stable `direct_replay_error`; terminal failure makes subsequent direct requests return signed unavailable results.
+The direct v2 signed rejection results are mapped to stable daemon errors. `private_message_conflict` means the sender/ID is already bound to different content. `private_recipient_busy` means no record was created because a rate/quota bound or the full delivery queue rejected it; after that condition changes, a new attempt requires a new ID because the old not-started result is cached. Transport loss or an undecodable acknowledgement is `private_send_failed` with an unknown outcome: reconcile or retry only the exact input with the same ID; changing to a new ID can duplicate the message.
 
-Nonempty lines entered in `chat` are still broadcasts; blank lines are ignored without allocating an operation ID or contacting the daemon. It has no direct-reply mode. Private bodies are suppressed from unattended daemon logs and replay persistence.
+`listen` and `chat` subscribers receive accepted messages as `private_message` events containing `private:true`, the canonical `from`, message ID, timestamp, body, and explicit `durable:false`/`read:false` fields. Live IDs are never pressure-evicted: a new ID is answered with signed `Busy` when the global 8,192-ID quota, per-sender 512-ID quota, per-sender 8/second (burst 16) rate, global 128/second (burst 256) rate, or volatile delivery queue is exhausted.
+
+Nonempty lines entered in `chat` are still broadcasts; blank lines are ignored without allocating an operation ID or contacting the daemon. It has no direct-reply mode. Private bodies are suppressed from unattended daemon logs.
 
 ### Streaming sends
 
@@ -288,7 +290,7 @@ meshmsg --json doctor
 ```
 
 The strict status frame includes local identity/topic and connectivity fields, alias
-state, operation-cache and direct-replay bounds/health, attachment limits and storage
+state, operation-cache bounds, attachment limits and storage
 pressure, plus its protocol version and request correlation. See
 [`Status`](../meshmsg-protocol/src/model.rs) for the complete typed field inventory.
 

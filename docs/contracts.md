@@ -137,7 +137,7 @@ positive and `received_bytes <= total_bytes`. Listen/chat never print an
 unrecognized daemon event. Beyond strict typed decoding, request/response correlation,
 response family, and operation ID, the CLI trusts its own daemon (same binary,
 owner-only socket) and does not re-verify signatures or echoed request fields.
-Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
+Error objects are strictly decoded against the closed error contract. Status includes mutation-cache semantics, attachment limits, and
 attachment-storage pressure. Clients and the daemon are one protocol-v5 component
 set, so commands are submitted directly without status capability probes.
 
@@ -217,8 +217,9 @@ are no longer nullable. The removed inactive error codes are `daemon_unavailable
 `share_outcome_unknown`. Every code emitted by the daemon or current CLI adapters is
 retained.
 
-Protocol v5 is a further hard break that narrows the attachment surface; v4
-components are rejected like every other version. Relative to v4:
+Protocol v5 is a further hard break that narrows the attachment surface and drops
+private-replay persistence; v4 components are rejected like every other version.
+Relative to v4:
 
 - `download` accepts only a signed offer token, typed and bounded at decode; raw Iroh
   blob tickets are rejected with `invalid_attachment_offer`. The request has no `mode`.
@@ -236,6 +237,14 @@ components are rejected like every other version. Relative to v4:
 - The CLI no longer re-verifies its daemon: attachment events are not re-checked for
   signature, topic, or freshness; `download`, `share`, and `offers prune` make no
   preliminary `status` request; and echoed request fields are not compared.
+- Private replay suppression is held only in recipient memory for 630 seconds and is
+  cleared by a recipient restart, after which a same-ID private send is delivered
+  again as a new message. `status` drops `direct_replay_available`,
+  `direct_replay_error`, `direct_replay_capacity`,
+  `direct_replay_per_sender_capacity`, `direct_replay_queue_capacity`, and the four
+  `direct_replay_*_rate_*` fields; the limits are fixed and listed under
+  [Operations](operations.md#trust-and-privacy-model). Error codes
+  `private_replay_unavailable` and `private_delivery_unknown` are removed.
 
 Clients send only strict protocol-v5 IPC envelopes and require exact
 correlated replies. Older clients and daemons are rejected before any

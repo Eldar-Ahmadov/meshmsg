@@ -203,13 +203,11 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
         result = tokio::time::timeout(ENDPOINT_ONLINE_TIMEOUT, node.endpoint.online()) => result,
         _ = shutdown.recv() => {
             node.router.shutdown().await?;
-            node.direct_replay.shutdown().await?;
             return Ok(());
         }
     };
     if online.is_err() {
         node.router.shutdown().await?;
-        node.direct_replay.shutdown().await?;
         anyhow::bail!(
             "endpoint did not become online within {}s; check internet, DNS, firewall, and relay access",
             ENDPOINT_ONLINE_TIMEOUT.as_secs()
@@ -559,7 +557,6 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
     while neighbor_presence_tasks.join_next().await.is_some() {}
     ipc_server.shutdown().await;
     node.router.shutdown().await?;
-    node.direct_replay.shutdown().await?;
     Ok(())
 }
 

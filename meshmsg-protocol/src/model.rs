@@ -788,15 +788,6 @@ pub struct Status {
     pub operation_cache_capacity: usize,
     pub operation_cache_ttl_ms: u64,
     pub operation_cache_persistent: bool,
-    pub direct_replay_available: bool,
-    pub direct_replay_error: Option<String>,
-    pub direct_replay_capacity: usize,
-    pub direct_replay_per_sender_capacity: usize,
-    pub direct_replay_queue_capacity: usize,
-    pub direct_replay_global_rate_per_second: u64,
-    pub direct_replay_global_rate_burst: u64,
-    pub direct_replay_sender_rate_per_second: u64,
-    pub direct_replay_sender_rate_burst: u64,
     pub max_attachment_bytes: u64,
     pub attachment_storage: AttachmentStorageStatus,
     pub attachment_retention_secs: u64,
@@ -818,10 +809,6 @@ impl Status {
                 .custom_alias
                 .as_deref()
                 .is_some_and(|value| !valid_public_text(value, 63))
-            || self
-                .direct_replay_error
-                .as_deref()
-                .is_some_and(|value| !valid_public_text(value, 1024))
         {
             return Err("invalid status values");
         }
@@ -1357,8 +1344,6 @@ pub enum ErrorCode {
     InitialFrameTimeout,
     PrivateSendBusy,
     PrivateRecipientBusy,
-    PrivateReplayUnavailable,
-    PrivateDeliveryUnknown,
     AttachmentQuotaExceeded,
     AttachmentTagCapacity,
     AttachmentMinFreeSpace,
@@ -1392,7 +1377,6 @@ impl ErrorCode {
                 "The requested operation is currently busy."
             }
             Self::PrivateMessageConflict => "The message ID is bound to different content.",
-            Self::PrivateReplayUnavailable => "Recipient replay protection is unavailable.",
             Self::AttachmentQuotaExceeded => "The attachment storage quota is exceeded.",
             Self::AttachmentMinFreeSpace => "The attachment free-space reserve is unavailable.",
             Self::AttachmentTagCapacity => "The attachment pin capacity is exhausted.",
@@ -1405,17 +1389,13 @@ impl ErrorCode {
             Self::OffersFailed | Self::AttachmentLifecycleInternal => {
                 "The attachment lifecycle operation failed."
             }
-            Self::PrivateDeliveryUnknown => "The private-message outcome is unknown.",
         }
     }
 
     pub fn retry_advice(self, outcome: Outcome) -> RetryAdvice {
         match outcome {
             Outcome::Partial => {
-                if matches!(
-                    self,
-                    Self::SendFailed | Self::PrivateDeliveryUnknown | Self::InternalContractError
-                ) {
+                if matches!(self, Self::SendFailed | Self::InternalContractError) {
                     RetryAdvice::Never
                 } else {
                     RetryAdvice::SameOperationReconciliation
@@ -1448,7 +1428,6 @@ impl ErrorCode {
                         | Self::AttachmentStorageBusy
                         | Self::PrivateSendBusy
                         | Self::PrivateRecipientBusy
-                        | Self::PrivateReplayUnavailable
                         | Self::RecipientUnresolved
                         | Self::AttachmentQuotaExceeded
                         | Self::AttachmentTagCapacity
@@ -1677,7 +1656,6 @@ mod tests {
             ErrorCode::AttachmentStorageBusy,
             ErrorCode::PrivateSendBusy,
             ErrorCode::PrivateRecipientBusy,
-            ErrorCode::PrivateReplayUnavailable,
             ErrorCode::RecipientUnresolved,
             ErrorCode::AttachmentQuotaExceeded,
             ErrorCode::AttachmentTagCapacity,
@@ -1716,7 +1694,7 @@ mod tests {
         for (code, outcome) in [
             (ErrorCode::CommandTimeout, Outcome::Unknown),
             (ErrorCode::AttachmentRemovalPartial, Outcome::Partial),
-            (ErrorCode::PrivateDeliveryUnknown, Outcome::Unknown),
+            (ErrorCode::PrivateSendFailed, Outcome::Unknown),
         ] {
             assert_eq!(
                 ProtocolError::new(Some(OperationId::new_random()), code, outcome,).retry_advice(),

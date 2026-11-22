@@ -183,7 +183,7 @@ for private, maximum in [(False, 65358), (True, 65358)]:
 # Terminal and ambiguous daemon failures preserve exact operation/request IDs.
 # Neither retries nor private-to-broadcast fallback are allowed.
 for code, outcome in [("private_recipient_busy", "not_started"),
-                      ("private_delivery_unknown", "unknown")]:
+                      ("private_send_failed", "unknown")]:
     def reject(frame, _connection):
         return {"type": "error", "code": code, "outcome": outcome,
                 "operation_id": frame["request"]["operation_id"]}

@@ -42,7 +42,6 @@ pub(super) struct RunningNode {
     pub(super) downloader: Downloader,
     pub(super) lookup: MemoryLookup,
     pub(super) presence_lookup: MemoryLookup,
-    pub(super) direct_replay: direct::ReplayWorker,
     pub(super) direct_incoming: mpsc::Receiver<meshmsg_protocol::Event>,
 }
 
@@ -88,8 +87,7 @@ pub(super) async fn start(
     let blob_store: Store = fs_store.into();
     let downloader = blob_store.downloader(&endpoint);
     let blobs = BlobsProtocol::new(&blob_store, None);
-    let (direct, direct_replay, direct_incoming) = direct::setup(secret.clone(), topic, state_dir)
-        .context("open persistent direct replay state")?;
+    let (direct, direct_incoming) = direct::setup(secret.clone(), topic);
     let router = Router::builder(endpoint.clone())
         .accept(gossip::ALPN, gossip.clone())
         .accept(presence::ALPN, presence_gossip.clone())
@@ -140,7 +138,6 @@ pub(super) async fn start(
         downloader,
         lookup,
         presence_lookup,
-        direct_replay,
         direct_incoming,
     })
 }

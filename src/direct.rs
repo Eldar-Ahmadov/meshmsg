@@ -1,6 +1,6 @@
 use crate::{
     clock::unix_timestamp_ms,
-    direct_replay::{self, ReplayClient, ReplayDecision},
+    direct_replay::{ReplayDecision, ReplayStore},
     ids::id_string,
     presence::validate_endpoint_addr,
 };
@@ -14,10 +14,11 @@ use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 use sha2::{Digest, Sha256};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
-
-pub(crate) use crate::direct_replay::ReplayWorker;
 
 pub(crate) const DIRECT_ALPN: &[u8] = b"/meshmsg/direct/2";
 const DIRECT_VERSION: u8 = 2;
@@ -146,14 +147,15 @@ impl DirectFrame {
     }
 }
 
+// Postcard encodes the variant index. Older recipients may still answer with
+// the retired indices 4 and 5; those fail to decode and the send conservatively
+// reports `private_send_failed` with an unknown outcome.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum AckResult {
     Accepted,
     DuplicateAccepted,
     Conflict,
     Busy,
-    Unavailable,
-    DeliveryOutcomeUnknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,7 +266,7 @@ pub(crate) struct DirectHandler {
     secret: SecretKey,
     topic: TopicId,
     incoming: mpsc::Sender<meshmsg_protocol::Event>,
-    replay: ReplayClient,
+    replay: Arc<Mutex<ReplayStore>>,
     connections: Arc<tokio::sync::Semaphore>,
 }
 
@@ -273,22 +275,17 @@ impl DirectHandler {
         secret: SecretKey,
         topic: TopicId,
         incoming: mpsc::Sender<meshmsg_protocol::Event>,
-        state_dir: &Path,
-    ) -> Result<(Self, ReplayWorker)> {
-        let (replay, worker) = direct_replay::start(state_dir, secret.public(), topic)?;
-        Ok((
-            Self {
-                secret,
-                topic,
-                incoming,
-                replay,
-                connections: Arc::new(tokio::sync::Semaphore::new(32)),
-            },
-            worker,
-        ))
+    ) -> Self {
+        Self {
+            secret,
+            topic,
+            incoming,
+            replay: Arc::new(Mutex::new(ReplayStore::new(REPLAY_LIFETIME))),
+            connections: Arc::new(tokio::sync::Semaphore::new(32)),
+        }
     }
 
-    async fn accept_message(&self, remote: PublicKey, bytes: &[u8]) -> Result<AckFrame> {
+    fn accept_message(&self, remote: PublicKey, bytes: &[u8]) -> Result<AckFrame> {
         let frame = DirectFrame::decode(bytes)?;
         anyhow::ensure!(
             frame.payload.sender == remote,
@@ -302,49 +299,39 @@ impl DirectHandler {
             frame.payload.topic == self.topic,
             "private message has wrong topic"
         );
-
-        // Reserve volatile delivery capacity before asking the worker to make a new
-        // ID durable. The worker still recognizes duplicates when no permit is
-        // available, so an already accepted request can always be re-acknowledged.
-        // The delivery closure travels in the bounded in-memory worker request but
-        // is never serialized. The worker invokes it only after sync, making the
-        // commit+delivery sequence safe even if this protocol future is cancelled.
-        let delivery = self
-            .incoming
-            .clone()
-            .try_reserve_owned()
-            .ok()
-            .map(|permit| {
-                let payload = frame.payload.clone();
-                Box::new(move || {
-                    permit.send(incoming_event(IncomingDirect {
-                        from: payload.sender,
-                        id: payload.id,
-                        timestamp_ms: payload.timestamp_ms,
-                        body: payload.body,
-                    }));
-                }) as Box<dyn FnOnce() + Send + 'static>
-            });
-        let expires_at_ms = unix_timestamp_ms()?.saturating_add(REPLAY_LIFETIME.as_millis() as u64);
         let fingerprint = replay_fingerprint(&frame.payload)?;
-        let decision = self
-            .replay
-            .admit(
-                frame.payload.sender,
-                frame.payload.id,
-                fingerprint,
-                expires_at_ms,
-                delivery,
-            )
-            .await?;
-        let result = match decision {
-            ReplayDecision::Accepted => AckResult::Accepted,
+        let now_wall_ms = unix_timestamp_ms()?;
+
+        // Reserve volatile delivery capacity before admitting a new ID. Known IDs
+        // are still classified without a permit, so an already accepted message
+        // can always be re-acknowledged. Recording and delivery happen under one
+        // lock with no await between them, so neither can occur without the other.
+        let permit = self.incoming.try_reserve().ok();
+        let mut replay = self.replay.lock().expect("direct replay store poisoned");
+        let result = match replay.admit(
+            frame.payload.sender,
+            frame.payload.id,
+            fingerprint,
+            permit.is_some(),
+            now_wall_ms,
+            Instant::now(),
+        ) {
+            ReplayDecision::Accepted => {
+                permit
+                    .expect("accepted admission reserved delivery capacity")
+                    .send(incoming_event(IncomingDirect {
+                        from: frame.payload.sender,
+                        id: frame.payload.id,
+                        timestamp_ms: frame.payload.timestamp_ms,
+                        body: frame.payload.body.clone(),
+                    }));
+                AckResult::Accepted
+            }
             ReplayDecision::DuplicateAccepted => AckResult::DuplicateAccepted,
             ReplayDecision::Conflict => AckResult::Conflict,
-            ReplayDecision::DeliveryOutcomeUnknown => AckResult::DeliveryOutcomeUnknown,
             ReplayDecision::Busy => AckResult::Busy,
-            ReplayDecision::Unavailable => AckResult::Unavailable,
         };
+        drop(replay);
         AckFrame::new(&self.secret, &frame.payload, result)
     }
 }
@@ -360,7 +347,7 @@ impl ProtocolHandler for DirectHandler {
             tokio::time::timeout(DIRECT_TIMEOUT, async {
                 let (mut send, mut recv) = connection.accept_bi().await?;
                 let request = recv.read_to_end(MAX_DIRECT_FRAME).await?;
-                let ack = self.accept_message(remote, &request).await?.encode()?;
+                let ack = self.accept_message(remote, &request)?.encode()?;
                 send.write_all(&ack).await?;
                 send.finish()?;
                 // Keep the connection alive until the authenticated peer has
@@ -377,20 +364,14 @@ impl ProtocolHandler for DirectHandler {
     }
 }
 
-/// Builds the protocol handler together with its persistent replay owner and
-/// bounded stream of already-validated private-message events.
+/// Builds the protocol handler together with its bounded stream of
+/// already-validated private-message events.
 pub(crate) fn setup(
     secret: SecretKey,
     topic: TopicId,
-    state_dir: &Path,
-) -> Result<(
-    DirectHandler,
-    ReplayWorker,
-    mpsc::Receiver<meshmsg_protocol::Event>,
-)> {
+) -> (DirectHandler, mpsc::Receiver<meshmsg_protocol::Event>) {
     let (incoming, receiver) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
-    let (handler, replay) = DirectHandler::new(secret, topic, incoming, state_dir)?;
-    Ok((handler, replay, receiver))
+    (DirectHandler::new(secret, topic, incoming), receiver)
 }
 
 #[derive(Debug)]
@@ -406,8 +387,6 @@ struct AcceptedDirect {
 enum DirectRejection {
     Conflict,
     Busy,
-    Unavailable,
-    DeliveryOutcomeUnknown,
 }
 
 #[derive(Debug)]
@@ -465,10 +444,6 @@ async fn send(
             }
             AckResult::Conflict => Ok(DirectSendOutcome::Rejected(DirectRejection::Conflict)),
             AckResult::Busy => Ok(DirectSendOutcome::Rejected(DirectRejection::Busy)),
-            AckResult::Unavailable => Ok(DirectSendOutcome::Rejected(DirectRejection::Unavailable)),
-            AckResult::DeliveryOutcomeUnknown => Ok(DirectSendOutcome::Rejected(
-                DirectRejection::DeliveryOutcomeUnknown,
-            )),
         }
     };
     tokio::time::timeout(DIRECT_TIMEOUT, operation)
@@ -583,23 +558,9 @@ fn rejection_response(
     rejection: DirectRejection,
     operation_id: [u8; 16],
 ) -> meshmsg_protocol::Response {
-    let (code, outcome) = match rejection {
-        DirectRejection::Conflict => (
-            meshmsg_protocol::ErrorCode::PrivateMessageConflict,
-            meshmsg_protocol::Outcome::NotStarted,
-        ),
-        DirectRejection::Busy => (
-            meshmsg_protocol::ErrorCode::PrivateRecipientBusy,
-            meshmsg_protocol::Outcome::NotStarted,
-        ),
-        DirectRejection::Unavailable => (
-            meshmsg_protocol::ErrorCode::PrivateReplayUnavailable,
-            meshmsg_protocol::Outcome::NotStarted,
-        ),
-        DirectRejection::DeliveryOutcomeUnknown => (
-            meshmsg_protocol::ErrorCode::PrivateDeliveryUnknown,
-            meshmsg_protocol::Outcome::Unknown,
-        ),
+    let code = match rejection {
+        DirectRejection::Conflict => meshmsg_protocol::ErrorCode::PrivateMessageConflict,
+        DirectRejection::Busy => meshmsg_protocol::ErrorCode::PrivateRecipientBusy,
     };
     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
         Some(
@@ -608,74 +569,38 @@ fn rejection_response(
                 .expect("operation ID is canonical"),
         ),
         code,
-        outcome,
+        meshmsg_protocol::Outcome::NotStarted,
     ))
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReplayStatus {
-    pub(crate) available: bool,
-    pub(crate) error: Option<String>,
-    pub(crate) capacity: usize,
-    pub(crate) per_sender_capacity: usize,
-    pub(crate) queue_capacity: usize,
-    pub(crate) global_rate_per_second: u64,
-    pub(crate) global_rate_burst: u64,
-    pub(crate) sender_rate_per_second: u64,
-    pub(crate) sender_rate_burst: u64,
-}
-
-pub(crate) fn replay_status(worker: &ReplayWorker) -> ReplayStatus {
-    let health = worker.health();
-    ReplayStatus {
-        available: health.available,
-        error: health.error,
-        capacity: direct_replay::MAX_REPLAY_ENTRIES,
-        per_sender_capacity: direct_replay::MAX_REPLAY_ENTRIES_PER_SENDER,
-        queue_capacity: direct_replay::REPLAY_QUEUE_CAPACITY,
-        global_rate_per_second: direct_replay::GLOBAL_RATE_PER_SECOND as u64,
-        global_rate_burst: direct_replay::GLOBAL_RATE_BURST as u64,
-        sender_rate_per_second: direct_replay::SENDER_RATE_PER_SECOND as u64,
-        sender_rate_burst: direct_replay::SENDER_RATE_BURST as u64,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn replay_is_reacknowledged_without_redelivery() {
+    fn delivered_body(rx: &mut mpsc::Receiver<meshmsg_protocol::Event>) -> String {
+        match rx.try_recv().expect("a delivered private message") {
+            meshmsg_protocol::Event::PrivateMessage(message) => message.body.as_str().to_owned(),
+            _ => panic!("expected private-message event"),
+        }
+    }
+
+    #[test]
+    fn replay_is_reacknowledged_without_redelivery_until_the_recipient_restarts() {
         let sender = SecretKey::generate();
         let receiver = SecretKey::generate();
         let topic = TopicId::from_bytes([9; 32]);
         let (tx, mut rx) = mpsc::channel(2);
-        let dir =
-            std::env::temp_dir().join(format!("meshmsg-replay-test-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (handler, mut worker) = DirectHandler::new(receiver.clone(), topic, tx, &dir).unwrap();
+        let handler = DirectHandler::new(receiver.clone(), topic, tx);
         let frame =
             DirectFrame::new(&sender, receiver.public(), topic, "deliver once".into()).unwrap();
         let bytes = frame.encode().unwrap();
 
-        for _ in 0..2 {
-            let ack = handler
-                .accept_message(sender.public(), &bytes)
-                .await
-                .unwrap();
-            assert!(matches!(
-                ack.payload.result,
-                AckResult::Accepted | AckResult::DuplicateAccepted
-            ));
+        for expected in [AckResult::Accepted, AckResult::DuplicateAccepted] {
+            let ack = handler.accept_message(sender.public(), &bytes).unwrap();
+            assert_eq!(ack.payload.result, expected);
             assert_eq!(ack.payload.id, frame.payload.id);
         }
-        let delivered = rx.try_recv().unwrap();
-        match delivered {
-            meshmsg_protocol::Event::PrivateMessage(message) => {
-                assert_eq!(message.body.as_str(), "deliver once");
-            }
-            _ => panic!("expected private-message event"),
-        }
+        assert_eq!(delivered_body(&mut rx), "deliver once");
         assert!(rx.try_recv().is_err());
         let conflict = DirectFrame::new_with_id(
             &sender,
@@ -687,44 +612,58 @@ mod tests {
         .unwrap();
         let conflict_ack = handler
             .accept_message(sender.public(), &conflict.encode().unwrap())
-            .await
             .unwrap();
         assert_eq!(conflict_ack.payload.result, AckResult::Conflict);
         assert!(rx.try_recv().is_err());
-        drop(handler);
-        worker.shutdown().await.unwrap();
-
-        // Restarting the handler reloads the accepted ID and re-acknowledges it
-        // without placing the plaintext into the new process queue.
-        let (restart_tx, mut restart_rx) = mpsc::channel(2);
-        let (restarted, mut restarted_worker) =
-            DirectHandler::new(receiver.clone(), topic, restart_tx, &dir).unwrap();
-        let ack = restarted
+        // Every clone served by the router shares one store.
+        let ack = handler
+            .clone()
             .accept_message(sender.public(), &bytes)
-            .await
             .unwrap();
         assert_eq!(ack.payload.result, AckResult::DuplicateAccepted);
-        let conflict_ack = restarted
-            .accept_message(sender.public(), &conflict.encode().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(conflict_ack.payload.result, AckResult::Conflict);
-        assert!(restart_rx.try_recv().is_err());
-        drop(restarted);
-        restarted_worker.shutdown().await.unwrap();
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_file() {
-                let bytes = std::fs::read(path).unwrap();
-                assert!(!bytes
-                    .windows(b"deliver once".len())
-                    .any(|value| value == b"deliver once"));
-                assert!(!bytes
-                    .windows(b"different signed body".len())
-                    .any(|value| value == b"different signed body"));
-            }
-        }
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        // Replay state is memory-only: a restarted recipient has forgotten the
+        // ID and delivers the same signed frame again as a new message.
+        let (restart_tx, mut restart_rx) = mpsc::channel(2);
+        let restarted = DirectHandler::new(receiver.clone(), topic, restart_tx);
+        let ack = restarted.accept_message(sender.public(), &bytes).unwrap();
+        assert_eq!(ack.payload.result, AckResult::Accepted);
+        assert_eq!(delivered_body(&mut restart_rx), "deliver once");
+    }
+
+    #[test]
+    fn full_delivery_queue_is_busy_for_new_ids_without_recording_them() {
+        let sender = SecretKey::generate();
+        let receiver = SecretKey::generate();
+        let topic = TopicId::from_bytes([10; 32]);
+        let (tx, mut rx) = mpsc::channel(1);
+        let handler = DirectHandler::new(receiver.clone(), topic, tx);
+        let frame = |body: &str| {
+            DirectFrame::new(&sender, receiver.public(), topic, body.into())
+                .unwrap()
+                .encode()
+                .unwrap()
+        };
+        let accept = |bytes: &[u8]| {
+            handler
+                .accept_message(sender.public(), bytes)
+                .unwrap()
+                .payload
+                .result
+        };
+        let (first, second) = (frame("first"), frame("second"));
+
+        assert_eq!(accept(&first), AckResult::Accepted);
+        assert_eq!(accept(&second), AckResult::Busy);
+        // An accepted ID is still re-acknowledged while the queue is full.
+        assert_eq!(accept(&first), AckResult::DuplicateAccepted);
+        assert_eq!(delivered_body(&mut rx), "first");
+        assert!(rx.try_recv().is_err());
+        // The busy ID left no record, so it is admitted once capacity returns.
+        assert_eq!(accept(&second), AckResult::Accepted);
+        assert_eq!(delivered_body(&mut rx), "second");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -753,12 +692,23 @@ mod tests {
             AckResult::DuplicateAccepted,
             AckResult::Conflict,
             AckResult::Busy,
-            AckResult::Unavailable,
-            AckResult::DeliveryOutcomeUnknown,
         ] {
             let ack = AckFrame::new(&receiver, &frame.payload, result).unwrap();
             let decoded = AckFrame::decode(&ack.encode().unwrap(), &frame.payload).unwrap();
             assert_eq!(decoded.payload.result, result);
+        }
+        // The variant indices are the direct v2 wire encoding and must not shift;
+        // the two retired trailing results no longer decode.
+        for (result, index) in [
+            (AckResult::Accepted, 0),
+            (AckResult::DuplicateAccepted, 1),
+            (AckResult::Conflict, 2),
+            (AckResult::Busy, 3),
+        ] {
+            assert_eq!(postcard::to_stdvec(&result).unwrap(), [index]);
+        }
+        for retired in [4, 5] {
+            assert!(postcard::from_bytes::<AckResult>(&[retired]).is_err());
         }
         let mut legacy_version =
             AckFrame::new(&receiver, &frame.payload, AckResult::Accepted).unwrap();
@@ -770,30 +720,16 @@ mod tests {
 
     #[test]
     fn send_outcomes_map_to_stable_ipc_contracts() {
-        for (rejection, code, outcome, retry_advice) in [
+        for (rejection, code, retry_advice) in [
             (
                 DirectRejection::Conflict,
                 "private_message_conflict",
-                "not_started",
                 meshmsg_protocol::RetryAdvice::Never,
             ),
             (
                 DirectRejection::Busy,
                 "private_recipient_busy",
-                "not_started",
                 meshmsg_protocol::RetryAdvice::NewOperationAfterConditionsChange,
-            ),
-            (
-                DirectRejection::Unavailable,
-                "private_replay_unavailable",
-                "not_started",
-                meshmsg_protocol::RetryAdvice::NewOperationAfterConditionsChange,
-            ),
-            (
-                DirectRejection::DeliveryOutcomeUnknown,
-                "private_delivery_unknown",
-                "unknown",
-                meshmsg_protocol::RetryAdvice::SameOperationReconciliation,
             ),
         ] {
             let response = rejection_response(rejection, [1; 16]);
@@ -801,7 +737,7 @@ mod tests {
                 panic!("expected error response");
             };
             assert_eq!(error.code.to_string(), code);
-            assert_eq!(error.outcome.to_string(), outcome);
+            assert_eq!(error.outcome.to_string(), "not_started");
             assert_eq!(error.retry_advice(), retry_advice);
         }
     }

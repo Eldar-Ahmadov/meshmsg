@@ -319,7 +319,6 @@ pub(super) async fn execute(
         }) => {
             let connectivity = presence::local_connectivity(&node.endpoint, &node.receiver);
             let neighbors = node.receiver.neighbors().count();
-            let replay_status = direct::replay_status(&node.direct_replay);
             let status = meshmsg_protocol::Status {
                 running: true,
                 peer: peer.parse()?,
@@ -339,15 +338,6 @@ pub(super) async fn execute(
                 operation_cache_capacity: OPERATION_CACHE_CAPACITY,
                 operation_cache_ttl_ms: OPERATION_CACHE_TTL.as_millis() as u64,
                 operation_cache_persistent: false,
-                direct_replay_available: replay_status.available,
-                direct_replay_error: replay_status.error,
-                direct_replay_capacity: replay_status.capacity,
-                direct_replay_per_sender_capacity: replay_status.per_sender_capacity,
-                direct_replay_queue_capacity: replay_status.queue_capacity,
-                direct_replay_global_rate_per_second: replay_status.global_rate_per_second,
-                direct_replay_global_rate_burst: replay_status.global_rate_burst,
-                direct_replay_sender_rate_per_second: replay_status.sender_rate_per_second,
-                direct_replay_sender_rate_burst: replay_status.sender_rate_burst,
                 max_attachment_bytes,
                 attachment_storage: attachment_storage.status(),
                 attachment_retention_secs,
@@ -759,7 +749,7 @@ mod tests {
         let (state, secret) = State::load_for_doctor(&dir).unwrap();
         let alias_config = AliasConfig::load_for_identity(&dir, secret.public()).unwrap();
         let topic = state.topic_id().unwrap();
-        let mut node = bootstrap::start(&state, secret, &dir).await.unwrap();
+        let node = bootstrap::start(&state, secret, &dir).await.unwrap();
         let blob_root = dir.join("blobs-v1").join(node.secret.public().to_string());
         let attachment_storage =
             AttachmentStorage::open(node.blob_store.clone(), blob_root, &dir, 1024, 0, 0)
@@ -868,7 +858,6 @@ mod tests {
         drop(direct_sender);
         drop(attachment_storage);
         node.router.shutdown().await.unwrap();
-        node.direct_replay.shutdown().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -888,7 +877,7 @@ mod tests {
         let (state, secret) = State::load_for_doctor(&dir).unwrap();
         let alias_config = AliasConfig::load_for_identity(&dir, secret.public()).unwrap();
         let topic = state.topic_id().unwrap();
-        let mut node = bootstrap::start(&state, secret, &dir).await.unwrap();
+        let node = bootstrap::start(&state, secret, &dir).await.unwrap();
         let blob_root = dir.join("blobs-v1").join(node.secret.public().to_string());
         let attachment_storage =
             AttachmentStorage::open(node.blob_store.clone(), blob_root, &dir, 1024, 0, 0)
@@ -1006,7 +995,6 @@ mod tests {
         drop(direct_sender);
         drop(attachment_storage);
         node.router.shutdown().await.unwrap();
-        node.direct_replay.shutdown().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
