@@ -1,26 +1,17 @@
-//! Supervision for daemon-owned attachment background tasks.
+//! Supervision for daemon-owned background tasks.
 
 use super::operation_cache::OperationCache;
 use anyhow::Result;
-use std::{
-    collections::HashMap,
-    future::Future,
-    sync::{Arc, Mutex},
-    time::Instant as StdInstant,
+use std::{collections::HashMap, future::Future};
+use tokio::{
+    sync::{broadcast, oneshot},
+    task::{Id, JoinError, JoinSet},
 };
-use tokio::sync::{broadcast, oneshot};
 
-pub(super) enum OperationEventKind {
-    None,
-    AttachmentShared,
-    DownloadComplete,
-}
-
-pub(super) enum AttachmentTaskCompletion {
+pub(super) enum TaskOutput {
     Operation {
         operation_id: meshmsg_protocol::OperationId,
         response: meshmsg_protocol::Response,
-        event: OperationEventKind,
     },
     OfferList {
         reply: oneshot::Sender<meshmsg_protocol::Response>,
@@ -30,195 +21,203 @@ pub(super) enum AttachmentTaskCompletion {
     Retention(Result<Option<meshmsg_protocol::Response>>),
 }
 
-pub(super) struct AttachmentTaskMetadata {
-    pub(super) kind: &'static str,
-    pub(super) unexpected_operation:
-        Option<(meshmsg_protocol::OperationId, meshmsg_protocol::ErrorCode)>,
-    pub(super) space_refresh: bool,
+pub(super) type JoinedTask = Result<(Id, TaskOutput), JoinError>;
+
+struct TaskMetadata {
+    kind: &'static str,
+    /// The operation this task owns, and the code that completes it if the
+    /// task panics or is aborted before returning a response.
+    operation: Option<(meshmsg_protocol::OperationId, meshmsg_protocol::ErrorCode)>,
 }
 
-pub(super) fn spawn_attachment_task<F>(
-    tasks: &mut tokio::task::JoinSet<AttachmentTaskCompletion>,
-    metadata: &mut HashMap<tokio::task::Id, AttachmentTaskMetadata>,
-    task_metadata: AttachmentTaskMetadata,
-    task: F,
-) -> tokio::task::AbortHandle
-where
-    F: Future<Output = AttachmentTaskCompletion> + Send + 'static,
-{
-    let handle = tasks.spawn(task);
-    metadata.insert(handle.id(), task_metadata);
-    handle
+/// Every background task the daemon loop supervises. Concurrency is bounded
+/// where each task is admitted (semaphores, the storage gate, the single
+/// free-space refresh), not by this set.
+#[derive(Default)]
+pub(super) struct BackgroundTasks {
+    tasks: JoinSet<TaskOutput>,
+    metadata: HashMap<Id, TaskMetadata>,
+    space_refresh: Option<Id>,
 }
 
-pub(super) fn try_spawn_attachment_space_refresh<F>(
-    active: &mut bool,
-    tasks: &mut tokio::task::JoinSet<AttachmentTaskCompletion>,
-    metadata: &mut HashMap<tokio::task::Id, AttachmentTaskMetadata>,
-    task: F,
-) -> bool
-where
-    F: Future<Output = Result<()>> + Send + 'static,
-{
-    if *active {
-        return false;
-    }
-    *active = true;
-    spawn_attachment_task(
-        tasks,
-        metadata,
-        AttachmentTaskMetadata {
-            kind: "attachment free-space refresh",
-            unexpected_operation: None,
-            space_refresh: true,
-        },
-        async move { AttachmentTaskCompletion::SpaceRefresh(task.await) },
-    );
-    true
-}
-
-pub(super) fn complete_attachment_task(
-    completed: Result<(tokio::task::Id, AttachmentTaskCompletion), tokio::task::JoinError>,
-    metadata: &mut HashMap<tokio::task::Id, AttachmentTaskMetadata>,
-    operation_cache: &Arc<Mutex<OperationCache>>,
-    events: &broadcast::Sender<meshmsg_protocol::Event>,
-    space_refresh_active: &mut bool,
-) {
-    let task_id = match &completed {
-        Ok((task_id, _)) => *task_id,
-        Err(error) => error.id(),
-    };
-    let Some(task_metadata) = metadata.remove(&task_id) else {
-        eprintln!("untracked background attachment task {task_id} completed");
-        return;
-    };
-    if task_metadata.space_refresh {
-        *space_refresh_active = false;
+impl BackgroundTasks {
+    fn spawn<F>(&mut self, metadata: TaskMetadata, task: F) -> Id
+    where
+        F: Future<Output = TaskOutput> + Send + 'static,
+    {
+        let id = self.tasks.spawn(task).id();
+        self.metadata.insert(id, metadata);
+        id
     }
 
-    match completed {
-        Ok((
-            _,
-            AttachmentTaskCompletion::Operation {
-                operation_id,
-                response,
-                event,
+    /// Runs an admitted operation to its terminal response. If the task exits
+    /// without one, the operation completes with `unexpected_exit` and an
+    /// unknown outcome.
+    pub(super) fn spawn_operation<F>(
+        &mut self,
+        kind: &'static str,
+        operation_id: meshmsg_protocol::OperationId,
+        unexpected_exit: meshmsg_protocol::ErrorCode,
+        task: F,
+    ) where
+        F: Future<Output = meshmsg_protocol::Response> + Send + 'static,
+    {
+        self.spawn(
+            TaskMetadata {
+                kind,
+                operation: Some((operation_id, unexpected_exit)),
             },
-        )) => {
-            let response = operation_cache
-                .lock()
-                .expect("operation cache poisoned")
-                .complete(&operation_id, response, StdInstant::now());
-            let event = match (event, response) {
-                (
-                    OperationEventKind::AttachmentShared,
-                    meshmsg_protocol::Response::AttachmentShared(value),
-                ) => Some(meshmsg_protocol::Event::AttachmentShared(value)),
-                (
-                    OperationEventKind::DownloadComplete,
-                    meshmsg_protocol::Response::DownloadComplete(value),
-                ) => Some(meshmsg_protocol::Event::DownloadComplete(value)),
-                _ => None,
-            };
-            if let Some(event) = event {
-                let _ = events.send(event);
+            async move {
+                TaskOutput::Operation {
+                    operation_id,
+                    response: task.await,
+                }
+            },
+        );
+    }
+
+    pub(super) fn spawn_offer_list<F>(
+        &mut self,
+        reply: oneshot::Sender<meshmsg_protocol::Response>,
+        task: F,
+    ) where
+        F: Future<Output = meshmsg_protocol::Response> + Send + 'static,
+    {
+        self.spawn(
+            TaskMetadata {
+                kind: "attachment offer listing",
+                operation: None,
+            },
+            async move {
+                TaskOutput::OfferList {
+                    reply,
+                    response: task.await,
+                }
+            },
+        );
+    }
+
+    /// Starts a free-space refresh unless the previous one is still running.
+    pub(super) fn try_spawn_space_refresh<F>(&mut self, task: F) -> bool
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        if self.space_refresh.is_some() {
+            return false;
+        }
+        self.space_refresh = Some(self.spawn(
+            TaskMetadata {
+                kind: "attachment free-space refresh",
+                operation: None,
+            },
+            async move { TaskOutput::SpaceRefresh(task.await) },
+        ));
+        true
+    }
+
+    pub(super) fn spawn_retention<F>(&mut self, task: F)
+    where
+        F: Future<Output = Result<Option<meshmsg_protocol::Response>>> + Send + 'static,
+    {
+        self.spawn(
+            TaskMetadata {
+                kind: "automatic attachment retention",
+                operation: None,
+            },
+            async move { TaskOutput::Retention(task.await) },
+        );
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    pub(super) async fn join_next(&mut self) -> Option<JoinedTask> {
+        self.tasks.join_next_with_id().await
+    }
+
+    pub(super) fn complete(
+        &mut self,
+        joined: JoinedTask,
+        operation_cache: &mut OperationCache,
+        events: &broadcast::Sender<meshmsg_protocol::Event>,
+    ) {
+        let task_id = match &joined {
+            Ok((task_id, _)) => *task_id,
+            Err(error) => error.id(),
+        };
+        if self.space_refresh == Some(task_id) {
+            self.space_refresh = None;
+        }
+        let Some(metadata) = self.metadata.remove(&task_id) else {
+            eprintln!("untracked background attachment task {task_id} completed");
+            return;
+        };
+
+        match joined {
+            Ok((
+                _,
+                TaskOutput::Operation {
+                    operation_id,
+                    response,
+                },
+            )) => operation_cache.finish(operation_id, response, events),
+            Ok((_, TaskOutput::OfferList { reply, response })) => {
+                let _ = reply.send(response);
+            }
+            Ok((_, TaskOutput::SpaceRefresh(Err(error)) | TaskOutput::Retention(Err(error)))) => {
+                eprintln!("{} failed: {error:#}", metadata.kind);
+            }
+            Ok((_, TaskOutput::Retention(Ok(Some(meshmsg_protocol::Response::Error(error)))))) => {
+                eprintln!(
+                    "{} completed with {} ({:?})",
+                    metadata.kind,
+                    error.code.message(),
+                    error.outcome
+                );
+            }
+            Ok((_, TaskOutput::SpaceRefresh(Ok(())) | TaskOutput::Retention(Ok(_)))) => {}
+            Err(error) => {
+                eprintln!("{} exited unexpectedly: {error}", metadata.kind);
+                fail_operation(metadata, operation_cache, events);
             }
         }
-        Ok((_, AttachmentTaskCompletion::OfferList { reply, response })) => {
-            let _ = reply.send(response);
+    }
+
+    pub(super) async fn abort_and_drain(
+        &mut self,
+        operation_cache: &mut OperationCache,
+        events: &broadcast::Sender<meshmsg_protocol::Event>,
+    ) {
+        self.tasks.abort_all();
+        while let Some(joined) = self.join_next().await {
+            self.complete(joined, operation_cache, events);
         }
-        Ok((_, AttachmentTaskCompletion::SpaceRefresh(Err(error)))) => {
-            eprintln!("{} failed: {error:#}", task_metadata.kind);
-        }
-        Ok((_, AttachmentTaskCompletion::Retention(Err(error)))) => {
-            eprintln!("{} failed: {error:#}", task_metadata.kind);
-        }
-        Ok((
-            _,
-            AttachmentTaskCompletion::Retention(Ok(Some(meshmsg_protocol::Response::Error(error)))),
-        )) => {
+        if !self.metadata.is_empty() {
             eprintln!(
-                "{} completed with {} ({:?})",
-                task_metadata.kind,
-                error.code.message(),
-                error.outcome
+                "{} background attachment task metadata entries remained after shutdown drain",
+                self.metadata.len()
             );
-        }
-        Ok((
-            _,
-            AttachmentTaskCompletion::SpaceRefresh(Ok(()))
-            | AttachmentTaskCompletion::Retention(Ok(_)),
-        )) => {}
-        Err(error) => {
-            eprintln!("{} exited unexpectedly: {error}", task_metadata.kind);
-            if let Some((operation_id, code)) = task_metadata.unexpected_operation {
-                let response =
-                    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                        Some(operation_id),
-                        code,
-                        meshmsg_protocol::Outcome::Unknown,
-                    ));
-                operation_cache
-                    .lock()
-                    .expect("operation cache poisoned")
-                    .complete(&operation_id, response, StdInstant::now());
+            self.space_refresh = None;
+            for (_, metadata) in self.metadata.drain() {
+                fail_operation(metadata, operation_cache, events);
             }
         }
     }
 }
 
-pub(super) async fn abort_and_drain_attachment_tasks(
-    transfer_tasks: &mut tokio::task::JoinSet<AttachmentTaskCompletion>,
-    offer_list_tasks: &mut tokio::task::JoinSet<AttachmentTaskCompletion>,
-    metadata: &mut HashMap<tokio::task::Id, AttachmentTaskMetadata>,
-    operation_cache: &Arc<Mutex<OperationCache>>,
+fn fail_operation(
+    metadata: TaskMetadata,
+    operation_cache: &mut OperationCache,
     events: &broadcast::Sender<meshmsg_protocol::Event>,
-    space_refresh_active: &mut bool,
 ) {
-    // Abort both classes before draining either so shutdown does not allow the
-    // second class to continue while the first is being supervised.
-    transfer_tasks.abort_all();
-    offer_list_tasks.abort_all();
-    while let Some(completed) = transfer_tasks.join_next_with_id().await {
-        complete_attachment_task(
-            completed,
-            metadata,
-            operation_cache,
-            events,
-            space_refresh_active,
-        );
-    }
-    while let Some(completed) = offer_list_tasks.join_next_with_id().await {
-        complete_attachment_task(
-            completed,
-            metadata,
-            operation_cache,
-            events,
-            space_refresh_active,
-        );
-    }
-    if !metadata.is_empty() {
-        eprintln!(
-            "{} background attachment task metadata entries remained after shutdown drain",
-            metadata.len()
-        );
-        for (_, task_metadata) in metadata.drain() {
-            if task_metadata.space_refresh {
-                *space_refresh_active = false;
-            }
-            if let Some((operation_id, code)) = task_metadata.unexpected_operation {
-                let response =
-                    meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                        Some(operation_id),
-                        code,
-                        meshmsg_protocol::Outcome::Unknown,
-                    ));
-                operation_cache
-                    .lock()
-                    .expect("operation cache poisoned")
-                    .complete(&operation_id, response, StdInstant::now());
-            }
-        }
+    if let Some((operation_id, code)) = metadata.operation {
+        let response = meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
+            Some(operation_id),
+            code,
+            meshmsg_protocol::Outcome::Unknown,
+        ));
+        operation_cache.finish(operation_id, response, events);
     }
 }
 
@@ -231,11 +230,14 @@ mod tests {
             server::{handle_local_client, LocalClientSession, LocalIpcTimeouts},
             write_request, MAX_IPC_EVENT_SIZE,
         },
-        node::{commands::operation_fingerprint, DaemonCommand},
+        node::{operation_cache::request_fingerprint, DaemonCommand},
     };
     use iroh::SecretKey;
     use meshmsg_protocol::Request;
-    use std::{sync::atomic::Ordering, time::Duration};
+    use std::{
+        sync::{atomic::Ordering, Arc},
+        time::{Duration, Instant as StdInstant},
+    };
     use tokio::sync::mpsc;
 
     fn connected_fixture() -> meshmsg_protocol::Event {
@@ -257,42 +259,21 @@ mod tests {
     #[tokio::test]
     async fn panicked_attachment_task_completes_operation_with_terminal_unknown_error() {
         let operation_id = meshmsg_protocol::OperationId::new_random();
-        let fingerprint = operation_fingerprint("share", &[b"panic"]);
-        let cache = Arc::new(Mutex::new(OperationCache::new(4, Duration::from_secs(10))));
+        let fingerprint = [1; 32];
+        let mut cache = OperationCache::new(4, Duration::from_secs(10));
         let (reply, response) = oneshot::channel();
-        assert!(cache
-            .lock()
-            .unwrap()
-            .admit(operation_id, fingerprint, reply, StdInstant::now(),));
+        assert!(cache.admit(operation_id, fingerprint, reply, StdInstant::now()));
         let (events, _) = broadcast::channel(1);
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut metadata = HashMap::new();
-        let mut refresh_active = false;
-        spawn_attachment_task(
-            &mut tasks,
-            &mut metadata,
-            AttachmentTaskMetadata {
-                kind: "panicking test attachment share",
-                unexpected_operation: Some((
-                    operation_id,
-                    meshmsg_protocol::ErrorCode::ShareFailed,
-                )),
-                space_refresh: false,
-            },
-            async move {
-                panic!("injected attachment task panic");
-                #[allow(unreachable_code)]
-                AttachmentTaskCompletion::SpaceRefresh(Ok(()))
-            },
+        let mut tasks = BackgroundTasks::default();
+        tasks.spawn_operation(
+            "panicking test attachment share",
+            operation_id,
+            meshmsg_protocol::ErrorCode::ShareFailed,
+            async { panic!("injected attachment task panic") },
         );
 
-        complete_attachment_task(
-            tasks.join_next_with_id().await.unwrap(),
-            &mut metadata,
-            &cache,
-            &events,
-            &mut refresh_active,
-        );
+        let joined = tasks.join_next().await.unwrap();
+        tasks.complete(joined, &mut cache, &events);
         let response = response
             .await
             .expect("operation waiter received terminal result");
@@ -302,51 +283,29 @@ mod tests {
         assert_eq!(error.operation_id.as_ref(), Some(&operation_id));
 
         let (retry, retry_response) = oneshot::channel();
-        assert!(!cache
-            .lock()
-            .unwrap()
-            .admit(operation_id, fingerprint, retry, StdInstant::now(),));
+        assert!(!cache.admit(operation_id, fingerprint, retry, StdInstant::now()));
         assert_eq!(retry_response.await.unwrap(), response);
-        assert!(metadata.is_empty());
+        assert!(tasks.metadata.is_empty());
     }
 
     #[tokio::test]
     async fn cancelled_attachment_task_also_completes_operation() {
         let operation_id = meshmsg_protocol::OperationId::new_random();
-        let cache = Arc::new(Mutex::new(OperationCache::new(2, Duration::from_secs(10))));
+        let mut cache = OperationCache::new(2, Duration::from_secs(10));
         let (reply, response) = oneshot::channel();
-        assert!(cache.lock().unwrap().admit(
-            operation_id,
-            operation_fingerprint("download", &[b"cancel"]),
-            reply,
-            StdInstant::now(),
-        ));
+        assert!(cache.admit(operation_id, [2; 32], reply, StdInstant::now()));
         let (events, _) = broadcast::channel(1);
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut metadata = HashMap::new();
-        let mut refresh_active = false;
-        let handle = spawn_attachment_task(
-            &mut tasks,
-            &mut metadata,
-            AttachmentTaskMetadata {
-                kind: "cancelled test attachment download",
-                unexpected_operation: Some((
-                    operation_id,
-                    meshmsg_protocol::ErrorCode::DownloadFailed,
-                )),
-                space_refresh: false,
-            },
-            std::future::pending::<AttachmentTaskCompletion>(),
+        let mut tasks = BackgroundTasks::default();
+        tasks.spawn_operation(
+            "cancelled test attachment download",
+            operation_id,
+            meshmsg_protocol::ErrorCode::DownloadFailed,
+            std::future::pending(),
         );
-        handle.abort();
+        tasks.tasks.abort_all();
 
-        complete_attachment_task(
-            tasks.join_next_with_id().await.unwrap(),
-            &mut metadata,
-            &cache,
-            &events,
-            &mut refresh_active,
-        );
+        let joined = tasks.join_next().await.unwrap();
+        tasks.complete(joined, &mut cache, &events);
         let response = response
             .await
             .expect("cancelled operation received terminal result");
@@ -385,53 +344,25 @@ mod tests {
         .await
         .unwrap();
         let DaemonCommand::Execute {
-            request:
-                Request::PrivateSend {
-                    operation_id: command_operation_id,
-                    to,
-                    body,
-                },
+            request: received,
             reply,
         } = command_rx.recv().await.unwrap()
         else {
             panic!("expected private-send command")
         };
-        let fingerprint =
-            operation_fingerprint("private_send", &[to.as_str().as_bytes(), body.as_bytes()]);
-        let cache = Arc::new(Mutex::new(OperationCache::new(4, Duration::from_secs(10))));
-        assert!(cache.lock().unwrap().admit(
-            command_operation_id,
-            fingerprint,
-            reply,
-            StdInstant::now(),
-        ));
+        assert_eq!(received, request);
+        let fingerprint = request_fingerprint(&received).unwrap();
+        let mut cache = OperationCache::new(4, Duration::from_secs(10));
+        assert!(cache.admit(operation_id, fingerprint, reply, StdInstant::now()));
 
-        let mut transfer_tasks = tokio::task::JoinSet::new();
-        let mut offer_list_tasks = tokio::task::JoinSet::new();
-        let mut metadata = HashMap::new();
-        let mut refresh_active = false;
-        spawn_attachment_task(
-            &mut transfer_tasks,
-            &mut metadata,
-            AttachmentTaskMetadata {
-                kind: "shutdown test private send",
-                unexpected_operation: Some((
-                    command_operation_id,
-                    meshmsg_protocol::ErrorCode::PrivateSendFailed,
-                )),
-                space_refresh: false,
-            },
-            std::future::pending::<AttachmentTaskCompletion>(),
+        let mut tasks = BackgroundTasks::default();
+        tasks.spawn_operation(
+            "shutdown test private send",
+            operation_id,
+            meshmsg_protocol::ErrorCode::PrivateSendFailed,
+            std::future::pending(),
         );
-        abort_and_drain_attachment_tasks(
-            &mut transfer_tasks,
-            &mut offer_list_tasks,
-            &mut metadata,
-            &cache,
-            &events,
-            &mut refresh_active,
-        )
-        .await;
+        tasks.abort_and_drain(&mut cache, &events).await;
 
         let frame = read_frame(&mut client, MAX_IPC_EVENT_SIZE).await.unwrap();
         let frame: meshmsg_protocol::ResponseFrame = serde_json::from_slice(&frame).unwrap();
@@ -445,72 +376,45 @@ mod tests {
         client_task.await.unwrap().unwrap();
 
         let (retry, retry_response) = oneshot::channel();
-        assert!(!cache
-            .lock()
-            .unwrap()
-            .admit(operation_id, fingerprint, retry, StdInstant::now(),));
+        assert!(!cache.admit(operation_id, fingerprint, retry, StdInstant::now()));
         assert_eq!(retry_response.await.unwrap(), frame.response);
-        let cache = cache.lock().unwrap();
         assert_eq!(cache.counts(), (0, 1));
-        assert!(metadata.is_empty());
+        assert!(tasks.metadata.is_empty());
     }
 
     #[tokio::test]
     async fn attachment_space_refresh_never_overlaps_and_reopens_after_completion() {
-        let cache = Arc::new(Mutex::new(OperationCache::new(1, Duration::from_secs(10))));
+        let mut cache = OperationCache::new(1, Duration::from_secs(10));
         let (events, _) = broadcast::channel(1);
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut metadata = HashMap::new();
-        let mut active = false;
+        let mut tasks = BackgroundTasks::default();
         let (release, wait) = oneshot::channel();
         let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let first_running = running.clone();
-        assert!(try_spawn_attachment_space_refresh(
-            &mut active,
-            &mut tasks,
-            &mut metadata,
-            async move {
-                first_running.fetch_add(1, Ordering::SeqCst);
-                wait.await.unwrap();
-                first_running.fetch_sub(1, Ordering::SeqCst);
-                Ok(())
-            },
-        ));
-        assert!(!try_spawn_attachment_space_refresh(
-            &mut active,
-            &mut tasks,
-            &mut metadata,
-            async { panic!("overlapping refresh was spawned") },
-        ));
+        assert!(tasks.try_spawn_space_refresh(async move {
+            first_running.fetch_add(1, Ordering::SeqCst);
+            wait.await.unwrap();
+            first_running.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(!tasks.try_spawn_space_refresh(async { panic!("overlapping refresh was spawned") }));
         tokio::task::yield_now().await;
         assert_eq!(running.load(Ordering::SeqCst), 1);
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(metadata.len(), 1);
+        assert_eq!(tasks.tasks.len(), 1);
+        assert_eq!(tasks.metadata.len(), 1);
 
         release.send(()).unwrap();
-        complete_attachment_task(
-            tasks.join_next_with_id().await.unwrap(),
-            &mut metadata,
-            &cache,
-            &events,
-            &mut active,
-        );
-        assert!(!active);
+        let joined = tasks.join_next().await.unwrap();
+        tasks.complete(joined, &mut cache, &events);
+        assert!(tasks.space_refresh.is_none());
         assert_eq!(running.load(Ordering::SeqCst), 0);
-        assert!(try_spawn_attachment_space_refresh(
-            &mut active,
-            &mut tasks,
-            &mut metadata,
-            async { Ok(()) },
-        ));
-        complete_attachment_task(
-            tasks.join_next_with_id().await.unwrap(),
-            &mut metadata,
-            &cache,
-            &events,
-            &mut active,
-        );
-        assert!(!active);
-        assert!(metadata.is_empty());
+        // A failed or panicked refresh reopens the slot as well.
+        assert!(tasks.try_spawn_space_refresh(async { panic!("injected refresh panic") }));
+        let joined = tasks.join_next().await.unwrap();
+        tasks.complete(joined, &mut cache, &events);
+        assert!(tasks.try_spawn_space_refresh(async { Ok(()) }));
+        let joined = tasks.join_next().await.unwrap();
+        tasks.complete(joined, &mut cache, &events);
+        assert!(tasks.space_refresh.is_none());
+        assert!(tasks.metadata.is_empty());
     }
 }

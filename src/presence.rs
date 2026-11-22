@@ -22,7 +22,6 @@ use std::{
     str::FromStr,
     time::{Duration, Instant},
 };
-use tokio::sync::broadcast;
 
 /// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
 /// locally derived and never extends beyond this bound.
@@ -568,15 +567,6 @@ pub(crate) fn local_connectivity(
             .iter()
             .any(|status| status.is_connected()),
         topic_joined: receiver.is_joined(),
-    }
-}
-
-pub(crate) fn emit_transitions(
-    transitions: impl IntoIterator<Item = Event>,
-    events: &broadcast::Sender<Event>,
-) {
-    for transition in transitions {
-        let _ = events.send(transition);
     }
 }
 
