@@ -543,16 +543,13 @@ pub(super) async fn execute(
             {
                 return Ok(CommandAction::Continue);
             }
-            let resolution = operation_cache
-                .lock()
-                .expect("operation cache poisoned")
-                .resolve_prune(
-                    &operation_id,
-                    older_than_secs,
-                    unix_timestamp_ms_saturating(SystemTime::now()),
-                );
-            let age = resolution.older_than_secs;
-            let cutoff = resolution.cutoff_ms;
+            // Resolved once by the admitted owner. Retries replay the cached
+            // terminal response, so the cutoff is never derived a second time.
+            let age = older_than_secs;
+            let cutoff = crate::attachment::prune_cutoff_upper_bound(
+                unix_timestamp_ms_saturating(SystemTime::now()),
+                older_than_secs,
+            );
             let storage = attachment_storage.clone();
             let task_operation_id = operation_id.clone();
             spawn_attachment_task(

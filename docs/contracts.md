@@ -114,8 +114,8 @@ Private/direct sends accept the same 1 through 65,358-byte body over a separate
 direct transport frame bounded to the body maximum plus 2 KiB. The complete 65,536-byte broadcast envelope bound is
 checked before decoding. Local rejection occurs
 before throttle/operation-cache admission, has `code:"invalid_message"` and
-`outcome:"not_started"`, and preserves the operation ID. Invalid signed remote text or attachment semantics are rejected before accepted-traffic
-or replay/rate admission and fanout, while every frame still pays a separate bounded
+`outcome:"not_started"`, and preserves the operation ID. Invalid signed remote text or attachment semantics are rejected before
+replay/rate admission and fanout, while every frame still pays a separate bounded
 pre-verification attempt budget. Attachment validation binds one canonical lowercase
 operation/offer ID plus the configured signed topic, kind, provider, ticket hash/format,
 name, size, and nonzero timestamp before download registration or transfer work. Live

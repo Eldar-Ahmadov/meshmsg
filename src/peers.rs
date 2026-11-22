@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 /// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
 /// locally derived and never extends beyond this bound.
 pub(crate) const PEER_LEASE_MS: u64 = meshmsg_protocol::PEER_LEASE_MS;
+/// Documented ceiling for one encoded lifecycle event. The typed field bounds
+/// guarantee it; the test below proves the worst case.
+#[cfg(test)]
 pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
 pub(crate) const MAX_DYNAMIC_IDENTITIES: usize = meshmsg_protocol::MAX_PEERS;
 

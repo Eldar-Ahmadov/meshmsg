@@ -5,23 +5,15 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PruneResolution {
-    pub(super) older_than_secs: u64,
-    pub(super) cutoff_ms: u64,
-}
-
 struct CompletedOperation {
     fingerprint: [u8; 32],
     response: meshmsg_protocol::Response,
     expires_at: StdInstant,
-    prune_resolution: Option<PruneResolution>,
 }
 
 struct InFlightOperation {
     fingerprint: [u8; 32],
     waiters: Vec<oneshot::Sender<meshmsg_protocol::Response>>,
-    prune_resolution: Option<PruneResolution>,
 }
 
 pub(super) struct OperationCache {
@@ -70,12 +62,6 @@ impl OperationCache {
         self.prune(now);
         if let Some(entry) = self.completed.get(&operation_id) {
             let response = if entry.fingerprint == fingerprint {
-                if let (Some(resolution), meshmsg_protocol::Response::OffersPruned(result)) =
-                    (entry.prune_resolution, &entry.response)
-                {
-                    debug_assert_eq!(result.older_than_secs, resolution.older_than_secs);
-                    debug_assert_eq!(result.cutoff_ms, resolution.cutoff_ms);
-                }
                 entry.response.clone()
             } else {
                 Self::error(
@@ -112,30 +98,9 @@ impl OperationCache {
             InFlightOperation {
                 fingerprint,
                 waiters: vec![reply],
-                prune_resolution: None,
             },
         );
         true
-    }
-
-    /// Resolve a prune boundary only for the newly admitted owner and retain it
-    /// with the cache entry so execution and terminal replay share one authority.
-    pub(super) fn resolve_prune(
-        &mut self,
-        operation_id: &meshmsg_protocol::OperationId,
-        older_than_secs: u64,
-        now_ms: u64,
-    ) -> PruneResolution {
-        let entry = self
-            .in_flight
-            .get_mut(operation_id)
-            .expect("newly admitted prune is in flight");
-        let resolution = *entry.prune_resolution.get_or_insert(PruneResolution {
-            older_than_secs,
-            cutoff_ms: crate::attachment::prune_cutoff_upper_bound(now_ms, older_than_secs),
-        });
-        debug_assert_eq!(resolution.older_than_secs, older_than_secs);
-        resolution
     }
 
     pub(super) fn complete(
@@ -156,7 +121,6 @@ impl OperationCache {
                 fingerprint: in_flight.fingerprint,
                 response,
                 expires_at: now + self.ttl,
-                prune_resolution: in_flight.prune_resolution,
             },
         );
         self.order.push_back(operation_id.clone());
@@ -492,8 +456,10 @@ mod tests {
         let mut cache = OperationCache::new(4, ttl);
         let (first_reply, _first_receiver) = oneshot::channel();
         assert!(cache.admit(operation.clone(), fingerprint(60), first_reply, now));
-        let resolution = cache.resolve_prune(&operation, 60, 100_000);
-        assert_eq!(resolution.cutoff_ms, 40_000);
+        // The owner resolves the cutoff once at admission; the cached terminal
+        // response is the only place it is retained.
+        let cutoff_ms = crate::attachment::prune_cutoff_upper_bound(100_000, 60);
+        assert_eq!(cutoff_ms, 40_000);
         let terminal = meshmsg_protocol::Response::OffersPruned(meshmsg_protocol::OffersPruned {
             operation_id: operation.parse().unwrap(),
             direction: Some(meshmsg_protocol::OfferDirection::Outgoing),
@@ -504,13 +470,9 @@ mod tests {
             removed_tags: 0,
             released_bytes: 0,
             limited: false,
-            cutoff_ms: 40_000,
+            cutoff_ms,
         });
         cache.complete(&operation, terminal.clone(), now);
-        assert_eq!(
-            cache.completed.get(&operation).unwrap().prune_resolution,
-            Some(resolution)
-        );
 
         // A retry can arrive with a much later or backwards wall clock. Its
         // stable caller-intent fingerprint does not derive another cutoff.

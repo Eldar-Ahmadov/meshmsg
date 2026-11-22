@@ -560,19 +560,12 @@ pub(crate) fn emit_transitions(
         let candidate_revision = directory_revision
             .checked_add(1)
             .expect("directory revision overflow");
-        let value = peer_api::transition_value(transition, directory_epoch, candidate_revision);
-        // The type-level field bounds make this unreachable; keep an explicit
-        // final guard so future schema changes fail closed instead of creating
-        // unexpectedly large subscription events.
-        if serde_json::to_vec(&meshmsg_protocol::EventFrame::new(
-            meshmsg_protocol::RequestId::new_random(),
-            value.clone(),
-        ))
-        .is_ok_and(|encoded| encoded.len() <= peer_api::MAX_PEER_LIFECYCLE_EVENT_BYTES)
-        {
-            *directory_revision = candidate_revision;
-            let _ = events.send(value.clone());
-        }
+        *directory_revision = candidate_revision;
+        let _ = events.send(peer_api::transition_value(
+            transition,
+            directory_epoch,
+            candidate_revision,
+        ));
     }
 }
 

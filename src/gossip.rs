@@ -26,7 +26,7 @@ const TRANSPORT_SOURCE_BURST: u64 = 1_000;
 const GLOBAL_TRANSPORT_RATE_PER_SEC: u64 = 1_500;
 const GLOBAL_TRANSPORT_BURST: u64 = 3_000;
 /// Byte budgets prevent the 16x larger envelope from turning count-based
-/// verification/admission limits into unbounded bandwidth and fanout work.
+/// verification limits into unbounded bandwidth and fanout work.
 const TRANSPORT_SOURCE_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 const TRANSPORT_SOURCE_BYTE_BURST: u64 = 8 * 1024 * 1024;
 const GLOBAL_TRANSPORT_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
@@ -157,15 +157,16 @@ impl TokenBucket {
 struct TransportSourceState {
     verification_limiter: TokenBucket,
     verification_byte_limiter: TokenBucket,
-    admission_limiter: TokenBucket,
     last_seen_ms: u64,
 }
 
+/// Bounds signature-verification work per authenticated transport hop. Every
+/// received frame pays this budget before decoding; accepted traffic is then
+/// bounded separately by [`EnvelopeReplayCache`].
 struct TransportSourceLimiter {
     sources: HashMap<PublicKey, TransportSourceState>,
     verification_global: TokenBucket,
     verification_bytes_global: TokenBucket,
-    admission_global: TokenBucket,
 }
 
 impl Default for TransportSourceLimiter {
@@ -180,11 +181,6 @@ impl Default for TransportSourceLimiter {
             verification_bytes_global: TokenBucket::new(
                 GLOBAL_TRANSPORT_BYTES_PER_SEC,
                 GLOBAL_TRANSPORT_BYTE_BURST,
-                0,
-            ),
-            admission_global: TokenBucket::new(
-                GLOBAL_TRANSPORT_RATE_PER_SEC,
-                GLOBAL_TRANSPORT_BURST,
                 0,
             ),
         }
@@ -211,11 +207,6 @@ impl TransportSourceLimiter {
                     verification_byte_limiter: TokenBucket::new(
                         TRANSPORT_SOURCE_BYTES_PER_SEC,
                         TRANSPORT_SOURCE_BYTE_BURST,
-                        now_ms,
-                    ),
-                    admission_limiter: TokenBucket::new(
-                        TRANSPORT_SOURCE_RATE_PER_SEC,
-                        TRANSPORT_SOURCE_BURST,
                         now_ms,
                     ),
                     last_seen_ms: now_ms,
@@ -255,24 +246,6 @@ impl TransportSourceLimiter {
         state.verification_byte_limiter.consume_amount(frame_bytes);
         state.last_seen_ms = now_ms;
         true
-    }
-
-    fn admission_available(&mut self, source: PublicKey, now_ms: u64) -> bool {
-        if !self.prepare_source(source, now_ms) {
-            return false;
-        }
-        self.admission_global.refill(now_ms);
-        let state = self.sources.get_mut(&source).expect("source was inserted");
-        state.admission_limiter.refill(now_ms);
-        self.admission_global.available() && state.admission_limiter.available()
-    }
-
-    fn consume_admission(&mut self, source: PublicKey, now_ms: u64) {
-        debug_assert!(self.admission_available(source, now_ms));
-        self.admission_global.consume();
-        let state = self.sources.get_mut(&source).expect("source was reserved");
-        state.admission_limiter.consume();
-        state.last_seen_ms = now_ms;
     }
 }
 
@@ -653,7 +626,6 @@ where
                 &message.content,
                 topic,
                 replay,
-                sources,
                 now_ms,
                 attachment_event,
             )
@@ -672,15 +644,14 @@ fn process_received<F>(
     content: &[u8],
     topic: TopicId,
     replay: &mut EnvelopeReplayCache,
-    sources: &mut TransportSourceLimiter,
     now_ms: u64,
     attachment_event: F,
 ) -> Vec<meshmsg_protocol::Event>
 where
     F: FnOnce(AttachmentEnvelope<'_>) -> Result<meshmsg_protocol::Event>,
 {
-    // Complete signature and kind-specific semantics precede freshness, replay,
-    // accepted-traffic accounting, and subscriber fanout.
+    // Complete signature and kind-specific semantics precede freshness, replay
+    // and rate admission, and subscriber fanout.
     let accepted = Envelope::decode(content, topic).and_then(|envelope| {
         let event = match envelope.kind {
             EnvelopeKind::Message => message_event(&envelope),
@@ -692,12 +663,7 @@ where
                 encoded: content,
             })?,
         };
-        anyhow::ensure!(
-            sources.admission_available(source, now_ms),
-            "broadcast transport source rate limit exceeded"
-        );
         replay.accept(&envelope, source, now_ms)?;
-        sources.consume_admission(source, now_ms);
         Ok(event)
     });
     accepted.map_or_else(|_| Vec::new(), |event| vec![event])
@@ -1013,8 +979,8 @@ mod tests {
                 "invalid semantics consumed replay state"
             );
             assert_eq!(
-                sources.admission_global.milli_tokens,
-                GLOBAL_TRANSPORT_BURST * 1_000,
+                replay.global_limiter.milli_tokens,
+                GLOBAL_REPLAY_BURST * 1_000,
                 "invalid semantics consumed admission capacity"
             );
         }
@@ -1094,8 +1060,8 @@ mod tests {
             assert_eq!(replay.live_ids, 0);
             assert_eq!(sources.sources.len(), 1);
             assert_eq!(
-                sources.admission_global.milli_tokens,
-                GLOBAL_TRANSPORT_BURST * 1_000
+                replay.global_limiter.milli_tokens,
+                GLOBAL_REPLAY_BURST * 1_000
             );
 
             let valid = Envelope::encode_with_id_at(
@@ -1177,7 +1143,7 @@ mod tests {
             operation_id_bytes("fedcba9876543210fedcba9876543210"),
             now_ms,
         );
-        let source_tokens = sources.admission_global.milli_tokens;
+        let admission_tokens = replay.global_limiter.milli_tokens;
         let bypass = network_event(
             received(alternate),
             test_topic(),
@@ -1187,7 +1153,7 @@ mod tests {
         );
         assert!(bypass.is_empty(), "malformed offer reached subscribers");
         assert_eq!(replay.live_ids, 1);
-        assert_eq!(sources.admission_global.milli_tokens, source_tokens);
+        assert_eq!(replay.global_limiter.milli_tokens, admission_tokens);
     }
 
     #[test]
@@ -1218,7 +1184,7 @@ mod tests {
             [2; 16],
             now_ms + ENVELOPE_FUTURE_SKEW.as_millis() as u64 + 1,
         );
-        let initial_admission = GLOBAL_TRANSPORT_BURST * 1_000;
+        let initial_admission = GLOBAL_REPLAY_BURST * 1_000;
         for rejected in [stale, future] {
             let _ = network_event(
                 received(rejected),
@@ -1227,11 +1193,8 @@ mod tests {
                 &mut sources,
                 now_ms,
             );
-            assert_eq!(sources.admission_global.milli_tokens, initial_admission);
-            assert_eq!(
-                sources.sources[&source].admission_limiter.milli_tokens,
-                TRANSPORT_SOURCE_BURST * 1_000
-            );
+            assert_eq!(replay.global_limiter.milli_tokens, initial_admission);
+            assert!(replay.senders.is_empty());
         }
 
         let valid = Envelope::encode_with_id_at(
@@ -1253,8 +1216,9 @@ mod tests {
             )[0]["type"],
             "message"
         );
-        let after_valid = sources.admission_global.milli_tokens;
-        let source_after_valid = sources.sources[&source].admission_limiter.milli_tokens;
+        let after_valid = replay.global_limiter.milli_tokens;
+        let sender_after_valid = replay.senders[&signer.public()].limiter.milli_tokens;
+        assert_eq!(after_valid, initial_admission - 1_000);
         let _ = network_event(
             received(valid),
             test_topic(),
@@ -1262,10 +1226,10 @@ mod tests {
             &mut sources,
             now_ms,
         );
-        assert_eq!(sources.admission_global.milli_tokens, after_valid);
+        assert_eq!(replay.global_limiter.milli_tokens, after_valid);
         assert_eq!(
-            sources.sources[&source].admission_limiter.milli_tokens,
-            source_after_valid
+            replay.senders[&signer.public()].limiter.milli_tokens,
+            sender_after_valid
         );
 
         let unrelated = Envelope::encode_with_id_at(
@@ -1287,10 +1251,10 @@ mod tests {
             )[0]["body"],
             "unrelated"
         );
-        assert_eq!(sources.admission_global.milli_tokens, after_valid - 1_000);
+        assert_eq!(replay.global_limiter.milli_tokens, after_valid - 1_000);
         assert_eq!(
-            sources.sources[&source].admission_limiter.milli_tokens,
-            source_after_valid - 1_000
+            replay.senders[&signer.public()].limiter.milli_tokens,
+            sender_after_valid - 1_000
         );
         assert_eq!(
             sources.verification_global.milli_tokens,
@@ -1444,8 +1408,8 @@ mod tests {
         for _ in 0..TRANSPORT_SOURCE_BURST {
             assert!(sources.allow_verification(source, now_ms, 1));
         }
-        let global_tokens_before_malformed = sources.admission_global.milli_tokens;
         let mut replay = EnvelopeReplayCache::default();
+        let global_tokens_before_malformed = replay.global_limiter.milli_tokens;
         let values = network_event(
             Event::Received(iroh_gossip::api::Message {
                 content: Bytes::from_static(b"not an envelope"),
@@ -1461,7 +1425,7 @@ mod tests {
         assert_eq!(replay.live_ids, 0);
         assert_eq!(sources.sources.len(), 1);
         assert_eq!(
-            sources.admission_global.milli_tokens,
+            replay.global_limiter.milli_tokens,
             global_tokens_before_malformed
         );
     }

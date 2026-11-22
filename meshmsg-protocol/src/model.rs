@@ -1340,13 +1340,6 @@ impl ProtocolError {
             advice
         }
     }
-
-    /// Compatibility adapter for callers that do not yet consume typed advice.
-    /// Prefer [`Self::retry_advice`] so a fresh operation is not confused with
-    /// reconciliation of an existing operation.
-    pub fn retryable(&self) -> bool {
-        self.retry_advice() != RetryAdvice::Never
-    }
 }
 
 /// Local guidance for handling a terminal error. This is deliberately not a
@@ -1520,12 +1513,6 @@ impl ErrorCode {
                 }
             }
         }
-    }
-
-    /// Compatibility adapter for callers that do not yet consume typed advice.
-    /// Prefer [`Self::retry_advice`] to retain the retry strategy.
-    pub fn retryable(self, outcome: Outcome) -> bool {
-        self.retry_advice(outcome) != RetryAdvice::Never
     }
 }
 
@@ -1729,8 +1716,6 @@ mod tests {
                 error.retry_advice(),
                 RetryAdvice::NewOperationAfterConditionsChange
             );
-            assert!(code.retryable(Outcome::NotStarted));
-            assert!(error.retryable());
         }
 
         for code in [
@@ -1766,8 +1751,10 @@ mod tests {
 
         let invalid = ProtocolError::new(None, ErrorCode::InvalidRequest, Outcome::NotStarted);
         assert_eq!(invalid.retry_advice(), RetryAdvice::Never);
-        assert!(!invalid.retryable());
-        assert!(!ErrorCode::InvalidRequest.retryable(Outcome::NotStarted));
+        assert_eq!(
+            ErrorCode::InvalidRequest.retry_advice(Outcome::NotStarted),
+            RetryAdvice::Never
+        );
     }
 
     #[test]
