@@ -52,7 +52,7 @@ bash tests/run-linux-integrations.sh target/debug/meshmsg
 
 The driver requires `target/debug/meshmsg` and substitutes its `{BIN}` inventory
 placeholder. The five-peer test retains equal-peer messaging, selective endpoint
-advertising, restart/failover/rejoin, owner-only protocol-v4 IPC hardening, and exact
+advertising, restart/failover/rejoin, owner-only protocol-v5 IPC hardening, and exact
 EnvelopeV3 65,358/65,359-byte positional/file/stdin/chat plus subscription-boundary coverage. The
 inventory also includes CLI errors, streaming-send framing/failure/interruption
 checks against fake local IPC, peer directory, attachments, direct messages,

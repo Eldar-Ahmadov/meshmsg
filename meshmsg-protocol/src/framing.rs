@@ -38,7 +38,7 @@ const EVENT_ACCEPTED_TEXT_BYTES: usize = checked_sum(
     checked_sum(
         checked_sum(
             crate::MAX_BROADCAST_BODY_BYTES,
-            checked_product(crate::MAX_SIGNED_ATTACHMENT_TOKEN_BYTES, 2),
+            crate::MAX_SIGNED_ATTACHMENT_TOKEN_BYTES,
         ),
         checked_sum(
             crate::MAX_IPC_PATH_BYTES,
@@ -61,7 +61,7 @@ pub const MAX_REQUEST_FRAME_BYTES: usize = checked_sum(
 );
 /// Maximum encoded response or event frame, excluding its newline delimiter.
 /// The derivation conservatively sums every largest accepted DTO family: body,
-/// two attachment tokens, path, warnings, peer snapshot, and offer listing.
+/// attachment token, path, warnings, peer snapshot, and offer listing.
 pub const MAX_EVENT_FRAME_BYTES: usize = checked_sum(
     checked_product(EVENT_ACCEPTED_TEXT_BYTES, JSON_ESCAPE_EXPANSION),
     EVENT_PROTOCOL_HEADROOM_BYTES,
@@ -314,7 +314,7 @@ mod tests {
     fn ipc_limits_cover_worst_case_json_escaping() {
         assert_eq!(crate::MAX_BROADCAST_BODY_BYTES, 65_358);
         assert_eq!(MAX_REQUEST_FRAME_BYTES, 1_129_432);
-        assert_eq!(MAX_EVENT_FRAME_BYTES, 5_045_212);
+        assert_eq!(MAX_EVENT_FRAME_BYTES, 4_520_920);
         let escaped_broadcast =
             checked_product(crate::MAX_BROADCAST_BODY_BYTES, JSON_ESCAPE_EXPANSION);
         assert!(
@@ -344,9 +344,8 @@ mod tests {
             crate::RequestId::new_random(),
             crate::Request::Download {
                 operation_id: crate::OperationId::new_random(),
-                offer: token.as_str().to_owned(),
+                offer: token.clone(),
                 output: path.clone(),
-                mode: crate::DownloadMode::Install,
             },
         );
         assert!(serde_json::to_vec(&download).unwrap().len() <= MAX_REQUEST_FRAME_BYTES);
@@ -358,16 +357,12 @@ mod tests {
             crate::Event::AttachmentShared(crate::AttachmentShared {
                 operation_id: operation.clone(),
                 from: peer.clone(),
-                message_id: operation.as_str().parse().unwrap(),
                 timestamp_ms: u64::MAX,
                 offer_id: operation.as_str().parse().unwrap(),
-                source_digest: "a".repeat(64).parse().unwrap(),
                 kind: crate::AttachmentKind::File,
                 name: crate::AttachmentName::new("x".repeat(100)).unwrap(),
                 size: u64::MAX,
-                ticket: token.clone(),
                 offer: token,
-                delivery_acknowledged: false,
             }),
         );
         assert!(serde_json::to_vec(&attachment).unwrap().len() <= MAX_EVENT_FRAME_BYTES);
@@ -387,16 +382,12 @@ mod tests {
             Some(crate::RequestId::new_random()),
             crate::Response::DownloadComplete(crate::DownloadResult {
                 operation_id: operation.clone(),
-                token_digest: "b".repeat(64).parse().unwrap(),
                 offer_id: operation.as_str().parse().unwrap(),
                 kind: crate::AttachmentKind::File,
                 name: crate::AttachmentName::new("x".repeat(100)).unwrap(),
                 size: u64::MAX,
                 from: peer,
                 output: path,
-                mode: crate::DownloadMode::Install,
-                installed: true,
-                pinned: true,
                 destination_synced: false,
                 cleanup_complete: false,
                 warnings: vec!["x".repeat(crate::MAX_PUBLIC_TEXT_BYTES); crate::MAX_WARNINGS],
@@ -412,9 +403,7 @@ mod tests {
                 name: crate::AttachmentName::new("x".repeat(100)).unwrap(),
                 kind: crate::AttachmentKind::DirectoryTarV1,
                 hash: "c".repeat(64).parse().unwrap(),
-                format: "raw".into(),
-                status: "complete".into(),
-                size: Some(u64::MAX),
+                size: u64::MAX,
             })
             .collect();
         let offers = crate::ResponseFrame::new(

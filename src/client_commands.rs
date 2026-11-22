@@ -1,9 +1,5 @@
 use crate::{
     alias::AliasConfig,
-    attachment::{
-        self,
-        runtime::{download_request_context, MAX_PRUNE_TAGS},
-    },
     config::State,
     contracts,
     invite::configured_details,
@@ -11,7 +7,6 @@ use crate::{
     output,
 };
 use anyhow::{Context, Result};
-use iroh_gossip::proto::TopicId;
 use meshmsg_protocol::{OfferId, OperationId, Request, RequestId};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -23,37 +18,21 @@ pub(crate) async fn send_once(
     body: &str,
     json: bool,
 ) -> Result<()> {
-    let value = if let Some(to) = to {
-        let value = send_request_checked(
-            dir,
-            &Request::PrivateSend {
-                operation_id: operation_id.clone(),
-                to: to.parse()?,
-                body: meshmsg_protocol::PrivateBody::new(body)?,
-            },
-        )
-        .await
-        .with_context(|| format!("operation {operation_id}"))?;
-        match &value.response {
-            meshmsg_protocol::Response::PrivateAccepted(accepted) => anyhow::ensure!(
-                accepted.body_bytes == body.len(),
-                "private-send acceptance metadata does not match the request"
-            ),
-            _ => unreachable!("checked response family"),
+    let request = if let Some(to) = to {
+        Request::PrivateSend {
+            operation_id: operation_id.clone(),
+            to: to.parse()?,
+            body: meshmsg_protocol::PrivateBody::new(body)?,
         }
-        value
     } else {
-        let value = send_request_checked(
-            dir,
-            &Request::Send {
-                operation_id: operation_id.clone(),
-                body: meshmsg_protocol::BroadcastBody::new(body)?,
-            },
-        )
+        Request::Send {
+            operation_id: operation_id.clone(),
+            body: meshmsg_protocol::BroadcastBody::new(body)?,
+        }
+    };
+    let value = send_request_checked(dir, &request)
         .await
         .with_context(|| format!("operation {operation_id}"))?;
-        value
-    };
     output::response(json, &value)?;
     Ok(())
 }
@@ -78,33 +57,15 @@ pub(crate) async fn share(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
     let path = caller_path(path)?;
-    let status = send_request_checked(dir, &Request::Status).await?;
-    let maximum = match &status.response {
-        meshmsg_protocol::Response::Status(status) => status.max_attachment_bytes,
-        _ => unreachable!("checked response family"),
-    };
-    let digest_path = path.clone();
-    let source_digest =
-        tokio::task::spawn_blocking(move || attachment::share_source_digest(&digest_path, maximum))
-            .await
-            .context("attachment digest task failed")??;
     let frame = send_request_checked(
         dir,
         &Request::Share {
             operation_id: operation_id.clone(),
-            source_digest: source_digest.parse()?,
             path,
         },
     )
     .await
     .with_context(|| format!("operation {operation_id}"))?;
-    let meshmsg_protocol::Response::AttachmentShared(shared) = &frame.response else {
-        unreachable!("checked attachment-shared family")
-    };
-    anyhow::ensure!(
-        shared.source_digest.as_str() == source_digest,
-        "daemon returned mismatched share operation metadata"
-    );
     output::response(json, &frame)?;
     Ok(())
 }
@@ -132,27 +93,16 @@ pub(crate) async fn offers_remove(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
-    let provider: Option<meshmsg_protocol::PeerId> = provider.map(str::parse).transpose()?;
     let frame = send_request_checked(
         dir,
         &Request::OffersRemove {
-            operation_id: operation_id.clone(),
-            offer_id: offer_id.clone(),
+            operation_id,
+            offer_id,
             direction,
-            provider: provider.clone(),
+            provider: provider.map(str::parse).transpose()?,
         },
     )
     .await?;
-    let meshmsg_protocol::Response::OfferRemoved(result) = &frame.response else {
-        unreachable!("checked lifecycle family")
-    };
-    anyhow::ensure!(
-        result.offer_id == offer_id
-            && result.direction == direction
-            && result.provider == provider
-            && result.maximum == MAX_PRUNE_TAGS,
-        "lifecycle response does not match its request"
-    );
     output::response(json, &frame)?;
     Ok(())
 }
@@ -166,36 +116,37 @@ pub(crate) async fn offers_prune(
     max_delete: usize,
     json: bool,
 ) -> Result<()> {
-    let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
-    let status = send_request_checked(dir, &Request::Status).await?;
-    let retention = match &status.response {
-        meshmsg_protocol::Response::Status(status) => status.attachment_retention_secs,
-        _ => unreachable!("checked response family"),
-    };
-    let effective_age = older_than_secs.unwrap_or(retention);
     let frame = send_request_checked(
         dir,
         &Request::OffersPrune {
-            operation_id: operation_id.clone(),
-            older_than_secs: effective_age,
+            operation_id: operation_id.unwrap_or_else(OperationId::new_random),
+            older_than_secs,
             direction,
             dry_run,
             max_delete,
         },
     )
     .await?;
-    let meshmsg_protocol::Response::OffersPruned(result) = &frame.response else {
-        unreachable!("checked lifecycle family")
-    };
-    anyhow::ensure!(
-        result.older_than_secs == effective_age
-            && result.direction == direction
-            && result.dry_run == dry_run
-            && result.maximum == max_delete,
-        "lifecycle response does not match its request"
-    );
     output::response(json, &frame)?;
     Ok(())
+}
+
+/// An input that cannot even be framed as an offer token gets the same typed
+/// rejection the daemon returns for any input that is not a signed offer.
+fn invalid_attachment_offer(
+    operation_id: &OperationId,
+    diagnostic: meshmsg_protocol::TextError,
+) -> anyhow::Error {
+    let error = meshmsg_protocol::ProtocolError::new(
+        Some(operation_id.clone()),
+        meshmsg_protocol::ErrorCode::InvalidAttachmentOffer,
+        meshmsg_protocol::Outcome::NotStarted,
+    );
+    anyhow::Error::new(contracts::ContractFailure::new(
+        Some(RequestId::new_random()),
+        error,
+    ))
+    .context(diagnostic)
 }
 
 pub(crate) async fn download(
@@ -206,36 +157,19 @@ pub(crate) async fn download(
     json: bool,
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
-    let requested_output = caller_path(output_path)?;
-    let status = send_request_checked(dir, &Request::Status).await?;
-    let status = match &status.response {
-        meshmsg_protocol::Response::Status(status) => status,
-        _ => unreachable!("checked response family"),
-    };
-    let topic_bytes = status.topic.to_bytes();
-    let expected = download_request_context(
-        &operation_id,
-        offer,
-        &requested_output,
-        TopicId::from_bytes(topic_bytes),
-    )
-    .context("validate submitted attachment offer")?;
+    let output = caller_path(output_path)?;
+    let offer = offer
+        .parse()
+        .map_err(|error| invalid_attachment_offer(&operation_id, error))?;
     let frame = send_request_checked(
         dir,
         &Request::Download {
-            operation_id: operation_id.clone(),
-            offer: offer.to_owned(),
-            output: requested_output.clone(),
-            mode: meshmsg_protocol::DownloadMode::Install,
+            operation_id,
+            offer,
+            output,
         },
     )
     .await?;
-    let meshmsg_protocol::Response::DownloadComplete(result) = &frame.response else {
-        unreachable!("checked download family")
-    };
-    result
-        .validate_for_request(&expected)
-        .map_err(anyhow::Error::msg)?;
     output::response(json, &frame)?;
     Ok(())
 }
@@ -453,6 +387,7 @@ mod tests {
     use super::*;
     use crate::invite::Invite;
     use iroh::SecretKey;
+    use iroh_gossip::proto::TopicId;
 
     #[test]
     fn message_lines_preserve_content_and_strip_only_delimiters() {

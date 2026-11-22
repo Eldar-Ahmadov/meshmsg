@@ -28,22 +28,19 @@ def run_case(command, response, expected_code="command_failed",
 
         def daemon():
             try:
-                needs_status_context = command[0] == "download" or (
-                    command[0] == "offers" and len(command) > 1
-                    and command[1] == "prune")
-                request_count = 2 if needs_status_context else 1
-                for _ in range(request_count):
-                    connection, _ = listener.accept()
-                    with connection:
-                        request = json.loads(connection.makefile("rb").readline())
-                        assert request["protocol_version"] == 4
-                        assert len(request["request_id"]) == 32
-                        assert "command" in request["request"]
-                        reply = dict(response(request) if callable(response) else response)
-                        if reply.pop("_correlate", True):
-                            reply["request_id"] = request["request_id"]
-                        reply.setdefault("protocol_version", 4)
-                        connection.sendall(json.dumps(reply).encode() + b"\n")
+                # Every command, including download and prune, makes exactly
+                # one request: the CLI never probes status first.
+                connection, _ = listener.accept()
+                with connection:
+                    request = json.loads(connection.makefile("rb").readline())
+                    assert request["protocol_version"] == 5
+                    assert len(request["request_id"]) == 32
+                    assert request["request"]["command"] != "status" or command == ["status"]
+                    reply = dict(response(request) if callable(response) else response)
+                    if reply.pop("_correlate", True):
+                        reply["request_id"] = request["request_id"]
+                    reply.setdefault("protocol_version", 5)
+                    connection.sendall(json.dumps(reply).encode() + b"\n")
             except BaseException as error:
                 failure.append(error)
 
@@ -62,7 +59,7 @@ def run_case(command, response, expected_code="command_failed",
         lines = child.stdout.splitlines()
         assert len(lines) == 1, (command, child.stdout)
         error = json.loads(lines[0])
-        assert error["protocol_version"] == 4 and error["type"] == "error"
+        assert error["protocol_version"] == 5 and error["type"] == "error"
         assert error["code"] == expected_code
         assert error["outcome"] == expected_outcome
         assert "schema_version" not in error
@@ -83,82 +80,72 @@ run_case(["status"], {"type": "status", "schema_version": 2, "body": "response-b
 run_case(["status"], {"type": "error", "message": "response-body-secret"})
 run_case(["status"], {"type": "status", "request_id": "2" * 32, "_correlate": False})
 
-# Correlated, fully valid completions must echo the exact submitted OS-string
-# representation, not merely a Path-equivalent spelling.
-def download_status():
-    return {
-        "type": "status", "running": True, "peer": "3" * 64, "topic": "4" * 64,
-        "advertises_self": False, "has_invite": True, "bootstrap_peer_count": 1,
-        "self_advertised": False, "neighbors": 1, "endpoint_online": True,
-        "topic_joined": True, "alias": None, "alias_enabled": False,
-        "captured_hostname": None, "custom_alias": None, "advertised_aliases": 0,
-        "operation_cache_capacity": 1024, "operation_cache_ttl_ms": 600000,
-        "operation_cache_persistent": False, "direct_replay_available": True,
-        "direct_replay_error": None, "direct_replay_capacity": 8192,
-        "direct_replay_per_sender_capacity": 512, "direct_replay_queue_capacity": 64,
-        "direct_replay_global_rate_per_second": 128, "direct_replay_global_rate_burst": 256,
-        "direct_replay_sender_rate_per_second": 8, "direct_replay_sender_rate_burst": 16,
-        "max_attachment_bytes": 1024,
-        "attachment_storage": {"tagged_bytes": 0, "tagged_blobs": 0, "tags": 0,
-            "tag_capacity": 8192, "quota_bytes": 1024, "available_bytes": 1024,
-            "min_free_bytes": 0, "pressure": False, "over_quota": False,
-            "below_min_free": False, "sampled_at_ms": 1},
-        "attachment_retention_secs": 0,
-    }
-
-
-def mismatched_download(transform):
+# The CLI trusts its daemon's payload, but a completion must still be the strict
+# current typed shape, belong to the download family, and carry the request's
+# operation ID.
+def download_reply(**changes):
     def response(request):
-        if request["request"]["command"] == "status":
-            return download_status()
-        requested = request["request"]["output"]
-        assert pathlib.Path(requested).is_absolute()
-        different = transform(requested)
-        assert different != requested
-        return {
+        submitted = request["request"]
+        assert submitted["command"] == "download"
+        assert set(submitted) == {"command", "operation_id", "offer", "output"}
+        assert submitted["offer"] == "fake-offer"
+        assert pathlib.Path(submitted["output"]).is_absolute()
+        reply = {
             "type": "download_complete",
-            "operation_id": request["request"]["operation_id"],
+            "operation_id": submitted["operation_id"],
             "offer_id": "2" * 32,
             "kind": "file",
             "name": "safe.txt",
             "size": 0,
             "from": "3" * 64,
-            "output": different,
-            "installed": True,
-            "pinned": True,
+            "output": submitted["output"],
             "destination_synced": True,
             "cleanup_complete": True,
             "warnings": [],
         }
+        reply.update(changes)
+        return reply
     return response
 
 
-def dot_component(path):
-    parent, name = path.rsplit("/", 1)
-    return parent + "/./" + name
-
-
-def parent_component(path):
-    parent, name = path.rsplit("/", 1)
-    return parent + "/unused/../" + name
-
-
-for transform in [
-    lambda path: path + ".different",
-    lambda path: "/" + path,
-    dot_component,
-    parent_component,
-    lambda path: path + "/",
+for changes in [
+    {"operation_id": "f" * 32},
+    # Fields removed in protocol v5 are unknown and fail closed.
+    {"installed": True, "pinned": True},
+    {"mode": "install"},
+    {"token_digest": "4" * 64},
+    {"output": "relative.bin"},
 ]:
     run_case(
-        ["download", "fake-offer", "--output", "requested.bin"],
-        mismatched_download(transform),
+        ["download", "--operation-id", "a" * 32, "fake-offer", "--output", "requested.bin"],
+        download_reply(**changes),
     )
+
+run_case(
+    ["download", "--operation-id", "a" * 32, "fake-offer", "--output", "requested.bin"],
+    {"type": "stopping"},
+)
+
+# A prune without an explicit age submits a null age for the daemon to resolve.
+def default_age_prune(request):
+    submitted = request["request"]
+    assert submitted["command"] == "offers_prune"
+    assert submitted["older_than_secs"] is None
+    return {
+        "type": "error", "code": "attachment_storage_busy",
+        "operation_id": submitted["operation_id"], "outcome": "not_started",
+    }
+
+
+run_case(
+    ["offers", "prune", "--operation-id", "9" * 32, "--dry-run"],
+    default_age_prune,
+    expected_code="attachment_storage_busy",
+    expected_fields={"operation_id": "9" * 32},
+)
 
 def lifecycle_error(code, outcome, include_offer=False, partial=False):
     def response(request):
-        if request["request"]["command"] == "status":
-            return download_status()
         operation_id = request["request"]["operation_id"]
         # Retry guidance and display text are derived for human output, not IPC or JSON.
         assert include_offer in (True, False) and partial in (True, False)
@@ -230,8 +217,8 @@ with tempfile.TemporaryDirectory(prefix="meshmsg-cli-offline-") as temporary:
     )
     assert child.returncode == 1 and child.stderr == ""
     error = json.loads(child.stdout)
-    assert error["protocol_version"] == 4 and len(error["request_id"]) == 32
+    assert error["protocol_version"] == 5 and len(error["request_id"]) == 32
     assert error["code"] == "daemon_offline" and error["outcome"] == "not_started"
     assert "message" not in error and "retryable" not in error
 
-print("PASS: CLI JSON failures are one canonical protocol-v4 stdout frame")
+print("PASS: CLI JSON failures are one canonical protocol-v5 stdout frame")

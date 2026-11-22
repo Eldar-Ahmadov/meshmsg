@@ -47,7 +47,7 @@ stop_node() {
 ipc() {
   python3 - "$ROOT/$1/daemon.sock" "$2" <<'PY'
 import json,socket,sys
-request=json.loads(sys.argv[2]); envelope={'protocol_version':4,'request_id':'9'*32,'request':request}
+request=json.loads(sys.argv[2]); envelope={'protocol_version':5,'request_id':'9'*32,'request':request}
 s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(json.dumps(envelope).encode()+b'\n')
 data=b''
 while not data.endswith(b'\n'):
@@ -106,12 +106,12 @@ python3 - "$ROOT/sender/daemon.sock" "$SEND_ID" <<'PY'
 import json,socket,sys
 s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
 request={'command':'send','operation_id':sys.argv[2],'body':'lost-response-message'}
-s.sendall((json.dumps({'protocol_version':4,'request_id':'8'*32,'request':request})+'\n').encode())
+s.sendall((json.dumps({'protocol_version':5,'request_id':'8'*32,'request':request})+'\n').encode())
 s.close()
 PY
 wait_for 30 "lost-response broadcast" grep -q '"body":"lost-response-message"' "$ROOT/receiver.listen"
 RETRY=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$SEND_ID" lost-response-message)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["protocol_version"] == 4 and v["operation_id"] == sys.argv[1] and v["message_id"] == sys.argv[1]' "$SEND_ID" <<<"$RETRY" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["protocol_version"] == 5 and v["operation_id"] == sys.argv[1] and v["message_id"] == sys.argv[1]' "$SEND_ID" <<<"$RETRY" \
   || fail "broadcast retry did not return its original operation outcome"
 sleep 1
 grep -c '"body":"lost-response-message"' "$ROOT/receiver.listen" | grep -qx 1 \
@@ -131,7 +131,7 @@ import json,sys
 left=json.load(open(sys.argv[1])); right=json.load(open(sys.argv[2]))
 left.pop('request_id'); right.pop('request_id'); assert left == right
 PY
-python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["protocol_version"] == 4 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2] and v["duplicate_accepted"] is False' "$ROOT/private.1" "$PRIVATE_ID" \
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["protocol_version"] == 5 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2] and v["duplicate_accepted"] is False' "$ROOT/private.1" "$PRIVATE_ID" \
   || fail "private operation ID did not reach the wire response"
 wait_for 30 "private delivery" grep -q '"body":"private-idempotent"' "$ROOT/receiver.listen"
 sleep 1
@@ -149,8 +149,8 @@ import json,sys
 left=json.load(open(sys.argv[1])); right=json.load(open(sys.argv[2]))
 left.pop('request_id'); right.pop('request_id'); assert left == right
 PY
-python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["protocol_version"] == 4 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2] and v["offer_id"] == sys.argv[2]' "$ROOT/share.1" "$SHARE_ID" \
-  || fail "share operation ID did not reach offer and wire IDs"
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["protocol_version"] == 5 and v["operation_id"] == sys.argv[2] and v["offer_id"] == sys.argv[2]' "$ROOT/share.1" "$SHARE_ID" \
+  || fail "share operation ID did not become the offer ID"
 python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len([x for x in b if x["offer_id"] == sys.argv[1]]) == 1' "$SHARE_ID" \
   <<<"$("$BIN" --state-dir "$ROOT/sender" --json offers)" || fail "duplicate share created duplicate permanent tags"
 REPLAY=$("$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/source.txt")
@@ -164,11 +164,16 @@ import pathlib,sys
 path = pathlib.Path(sys.argv[1])
 path.write_bytes(b'X' * len(path.read_bytes()))
 PY
-if "$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/source.txt" >"$ROOT/share.changed" 2>"$ROOT/share.changed.err"; then
-  fail "same-size changed attachment reused an operation ID"
-fi
-[[ ! -s "$ROOT/share.changed.err" ]] || fail "JSON conflict wrote to stderr"
-python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["code"] == "operation_id_conflict" and v["outcome"] == "not_started"' "$ROOT/share.changed" || fail "changed attachment conflict was not reported"
+# The share fingerprint binds the submitted path, not file content: a same-ID
+# retry replays the cached result without importing or publishing again.
+CHANGED=$("$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/source.txt")
+python3 - "$ROOT/share.1" "$CHANGED" <<'PY' || fail "same-ID share retry after a source change did not replay the cached result"
+import json,sys
+left=json.load(open(sys.argv[1])); right=json.loads(sys.argv[2])
+left.pop('request_id'); right.pop('request_id'); assert left == right
+PY
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len([x for x in b if x["offer_id"] == sys.argv[1]]) == 1' "$SHARE_ID" \
+  <<<"$("$BIN" --state-dir "$ROOT/sender" --json offers)" || fail "share replay created another permanent tag"
 printf 'idempotent attachment\n' >"$ROOT/source.txt"
 if "$BIN" --state-dir "$ROOT/sender" --json share --operation-id "$SHARE_ID" "$ROOT/./source.txt" >"$ROOT/share.spelling" 2>"$ROOT/share.spelling.err"; then
   fail "equivalent but differently submitted absolute path reused an operation ID"
@@ -195,6 +200,15 @@ SATURATED_ID=55555555555555555555555555555554
 SATURATED=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$SATURATED_ID\",\"older_than_secs\":18446744073709551615,\"direction\":\"incoming\",\"dry_run\":true,\"max_delete\":1}")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["older_than_secs"] == 18446744073709551615 and v["cutoff_ms"] == 0' <<<"$SATURATED" \
   || fail "saturating u64 prune cutoff was not preserved"
+# An omitted age resolves to the daemon's configured retention (0 by default)
+# and is fingerprinted as submitted, so an explicit equal age conflicts.
+DEFAULT_AGE_ID=55555555555555555555555555555556
+DEFAULT_AGE=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$DEFAULT_AGE_ID\",\"direction\":\"incoming\",\"dry_run\":true,\"max_delete\":1}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["older_than_secs"] == 0 and isinstance(v["cutoff_ms"], int) and v["cutoff_ms"] > 0' <<<"$DEFAULT_AGE" \
+  || fail "daemon did not resolve the default prune age"
+EXPLICIT_AGE=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"$DEFAULT_AGE_ID\",\"older_than_secs\":0,\"direction\":\"incoming\",\"dry_run\":true,\"max_delete\":1}")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict" and v["operation_id"] == sys.argv[1]' "$DEFAULT_AGE_ID" <<<"$EXPLICIT_AGE" \
+  || fail "explicit prune age reused the operation ID of an omitted age"
 for BAD_CUTOFF in 0 18446744073709551615; do
   REJECTED=$(ipc sender "{\"command\":\"offers_prune\",\"operation_id\":\"55555555555555555555555555555552\",\"older_than_secs\":0,\"cutoff_ms\":$BAD_CUTOFF,\"direction\":\"outgoing\",\"dry_run\":true,\"max_delete\":1}")
   python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "invalid_request"' <<<"$REJECTED" \
@@ -202,7 +216,7 @@ for BAD_CUTOFF in 0 18446744073709551615; do
 done
 
 # Put a transparent Unix-socket proxy in front of the daemon. It forwards the
-# real CLI's status context lookup and prune request, waits for the daemon's terminal
+# real CLI's prune request, waits for the daemon's terminal
 # prune result, then discards that response. The identical CLI retry must replay.
 PRUNE_ID=55555555555555555555555555555555
 SOCKET="$ROOT/sender/daemon.sock"
@@ -241,7 +255,7 @@ PRUNE_RETRY=$("$BIN" --state-dir "$ROOT/sender" --json offers prune --operation-
 python3 - "$ROOT/prune.discarded" "$PRUNE_RETRY" "$PRUNE_ID" <<'PY' || fail "identical CLI prune retry did not replay its authoritative original result"
 import json,sys
 original=json.load(open(sys.argv[1])); replay=json.loads(sys.argv[2])
-assert original["protocol_version"] == 4
+assert original["protocol_version"] == 5
 assert original["type"] == "offers_pruned"
 assert original["operation_id"] == sys.argv[3] and original["selected_tags"] == original["removed_tags"] == 1
 assert isinstance(original["cutoff_ms"], int)
@@ -275,7 +289,7 @@ python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operat
 DOWNLOAD_OFFER=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["offer"])' "$THIRD")
 DOWNLOAD_ID=77777777777777777777777777777777
 DOWNLOAD_OUT="$ROOT/downloaded.txt"
-DOWNLOAD_FIRST=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3],"mode":"install"}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$DOWNLOAD_OUT")")
+DOWNLOAD_FIRST=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3]}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$DOWNLOAD_OUT")")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["operation_id"] == sys.argv[1]' "$DOWNLOAD_ID" <<<"$DOWNLOAD_FIRST" \
   || fail "initial lost-response download did not complete"
 [[ -f "$DOWNLOAD_OUT" ]] || fail "lost-response download did not install output"
@@ -287,9 +301,9 @@ if [[ $DOWNLOAD_STATUS != 0 ]]; then
   DEBUG_ERROR=$($BIN --state-dir "$ROOT/sender" download --operation-id "$DOWNLOAD_ID" --output "$DOWNLOAD_OUT" "$DOWNLOAD_OFFER" 2>&1 || true)
   fail "download retry failed: $DEBUG_ERROR $DOWNLOAD_RETRY"
 fi
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["protocol_version"] == 4 and v["operation_id"] == sys.argv[1] and v["output"] == sys.argv[2]' "$DOWNLOAD_ID" "$DOWNLOAD_OUT" <<<"$DOWNLOAD_RETRY" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["protocol_version"] == 5 and v["operation_id"] == sys.argv[1] and v["output"] == sys.argv[2]' "$DOWNLOAD_ID" "$DOWNLOAD_OUT" <<<"$DOWNLOAD_RETRY" \
   || fail "download retry did not replay cached completion"
-DOWNLOAD_CONFLICT=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3],"mode":"install"}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$ROOT/changed-output.txt")")
+DOWNLOAD_CONFLICT=$(ipc sender "$(python3 -c 'import json,sys; print(json.dumps({"command":"download","operation_id":sys.argv[1],"offer":sys.argv[2],"output":sys.argv[3]}))' "$DOWNLOAD_ID" "$DOWNLOAD_OFFER" "$ROOT/changed-output.txt")")
 python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["code"] == "operation_id_conflict"' <<<"$DOWNLOAD_CONFLICT" \
   || fail "changed download output did not conflict"
 [[ ! -e "$ROOT/changed-output.txt" ]] || fail "download conflict performed extra export/install work"

@@ -231,7 +231,7 @@ mod tests {
             server::{handle_local_client, LocalClientSession, LocalIpcTimeouts},
             write_request, MAX_IPC_EVENT_SIZE,
         },
-        node::{commands::operation_fingerprint, DaemonCommand, ExecutableRequest},
+        node::{commands::operation_fingerprint, DaemonCommand},
     };
     use iroh::SecretKey;
     use meshmsg_protocol::Request;
@@ -390,11 +390,11 @@ mod tests {
         .unwrap();
         let DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(Request::PrivateSend {
+                Request::PrivateSend {
                     operation_id: command_operation_id,
                     to,
                     body,
-                }),
+                },
             reply,
         } = command_rx.recv().await.unwrap()
         else {

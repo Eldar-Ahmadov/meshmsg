@@ -10,15 +10,9 @@ use iroh::{PublicKey, SecretKey};
 use iroh_blobs::{ticket::BlobTicket, BlobFormat};
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use std::time::Duration;
 
 pub(crate) const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";
 pub(crate) const ATTACHMENT_OFFER_VERSION: u8 = 1;
-#[cfg(test)]
-const ENVELOPE_FUTURE_SKEW: Duration = Duration::from_secs(60);
-#[cfg(test)]
-pub(crate) const ENVELOPE_ACCEPTANCE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AttachmentWire {
@@ -29,7 +23,6 @@ pub(crate) struct AttachmentWire {
 pub(crate) struct EncodedOffer {
     pub(crate) encoded: Bytes,
     pub(crate) from: PublicKey,
-    pub(crate) message_id: [u8; 16],
     pub(crate) timestamp_ms: u64,
     pub(crate) offer: AttachmentOffer,
 }
@@ -158,7 +151,6 @@ pub(crate) fn encode_signed_offer(
     Ok(EncodedOffer {
         encoded,
         from: secret.public(),
-        message_id,
         timestamp_ms,
         offer,
     })
@@ -166,16 +158,12 @@ pub(crate) fn encode_signed_offer(
 
 pub(crate) fn offer_event(
     from: PublicKey,
-    message_id: [u8; 16],
     timestamp_ms: u64,
     encoded: &[u8],
     offer: AttachmentOffer,
 ) -> meshmsg_protocol::Event {
     meshmsg_protocol::Event::AttachmentOffer(meshmsg_protocol::AttachmentOffer {
         from: from.to_string().parse().expect("public key is canonical"),
-        message_id: id_string(&message_id)
-            .parse()
-            .expect("message ID is canonical"),
         timestamp_ms,
         offer_id: offer.offer_id.parse().expect("validated offer ID"),
         kind: match offer.kind {
@@ -186,72 +174,9 @@ pub(crate) fn offer_event(
         },
         name: meshmsg_protocol::AttachmentName::new(offer.name).expect("validated attachment name"),
         size: offer.size,
-        ticket: meshmsg_protocol::AttachmentToken::new(offer.ticket)
-            .expect("validated attachment ticket"),
         offer: meshmsg_protocol::AttachmentToken::new(BASE64URL_NOPAD.encode(encoded))
             .expect("bounded signed attachment offer"),
     })
-}
-
-#[cfg(test)]
-pub(crate) fn validate_attachment_event(
-    expected_topic: Option<TopicId>,
-    live_now_ms: Option<u64>,
-    from: &str,
-    message_id: &str,
-    timestamp_ms: u64,
-    offer: &AttachmentOffer,
-    token: &str,
-) -> Result<()> {
-    anyhow::ensure!(
-        message_id.parse::<meshmsg_protocol::MessageId>().is_ok(),
-        "invalid attachment message ID"
-    );
-    anyhow::ensure!(
-        offer.offer_id == message_id,
-        "attachment event IDs do not match"
-    );
-    let encoded = BASE64URL_NOPAD
-        .decode(token.as_bytes())
-        .context("decode signed attachment event")?;
-    let envelope = Envelope::decode_signed(&encoded)?;
-    if let Some(expected_topic) = expected_topic {
-        anyhow::ensure!(
-            envelope.topic == expected_topic,
-            "attachment event belongs to another topic"
-        );
-    }
-    if let Some(now_ms) = live_now_ms {
-        let oldest = now_ms.saturating_sub(ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64);
-        let newest = now_ms.saturating_add(ENVELOPE_FUTURE_SKEW.as_millis() as u64);
-        anyhow::ensure!(
-            (oldest..=newest).contains(&envelope.timestamp_ms),
-            "attachment event timestamp is outside the live acceptance window"
-        );
-    }
-    let signed_offer = validate_offer_binding(
-        envelope.from,
-        envelope.message_id,
-        envelope.timestamp_ms,
-        &envelope.body,
-    )?;
-    anyhow::ensure!(
-        envelope.from.to_string() == from,
-        "attachment event provider does not match"
-    );
-    anyhow::ensure!(
-        id_string(&envelope.message_id) == message_id,
-        "attachment event message ID does not match"
-    );
-    anyhow::ensure!(
-        envelope.timestamp_ms == timestamp_ms && timestamp_ms != 0,
-        "attachment event timestamp does not match"
-    );
-    anyhow::ensure!(
-        &signed_offer == offer,
-        "attachment event metadata does not match its signed offer"
-    );
-    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -296,7 +221,6 @@ pub(crate) fn signed_attachment_fixture(
     let signed = encode_signed_offer(&secret, topic, operation_id, offer, timestamp_ms)?;
     Ok(fixture_event_value(offer_event(
         signed.from,
-        signed.message_id,
         signed.timestamp_ms,
         &signed.encoded,
         signed.offer,
@@ -304,45 +228,10 @@ pub(crate) fn signed_attachment_fixture(
 }
 
 #[cfg(test)]
-pub(crate) fn signed_attachment_event_for_topic_for_test(
-    secret: &SecretKey,
-    topic: TopicId,
-    offer_id: &str,
-    kind: super::AttachmentKind,
-    name: &str,
-    size: u64,
-    timestamp_ms: u64,
-) -> serde_json::Value {
-    let offer = AttachmentOffer {
-        offer_id: offer_id.to_owned(),
-        kind,
-        name: name.to_owned(),
-        size,
-        ticket: BlobTicket::new(
-            iroh::EndpointAddr::new(secret.public()),
-            iroh_blobs::Hash::new(b"test attachment"),
-            BlobFormat::Raw,
-        )
-        .to_string(),
-    };
-    let operation_id = offer_id.parse().unwrap();
-    let signed = encode_signed_offer(secret, topic, &operation_id, offer, timestamp_ms)
-        .expect("test signed attachment envelope");
-    fixture_event_value(offer_event(
-        signed.from,
-        signed.message_id,
-        signed.timestamp_ms,
-        &signed.encoded,
-        signed.offer,
-    ))
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attachment::{runtime::download_request_context, AttachmentKind};
+    use crate::attachment::AttachmentKind;
     use serde_byte_array::ByteArray;
-    use std::path::Path;
 
     fn test_topic() -> TopicId {
         TopicId::from_bytes([7; 32])
@@ -421,54 +310,16 @@ mod tests {
         let (decoded, ticket) = parse_signed_offer_token(&token, test_topic()).unwrap();
         assert_eq!(decoded, offer);
         assert_eq!(ticket.addr().id, secret.public());
-        let operation_id: meshmsg_protocol::OperationId =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
-        let context = download_request_context(
-            &operation_id,
-            &token,
-            Path::new("/tmp/report.txt"),
-            test_topic(),
-        )
-        .unwrap();
-        assert_eq!(context.offer_id.to_string(), offer.offer_id);
-        assert_eq!(context.provider.to_string(), secret.public().to_string());
-        assert_eq!(context.kind, meshmsg_protocol::AttachmentKind::File);
-        assert_eq!(context.name.as_str(), "report.txt");
-        assert_eq!(context.declared_size, Some(6));
-        assert_eq!(
-            context.token_digest,
-            crate::ipc::download_token_digest(&token)
-        );
-        validate_attachment_event(
-            Some(test_topic()),
-            Some(42),
-            &secret.public().to_string(),
-            &decoded.offer_id,
-            42,
-            &decoded,
-            &token,
-        )
-        .unwrap();
-        assert!(validate_attachment_event(
-            Some(TopicId::from_bytes([8; 32])),
-            Some(42),
-            &secret.public().to_string(),
-            &decoded.offer_id,
-            42,
-            &decoded,
-            &token,
-        )
-        .is_err());
-        assert!(validate_attachment_event(
-            Some(test_topic()),
-            Some(42 + ENVELOPE_ACCEPTANCE_WINDOW.as_millis() as u64 + 1),
-            &secret.public().to_string(),
-            &decoded.offer_id,
-            42,
-            &decoded,
-            &token,
-        )
-        .is_err());
+        assert!(parse_signed_offer_token(&token, TopicId::from_bytes([8; 32])).is_err());
+        let offer_frame =
+            serde_json::to_value(offer_event(secret.public(), 42, &encoded, decoded.clone()))
+                .unwrap();
+        assert_eq!(offer_frame["type"], "attachment_offer");
+        assert_eq!(offer_frame["offer"], token);
+        assert_eq!(offer_frame["offer_id"], offer.offer_id);
+        for removed in ["ticket", "message_id"] {
+            assert!(offer_frame.get(removed).is_none(), "{removed}");
+        }
         // Saved signed tokens are portable capabilities: their nonzero signed
         // timestamp remains authenticated but does not expire at download time.
         assert!(parse_signed_offer_token(&token, test_topic()).is_ok());

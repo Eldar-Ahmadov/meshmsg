@@ -1,4 +1,4 @@
-//! Typed local failure envelope for the strict protocol-v4 error boundary.
+//! Typed local failure envelope for the strict protocol-v5 error boundary.
 //!
 //! Failures travel through `anyhow` chains as [`ContractFailure`] values and
 //! become a protocol frame only at the CLI boundary. Diagnostic text is local

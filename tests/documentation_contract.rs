@@ -42,11 +42,11 @@ fn json_examples(document: &str) -> Vec<serde_json::Value> {
 #[test]
 fn json_examples_accept_crlf_fenced_blocks() {
     let document =
-        "before\r\n```json\r\n{\"protocol_version\":4,\"type\":\"stopping\"}\r\n```\r\nafter\r\n";
+        "before\r\n```json\r\n{\"protocol_version\":5,\"type\":\"stopping\"}\r\n```\r\nafter\r\n";
     assert_eq!(
         json_examples(document),
         vec![serde_json::json!({
-            "protocol_version": 4,
+            "protocol_version": 5,
             "type": "stopping"
         })]
     );
@@ -117,7 +117,7 @@ fn authoritative_contract_facts_match_protocol_constants() {
 }
 
 #[test]
-fn authoritative_json_examples_are_v4_and_lifecycle_shapes_are_distinct() {
+fn authoritative_json_examples_are_v5_and_lifecycle_shapes_are_distinct() {
     let document = repository_file("docs/contracts.md");
     let examples = json_examples(&document);
     assert!(

@@ -812,7 +812,6 @@ mod tests {
             )?;
             Ok(offer_event(
                 envelope.from,
-                envelope.message_id,
                 envelope.timestamp_ms,
                 envelope.encoded,
                 offer,
@@ -1656,7 +1655,7 @@ mod tests {
         );
 
         assert_eq!(value["type"], "queued");
-        assert_eq!(value["protocol_version"], 4);
+        assert_eq!(value["protocol_version"], 5);
         assert!(value["request_id"]
             .as_str()
             .unwrap()

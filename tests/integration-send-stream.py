@@ -57,13 +57,13 @@ def daemon(handler=accepted):
                         connection.settimeout(5)
                         with connection.makefile("rb") as source:
                             frame = json.loads(source.readline())
-                        assert frame["protocol_version"] == 4
+                        assert frame["protocol_version"] == 5
                         assert ID.fullmatch(frame["request_id"])
                         assert ID.fullmatch(frame["request"]["operation_id"])
                         requests.append(frame)
                         reply = handler(frame, connection)
                         if reply is not None:
-                            reply = {**reply, "protocol_version": 4,
+                            reply = {**reply, "protocol_version": 5,
                                      "request_id": frame["request_id"]}
                             connection.sendall(json.dumps(reply).encode() + b"\n")
             except BaseException as error:

@@ -51,10 +51,10 @@ INVITE=$("$BIN" --state-dir "$ROOT/provider" --json invite | json_field '"token"
 "$BIN" --state-dir "$ROOT/receiver" join "$INVITE" >/dev/null
 start_node receiver
 
-python3 -c 'import json,sys; v=json.load(sys.stdin); r=v.pop("request_id"); assert len(r) == 32 and v == {"protocol_version":4,"type":"offers","blobs":[],"truncated":False,"item_errors":0}' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); r=v.pop("request_id"); assert len(r) == 32 and v == {"protocol_version":5,"type":"offers","blobs":[],"truncated":False,"item_errors":0}' \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
   || fail "fresh provider had pinned attachment blobs"
-python3 -c 'import json,sys; v=json.load(sys.stdin); r=v.pop("request_id"); assert len(r) == 32 and v == {"protocol_version":4,"type":"offers","blobs":[],"truncated":False,"item_errors":0}' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); r=v.pop("request_id"); assert len(r) == 32 and v == {"protocol_version":5,"type":"offers","blobs":[],"truncated":False,"item_errors":0}' \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "fresh receiver had pinned attachment blobs"
 
@@ -65,35 +65,36 @@ wait_for 10 "receiver listener" grep -Fq '"type":"connected"' "$ROOT/receiver.li
 printf 'attachment integration payload\n' >"$ROOT/source.txt"
 FILE_SHARE=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/provider" --json share source.txt)
 FILE_OFFER=$(json_field '"offer"' <<<"$FILE_SHARE")
-FILE_TICKET=$(json_field '"ticket"' <<<"$FILE_SHARE")
 FILE_ID=$(json_field '"offer_id"' <<<"$FILE_SHARE")
 FILE_TIMESTAMP=$(json_field '"timestamp_ms"' <<<"$FILE_SHARE")
-FILE_MESSAGE_ID=$(json_field '"message_id"' <<<"$FILE_SHARE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "attachment_shared" and v["protocol_version"] == 4 and len(v["operation_id"]) == 32 and v["message_id"] == v["operation_id"] and isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["delivery_acknowledged"] is False' \
-  <<<"$FILE_SHARE" || fail "shared attachment JSON omitted its canonical timestamp or existing fields"
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["name"] == "source.txt" and b["kind"] == "file" and b["status"] == "complete"' "$FILE_ID" \
+PROVIDER_PEER=$(json_field '"from"' <<<"$FILE_SHARE")
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "attachment_shared" and v["protocol_version"] == 5 and len(v["operation_id"]) == 32 and v["offer_id"] == v["operation_id"] and isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["name"] == "source.txt" and v["kind"] == "file" and v["size"] == int(sys.argv[1]) and all(k not in v for k in ("ticket", "message_id", "source_digest", "delivery_acknowledged"))' "$(stat -c %s "$ROOT/source.txt")" \
+  <<<"$FILE_SHARE" || fail "shared attachment JSON omitted its canonical timestamp or retained removed fields"
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["blobs"]) == 1; b=v["blobs"][0]; assert b["direction"] == "outgoing" and b["offer_id"] == sys.argv[1] and b["provider"] is None and b["name"] == "source.txt" and b["kind"] == "file" and b["size"] == int(sys.argv[2]) and len(b["hash"]) == 64 and "format" not in b and "status" not in b' "$FILE_ID" "$(stat -c %s "$ROOT/source.txt")" \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
   || fail "provider offer listing did not include shared file"
 python3 -c 'import json,sys; assert json.load(sys.stdin)["blobs"] == []' \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "received but undownloaded offer was listed as pinned"
 wait_for 30 "file offer" grep -Fq '"type":"attachment_offer"' "$ROOT/receiver.listen.log"
-python3 -c 'import json,sys; events=[json.loads(line) for line in open(sys.argv[1])]; offer=next(v for v in events if v.get("type") == "attachment_offer" and v.get("offer_id") == sys.argv[2]); assert offer["protocol_version"] == 4 and len(offer["request_id"]) == 32 and offer["message_id"] == sys.argv[4] and offer["timestamp_ms"] == int(sys.argv[3]) and offer["name"] == "source.txt" and offer["kind"] == "file"' \
-  "$ROOT/receiver.listen.log" "$FILE_ID" "$FILE_TIMESTAMP" "$FILE_MESSAGE_ID" \
+python3 -c 'import json,sys; events=[json.loads(line) for line in open(sys.argv[1])]; offer=next(v for v in events if v.get("type") == "attachment_offer" and v.get("offer_id") == sys.argv[2]); assert offer["protocol_version"] == 5 and len(offer["request_id"]) == 32 and offer["offer"] == sys.argv[4] and offer["from"] == sys.argv[5] and offer["timestamp_ms"] == int(sys.argv[3]) and offer["name"] == "source.txt" and offer["kind"] == "file" and "ticket" not in offer and "message_id" not in offer' \
+  "$ROOT/receiver.listen.log" "$FILE_ID" "$FILE_TIMESTAMP" "$FILE_OFFER" "$PROVIDER_PEER" \
   || fail "local attachment_shared timestamp/metadata did not match the received offer"
 [[ ! -e "$ROOT/receiver/source.txt" ]] || fail "receiver automatically exported an offered file"
 
-RAW_DOWNLOAD=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket.txt)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["installed"] is True and v["pinned"] is True and v["destination_synced"] is True and v["cleanup_complete"] is True and v["warnings"] == []' \
-  <<<"$RAW_DOWNLOAD" || fail "successful download omitted commit durability metadata"
-cmp "$ROOT/source.txt" "$ROOT/raw-ticket.txt" || fail "raw-ticket download differs"
-RAW_RETRY=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "$FILE_TICKET" --output raw-ticket-retry.txt)
-python3 -c 'import json,sys; assert json.loads(sys.argv[1])["offer_id"] == json.loads(sys.argv[2])["offer_id"]' \
-  "$RAW_DOWNLOAD" "$RAW_RETRY" || fail "raw-ticket retry changed its deterministic pin identity"
-cmp "$ROOT/source.txt" "$ROOT/raw-ticket-retry.txt" || fail "raw-ticket retry download differs"
+# Only a signed offer is accepted; any other input is rejected before transfer work.
+if (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download "not-a-signed-offer" --output rejected.txt) >"$ROOT/rejected.out" 2>"$ROOT/rejected.err"; then
+  fail "download accepted input that is not a signed offer"
+fi
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["type"] == "error" and v["code"] == "invalid_attachment_offer" and v["outcome"] == "not_started" and len(v["operation_id"]) == 32' "$ROOT/rejected.out" \
+  || fail "unsigned download input lacked the strict invalid-offer error"
+test ! -s "$ROOT/rejected.err" || fail "JSON invalid-offer failure wrote to stderr"
+[[ ! -e "$ROOT/rejected.txt" ]] || fail "invalid offer installed a download"
+
 printf '%s\n' "$FILE_OFFER" >"$ROOT/signed-offer.txt"
-(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download --offer-file signed-offer.txt --output received-from-file.txt) \
-  | grep -q '"type":"download_complete"'
+FILE_DOWNLOAD=$(cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download --offer-file signed-offer.txt --output received-from-file.txt)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "download_complete" and v["offer_id"] == sys.argv[1] and v["from"] == sys.argv[2] and v["name"] == "source.txt" and v["kind"] == "file" and v["size"] == int(sys.argv[3]) and v["destination_synced"] is True and v["cleanup_complete"] is True and v["warnings"] == [] and all(k not in v for k in ("token_digest", "mode", "installed", "pinned"))' "$FILE_ID" "$PROVIDER_PEER" "$(stat -c %s "$ROOT/source.txt")" \
+  <<<"$FILE_DOWNLOAD" || fail "successful download omitted commit durability metadata"
 cmp "$ROOT/source.txt" "$ROOT/received-from-file.txt" || fail "offer-file download differs"
 printf '%s\n' "$FILE_OFFER" \
   | (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" --json download --offer-stdin --output received.txt) \
@@ -103,9 +104,9 @@ if (cd "$ROOT" && "$BIN" --state-dir "$ROOT/receiver" download "$FILE_OFFER" --o
   fail "download overwrote an existing file"
 fi
 grep -q 'download_failed' "$ROOT/clobber.err" || fail "overwrite refusal lacked a stable error code"
-python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {x["name"] for x in b} == {"raw-ticket.blob", "source.txt"} and all(x["direction"] == "incoming" and x["kind"] == "file" and x["status"] == "complete" for x in b)' \
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 1 and b[0]["name"] == "source.txt" and b[0]["direction"] == "incoming" and b[0]["kind"] == "file" and b[0]["offer_id"] == sys.argv[1] and b[0]["provider"] == sys.argv[2]' "$FILE_ID" "$PROVIDER_PEER" \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
-  || fail "receiver listing did not include downloaded blobs"
+  || fail "repeated downloads of one signed offer did not share one inbound pin"
 
 # Download success is acknowledged only after the inbound pins are durable.
 # Restart immediately and verify recovery before performing another transfer.
@@ -122,7 +123,7 @@ start_node receiver
   || fail "startup unsafely removed arbitrary download staging"
 [[ -d "$ROOT/receiver/.meshmsg-part-fedcba9876543210.tar" ]] \
   || fail "startup unsafely removed a non-regular staging lookalike"
-python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and all(x["direction"] == "incoming" and x["status"] == "complete" for x in b)' \
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 1 and b[0]["direction"] == "incoming" and b[0]["offer_id"] == sys.argv[1] and b[0]["size"] == int(sys.argv[2])' "$FILE_ID" "$(stat -c %s "$ROOT/source.txt")" \
   <<<"$("$BIN" --state-dir "$ROOT/receiver" --json offers)" \
   || fail "durable inbound pins did not recover after receiver restart"
 
@@ -132,11 +133,11 @@ printf alpha >"$ROOT/source-dir/a.txt"
 printf beta >"$ROOT/source-dir/nested/b.txt"
 DIR_SHARE=$("$BIN" --state-dir "$ROOT/provider" --json share "$ROOT/source-dir")
 DIR_OFFER=$(json_field '"offer"' <<<"$DIR_SHARE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["kind"] == "directory_tar_v1" and v["message_id"] == v["operation_id"]' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert isinstance(v["timestamp_ms"], int) and v["timestamp_ms"] > 0 and v["kind"] == "directory_tar_v1" and v["offer_id"] == v["operation_id"]' \
   <<<"$DIR_SHARE" || fail "shared directory JSON omitted its canonical timestamp or kind"
 stop_node provider
 start_node provider
-python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {(x["name"], x["kind"]) for x in b} == {("source.txt", "file"), ("source-dir.tar", "directory_tar_v1")} and all(x["direction"] == "outgoing" and x["status"] == "complete" for x in b)' \
+python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; assert len(b) == 2 and {(x["name"], x["kind"]) for x in b} == {("source.txt", "file"), ("source-dir.tar", "directory_tar_v1")} and all(x["direction"] == "outgoing" and x["provider"] is None and x["size"] > 0 for x in b)' \
   <<<"$("$BIN" --state-dir "$ROOT/provider" --json offers)" \
   || fail "provider offer listing did not survive restart"
 "$BIN" --state-dir "$ROOT/receiver" --json download "$DIR_OFFER" --output "$ROOT/received-dir" \
@@ -159,11 +160,15 @@ python3 -c 'import json,sys; assert json.load(sys.stdin)["offer_id"] == sys.argv
 python3 -c 'import json,sys; b=json.load(sys.stdin)["blobs"]; same=[x for x in b if x["name"] == "source.txt"]; assert len(same) == 2 and len({x["hash"] for x in same}) == 1' \
   <<<"$($BIN --state-dir "$ROOT/provider" --json offers)" || fail "deduplicated tags were not independently listed"
 REMOVED=$($BIN --state-dir "$ROOT/provider" --json offers remove "$FILE_ID" --direction outgoing)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["request_id"]) == len(v["operation_id"]) == 32 and v["type"] == "offer_removed" and v["protocol_version"] == 4 and v["offer_id"] == sys.argv[1] and v["direction"] == "outgoing" and v["provider"] is None and v["maximum"] == 512 and v["selected_tags"] == v["removed_tags"] == 1 and v["released_bytes"] == 0 and v["limited"] is False and all(k not in v for k in ("older_than_secs", "dry_run", "cutoff_ms"))' "$FILE_ID" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert len(v["request_id"]) == len(v["operation_id"]) == 32 and v["type"] == "offer_removed" and v["protocol_version"] == 5 and v["offer_id"] == sys.argv[1] and v["direction"] == "outgoing" and v["provider"] is None and v["maximum"] == 512 and v["selected_tags"] == v["removed_tags"] == 1 and v["released_bytes"] == 0 and v["limited"] is False and all(k not in v for k in ("older_than_secs", "dry_run", "cutoff_ms"))' "$FILE_ID" \
   <<<"$REMOVED" || fail "removing one deduplicated reference released shared bytes"
 DRY=$($BIN --state-dir "$ROOT/provider" --json offers prune --older-than-secs 0 --dry-run --max-delete 1)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["protocol_version"] == 4 and v["direction"] is None and v["older_than_secs"] == 0 and v["maximum"] == 1 and v["dry_run"] is True and v["selected_tags"] == 1 and v["removed_tags"] == 0 and v["limited"] is True and isinstance(v["cutoff_ms"], int) and all(k not in v for k in ("offer_id", "provider"))' \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["protocol_version"] == 5 and v["direction"] is None and v["older_than_secs"] == 0 and v["maximum"] == 1 and v["dry_run"] is True and v["selected_tags"] == 1 and v["removed_tags"] == 0 and v["limited"] is True and isinstance(v["cutoff_ms"], int) and all(k not in v for k in ("offer_id", "provider"))' \
   <<<"$DRY" || fail "bounded prune dry-run was not deterministic/non-mutating"
+# Without an explicit age the daemon applies its configured retention (0 here).
+DEFAULT_DRY=$($BIN --state-dir "$ROOT/provider" --json offers prune --dry-run --max-delete 1)
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "offers_pruned" and v["older_than_secs"] == 0 and v["maximum"] == 1 and v["dry_run"] is True and v["selected_tags"] == 1 and v["removed_tags"] == 0 and isinstance(v["cutoff_ms"], int)' \
+  <<<"$DEFAULT_DRY" || fail "prune without an age did not use the daemon retention default"
 
 # A remote transfer remains protected after it has started while the provider
 # removes its durable offer pin. Concurrent local share/download/lifecycle

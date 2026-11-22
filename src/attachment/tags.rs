@@ -191,9 +191,7 @@ pub(super) async fn list_pinned_blobs(
                     }
                 },
                 hash: tag.hash.to_string().parse()?,
-                format: "raw".into(),
-                status: "complete".into(),
-                size: Some(size),
+                size,
             });
         }
     }
@@ -238,6 +236,13 @@ mod tests {
                 name: "results.tar".to_owned(),
                 kind: AttachmentKind::DirectoryTarV1,
             })
+        );
+        // Pins that earlier versions created from raw tickets keep parsing, so
+        // they remain listable and removable.
+        let legacy = inbound_blob_tag(provider, id, AttachmentKind::File, "raw-ticket.blob");
+        assert_eq!(
+            parse_pinned_blob_tag(legacy.as_bytes()).map(|tag| tag.name),
+            Some("raw-ticket.blob".to_owned())
         );
     }
 

@@ -75,12 +75,12 @@ pub struct MessageInput {
         .args(["offer", "offer_file", "offer_stdin"])
 ))]
 pub struct OfferInput {
-    /// Signed offer or blob ticket (visible in shell history and process listings; prefer a file or stdin)
+    /// Signed offer (visible in shell history and process listings; prefer a file or stdin)
     pub offer: Option<String>,
-    /// Read the signed offer or blob ticket from this UTF-8 file
+    /// Read the signed offer from this UTF-8 file
     #[arg(long, value_name = "PATH")]
     pub offer_file: Option<PathBuf>,
-    /// Read the signed offer or blob ticket from stdin through EOF
+    /// Read the signed offer from stdin through EOF
     #[arg(long)]
     pub offer_stdin: bool,
 }

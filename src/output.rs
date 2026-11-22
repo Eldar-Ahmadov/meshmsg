@@ -126,7 +126,7 @@ fn print_offers(value: &meshmsg_protocol::OffersList) {
     } else {
         for blob in &value.blobs {
             println!(
-                "{}  {}  {}  {}  {}  {}  {}  {} bytes  {}",
+                "{}  {}  {}  {}  {}  {} bytes  {}",
                 blob.direction,
                 terminal_safe(blob.name.as_str()),
                 attachment_kind_name(blob.kind),
@@ -136,12 +136,7 @@ fn print_offers(value: &meshmsg_protocol::OffersList) {
                     .map(ToString::to_string)
                     .as_deref()
                     .unwrap_or("-"),
-                terminal_safe(&blob.format),
-                terminal_safe(&blob.status),
-                blob.size
-                    .map(|size| size.to_string())
-                    .as_deref()
-                    .unwrap_or("?"),
+                blob.size,
                 blob.hash
             );
         }

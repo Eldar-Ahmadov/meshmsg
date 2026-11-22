@@ -2086,7 +2086,6 @@ version = "0.1.26"
 dependencies = [
  "anyhow",
  "bao-tree",
- "blake3",
  "bytes",
  "clap",
  "data-encoding",
@@ -2116,13 +2115,8 @@ name = "meshmsg-protocol"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
- "iroh",
- "iroh-blobs",
- "iroh-gossip",
- "postcard",
  "rand",
  "serde",
- "serde-byte-array",
  "serde_json",
  "tokio",
 ]

@@ -7,7 +7,6 @@ mod transfer;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, Metadata, OpenOptions},
@@ -471,99 +470,6 @@ pub fn create_deterministic_tar(
         max_attachment_bytes
     );
     Ok(size)
-}
-
-struct DigestWriter {
-    digest: Sha256,
-    bytes: u64,
-}
-
-impl Write for DigestWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.digest.update(buffer);
-        self.bytes = self
-            .bytes
-            .checked_add(buffer.len() as u64)
-            .ok_or_else(|| io::Error::other("digest size overflow"))?;
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn regular_file_digest(
-    source: &Path,
-    kind_domain: &[u8],
-    max_attachment_bytes: u64,
-) -> Result<String> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("inspect shared path {}", source.display()))?;
-    anyhow::ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "shared path is not a regular file"
-    );
-    anyhow::ensure!(
-        metadata.len() <= max_attachment_bytes,
-        "file exceeds the {}-byte limit",
-        max_attachment_bytes
-    );
-    let mut writer = DigestWriter {
-        digest: Sha256::new(),
-        bytes: 0,
-    };
-    writer.digest.update(b"meshmsg-share-source-v1\0");
-    writer.digest.update(kind_domain);
-    let (mut file, before) = open_regular_file_no_follow(source)?;
-    anyhow::ensure!(before.len() == metadata.len(), "file changed while hashing");
-    io::copy(&mut file, &mut writer)?;
-    anyhow::ensure!(
-        writer.bytes == metadata.len() && file.metadata()?.len() == metadata.len(),
-        "file changed while hashing"
-    );
-    Ok(data_encoding::HEXLOWER.encode(&writer.digest.finalize()))
-}
-
-pub fn staged_share_digest(
-    staged: &Path,
-    directory: bool,
-    max_attachment_bytes: u64,
-) -> Result<String> {
-    regular_file_digest(
-        staged,
-        if directory {
-            b"directory_tar_v1\0"
-        } else {
-            b"file\0"
-        },
-        max_attachment_bytes,
-    )
-}
-
-pub fn share_source_digest(source: &Path, max_attachment_bytes: u64) -> Result<String> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("inspect shared path {}", source.display()))?;
-    if metadata.is_file() && !metadata.file_type().is_symlink() {
-        return regular_file_digest(source, b"file\0", max_attachment_bytes);
-    }
-    let mut writer = DigestWriter {
-        digest: Sha256::new(),
-        bytes: 0,
-    };
-    writer.digest.update(b"meshmsg-share-source-v1\0");
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        writer.digest.update(b"directory_tar_v1\0");
-        writer = write_deterministic_tar(source, writer, max_attachment_bytes)?;
-        anyhow::ensure!(
-            writer.bytes <= max_attachment_bytes,
-            "archive exceeds the {}-byte limit",
-            max_attachment_bytes
-        );
-    } else {
-        anyhow::bail!("shared path is not a regular file or directory");
-    }
-    Ok(data_encoding::HEXLOWER.encode(&writer.digest.finalize()))
 }
 
 fn unique_staging_path(parent: &Path, suffix: &str) -> PathBuf {
@@ -1038,40 +944,6 @@ mod tests {
         assert_eq!(fs::read(out_one).unwrap(), fs::read(out_two).unwrap());
         let _ = fs::remove_dir_all(one);
         let _ = fs::remove_dir_all(two);
-    }
-
-    #[test]
-    fn share_source_digest_is_kind_bound_deterministic_and_content_sensitive() {
-        let root = temp_dir("share-digest");
-        let file = root.join("same.bin");
-        fs::write(&file, b"aaaa").unwrap();
-        let first = share_source_digest(&file, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
-        assert_eq!(first.len(), 64);
-        assert_eq!(
-            first,
-            share_source_digest(&file, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap()
-        );
-        fs::write(&file, b"bbbb").unwrap();
-        let changed = share_source_digest(&file, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
-        assert_ne!(first, changed, "equal-size content change was not detected");
-
-        let directory = root.join("directory");
-        fs::create_dir(&directory).unwrap();
-        fs::write(directory.join("same.bin"), b"bbbb").unwrap();
-        let directory_digest =
-            share_source_digest(&directory, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
-        assert_ne!(
-            changed, directory_digest,
-            "source kind was not digest-bound"
-        );
-        let archive = root.join("directory.tar");
-        create_deterministic_tar(&directory, &archive, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap();
-        assert_eq!(
-            directory_digest,
-            staged_share_digest(&archive, true, DEFAULT_MAX_ATTACHMENT_BYTES).unwrap(),
-            "directory source and staged archive digests diverged"
-        );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

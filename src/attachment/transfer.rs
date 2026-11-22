@@ -7,7 +7,7 @@ use super::{
     },
     AttachmentKind, AttachmentOffer,
 };
-use crate::{attachment, clock::unix_timestamp_ms, ids::id_string};
+use crate::{attachment, clock::unix_timestamp_ms};
 use anyhow::{Context, Result};
 use data_encoding::BASE64URL_NOPAD;
 use futures_util::StreamExt;
@@ -23,7 +23,6 @@ use iroh_blobs::{
 };
 use iroh_gossip::{api::GossipSender, proto::TopicId};
 use std::{
-    io::Read as _,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -32,20 +31,6 @@ use tokio::sync::broadcast;
 const ENDPOINT_ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const DOWNLOAD_PROGRESS_STEP: u64 = 8 * 1024 * 1024;
-
-fn hash_file(path: &Path) -> Result<iroh_blobs::Hash> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(iroh_blobs::Hash::from_bytes(*hasher.finalize().as_bytes()))
-}
 
 pub(crate) struct ShareResources {
     pub(crate) store: Store,
@@ -60,7 +45,6 @@ pub(crate) struct ShareResources {
 pub(super) async fn share_attachment(
     resources: ShareResources,
     operation_id: meshmsg_protocol::OperationId,
-    source_digest: meshmsg_protocol::ContentDigest,
     path: PathBuf,
     max_attachment_bytes: u64,
 ) -> Result<meshmsg_protocol::Response> {
@@ -91,31 +75,18 @@ pub(super) async fn share_attachment(
         &state_dir.join("attachment-stage"),
         if directory { ".tar" } else { ".blob" },
     )?;
-    let source = path.clone();
-    let expected_digest = source_digest.to_string();
-    let staged = tokio::task::spawn_blocking(move || {
+    let (size, staged) = tokio::task::spawn_blocking(move || {
         let staged = attachment::StagedFile::new(staging);
         let size = if directory {
-            attachment::create_deterministic_tar(&source, staged.path(), max_attachment_bytes)?
+            attachment::create_deterministic_tar(&path, staged.path(), max_attachment_bytes)?
         } else {
-            attachment::copy_bounded(&source, staged.path(), max_attachment_bytes)?
+            attachment::copy_bounded(&path, staged.path(), max_attachment_bytes)?
         };
-        let actual_digest =
-            attachment::staged_share_digest(staged.path(), directory, max_attachment_bytes)?;
-        anyhow::ensure!(
-            actual_digest == expected_digest,
-            "shared source digest does not match the staged content"
-        );
         Ok::<_, anyhow::Error>((size, staged))
     })
     .await
     .context("attachment staging task failed")??;
-    let (size, staged) = staged;
     storage.preflight_free_space(size).await?;
-    let staged_path = staged.path().to_owned();
-    let content_hash = tokio::task::spawn_blocking(move || hash_file(&staged_path))
-        .await
-        .context("attachment hash task failed")??;
     let offer_id = operation_id.to_string();
     let kind = if directory {
         AttachmentKind::DirectoryTarV1
@@ -130,8 +101,8 @@ pub(super) async fn share_attachment(
         .context("import attachment with a temporary pin")?;
     drop(staged);
     anyhow::ensure!(
-        imported.format() == BlobFormat::Raw && imported.hash() == content_hash,
-        "imported attachment identity is unsupported or changed"
+        imported.format() == BlobFormat::Raw,
+        "imported attachment blob format is unsupported"
     );
 
     let publish_result = async {
@@ -148,7 +119,6 @@ pub(super) async fn share_attachment(
             protocol::encode_signed_offer(&secret, topic, &operation_id, offer, timestamp_ms)?;
         let timestamp_ms = signed.timestamp_ms;
         let encoded = signed.encoded;
-        let message_id = signed.message_id;
         let offer = signed.offer;
         let tag_name = outbound_blob_tag(&offer.offer_id, offer.kind, &offer.name);
         storage
@@ -181,21 +151,14 @@ pub(super) async fn share_attachment(
                     .to_string()
                     .parse()
                     .expect("public key is canonical"),
-                message_id: id_string(&message_id)
-                    .parse()
-                    .expect("message ID is canonical"),
                 timestamp_ms,
                 offer_id: offer.offer_id.parse().expect("validated offer ID"),
-                source_digest,
                 kind: protocol_attachment_kind(offer.kind),
                 name: meshmsg_protocol::AttachmentName::new(offer.name)
                     .expect("validated attachment name"),
                 size: offer.size,
-                ticket: meshmsg_protocol::AttachmentToken::new(offer.ticket)
-                    .expect("validated attachment ticket"),
                 offer: meshmsg_protocol::AttachmentToken::new(BASE64URL_NOPAD.encode(&encoded))
                     .expect("bounded signed offer"),
-                delivery_acknowledged: false,
             },
         ))
     }
@@ -204,111 +167,11 @@ pub(super) async fn share_attachment(
     publish_result
 }
 
-fn raw_ticket_offer_id(ticket: &BlobTicket) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut digest = Sha256::new();
-    digest.update(b"meshmsg-raw-ticket-pin-v1\0");
-    digest.update(ticket.addr().id.to_string().as_bytes());
-    digest.update(b"\0");
-    digest.update(ticket.hash().to_string().as_bytes());
-    digest.update(b"\0raw");
-    id_string(
-        &digest.finalize()[..16]
-            .try_into()
-            .expect("fixed digest prefix"),
-    )
-}
-
-fn raw_ticket_blob_tag(ticket: &BlobTicket) -> String {
-    inbound_blob_tag(
-        ticket.addr().id,
-        &raw_ticket_offer_id(ticket),
-        AttachmentKind::File,
-        "raw-ticket.blob",
-    )
-}
-
-fn raw_ticket_attachment_name(output: &Path) -> Result<meshmsg_protocol::AttachmentName> {
-    let name = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("attachment");
-    meshmsg_protocol::AttachmentName::new(name.to_owned()).map_err(anyhow::Error::from)
-}
-
-pub(super) fn validate_raw_ticket_request_name(
-    token: &str,
-    output: &Path,
-    topic: TopicId,
-) -> Result<()> {
-    if protocol::parse_signed_offer_token(token, topic).is_ok() {
-        return Ok(());
-    }
-    let ticket: BlobTicket = token.parse()?;
+fn validate_declared_attachment_size(declared_size: u64, actual_size: u64) -> Result<()> {
     anyhow::ensure!(
-        ticket.format() == BlobFormat::Raw,
-        "only raw blob tickets are supported"
+        actual_size == declared_size,
+        "provider size does not match the signed offer"
     );
-    raw_ticket_attachment_name(output)?;
-    Ok(())
-}
-
-pub(crate) fn download_request_context(
-    operation_id: &meshmsg_protocol::OperationId,
-    token: &str,
-    output: &Path,
-    topic: TopicId,
-) -> Result<meshmsg_protocol::DownloadRequestContext> {
-    let (offer_id, provider, kind, name, declared_size) =
-        match protocol::parse_signed_offer_token(token, topic) {
-            Ok((offer, ticket)) => (
-                offer.offer_id,
-                ticket.addr().id.to_string(),
-                match offer.kind {
-                    AttachmentKind::File => "file".to_owned(),
-                    AttachmentKind::DirectoryTarV1 => "directory_tar_v1".to_owned(),
-                },
-                offer.name,
-                Some(offer.size),
-            ),
-            Err(signed_error) => {
-                let ticket: BlobTicket = token.parse().map_err(|_| signed_error)?;
-                anyhow::ensure!(
-                    ticket.format() == BlobFormat::Raw,
-                    "only raw blob tickets are supported"
-                );
-                (
-                    raw_ticket_offer_id(&ticket),
-                    ticket.addr().id.to_string(),
-                    "file".to_owned(),
-                    raw_ticket_attachment_name(output)?.into_string(),
-                    None,
-                )
-            }
-        };
-    Ok(meshmsg_protocol::DownloadRequestContext {
-        operation_id: operation_id.clone(),
-        token_digest: crate::ipc::download_token_digest(token),
-        offer_id: offer_id.parse()?,
-        provider: provider.parse()?,
-        kind: kind
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid attachment kind"))?,
-        name: meshmsg_protocol::AttachmentName::new(name)?,
-        declared_size,
-        output: output.to_path_buf(),
-        mode: meshmsg_protocol::DownloadMode::Install,
-    })
-}
-
-fn validate_declared_attachment_size(declared_size: Option<u64>, actual_size: u64) -> Result<()> {
-    if let Some(declared_size) = declared_size {
-        anyhow::ensure!(
-            actual_size == declared_size,
-            "provider size does not match the signed offer"
-        );
-    }
     Ok(())
 }
 
@@ -542,46 +405,20 @@ pub(super) async fn download_attachment(
     resources: DownloadResources,
     events: broadcast::Sender<meshmsg_protocol::Event>,
     operation_id: &meshmsg_protocol::OperationId,
-    offer_token: String,
+    offer: AttachmentOffer,
+    ticket: BlobTicket,
     output: PathBuf,
     max_attachment_bytes: u64,
 ) -> Result<meshmsg_protocol::Response> {
     let DownloadResources {
         store,
         storage,
-        topic,
         downloader,
         endpoint,
         lookup,
+        ..
     } = resources;
-    let token_digest = crate::ipc::download_token_digest(&offer_token);
-    let parsed_signed = protocol::parse_signed_offer_token(&offer_token, topic);
-    let (offer, ticket, declared_size, raw_ticket) = match parsed_signed {
-        Ok((offer, ticket)) => {
-            let declared_size = Some(offer.size);
-            (offer, ticket, declared_size, false)
-        }
-        Err(signed_error) => {
-            let ticket: BlobTicket = offer_token.parse().map_err(|_| signed_error)?;
-            anyhow::ensure!(
-                ticket.format() == BlobFormat::Raw,
-                "only raw blob tickets are supported"
-            );
-            let name = raw_ticket_attachment_name(&output)?.into_string();
-            (
-                AttachmentOffer {
-                    offer_id: raw_ticket_offer_id(&ticket),
-                    kind: AttachmentKind::File,
-                    name,
-                    size: 0,
-                    ticket: ticket.to_string(),
-                },
-                ticket,
-                None,
-                true,
-            )
-        }
-    };
+    let declared_size = offer.size;
     // All names transitively derived from IPC input are validated before any
     // filesystem, blob-store, or network work starts.
     let response_name = meshmsg_protocol::AttachmentName::new(offer.name.clone())?;
@@ -597,12 +434,10 @@ pub(super) async fn download_attachment(
         ticket.format() == BlobFormat::Raw,
         "only raw attachment blob formats are supported by lifecycle storage"
     );
-    if let Some(declared_size) = declared_size {
-        anyhow::ensure!(
-            declared_size <= max_attachment_bytes,
-            "attachment exceeds the configured size limit of {max_attachment_bytes} bytes"
-        );
-    }
+    anyhow::ensure!(
+        declared_size <= max_attachment_bytes,
+        "attachment exceeds the configured size limit of {max_attachment_bytes} bytes"
+    );
     lookup.add_endpoint_info(ticket.addr().clone());
     // Protect complete or partial content from periodic GC until installation
     // and creation of the durable inbound pin have both completed.
@@ -710,11 +545,7 @@ pub(super) async fn download_attachment(
     })
     .await
     .context("attachment export task failed")??;
-    let tag_name = if raw_ticket {
-        raw_ticket_blob_tag(&ticket)
-    } else {
-        inbound_blob_tag(ticket.addr().id, &offer.offer_id, offer.kind, &offer.name)
-    };
+    let tag_name = inbound_blob_tag(ticket.addr().id, &offer.offer_id, offer.kind, &offer.name);
     let parsed_tag = parse_pinned_blob_tag(tag_name.as_bytes())
         .context("generated attachment tag is invalid")?;
     let newly_created = storage
@@ -754,7 +585,6 @@ pub(super) async fn download_attachment(
     Ok(meshmsg_protocol::Response::DownloadComplete(
         meshmsg_protocol::DownloadResult {
             operation_id: operation_id.clone(),
-            token_digest,
             offer_id: offer.offer_id.parse().expect("validated offer ID"),
             kind: protocol_attachment_kind(offer.kind),
             name: response_name,
@@ -766,9 +596,6 @@ pub(super) async fn download_attachment(
                 .parse()
                 .expect("public key is canonical"),
             output,
-            mode: meshmsg_protocol::DownloadMode::Install,
-            installed: true,
-            pinned: true,
             destination_synced: commit.destination_synced,
             cleanup_complete: commit.cleanup_complete,
             warnings: commit.warnings,
@@ -792,10 +619,21 @@ mod tests {
     }
 
     #[test]
-    fn signed_zero_size_is_validated_but_raw_ticket_size_is_unspecified() {
-        validate_declared_attachment_size(Some(0), 0).unwrap();
-        assert!(validate_declared_attachment_size(Some(0), 1).is_err());
-        validate_declared_attachment_size(None, 1).unwrap();
+    fn signed_declared_size_must_match_including_zero() {
+        validate_declared_attachment_size(0, 0).unwrap();
+        assert!(validate_declared_attachment_size(0, 1).is_err());
+        assert!(validate_declared_attachment_size(1, 0).is_err());
+    }
+
+    const CRASH_OFFER_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn crash_recovery_tag(ticket: &BlobTicket) -> String {
+        inbound_blob_tag(
+            ticket.addr().id,
+            CRASH_OFFER_ID,
+            AttachmentKind::File,
+            "crash.bin",
+        )
     }
 
     #[tokio::test]
@@ -817,7 +655,7 @@ mod tests {
             iroh_blobs::Hash::new(b"crash payload"),
             BlobFormat::Raw,
         );
-        let tag = raw_ticket_blob_tag(&ticket);
+        let tag = crash_recovery_tag(&ticket);
         let staging = root.join(".meshmsg-part-1111111111111111.download");
         std::fs::write(&staging, b"crash payload").unwrap();
         let output = root.join("output");
@@ -844,8 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_exit_recovery_reopens_raw_pin_retries_without_duplicates_and_tracks_leftovers()
-    {
+    async fn process_exit_recovery_reopens_pin_retries_without_duplicates_and_tracks_leftovers() {
         for phase in ["after_blob_tag_sync", "after_destination_install"] {
             let root = std::env::temp_dir().join(format!(
                 "meshmsg-commit-process-exit-{phase}-{}",
@@ -867,10 +704,7 @@ mod tests {
                 iroh_blobs::Hash::new(b"crash payload"),
                 BlobFormat::Raw,
             );
-            let offer_id = raw_ticket_offer_id(&ticket);
-            assert!(offer_id.parse::<meshmsg_protocol::OfferId>().is_ok());
-            assert_eq!(offer_id, raw_ticket_offer_id(&ticket));
-            let tag = raw_ticket_blob_tag(&ticket);
+            let tag = crash_recovery_tag(&ticket);
             let options = FsStoreOptions::new(&root.join("store"));
             let store: Store = FsStore::load_with_opts(root.join("blobs.db"), options)
                 .await
@@ -927,7 +761,7 @@ mod tests {
                         .unwrap()
                         .hash_and_format(),
                     ticket.hash_and_format(),
-                    "raw retry changed the permanent pin"
+                    "retry changed the permanent pin"
                 );
                 assert_eq!(std::fs::read(&output).unwrap(), b"crash payload");
                 assert!(!staging.exists());

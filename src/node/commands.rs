@@ -29,41 +29,10 @@ use tokio::sync::{broadcast, oneshot, Semaphore};
 
 pub(crate) enum DaemonCommand {
     Execute {
-        request: ExecutableRequest,
+        request: Request,
         reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Stop,
-}
-
-pub(crate) enum ExecutableRequest {
-    Protocol(Request),
-    Download {
-        operation_id: meshmsg_protocol::OperationId,
-        offer: meshmsg_protocol::AttachmentToken,
-        output: std::path::PathBuf,
-        mode: meshmsg_protocol::DownloadMode,
-    },
-}
-
-impl TryFrom<Request> for ExecutableRequest {
-    type Error = meshmsg_protocol::TextError;
-
-    fn try_from(request: Request) -> Result<Self, Self::Error> {
-        match request {
-            Request::Download {
-                operation_id,
-                offer,
-                output,
-                mode,
-            } => Ok(Self::Download {
-                operation_id,
-                offer: meshmsg_protocol::AttachmentToken::new(offer)?,
-                output,
-                mode,
-            }),
-            request => Ok(Self::Protocol(request)),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,20 +87,6 @@ impl CommandPolicy {
             timeout_code,
             unavailable_code,
         })
-    }
-}
-
-pub(crate) fn request_operation_id(request: &Request) -> Option<meshmsg_protocol::OperationId> {
-    match request {
-        Request::Send { operation_id, .. }
-        | Request::PrivateSend { operation_id, .. }
-        | Request::OffersRemove { operation_id, .. }
-        | Request::OffersPrune { operation_id, .. }
-        | Request::Share { operation_id, .. }
-        | Request::Download { operation_id, .. } => Some(operation_id.clone()),
-        Request::Subscribe | Request::Status | Request::Peers | Request::Offers | Request::Stop => {
-            None
-        }
     }
 }
 
@@ -218,7 +173,7 @@ pub(super) async fn execute(
     } = context;
     match command {
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(Request::Send { operation_id, body }),
+            request: Request::Send { operation_id, body },
             reply,
         }) => {
             let fingerprint = operation_fingerprint("send", &[body.as_bytes()]);
@@ -278,11 +233,11 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(Request::PrivateSend {
+                Request::PrivateSend {
                     operation_id,
                     to,
                     body,
-                }),
+                },
             reply,
         }) => {
             let fingerprint =
@@ -359,7 +314,7 @@ pub(super) async fn execute(
             );
         }
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(Request::Status),
+            request: Request::Status,
             reply,
         }) => {
             let connectivity = presence::local_connectivity(&node.endpoint, &node.receiver);
@@ -401,7 +356,7 @@ pub(super) async fn execute(
             let _ = reply.send(meshmsg_protocol::Response::Status(status));
         }
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(Request::Peers),
+            request: Request::Peers,
             reply,
         }) => {
             presence::emit_transitions(
@@ -424,7 +379,7 @@ pub(super) async fn execute(
             ));
         }
         Some(DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(Request::Offers),
+            request: Request::Offers,
             reply,
         }) => {
             let permit = match try_admit_offer_listing(offer_list_limit) {
@@ -454,12 +409,12 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(Request::OffersRemove {
+                Request::OffersRemove {
                     operation_id,
                     offer_id,
                     direction,
                     provider,
-                }),
+                },
             reply,
         }) => {
             let direction_fingerprint =
@@ -513,16 +468,21 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Protocol(Request::OffersPrune {
+                Request::OffersPrune {
                     operation_id,
                     older_than_secs,
                     direction,
                     dry_run,
                     max_delete,
-                }),
+                },
             reply,
         }) => {
-            let age_fingerprint = older_than_secs.to_le_bytes();
+            // The fingerprint binds the age as submitted, so an omitted age and
+            // an explicit one never share an operation ID.
+            let age_fingerprint = match older_than_secs {
+                Some(age) => [b"some\0".as_slice(), &age.to_le_bytes()].concat(),
+                None => b"none".to_vec(),
+            };
             let direction_fingerprint =
                 optional_text_fingerprint(direction.map(|value| value.to_string()).as_deref());
             let dry_run_fingerprint = [u8::from(dry_run)];
@@ -544,11 +504,12 @@ pub(super) async fn execute(
                 return Ok(CommandAction::Continue);
             }
             // Resolved once by the admitted owner. Retries replay the cached
-            // terminal response, so the cutoff is never derived a second time.
-            let age = older_than_secs;
+            // terminal response, so neither the default age nor the cutoff is
+            // derived a second time.
+            let age = older_than_secs.unwrap_or(attachment_retention_secs);
             let cutoff = crate::attachment::prune_cutoff_upper_bound(
                 unix_timestamp_ms_saturating(SystemTime::now()),
-                older_than_secs,
+                age,
             );
             let storage = attachment_storage.clone();
             let task_operation_id = operation_id.clone();
@@ -583,21 +544,11 @@ pub(super) async fn execute(
             );
         }
         Some(DaemonCommand::Execute {
-            request:
-                ExecutableRequest::Protocol(Request::Share {
-                    operation_id,
-                    source_digest,
-                    path,
-                }),
+            request: Request::Share { operation_id, path },
             reply,
         }) => {
-            let fingerprint = operation_fingerprint(
-                "share",
-                &[
-                    path.as_os_str().as_encoded_bytes(),
-                    source_digest.as_bytes(),
-                ],
-            );
+            let fingerprint =
+                operation_fingerprint("share", &[path.as_os_str().as_encoded_bytes()]);
             if !operation_cache
                 .lock()
                 .expect("operation cache poisoned")
@@ -655,7 +606,6 @@ pub(super) async fn execute(
                             state_dir,
                         },
                         task_operation_id.clone(),
-                        source_digest,
                         path,
                         max_attachment_bytes,
                     )
@@ -670,23 +620,18 @@ pub(super) async fn execute(
         }
         Some(DaemonCommand::Execute {
             request:
-                ExecutableRequest::Download {
+                Request::Download {
                     operation_id,
                     offer,
                     output,
-                    mode,
                 },
             reply,
         }) => {
-            let mode_name = match mode {
-                meshmsg_protocol::DownloadMode::Install => "install",
-            };
             let fingerprint = operation_fingerprint(
                 "download",
                 &[
                     offer.as_str().as_bytes(),
                     output.as_os_str().as_encoded_bytes(),
-                    mode_name.as_bytes(),
                 ],
             );
             if !operation_cache
@@ -760,10 +705,7 @@ pub(super) async fn execute(
             );
         }
         Some(DaemonCommand::Execute {
-            request:
-                ExecutableRequest::Protocol(
-                    Request::Subscribe | Request::Stop | Request::Download { .. },
-                ),
+            request: Request::Subscribe | Request::Stop,
             reply,
         }) => {
             let _ = reply.send(meshmsg_protocol::Response::Error(
@@ -930,30 +872,142 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn download_is_typed_once_when_it_becomes_executable() {
-        let operation_id = meshmsg_protocol::OperationId::new_random();
-        let output = std::env::temp_dir().join("meshmsg-typed-download");
-        let executable = ExecutableRequest::try_from(Request::Download {
-            operation_id: operation_id.clone(),
-            offer: String::from("typed-on-admission"),
-            output: output.clone(),
-            mode: meshmsg_protocol::DownloadMode::Install,
-        })
-        .unwrap();
-        let ExecutableRequest::Download {
-            operation_id: actual_id,
-            offer,
-            output: actual_output,
-            mode,
-        } = executable
-        else {
-            panic!("download did not become a typed executable request")
-        };
-        assert_eq!(actual_id, operation_id);
-        assert_eq!(offer.as_str(), "typed-on-admission");
-        assert_eq!(actual_output, output);
-        assert_eq!(mode, meshmsg_protocol::DownloadMode::Install);
+    #[tokio::test]
+    async fn prune_without_an_age_resolves_the_configured_retention_in_the_daemon() {
+        use crate::node::supervisor::complete_attachment_task;
+
+        let dir = std::env::temp_dir().join(format!(
+            "meshmsg-prune-default-age-test-{}",
+            rand::random::<u64>()
+        ));
+        let initial_state = State::new_topic();
+        let mut initial_alias = AliasConfig::prepare(false).unwrap();
+        initial_state
+            .save_new_with_alias(&dir, false, &mut initial_alias)
+            .unwrap();
+        let (state, secret) = State::load_for_doctor(&dir).unwrap();
+        let alias_config = AliasConfig::load_for_identity(&dir, secret.public()).unwrap();
+        let topic = state.topic_id().unwrap();
+        let mut node = bootstrap::start(&state, secret, &dir).await.unwrap();
+        let blob_root = dir.join("blobs-v1").join(node.secret.public().to_string());
+        let attachment_storage =
+            AttachmentStorage::open(node.blob_store.clone(), blob_root, &dir, 1024, 0, 0)
+                .await
+                .unwrap();
+        let direct_sender =
+            direct::DirectSender::new(node.endpoint.clone(), node.secret.clone(), topic);
+        let mut directory = Directory::new(node.presence_lookup.clone());
+        let (events, _receiver) = broadcast::channel(2);
+        let operation_cache = Arc::new(Mutex::new(OperationCache::new(
+            OPERATION_CACHE_CAPACITY,
+            OPERATION_CACHE_TTL,
+        )));
+        let offer_list_limit = Arc::new(Semaphore::new(1));
+        let transfer_limit = Arc::new(Semaphore::new(2));
+        let mut transfer_tasks = tokio::task::JoinSet::new();
+        let mut offer_list_tasks = tokio::task::JoinSet::new();
+        let mut attachment_task_metadata = HashMap::new();
+        let mut directory_revision = 0;
+        let mut space_refresh_active = false;
+        let peer = node.endpoint.id().to_string();
+
+        let default_age = meshmsg_protocol::OperationId::new_random();
+        let disabled_retention = meshmsg_protocol::OperationId::new_random();
+        // (operation, submitted age, configured retention, expected effective age)
+        let cases = [
+            (&default_age, None, 7, Some(7)),
+            // An explicit age equal to the default is still different input.
+            (&default_age, Some(7), 7, None),
+            // An exact retry replays the original resolution, even if the
+            // configured retention were to differ.
+            (&default_age, None, 9, Some(7)),
+            (&disabled_retention, None, 0, Some(0)),
+        ];
+        let mut first_resolution = None;
+        for (operation_id, older_than_secs, attachment_retention_secs, expected_age) in cases {
+            let (reply, response) = oneshot::channel();
+            let before_ms = unix_timestamp_ms().unwrap();
+            let action = execute(
+                Some(DaemonCommand::Execute {
+                    request: Request::OffersPrune {
+                        operation_id: operation_id.clone(),
+                        older_than_secs,
+                        direction: None,
+                        dry_run: true,
+                        max_delete: 1,
+                    },
+                    reply,
+                }),
+                ExecutionContext {
+                    node: &node,
+                    state: &state,
+                    alias_config: &alias_config,
+                    has_invite: false,
+                    bootstrap_peer_count: 0,
+                    self_advertised: false,
+                    max_attachment_bytes: 1024,
+                    attachment_retention_secs,
+                    attachment_storage: &attachment_storage,
+                    direct_sender: &direct_sender,
+                    operation_cache: &operation_cache,
+                    directory: &mut directory,
+                    event_tx: &events,
+                    directory_epoch: "prune-default-age-test-epoch",
+                    directory_revision: &mut directory_revision,
+                    peer: &peer,
+                    offer_list_limit: &offer_list_limit,
+                    transfer_limit: &transfer_limit,
+                    transfer_tasks: &mut transfer_tasks,
+                    offer_list_tasks: &mut offer_list_tasks,
+                    attachment_task_metadata: &mut attachment_task_metadata,
+                    dir: &dir,
+                    topic,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(action, CommandAction::Continue);
+            if let Some(completed) = offer_list_tasks.join_next_with_id().await {
+                complete_attachment_task(
+                    completed,
+                    &mut attachment_task_metadata,
+                    &operation_cache,
+                    &events,
+                    &mut space_refresh_active,
+                );
+            }
+            match (response.await.unwrap(), expected_age) {
+                (meshmsg_protocol::Response::OffersPruned(pruned), Some(age)) => {
+                    assert_eq!(pruned.operation_id, *operation_id);
+                    assert_eq!(pruned.older_than_secs, age);
+                    assert!(pruned.dry_run);
+                    assert_eq!(pruned.maximum, 1);
+                    if attachment_retention_secs == age {
+                        let newest = unix_timestamp_ms().unwrap() - age * 1000;
+                        assert!(
+                            (before_ms - age * 1000..=newest).contains(&pruned.cutoff_ms),
+                            "cutoff was not derived from the effective age"
+                        );
+                        first_resolution.get_or_insert(pruned);
+                    } else {
+                        assert_eq!(Some(&pruned), first_resolution.as_ref());
+                    }
+                }
+                (meshmsg_protocol::Response::Error(error), None) => {
+                    assert_eq!(error.code, meshmsg_protocol::ErrorCode::OperationIdConflict);
+                    assert_eq!(error.operation_id.as_ref(), Some(operation_id));
+                }
+                (response, _) => panic!("unexpected prune response: {response:?}"),
+            }
+        }
+        // Two admitted operations ran; the exact retry replayed the first.
+        assert_eq!(operation_cache.lock().unwrap().counts(), (0, 2));
+
+        drop(direct_sender);
+        drop(attachment_storage);
+        node.router.shutdown().await.unwrap();
+        node.direct_replay.shutdown().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1019,7 +1073,7 @@ mod tests {
             (
                 Request::OffersPrune {
                     operation_id: operation_id.clone(),
-                    older_than_secs: 7,
+                    older_than_secs: Some(7),
                     direction: Some(OfferDirection::Outgoing),
                     dry_run: true,
                     max_delete: 3,
@@ -1031,7 +1085,6 @@ mod tests {
             (
                 Request::Share {
                     operation_id: operation_id.clone(),
-                    source_digest: meshmsg_protocol::ContentDigest::new_random(),
                     path: std::env::temp_dir().join("meshmsg-policy-share"),
                 },
                 timeouts.transfer,
@@ -1041,9 +1094,8 @@ mod tests {
             (
                 Request::Download {
                     operation_id: operation_id.clone(),
-                    offer: "typed-token".into(),
+                    offer: "typed-token".parse().unwrap(),
                     output: std::env::temp_dir().join("meshmsg-policy-download"),
-                    mode: meshmsg_protocol::DownloadMode::Install,
                 },
                 timeouts.transfer,
                 ErrorCode::AttachmentCommandTimeout,
@@ -1057,7 +1109,7 @@ mod tests {
             assert_eq!(policy.timeout_code, timeout_code);
             assert_eq!(policy.unavailable_code, unavailable_code);
             assert_eq!(
-                request_operation_id(&request).as_ref(),
+                request.operation_id(),
                 matches!(
                     request,
                     Request::Send { .. }

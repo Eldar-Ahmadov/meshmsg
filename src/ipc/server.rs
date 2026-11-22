@@ -2,9 +2,7 @@
 
 use super::SubscriptionStream;
 use crate::{
-    node::{
-        request_operation_id, CommandPolicy, CommandTimeouts, DaemonCommand, ExecutableRequest,
-    },
+    node::{CommandPolicy, CommandTimeouts, DaemonCommand},
     presence::{self, Directory},
 };
 use anyhow::{Context, Result};
@@ -278,9 +276,7 @@ where
         | Request::Download { .. }) => {
             let policy = CommandPolicy::for_request(&request, timeouts.command_timeouts())
                 .expect("executable requests have a command policy");
-            let operation_id = request_operation_id(&request);
-            let request = ExecutableRequest::try_from(request)
-                .expect("validated IPC request has a bounded attachment token");
+            let operation_id = request.operation_id().cloned();
             let (reply, response) = oneshot::channel();
             let value = command_response(
                 send_command(
@@ -529,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_daemon_interoperates_with_v4_and_rejects_other_protocol_versions() {
+    async fn local_daemon_interoperates_with_v5_and_rejects_other_protocol_versions() {
         let exercise = |request: Vec<u8>| async move {
             let (mut client, server) = tokio::io::duplex(4096);
             let (commands, mut command_rx) = mpsc::channel(1);
@@ -568,7 +564,7 @@ mod tests {
             meshmsg_protocol::Response::Stopping {}
         ));
         let mut unsupported_response = response.clone();
-        unsupported_response["protocol_version"] = 2.into();
+        unsupported_response["protocol_version"] = 4.into();
         assert!(
             serde_json::from_value::<meshmsg_protocol::ResponseFrame>(unsupported_response)
                 .is_err()
@@ -598,12 +594,12 @@ mod tests {
             meshmsg_protocol::Event::Connected(_)
         ));
         let mut unsupported_event: serde_json::Value = serde_json::from_slice(&connected).unwrap();
-        unsupported_event["protocol_version"] = 2.into();
+        unsupported_event["protocol_version"] = 4.into();
         assert!(serde_json::from_value::<meshmsg_protocol::EventFrame>(unsupported_event).is_err());
         drop(client);
         subscriber.await.unwrap().unwrap();
 
-        for version in [1, 2] {
+        for version in [1, 2, 4] {
             let request = format!(
                 "{{\"protocol_version\":{version},\"request_id\":\"22222222222222222222222222222222\",\"request\":{{\"command\":\"stop\"}}}}\n"
             )
@@ -680,7 +676,7 @@ mod tests {
         let received: serde_json::Value = serde_json::from_slice(&received).unwrap();
         assert_eq!(received["type"], "peer_discovered");
         assert_eq!(received["peer"]["public_key"], "3".repeat(64));
-        assert_eq!(received["protocol_version"], 4);
+        assert_eq!(received["protocol_version"], 5);
         assert!(received["request_id"]
             .as_str()
             .unwrap()
@@ -1021,7 +1017,6 @@ mod tests {
             },
             Request::Share {
                 operation_id: operation.clone(),
-                source_digest: "3".repeat(64).parse().unwrap(),
                 path: PathBuf::from("x"),
             },
             Request::OffersRemove {
@@ -1032,16 +1027,15 @@ mod tests {
             },
             Request::OffersPrune {
                 operation_id: operation.clone(),
-                older_than_secs: 1,
+                older_than_secs: Some(1),
                 direction: None,
                 dry_run: false,
                 max_delete: 1,
             },
             Request::Download {
                 operation_id: operation,
-                offer: "x".into(),
+                offer: "x".parse().unwrap(),
                 output: PathBuf::from("x"),
-                mode: meshmsg_protocol::DownloadMode::Install,
             },
         ];
         for mutation in mutations {
@@ -1112,7 +1106,7 @@ mod tests {
             .await
             .unwrap();
         let DaemonCommand::Execute {
-            request: ExecutableRequest::Protocol(Request::Status),
+            request: Request::Status,
             reply,
         } = command_rx.recv().await.unwrap()
         else {

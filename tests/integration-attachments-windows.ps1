@@ -118,8 +118,6 @@ try {
     ) | ConvertFrom-Json
 
     if ($download.type -ne "download_complete" -or
-        $download.installed -ne $true -or
-        $download.pinned -ne $true -or
         $download.destination_synced -ne $true -or
         $download.cleanup_complete -ne $true -or
         $download.warnings.Count -ne 0) {

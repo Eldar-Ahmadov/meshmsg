@@ -2,9 +2,8 @@
 pub(crate) mod server;
 mod transport;
 
-use crate::{config::State, contracts::ContractFailure};
+use crate::contracts::ContractFailure;
 use anyhow::{Context, Result};
-use iroh_gossip::proto::TopicId;
 use meshmsg_protocol::{Request, RequestFrame, RequestId};
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -20,22 +19,9 @@ pub(crate) use meshmsg_protocol::framing::MAX_EVENT_FRAME_BYTES as MAX_IPC_EVENT
 #[cfg(test)]
 pub(crate) use meshmsg_protocol::framing::MAX_REQUEST_FRAME_BYTES as MAX_IPC_REQUEST_SIZE;
 
-pub(crate) fn download_token_digest(token: &str) -> meshmsg_protocol::ContentDigest {
-    use sha2::{Digest, Sha256};
-    let mut digest = Sha256::new();
-    digest.update(b"meshmsg-download-token-v1\0");
-    digest.update((token.len() as u64).to_le_bytes());
-    digest.update(token.as_bytes());
-    data_encoding::HEXLOWER
-        .encode(&digest.finalize())
-        .parse()
-        .expect("SHA-256 digest is canonical")
-}
-
 fn decode_event_frame(
     bytes: &[u8],
     expected_request_id: &RequestId,
-    expected_topic: Option<TopicId>,
 ) -> Result<meshmsg_protocol::EventFrame> {
     let frame: meshmsg_protocol::EventFrame =
         serde_json::from_slice(bytes).context("invalid typed event from local daemon")?;
@@ -43,55 +29,7 @@ fn decode_event_frame(
         &frame.request_id == expected_request_id,
         "daemon event request ID does not match the subscription"
     );
-    if let Some(topic) = expected_topic {
-        validate_typed_attachment_event(topic, &frame.event)?;
-    }
     Ok(frame)
-}
-
-fn validate_typed_attachment_event(topic: TopicId, event: &meshmsg_protocol::Event) -> Result<()> {
-    let (from, message_id, timestamp_ms, offer_id, kind, name, size, ticket, token) = match event {
-        meshmsg_protocol::Event::AttachmentOffer(value) => (
-            &value.from,
-            &value.message_id,
-            value.timestamp_ms,
-            &value.offer_id,
-            value.kind,
-            &value.name,
-            value.size,
-            &value.ticket,
-            &value.offer,
-        ),
-        meshmsg_protocol::Event::AttachmentShared(value) => (
-            &value.from,
-            &value.message_id,
-            value.timestamp_ms,
-            &value.offer_id,
-            value.kind,
-            &value.name,
-            value.size,
-            &value.ticket,
-            &value.offer,
-        ),
-        _ => return Ok(()),
-    };
-    let now_ms = crate::clock::unix_timestamp_ms().context("system clock before Unix epoch")?;
-    meshmsg_protocol::validate_attachment_event(
-        meshmsg_protocol::AttachmentEventRef {
-            from,
-            message_id,
-            timestamp_ms,
-            offer_id,
-            kind,
-            name,
-            size,
-            ticket,
-            offer: token,
-        },
-        &topic.to_string().parse()?,
-        now_ms,
-    )
-    .map_err(anyhow::Error::from)
 }
 
 fn decode_response_frame(
@@ -185,19 +123,13 @@ pub(crate) async fn write_request<S: AsyncWrite + Unpin>(
 pub(crate) struct SubscriptionReader<S> {
     reader: meshmsg_protocol::FrameReader<S>,
     request_id: RequestId,
-    expected_topic: Option<TopicId>,
 }
 
 impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
-    pub(crate) fn new_correlated_for_topic(
-        stream: S,
-        request_id: RequestId,
-        expected_topic: Option<TopicId>,
-    ) -> Self {
+    pub(crate) fn new(stream: S, request_id: RequestId) -> Self {
         Self {
             reader: meshmsg_protocol::FrameReader::new(stream),
             request_id,
-            expected_topic,
         }
     }
 
@@ -212,7 +144,7 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
         else {
             return Ok(None);
         };
-        decode_event_frame(&frame, &self.request_id, self.expected_topic)
+        decode_event_frame(&frame, &self.request_id)
             .context("invalid daemon event")
             .map(Some)
     }
@@ -221,15 +153,8 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
 pub(crate) async fn subscribe(dir: &Path) -> Result<SubscriptionReader<LocalClientStream>> {
     let request_id = RequestId::new_random();
     let mut stream = connect_daemon(dir).await?;
-    // Load after connecting so a stopped daemon's atomic state/socket
-    // replacement cannot pair a new subscription with the previous topic.
-    let expected_topic = Some(State::load(dir)?.topic_id()?);
     write_request(&mut stream, &Request::Subscribe, request_id.clone()).await?;
-    Ok(SubscriptionReader::new_correlated_for_topic(
-        stream,
-        request_id,
-        expected_topic,
-    ))
+    Ok(SubscriptionReader::new(stream, request_id))
 }
 
 #[cfg(test)]
@@ -255,9 +180,8 @@ mod tests {
         );
         let request = Request::Download {
             operation_id: meshmsg_protocol::OperationId::new_random(),
-            offer: "x".into(),
+            offer: meshmsg_protocol::AttachmentToken::new("x").unwrap(),
             output,
-            mode: meshmsg_protocol::DownloadMode::Install,
         };
         let mut bytes = Vec::new();
         let error = write_request(&mut bytes, &request, RequestId::new_random())
@@ -290,7 +214,7 @@ mod tests {
     fn response_decoder_rejects_structurally_valid_semantic_forgery() {
         let request_id = "0123456789abcdef0123456789abcdef";
         let malformed = serde_json::json!({
-            "protocol_version": 4,
+            "protocol_version": meshmsg_protocol::PROTOCOL_VERSION,
             "request_id": request_id,
             "type": "queued",
             "operation_id": "11111111111111111111111111111111",
@@ -312,7 +236,7 @@ mod tests {
         let request_id = "0123456789abcdef0123456789abcdef";
         let (mut writer, reader) = tokio::io::duplex(4096);
         let malformed = serde_json::json!({
-            "protocol_version": 4,
+            "protocol_version": meshmsg_protocol::PROTOCOL_VERSION,
             "request_id": request_id,
             "type": "download_progress",
             "operation_id": "11111111111111111111111111111111",
@@ -327,61 +251,8 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let mut subscription =
-            SubscriptionReader::new_correlated_for_topic(reader, request_id.parse().unwrap(), None);
+        let mut subscription = SubscriptionReader::new(reader, request_id.parse().unwrap());
         assert!(subscription.read().await.is_err());
-    }
-
-    async fn rejects_attachment_frame(
-        event_topic: TopicId,
-        expected_topic: TopicId,
-        mutate: impl FnOnce(&mut serde_json::Value),
-    ) {
-        let request_id = "0123456789abcdef0123456789abcdef";
-        let now_ms = crate::clock::unix_timestamp_ms().unwrap();
-        let secret = iroh::SecretKey::generate();
-        let mut event = crate::attachment::protocol::signed_attachment_event_for_topic_for_test(
-            &secret,
-            event_topic,
-            "11111111111111111111111111111111",
-            crate::attachment::AttachmentKind::File,
-            "safe.txt",
-            7,
-            now_ms,
-        );
-        event["protocol_version"] = meshmsg_protocol::PROTOCOL_VERSION.into();
-        event["request_id"] = request_id.into();
-        mutate(&mut event);
-        let (mut writer, reader) = tokio::io::duplex(16 * 1024);
-        tokio::spawn(async move {
-            let mut bytes = serde_json::to_vec(&event).unwrap();
-            bytes.push(b'\n');
-            tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
-                .await
-                .unwrap();
-        });
-        let mut subscription = SubscriptionReader::new_correlated_for_topic(
-            reader,
-            request_id.parse().unwrap(),
-            Some(expected_topic),
-        );
-        assert!(subscription.read().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn default_subscription_rejects_forged_cross_topic_and_malformed_attachment_events() {
-        let topic = TopicId::from_bytes([7; 32]);
-        rejects_attachment_frame(topic, topic, |event| {
-            let offer = event["offer"].as_str().unwrap();
-            let replacement = if offer.ends_with('A') { 'B' } else { 'A' };
-            event["offer"] = format!("{}{replacement}", &offer[..offer.len() - 1]).into();
-        })
-        .await;
-        rejects_attachment_frame(TopicId::from_bytes([8; 32]), topic, |_| {}).await;
-        rejects_attachment_frame(topic, topic, |event| {
-            event["ticket"] = "not-a-ticket".into();
-        })
-        .await;
     }
 
     #[test]

@@ -20,13 +20,11 @@ EVENT_FIELDS = {
         "delivery_acknowledged",
     },
     "attachment_offer": {
-        "from", "message_id", "timestamp_ms", "offer_id", "kind", "name",
-        "size", "ticket", "offer",
+        "from", "timestamp_ms", "offer_id", "kind", "name", "size", "offer",
     },
     "attachment_shared": {
-        "operation_id", "from", "message_id", "timestamp_ms", "offer_id",
-        "source_digest", "kind", "name", "size", "ticket", "offer",
-        "delivery_acknowledged",
+        "operation_id", "from", "timestamp_ms", "offer_id", "kind", "name",
+        "size", "offer",
     },
     "peers_snapshot": {
         "generated_at_ms", "directory_epoch", "directory_revision", "self", "peers",
@@ -37,9 +35,8 @@ EVENT_FIELDS = {
     "download_started": {"operation_id", "output"},
     "download_progress": {"operation_id", "received_bytes", "total_bytes", "output"},
     "download_complete": {
-        "operation_id", "token_digest", "offer_id", "kind", "name", "size", "from",
-        "output", "mode", "installed", "pinned", "destination_synced",
-        "cleanup_complete", "warnings",
+        "operation_id", "offer_id", "kind", "name", "size", "from", "output",
+        "destination_synced", "cleanup_complete", "warnings",
     },
     "lagged": {"source", "dropped", "message"},
 }
@@ -83,8 +80,8 @@ def decode_line(line, number):
         raise AssertionError(f"line {number}: invalid JSON frame: {error}") from error
     if not isinstance(value, dict):
         raise AssertionError(f"line {number}: frame is not an object")
-    if value.get("protocol_version") != 4:
-        raise AssertionError(f"line {number}: frame is not protocol v4")
+    if value.get("protocol_version") != 5:
+        raise AssertionError(f"line {number}: frame is not protocol v5")
     if not canonical_id(value.get("request_id")):
         raise AssertionError(f"line {number}: request_id is not canonical")
     if not isinstance(value.get("type"), str):
@@ -113,7 +110,7 @@ def validate(text):
             raise AssertionError(f"line {number}: event does not have its canonical fields")
 
     if set(error) != ERROR_KEYS:
-        raise AssertionError("terminal error does not have the canonical protocol-v4 fields")
+        raise AssertionError("terminal error does not have the canonical protocol-v5 fields")
     if error["code"] != "invalid_message" or error["outcome"] != "not_started":
         raise AssertionError("terminal error has the wrong code or outcome")
     if not canonical_id(error["operation_id"]):
@@ -124,7 +121,7 @@ def self_test():
     request_id = "1" * 32
     operation_id = "2" * 32
     connected = {
-        "protocol_version": 4,
+        "protocol_version": 5,
         "request_id": request_id,
         "type": "connected",
         "peer": "a" * 64,
@@ -133,7 +130,7 @@ def self_test():
         "alias": None,
     }
     snapshot = {
-        "protocol_version": 4,
+        "protocol_version": 5,
         "request_id": request_id,
         "type": "peers_snapshot",
         "generated_at_ms": 1,
@@ -143,7 +140,7 @@ def self_test():
         "peers": [],
     }
     terminal = {
-        "protocol_version": 4,
+        "protocol_version": 5,
         "request_id": "3" * 32,
         "type": "error",
         "code": "invalid_message",
@@ -159,11 +156,11 @@ def self_test():
         encode([terminal, connected]),
         encode([terminal, terminal]),
         encode([connected]),
-        encode([{**terminal, "protocol_version": 3}]),
+        encode([{**terminal, "protocol_version": 4}]),
         encode([{**terminal, "code": "command_failed"}]),
         encode([{**terminal, "operation_id": "A" * 32}]),
         json.dumps(terminal) + "\n\n" + json.dumps(terminal) + "\n",
-        '{"protocol_version":4,"protocol_version":4}\n',
+        '{"protocol_version":5,"protocol_version":5}\n',
         "not-json\n",
         "",
     ]

@@ -122,21 +122,20 @@ pub enum Request {
     },
     OffersPrune {
         operation_id: OperationId,
-        older_than_secs: u64,
+        /// `None` selects the daemon's configured attachment retention age.
+        older_than_secs: Option<u64>,
         direction: Option<OfferDirection>,
         dry_run: bool,
         max_delete: usize,
     },
     Share {
         operation_id: OperationId,
-        source_digest: ContentDigest,
         path: PathBuf,
     },
     Download {
         operation_id: OperationId,
-        offer: String,
+        offer: AttachmentToken,
         output: PathBuf,
-        mode: DownloadMode,
     },
     Stop,
 }
@@ -150,12 +149,8 @@ impl Request {
                 Err("invalid lifecycle maximum")
             }
             Self::Share { path, .. } if !safe_ipc_path(path) => Err("unsafe share path"),
-            Self::Download { offer, output, .. }
-                if offer.is_empty()
-                    || offer.len() > AttachmentToken::MAX_BYTES
-                    || !safe_ipc_path(output) =>
-            {
-                Err("invalid download request")
+            Self::Download { output, .. } if !safe_ipc_path(output) => {
+                Err("unsafe download output path")
             }
             _ => Ok(()),
         }
@@ -203,7 +198,8 @@ impl Request {
         Ok(())
     }
 
-    fn operation_id(&self) -> Option<&OperationId> {
+    /// The retry-safe mutation identity, absent for non-mutating requests.
+    pub fn operation_id(&self) -> Option<&OperationId> {
         match self {
             Self::Send { operation_id, .. }
             | Self::PrivateSend { operation_id, .. }
@@ -466,12 +462,6 @@ impl<'de> Deserialize<'de> for AttachmentName {
     {
         Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
     }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadMode {
-    Install,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -899,13 +889,11 @@ pub struct PrivateAccepted {
 #[serde(deny_unknown_fields)]
 pub struct AttachmentOffer {
     pub from: PeerId,
-    pub message_id: MessageId,
     pub timestamp_ms: u64,
     pub offer_id: OfferId,
     pub kind: AttachmentKind,
     pub name: AttachmentName,
     pub size: u64,
-    pub ticket: AttachmentToken,
     pub offer: AttachmentToken,
 }
 
@@ -955,9 +943,7 @@ pub struct OfferListItem {
     pub name: AttachmentName,
     pub kind: AttachmentKind,
     pub hash: ContentDigest,
-    pub format: String,
-    pub status: String,
-    pub size: Option<u64>,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -973,16 +959,12 @@ pub struct OffersList {
 pub struct AttachmentShared {
     pub operation_id: OperationId,
     pub from: PeerId,
-    pub message_id: MessageId,
     pub timestamp_ms: u64,
     pub offer_id: OfferId,
-    pub source_digest: ContentDigest,
     pub kind: AttachmentKind,
     pub name: AttachmentName,
     pub size: u64,
-    pub ticket: AttachmentToken,
     pub offer: AttachmentToken,
-    pub delivery_acknowledged: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1016,32 +998,14 @@ pub struct OffersPruned {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct DownloadRequestContext {
-    pub operation_id: OperationId,
-    pub token_digest: ContentDigest,
-    pub offer_id: OfferId,
-    pub provider: PeerId,
-    pub kind: AttachmentKind,
-    pub name: AttachmentName,
-    pub declared_size: Option<u64>,
-    pub output: PathBuf,
-    pub mode: DownloadMode,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct DownloadResult {
     pub operation_id: OperationId,
-    pub token_digest: ContentDigest,
     pub offer_id: OfferId,
     pub kind: AttachmentKind,
     pub name: AttachmentName,
     pub size: u64,
     pub from: PeerId,
     pub output: PathBuf,
-    pub mode: DownloadMode,
-    pub installed: bool,
-    pub pinned: bool,
     pub destination_synced: bool,
     pub cleanup_complete: bool,
     pub warnings: Vec<String>,
@@ -1117,25 +1081,19 @@ fn valid_signed_offer_shape(value: &AttachmentToken) -> bool {
 
 impl AttachmentOffer {
     fn validate(&self) -> Result<(), &'static str> {
-        (self.offer_id.as_str() == self.message_id.as_str()
-            && self.timestamp_ms != 0
-            && !self.ticket.as_str().is_empty()
-            && valid_signed_offer_shape(&self.offer))
-        .then_some(())
-        .ok_or("invalid attachment offer binding")
+        (self.timestamp_ms != 0 && valid_signed_offer_shape(&self.offer))
+            .then_some(())
+            .ok_or("invalid attachment offer")
     }
 }
 
 impl AttachmentShared {
     fn validate(&self) -> Result<(), &'static str> {
-        (self.operation_id.as_str() == self.message_id.as_str()
-            && self.offer_id.as_str() == self.message_id.as_str()
+        (self.operation_id.as_str() == self.offer_id.as_str()
             && self.timestamp_ms != 0
-            && !self.ticket.as_str().is_empty()
-            && valid_signed_offer_shape(&self.offer)
-            && !self.delivery_acknowledged)
-            .then_some(())
-            .ok_or("invalid shared-attachment binding")
+            && valid_signed_offer_shape(&self.offer))
+        .then_some(())
+        .ok_or("invalid shared-attachment binding")
     }
 }
 
@@ -1186,7 +1144,7 @@ impl OfferListItem {
             OfferDirection::Incoming => self.provider.is_some(),
             OfferDirection::Outgoing => self.provider.is_none(),
         };
-        (selector_valid && self.format == "raw" && self.status == "complete" && self.size.is_some())
+        selector_valid
             .then_some(())
             .ok_or("invalid offer list item")
     }
@@ -1253,8 +1211,6 @@ impl OffersPruned {
 impl DownloadResult {
     fn validate(&self) -> Result<(), &'static str> {
         (safe_ipc_path(&self.output)
-            && self.installed
-            && self.pinned
             && (self.destination_synced && self.cleanup_complete || !self.warnings.is_empty())
             && self.warnings.len() <= MAX_WARNINGS
             && self
@@ -1263,24 +1219,6 @@ impl DownloadResult {
                 .all(|warning| valid_public_text(warning, MAX_PUBLIC_TEXT_BYTES)))
         .then_some(())
         .ok_or("invalid download completion")
-    }
-
-    pub fn validate_for_request(
-        &self,
-        expected: &DownloadRequestContext,
-    ) -> Result<(), &'static str> {
-        self.validate()?;
-        (self.operation_id == expected.operation_id
-            && self.token_digest == expected.token_digest
-            && self.offer_id == expected.offer_id
-            && self.from == expected.provider
-            && self.kind == expected.kind
-            && self.name == expected.name
-            && expected.declared_size.is_none_or(|size| self.size == size)
-            && self.output == expected.output
-            && self.mode == expected.mode)
-            .then_some(())
-            .ok_or("download completion does not match request")
     }
 }
 
@@ -1291,7 +1229,7 @@ pub enum EventSource {
     Gossip,
 }
 
-/// Compact protocol-v4 error payload. Correlation and versioning are carried by
+/// Compact protocol-v5 error payload. Correlation and versioning are carried by
 /// the containing [`ResponseFrame`]; the flattened wire frame therefore contains
 /// exactly protocol version, request ID, optional operation ID, typed code, and
 /// typed outcome (plus the `type` discriminator).
@@ -1343,7 +1281,7 @@ impl ProtocolError {
 }
 
 /// Local guidance for handling a terminal error. This is deliberately not a
-/// protocol-v4 field: the wire carries only the typed code and outcome.
+/// protocol-v5 field: the wire carries only the typed code and outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryAdvice {
     /// Reconcile or repeat the exact operation with its existing operation ID.
@@ -1549,40 +1487,79 @@ mod tests {
     #[test]
     fn unknown_versions_and_fields_fail_closed() {
         let id = RequestId::new_random();
-        for version in [1, 2, 3, 255] {
+        for version in [1, 2, 3, 4, 255] {
             let wrong = format!(
                 r#"{{"protocol_version":{version},"request_id":"{id}","request":{{"command":"status"}}}}"#
             );
             assert!(serde_json::from_str::<RequestFrame>(&wrong).is_err());
         }
         let extra = format!(
-            r#"{{"protocol_version":4,"request_id":"{id}","request":{{"command":"status"}},"extra":true}}"#
+            r#"{{"protocol_version":5,"request_id":"{id}","request":{{"command":"status"}},"extra":true}}"#
         );
         assert!(serde_json::from_str::<RequestFrame>(&extra).is_err());
     }
 
     #[test]
-    fn download_request_keeps_its_string_source_api_and_wire_shape() {
-        let offer = String::from("public-string-token");
+    fn download_request_bounds_its_signed_offer_token_at_decode() {
         let request = Request::Download {
             operation_id: OperationId::new_random(),
-            offer: offer.clone(),
-            output: std::env::temp_dir().join("meshmsg-download-source-api"),
-            mode: DownloadMode::Install,
+            offer: AttachmentToken::new("signed-offer-token").unwrap(),
+            output: std::env::temp_dir().join("meshmsg-download-wire"),
         };
-        let Request::Download {
-            offer: source_offer,
-            ..
-        } = &request
-        else {
-            unreachable!()
-        };
-        let _: &String = source_offer;
-        assert_eq!(source_offer, &offer);
         let wire = serde_json::to_value(&request).unwrap();
         assert_eq!(wire["command"], "download");
-        assert_eq!(wire["offer"], offer);
-        assert_eq!(serde_json::from_value::<Request>(wire).unwrap(), request);
+        assert_eq!(wire["offer"], "signed-offer-token");
+        assert_eq!(
+            serde_json::from_value::<Request>(wire.clone()).unwrap(),
+            request
+        );
+        for invalid in [
+            String::new(),
+            "x".repeat(AttachmentToken::MAX_BYTES + 1),
+            "line\nfeed".to_owned(),
+        ] {
+            let mut malformed = wire.clone();
+            malformed["offer"] = invalid.into();
+            assert!(serde_json::from_value::<Request>(malformed).is_err());
+        }
+        let mut removed_mode = wire;
+        removed_mode["mode"] = "install".into();
+        assert!(serde_json::from_value::<Request>(removed_mode).is_err());
+    }
+
+    #[test]
+    fn prune_request_age_is_optional_and_share_request_carries_only_its_path() {
+        let operation_id = OperationId::new_random();
+        let prune = |age: &str| {
+            serde_json::from_str::<Request>(&format!(
+                r#"{{"command":"offers_prune","operation_id":"{operation_id}"{age},"direction":null,"dry_run":true,"max_delete":1}}"#
+            ))
+            .unwrap()
+        };
+        for (age, expected) in [
+            ("", None),
+            (r#","older_than_secs":null"#, None),
+            (r#","older_than_secs":0"#, Some(0)),
+        ] {
+            let Request::OffersPrune {
+                older_than_secs, ..
+            } = prune(age)
+            else {
+                unreachable!()
+            };
+            assert_eq!(older_than_secs, expected);
+        }
+
+        let path = std::env::temp_dir().join("meshmsg-share-wire");
+        let share = serde_json::to_value(Request::Share {
+            operation_id,
+            path: path.clone(),
+        })
+        .unwrap();
+        assert_eq!(share.as_object().unwrap().len(), 3);
+        let mut removed_digest = share;
+        removed_digest["source_digest"] = "a".repeat(64).into();
+        assert!(serde_json::from_value::<Request>(removed_digest).is_err());
     }
 
     #[test]
@@ -1646,26 +1623,22 @@ mod tests {
             MAX_IPC_PATH_BYTES + 1
         );
         let operation_id = OperationId::new_random();
-        let digest: ContentDigest = "a".repeat(64).parse().unwrap();
         assert!(Request::Share {
             operation_id: operation_id.clone(),
-            source_digest: digest.clone(),
             path: exact.clone(),
         }
         .validate()
         .is_ok());
         assert!(Request::Share {
             operation_id: operation_id.clone(),
-            source_digest: digest,
             path: oversized.clone(),
         }
         .validate()
         .is_err());
         assert!(Request::Download {
             operation_id,
-            offer: "x".into(),
+            offer: AttachmentToken::new("x").unwrap(),
             output: oversized.clone(),
-            mode: DownloadMode::Install,
         }
         .validate()
         .is_err());
@@ -1685,16 +1658,12 @@ mod tests {
         .is_err());
         let completion = DownloadResult {
             operation_id: OperationId::new_random(),
-            token_digest: "b".repeat(64).parse().unwrap(),
             offer_id: OfferId::new_random(),
             kind: AttachmentKind::File,
             name: AttachmentName::new("x").unwrap(),
             size: 0,
             from: "1".repeat(64).parse().unwrap(),
             output: oversized,
-            mode: DownloadMode::Install,
-            installed: true,
-            pinned: true,
             destination_synced: true,
             cleanup_complete: true,
             warnings: Vec::new(),
@@ -1807,7 +1776,7 @@ mod tests {
     fn response_and_event_families_reject_schema_versions_and_unknown_fields() {
         let request_id = RequestId::new_random();
         let response =
-            format!(r#"{{"protocol_version":4,"request_id":"{request_id}","type":"stopping"}}"#);
+            format!(r#"{{"protocol_version":5,"request_id":"{request_id}","type":"stopping"}}"#);
         assert!(serde_json::from_str::<ResponseFrame>(&response).is_ok());
         for malformed in [
             response.replace("\"type\":", "\"schema_version\":1,\"type\":"),
@@ -1817,7 +1786,7 @@ mod tests {
         }
 
         let event = format!(
-            r#"{{"protocol_version":4,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
+            r#"{{"protocol_version":5,"request_id":"{request_id}","type":"connected","peer":"{}","endpoint_online":true,"topic_joined":true,"alias":null}}"#,
             "2".repeat(64)
         );
         assert!(serde_json::from_str::<EventFrame>(&event).is_ok());
@@ -1865,7 +1834,7 @@ mod tests {
         let message_id = MessageId::new_random();
         let decode_event = |kind: &str, body: &str, private_fields: &str| {
             serde_json::from_str::<EventFrame>(&format!(
-                r#"{{"protocol_version":4,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
+                r#"{{"protocol_version":5,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
             ))
         };
         assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES), "").is_ok());
@@ -1887,29 +1856,34 @@ mod tests {
         let other = "3".repeat(32);
         let peer = "4".repeat(64);
         let other_peer = "5".repeat(64);
-        let digest = "6".repeat(64);
 
         let invalid_responses = [
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"maximum":1,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"maximum":1,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","direction":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"offers_pruned","operation_id":"{operation}","direction":null,"older_than_secs":1,"maximum":1,"dry_run":true,"selected_tags":0,"removed_tags":0,"released_bytes":1,"limited":false,"cutoff_ms":1}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","token_digest":"{digest}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","mode":"install","installed":true,"pinned":true,"destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"relative","destination_synced":true,"cleanup_complete":true,"warnings":[]}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"download_complete","operation_id":"{operation}","offer_id":"{other}","kind":"file","name":"x","size":1,"from":"{peer}","output":"/tmp/x","destination_synced":false,"cleanup_complete":true,"warnings":[]}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"attachment_shared","operation_id":"{operation}","from":"{peer}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"offer":"eA"}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
             ),
         ];
         for frame in invalid_responses {
@@ -1921,19 +1895,22 @@ mod tests {
 
         let invalid_events = [
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"attachment_offer","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"ticket":"ticket","offer":"eA"}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"attachment_offer","from":"{peer}","timestamp_ms":0,"offer_id":"{other}","kind":"file","name":"x","size":0,"offer":"eA"}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"attachment_offer","from":"{peer}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"offer":"not base64url"}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
             ),
             format!(
-                r#"{{"protocol_version":4,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
+            ),
+            format!(
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
             ),
         ];
         for frame in invalid_events {
@@ -1945,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v4_cleanup_round_trips_only_context_specific_frames() {
+    fn lifecycle_and_stop_frames_round_trip_only_their_context_specific_shape() {
         let request_id = RequestId::new_random();
         let operation_id = OperationId::new_random();
         let removed = ResponseFrame::new(
@@ -2002,30 +1979,43 @@ mod tests {
             stopping
         );
 
-        for removed_v4_surface in [
+        for removed_event_surface in [
             serde_json::json!({
-                "protocol_version": 4,
+                "protocol_version": 5,
                 "request_id": request_id,
                 "type": "stopping"
             }),
             serde_json::json!({
-                "protocol_version": 4,
+                "protocol_version": 5,
                 "request_id": RequestId::new_random(),
                 "type": "error",
                 "code": "invalid_request",
                 "outcome": "not_started"
             }),
         ] {
-            assert!(serde_json::from_value::<EventFrame>(removed_v4_surface).is_err());
+            assert!(serde_json::from_value::<EventFrame>(removed_event_surface).is_err());
         }
         let inactive_code = serde_json::json!({
-            "protocol_version": 4,
+            "protocol_version": 5,
             "request_id": RequestId::new_random(),
             "type": "error",
             "code": "request_forbidden",
             "outcome": "not_started"
         });
         assert!(serde_json::from_value::<ResponseFrame>(inactive_code).is_err());
+    }
+
+    #[test]
+    fn signed_token_outer_bound_matches_64_kib_envelope() {
+        let envelope_bytes = crate::MAX_SIGNED_BROADCAST_ENVELOPE_BYTES;
+        assert_eq!(envelope_bytes, 65_536);
+        assert_eq!(AttachmentToken::MAX_BYTES, 87_382);
+        let exact = data_encoding::BASE64URL_NOPAD.encode(&vec![0; envelope_bytes]);
+        assert_eq!(exact.len(), AttachmentToken::MAX_BYTES);
+        assert!(AttachmentToken::new(exact).is_ok());
+        let oversized = data_encoding::BASE64URL_NOPAD.encode(&vec![0; envelope_bytes + 1]);
+        assert_eq!(oversized.len(), AttachmentToken::MAX_BYTES + 1);
+        assert!(AttachmentToken::new(oversized).is_err());
     }
 
     #[test]

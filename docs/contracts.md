@@ -4,7 +4,7 @@ This document is the **authoritative local IPC and protocol contract**. Other gu
 explain workflows and link here; when an exact wire limit, invariant, or retry rule
 matters, this document is normative.
 
-Local IPC uses exactly protocol version 4. Responses and events are strict tagged
+Local IPC uses exactly protocol version 5. Responses and events are strict tagged
 typed variants inside one canonical frame shape; there are no per-family schema
 versions or compatibility mappings.
 
@@ -17,17 +17,16 @@ identifies a retry-safe mutation and may be reused only for an identical mutatio
 It is never generated from, compared with, or substituted for `request_id`.
 Transport retries used to reconcile one uncertain operation have different request IDs and the same operation ID. A fresh attempt after a terminal condition-dependent `not_started` result uses a new operation ID. `send`,
 `private_send`, `share`, `offers_remove`, `offers_prune`, and `download` all
-require an operation ID. Downloads require the sole typed mode `install`; the removed raw export mode is rejected. Attachment `offer_id` and signed
-message IDs retain their separate documented operation identity; a download's
-operation ID is not its offer ID.
+require an operation ID. A share's operation ID is reused as its `offer_id` and
+signed message ID; a download's operation ID is not its offer ID.
 
-## Protocol-v4 error boundary
+## Protocol-v5 error boundary
 
 Daemon IPC errors are compact typed frames:
 
 ```json
 {
-  "protocol_version": 4,
+  "protocol_version": 5,
   "type": "error",
   "code": "daemon_offline",
   "outcome": "not_started",
@@ -65,7 +64,7 @@ The exact bounded values are:
 
 | Contract | Exact maximum/value | Checked fact |
 | --- | ---: | --- |
-| Local IPC protocol version | 4 | `protocol_version` |
+| Local IPC protocol version | 5 | `protocol_version` |
 | Signed broadcast envelope version | 3 | `signed_broadcast_envelope_version` |
 | Signed broadcast envelope | 65,536 bytes | `max_signed_broadcast_envelope_bytes` |
 | Broadcast body (minimum is one byte) | 65,358 bytes | `max_broadcast_body_bytes` |
@@ -77,7 +76,7 @@ The exact bounded values are:
 | Offer tag inspections | 4,096 | `max_offer_scan` |
 | Lifecycle selection | 512 tags | `max_lifecycle_items` |
 | Request frame, excluding newline | 1,129,432 bytes | `max_request_frame_bytes` |
-| Response or event frame, excluding newline | 5,045,212 bytes (about 5 MiB) | `max_event_frame_bytes` |
+| Response or event frame, excluding newline | 4,520,920 bytes (about 4.3 MiB) | `max_event_frame_bytes` |
 
 Offer scans use one additional presence-only lookahead after the inspected-record
 maximum.
@@ -92,7 +91,7 @@ Each newline-delimited request is a strict nested envelope:
 
 ```json
 {
-  "protocol_version": 4,
+  "protocol_version": 5,
   "request_id": "0123456789abcdef0123456789abcdef",
   "request": { "command": "status" }
 }
@@ -118,10 +117,14 @@ before throttle/operation-cache admission, has `code:"invalid_message"` and
 replay/rate admission and fanout, while every frame still pays a separate bounded
 pre-verification attempt budget. Attachment validation binds one canonical lowercase
 operation/offer ID plus the configured signed topic, kind, provider, ticket hash/format,
-name, size, and nonzero timestamp before download registration or transfer work. Live
-IPC attachment events must remain inside the wire freshness window. Saved signed
+name, size, and nonzero timestamp before download registration or transfer work.
+Offers received over Gossip must be inside the wire freshness window. Saved signed
 download tokens deliberately do not expire by timestamp, but revalidate the nonzero time,
 signature, configured topic, identity, and complete metadata before any network work.
+`download` accepts only such a signed offer token: any other input, including a raw
+Iroh blob ticket or an offer signed for another topic, fails with
+`code:"invalid_attachment_offer"` and `outcome:"not_started"` before storage
+admission, events, or network work.
 Daemon-created message, queued, and attachment events cross the same typed event
 boundary before publication. Subscription frames are decoded directly into the closed
 typed event union; unknown families, protocol versions, unknown fields, malformed
@@ -130,12 +133,12 @@ are not repaired into a synthetic error event, skipped, or followed by later fra
 from the same subscription. This applies to every command response and subscription event, including
 stop, attachment share/download metadata, and lifecycle/progress/loss/peer events.
 Download progress permits `0/0` only for an empty blob; otherwise `total_bytes` is
-positive and `received_bytes <= total_bytes`. A CLI download accepts completion only
-when `output` has the exact retained OS-string/byte representation it submitted;
-Path-equivalent dot components, repeated/trailing separators, and other lexical
-rewrites are rejected. Listen/chat therefore never print an unrecognized daemon event.
+positive and `received_bytes <= total_bytes`. Listen/chat never print an
+unrecognized daemon event. Beyond strict typed decoding, request/response correlation,
+response family, and operation ID, the CLI trusts its own daemon (same binary,
+owner-only socket) and does not re-verify signatures or echoed request fields.
 Error objects are strictly decoded against the closed error contract. Status includes replay limits, mutation-cache semantics, attachment limits, and
-attachment-storage pressure. Clients and the daemon are one protocol-v4 component
+attachment-storage pressure. Clients and the daemon are one protocol-v5 component
 set, so commands are submitted directly without status capability probes.
 
 CLI-only setup/state-file records are `initialized`, `joined`, `alias`, `invite`,
@@ -156,7 +159,7 @@ Attachment commands that inherently select a caller-owned input/output path keep
 only on owner-authenticated IPC. Every request, response, and event `PathBuf` must
 be an absolute UTF-8 path whose serialized value is at most 32,768 bytes; one byte
 over fails typed validation. Checked frame derivation sums simultaneous worst-case
-body/token/path input and, for output, body, two tokens, path, warnings, maximum
+body/token/path input and, for output, body, one token, path, warnings, maximum
 peer snapshot, and maximum offer listing before applying sixfold JSON escaping.
 CLI share/download paths are made absolute without canonicalization and validated
 before daemon contact or typed frame construction; fallible frame constructors
@@ -212,7 +215,29 @@ are no longer nullable. The removed inactive error codes are `daemon_unavailable
 `idempotency_unsupported`, `request_throttled`, `send_throttled`,
 `request_timeout`, `request_failed`, `send_outcome_unknown`, and
 `share_outcome_unknown`. Every code emitted by the daemon or current CLI adapters is
-retained. Clients send only strict protocol-v4 IPC envelopes and require exact
+retained.
+
+Protocol v5 is a further hard break that narrows the attachment surface; v4
+components are rejected like every other version. Relative to v4:
+
+- `download` accepts only a signed offer token, typed and bounded at decode; raw Iroh
+  blob tickets are rejected with `invalid_attachment_offer`. The request has no `mode`.
+- `share` carries no `source_digest`; its operation fingerprint binds only the kind
+  and exact submitted path, so a same-ID retry replays the cached result.
+- `offers_prune.older_than_secs` is nullable; `null` or omission selects the daemon's
+  configured `attachment_retention_secs`.
+- `attachment_offer` drops `ticket` and `message_id`. `attachment_shared` drops
+  `ticket`, `message_id`, `source_digest`, and `delivery_acknowledged`. The signed
+  `offer` token already contains the ticket, and `offer_id` is the signed message ID.
+- `download_complete` drops `token_digest`, `mode`, `installed`, and `pinned`.
+- `offers` items drop `format` and `status`; `size` is a required integer.
+- The response/event frame limit shrinks from 5,045,212 to 4,520,920 bytes (one
+  attachment token instead of two).
+- The CLI no longer re-verifies its daemon: attachment events are not re-checked for
+  signature, topic, or freshness; `download`, `share`, and `offers prune` make no
+  preliminary `status` request; and echoed request fields are not compared.
+
+Clients send only strict protocol-v5 IPC envelopes and require exact
 correlated replies. Older clients and daemons are rejected before any
 payload is consumed. There is no permissive downgrade, capability probe, or field
 defaulting; operators must reinstall and restart the CLI and daemon together. Broadcast EnvelopeV3 and
@@ -233,16 +258,16 @@ Matching concurrent requests join one execution. A terminal success, failure, or
 post-install partial success is replayed for the terminal-result TTL;
 oldest terminal entries can be evicted under pressure, while in-flight entries are
 never evicted. IDs are global across operation kinds. Fingerprints bind kind and
-exact inputs: message/recipient/body, share path/content digest, lifecycle selectors,
-age/dry-run/limit, and download token, `DownloadMode::Install`, plus exact output OS representation. Changed
-input returns `operation_id_conflict` without work. For prune, the cached terminal
+exact inputs: message/recipient/body, exact share path representation, lifecycle
+selectors, submitted age/dry-run/limit, and download token plus exact output OS
+representation. Changed input returns `operation_id_conflict` without work. A share
+fingerprint does not bind file content: a same-ID, same-path retry replays the cached
+result even if the source changed. For prune, the cached terminal
 record is the authoritative original selected set/result, so a retry cannot consume
 the next batch and `max_delete` bounds one operation. For remove, an exact retry
 replays the original counts rather than recomputing the already-achieved end state.
 For download, replay occurs before the no-clobber check and prevents duplicate
-network/export/install work. `download_complete` includes a domain-separated
-SHA-256 digest of the exact submitted token; the shared request-aware validator binds operation ID, token identity, offer ID, provider, kind, name,
-signed declared size when present, and exact output representation. A cached partial-success `download_complete` remains a
+network/export/install work. A cached partial-success `download_complete` remains a
 success; callers inspect durability warnings rather than retrying the installed
 path. Once the memory-only entry expires, is evicted, or the daemon restarts, the
 retry guarantee ends: a retry is a new execution and an existing output fails closed
@@ -269,41 +294,43 @@ Lifecycle successes and compact partial errors repeat the exact operation ID. Th
 `offer_removed` DTO contains its offer/direction/provider selectors, maximum, and
 counts; the `offers_pruned` DTO contains its direction, required effective age,
 dry-run mode, maximum, required daemon cutoff, and counts. Remove has no cutoff.
-Canonical protocol-v4 lifecycle successes are, for example:
+Canonical protocol-v5 lifecycle successes are, for example:
 
 ```json
-{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"offer_removed","operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","offer_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","direction":"outgoing","provider":null,"maximum":512,"selected_tags":1,"removed_tags":1,"released_bytes":1234,"limited":false}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"offer_removed","operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","offer_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","direction":"outgoing","provider":null,"maximum":512,"selected_tags":1,"removed_tags":1,"released_bytes":1234,"limited":false}
 ```
 
 ```json
-{"protocol_version":4,"request_id":"0123456789abcdef0123456789abcdef","type":"offers_pruned","operation_id":"cccccccccccccccccccccccccccccccc","direction":null,"older_than_secs":86400,"maximum":10,"dry_run":true,"selected_tags":10,"removed_tags":0,"released_bytes":1234,"limited":true,"cutoff_ms":1699913600000}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"offers_pruned","operation_id":"cccccccccccccccccccccccccccccccc","direction":null,"older_than_secs":86400,"maximum":10,"dry_run":true,"selected_tags":10,"removed_tags":0,"released_bytes":1234,"limited":true,"cutoff_ms":1699913600000}
 ```
 
 The remove record has no `older_than_secs`, `dry_run`, or `cutoff_ms`; the prune
 record has no `offer_id` or `provider`. Required fields are not nullable unless shown
 as such. The canonical prune request variant contains
-`operation_id`, required `older_than_secs`, nullable `direction`, `dry_run`, and
+`operation_id`, nullable `older_than_secs`, nullable `direction`, `dry_run`, and
 `max_delete`; it never contains `cutoff_ms`. Strict deny-unknown-fields decoding
 therefore rejects cutoff-only, age-plus-cutoff, future-cutoff, saturated-cutoff, and
 selector/cutoff combinations instead of letting raw clients choose a boundary.
 
-The operation fingerprint binds only stable caller intent: kind, effective age,
-direction, dry-run, and maximum. For the first admitted owner, the daemon resolves
+The operation fingerprint binds only stable caller intent: kind, age as submitted
+(an omitted age is distinct from an explicit one), direction, dry-run, and maximum.
+For the first admitted owner, the daemon resolves an omitted age to its configured
+`attachment_retention_secs` (including zero) and then
 `cutoff_ms = daemon_now_ms.saturating_sub(
 older_than_secs.saturating_mul(1000))`; multiplication and subtraction cannot
 overflow, age zero uses admission time, and sufficiently large ages resolve to zero.
 That resolution is retained as authoritative in the in-flight and completed cache
-entry, drives selection, and is repeated in success or partial-error output.
+entry, drives selection, and is repeated as the effective `older_than_secs` and
+`cutoff_ms` in success output.
 Concurrent duplicates join it and terminal retries replay it without consulting the
 clock. This preserves delayed execution, backward-clock behavior, and retries up to
 the cache TTL while ensuring an identical CLI retry does not need a value from the
 lost response. Changed age/selectors/mode/limit conflict; cutoff is not caller input.
 Selection is bounded by `maximum`; `limited:true` requires a full selection;
 successful non-dry-run removal has equal selected and removed counts; dry-run removes
-zero; and an empty selection releases zero bytes. The same request-aware DTO
-validator is used by production IPC dispatch and CLI consumption and binds the
-required daemon-authoritative cutoff. The protocol-v4 lifecycle command is submitted directly and its strict response is
-validated before consumption.
+zero; and an empty selection releases zero bytes. The protocol-v5 lifecycle command
+is submitted directly and its strict typed response is checked for family and
+operation ID before consumption.
 
 Attachment operation errors use the same compact boundary and retain exact
 operation-ID correlation. Lifecycle selectors and counts exist only in typed requests

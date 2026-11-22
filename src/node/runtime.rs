@@ -383,7 +383,6 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
                         )?;
                         Ok(attachment_offer_event(
                             envelope.from,
-                            envelope.message_id,
                             envelope.timestamp_ms,
                             envelope.encoded,
                             offer,
