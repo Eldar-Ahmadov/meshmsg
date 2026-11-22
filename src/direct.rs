@@ -10,7 +10,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
     Endpoint, EndpointAddr, PublicKey, SecretKey,
 };
-use iroh_gossip::proto::TopicId;
+use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 use sha2::{Digest, Sha256};

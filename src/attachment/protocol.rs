@@ -8,7 +8,7 @@ use bytes::Bytes;
 use data_encoding::BASE64URL_NOPAD;
 use iroh::{PublicKey, SecretKey};
 use iroh_blobs::{ticket::BlobTicket, BlobFormat};
-use iroh_gossip::proto::TopicId;
+use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const ATTACHMENT_PREFIX: &str = "meshmsg-attachment-v1:";

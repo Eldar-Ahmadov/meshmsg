@@ -21,7 +21,7 @@ use iroh_blobs::{
     ticket::BlobTicket,
     BlobFormat,
 };
-use iroh_gossip::{api::GossipSender, proto::TopicId};
+use iroh_gossip::{GossipSender, TopicId};
 use std::{
     path::{Path, PathBuf},
     time::Duration,

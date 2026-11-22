@@ -19,11 +19,7 @@ use iroh_blobs::{
     },
     BlobsProtocol,
 };
-use iroh_gossip::{
-    api::{GossipReceiver, GossipSender},
-    net::Gossip,
-    proto::TopicId,
-};
+use iroh_gossip::{Gossip, GossipReceiver, GossipSender, TopicId};
 use std::path::Path;
 use tokio::sync::mpsc;
 

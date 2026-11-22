@@ -20,10 +20,10 @@ futures-util = "0.3"
 hostname = "0.4"
 fs2 = "0.4"
 libc = "0.2"
-iroh = "1"
+iroh = "1.5"
 meshmsg-protocol = { path = "meshmsg-protocol" }
-iroh-blobs = { version = "=0.103.1", default-features = false, features = ["fs-store"] }
-iroh-gossip = "0.101"
+iroh-blobs = { version = "=0.105.0", default-features = false, features = ["fs-store"] }
+iroh-gossip = "0.103"
 postcard = { version = "1", features = ["alloc", "use-std"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +34,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 tar = "0.4"
 
 [dev-dependencies]
-bao-tree = "0.16"
+bao-tree = "0.17"
 
 [profile.release]
 strip = true

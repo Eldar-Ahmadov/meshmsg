@@ -9,10 +9,7 @@ use iroh::{
     address_lookup::memory::MemoryLookup, Endpoint, EndpointAddr, PublicKey, SecretKey,
     TransportAddr, Watcher,
 };
-use iroh_gossip::{
-    api::{GossipReceiver, GossipSender},
-    proto::TopicId,
-};
+use iroh_gossip::{GossipReceiver, GossipSender, TopicId};
 use meshmsg_protocol::{Event, OperationId, PeerId, PeerSnapshot, RemotePeer};
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;

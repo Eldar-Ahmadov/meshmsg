@@ -8,7 +8,7 @@ pub(crate) fn peer_id(key: iroh::PublicKey) -> meshmsg_protocol::PeerId {
 }
 
 /// Local-API identity of a gossip topic.
-pub(crate) fn topic_id(topic: iroh_gossip::proto::TopicId) -> meshmsg_protocol::TopicId {
+pub(crate) fn topic_id(topic: iroh_gossip::TopicId) -> meshmsg_protocol::TopicId {
     meshmsg_protocol::TopicId::from_bytes(*topic.as_bytes())
 }
 
@@ -33,7 +33,7 @@ mod tests {
     #[test]
     fn topic_id_bytes_print_the_gossip_topic_text() {
         for bytes in [[0_u8; 32], [0xab; 32], rand::random()] {
-            let topic = iroh_gossip::proto::TopicId::from_bytes(bytes);
+            let topic = iroh_gossip::TopicId::from_bytes(bytes);
             assert_eq!(topic_id(topic).to_string(), topic.to_string());
             assert_eq!(topic.to_string().parse(), Ok(topic_id(topic)));
         }

@@ -2,7 +2,7 @@ use crate::ids::peer_id;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh::{PublicKey, SecretKey};
-use iroh_gossip::{api::Event, proto::TopicId};
+use iroh_gossip::{Event, TopicId};
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 use std::{
@@ -53,14 +53,16 @@ const _: () = assert!(
             + REPLAY_BUCKET_WIDTH.as_secs()
 );
 pub(crate) const MAX_ENVELOPE_SIZE: usize = meshmsg_protocol::MAX_SIGNED_BROADCAST_ENVELOPE_BYTES;
-/// Iroh 0.101's data frame adds a 32-byte topic, 32-byte content hash, enum
-/// discriminants, a payload-length varint, and delivery scope/round. Their
-/// postcard representation is bounded well below this audited 128-byte ceiling.
-const IROH_GOSSIP_0101_DATA_HEADER_BOUND: usize = 128;
+/// Iroh-gossip 0.103 sends the topic once in the stream header. Each data frame
+/// adds two enum discriminants, a 32-byte message id, a payload-length varint,
+/// and the delivery scope with its round varint, and the broadcast API reserves
+/// two more bytes below `max_message_size`. That is 42 bytes for a 65,536-byte
+/// payload, well below this audited 128-byte ceiling.
+const IROH_GOSSIP_0103_DATA_HEADER_BOUND: usize = 128;
 /// Iroh's configured limit includes that postcard protocol header. Keep an
 /// explicit conservative allowance while preserving a full 65,536-byte payload.
 const PROTOCOL_HEADROOM: usize = 512;
-const _: () = assert!(PROTOCOL_HEADROOM >= IROH_GOSSIP_0101_DATA_HEADER_BOUND);
+const _: () = assert!(PROTOCOL_HEADROOM >= IROH_GOSSIP_0103_DATA_HEADER_BOUND);
 pub(crate) const MAX_MESSAGE_SIZE: usize = MAX_ENVELOPE_SIZE + PROTOCOL_HEADROOM;
 pub(crate) const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 type Signature = ByteArray<SIGNATURE_LENGTH>;
@@ -630,11 +632,13 @@ where
                 attachment_event,
             )
         }
-        Event::NeighborUp(_) | Event::NeighborDown(_) => Vec::new(),
         Event::Lagged => vec![meshmsg_protocol::Event::Lagged {
             source: meshmsg_protocol::EventSource::Gossip,
             dropped: 0,
         }],
+        // Neighbor changes and event kinds added by later iroh-gossip releases
+        // carry no envelope.
+        _ => Vec::new(),
     }
 }
 
@@ -698,9 +702,9 @@ mod tests {
 
     #[test]
     fn broadcast_v3_uses_one_bounded_envelope_with_fixed_protocol_headroom() {
-        assert_ne!(ALPN, iroh_gossip::net::GOSSIP_ALPN);
+        assert_ne!(ALPN, iroh_gossip::ALPN);
         assert_eq!(MAX_ENVELOPE_SIZE, 65_536);
-        assert_eq!(IROH_GOSSIP_0101_DATA_HEADER_BOUND, 128);
+        assert_eq!(IROH_GOSSIP_0103_DATA_HEADER_BOUND, 128);
         assert_eq!(PROTOCOL_HEADROOM, 512);
         assert_eq!(MAX_MESSAGE_SIZE, 66_048);
     }
@@ -711,6 +715,26 @@ mod tests {
 
     fn test_topic() -> TopicId {
         TopicId::from_bytes([7; 32])
+    }
+
+    #[tokio::test]
+    async fn iroh_gossip_admits_the_maximum_envelope_within_the_header_bound() {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let gossip = iroh_gossip::Gossip::builder()
+            .alpn(ALPN)
+            .max_message_size(MAX_MESSAGE_SIZE)
+            .spawn(endpoint.clone());
+        let (sender, _receiver) = gossip
+            .subscribe(test_topic(), vec![])
+            .await
+            .unwrap()
+            .split();
+        assert!(sender.max_content_size() >= MAX_ENVELOPE_SIZE);
+        assert!(MAX_MESSAGE_SIZE - sender.max_content_size() <= IROH_GOSSIP_0103_DATA_HEADER_BOUND);
+        endpoint.close().await;
     }
 
     fn operation_id_bytes(operation_id: &str) -> [u8; 16] {
@@ -781,6 +805,19 @@ mod tests {
             )
             .to_string(),
         }
+    }
+
+    /// Builds a received gossip event; iroh-gossip marks `Message` non-exhaustive
+    /// without a constructor, so the test goes through its serde form.
+    fn received_event(content: impl AsRef<[u8]>, delivered_from: PublicKey) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "Received": {
+                "content": content.as_ref(),
+                "scope": "Neighbors",
+                "delivered_from": delivered_from.to_string(),
+            }
+        }))
+        .unwrap()
     }
 
     fn network_event(
@@ -946,11 +983,7 @@ mod tests {
             "x".repeat(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES + 1),
         ] {
             let rejected = network_event(
-                Event::Received(iroh_gossip::api::Message {
-                    content: signed_envelope(body).into(),
-                    scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                    delivered_from: source,
-                }),
+                received_event(signed_envelope(body), source),
                 topic,
                 &mut replay,
                 &mut sources,
@@ -969,11 +1002,7 @@ mod tests {
         }
 
         let accepted = network_event(
-            Event::Received(iroh_gossip::api::Message {
-                content: signed_envelope("still connected".to_owned()).into(),
-                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                delivered_from: source,
-            }),
+            received_event(signed_envelope("still connected".to_owned()), source),
             topic,
             &mut replay,
             &mut sources,
@@ -1023,17 +1052,16 @@ mod tests {
             let mut replay = EnvelopeReplayCache::default();
             let mut sources = TransportSourceLimiter::default();
             let rejected = network_event(
-                Event::Received(iroh_gossip::api::Message {
-                    content: encode_unchecked_signed_envelope(
+                received_event(
+                    encode_unchecked_signed_envelope(
                         &signer,
                         EnvelopeKind::AttachmentOffer,
                         body,
                         message_id,
                         now_ms,
                     ),
-                    scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                    delivered_from: source,
-                }),
+                    source,
+                ),
                 test_topic(),
                 &mut replay,
                 &mut sources,
@@ -1057,11 +1085,7 @@ mod tests {
             )
             .unwrap();
             let accepted = network_event(
-                Event::Received(iroh_gossip::api::Message {
-                    content: valid,
-                    scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                    delivered_from: source,
-                }),
+                received_event(valid, source),
                 test_topic(),
                 &mut replay,
                 &mut sources,
@@ -1092,13 +1116,7 @@ mod tests {
         .unwrap();
         let mut replay = EnvelopeReplayCache::default();
         let mut sources = TransportSourceLimiter::default();
-        let received = |content| {
-            Event::Received(iroh_gossip::api::Message {
-                content,
-                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                delivered_from: source,
-            })
-        };
+        let received = |content| received_event(content, source);
         let accepted = network_event(
             received(canonical.clone()),
             test_topic(),
@@ -1146,13 +1164,7 @@ mod tests {
         let now_ms = 1_700_000_040_000;
         let mut replay = EnvelopeReplayCache::default();
         let mut sources = TransportSourceLimiter::default();
-        let received = |content| {
-            Event::Received(iroh_gossip::api::Message {
-                content,
-                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                delivered_from: source,
-            })
-        };
+        let received = |content| received_event(content, source);
         let stale = encode_unchecked_signed_envelope(
             &signer,
             EnvelopeKind::Message,
@@ -1394,11 +1406,7 @@ mod tests {
         let mut replay = EnvelopeReplayCache::default();
         let global_tokens_before_malformed = replay.global_limiter.milli_tokens;
         let values = network_event(
-            Event::Received(iroh_gossip::api::Message {
-                content: Bytes::from_static(b"not an envelope"),
-                scope: iroh_gossip::proto::DeliveryScope::Neighbors,
-                delivered_from: source,
-            }),
+            received_event(Bytes::from_static(b"not an envelope"), source),
             test_topic(),
             &mut replay,
             &mut sources,

@@ -380,7 +380,7 @@ mod tests {
     use super::*;
     use crate::invite::Invite;
     use iroh::SecretKey;
-    use iroh_gossip::proto::TopicId;
+    use iroh_gossip::TopicId;
 
     #[test]
     fn message_lines_preserve_content_and_strip_only_delimiters() {

@@ -381,7 +381,7 @@ mod tests {
     }
     use crate::invite::MAX_BOOTSTRAP_PEERS;
     use iroh::{EndpointAddr, SecretKey};
-    use iroh_gossip::proto::TopicId;
+    use iroh_gossip::TopicId;
 
     #[test]
     fn advertising_join_preflights_capacity_before_replacing_state() {

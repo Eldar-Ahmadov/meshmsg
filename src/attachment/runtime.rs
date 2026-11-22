@@ -178,7 +178,7 @@ pub(crate) type SignedOffer = (super::AttachmentOffer, iroh_blobs::ticket::BlobT
 pub(crate) fn parse_download_offer(
     operation_id: meshmsg_protocol::OperationId,
     offer: &meshmsg_protocol::AttachmentToken,
-    topic: iroh_gossip::proto::TopicId,
+    topic: iroh_gossip::TopicId,
 ) -> Result<SignedOffer, meshmsg_protocol::ProtocolError> {
     protocol::parse_signed_offer_token(offer.as_str(), topic).map_err(|_| {
         meshmsg_protocol::ProtocolError::new(
@@ -234,7 +234,7 @@ mod tests {
     use super::*;
     use iroh::{EndpointAddr, SecretKey};
     use iroh_blobs::{ticket::BlobTicket, BlobFormat};
-    use iroh_gossip::proto::TopicId;
+    use iroh_gossip::TopicId;
 
     fn test_topic() -> TopicId {
         TopicId::from_bytes([7; 32])

@@ -569,7 +569,7 @@ mod tests {
         let offer_id = OperationId::new_random();
         let other_topic_offer = crate::attachment::protocol::encode_signed_offer(
             &provider,
-            iroh_gossip::proto::TopicId::from_bytes([8; 32]),
+            iroh_gossip::TopicId::from_bytes([8; 32]),
             &offer_id,
             crate::attachment::AttachmentOffer {
                 offer_id: offer_id.to_string(),

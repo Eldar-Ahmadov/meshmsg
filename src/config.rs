@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use data_encoding::HEXLOWER;
 use fs2::FileExt;
 use iroh::{PublicKey, SecretKey};
-use iroh_gossip::proto::TopicId;
+use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,

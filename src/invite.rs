@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use data_encoding::BASE32_NOPAD;
 use iroh::{EndpointAddr, PublicKey};
-use iroh_gossip::proto::TopicId;
+use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 

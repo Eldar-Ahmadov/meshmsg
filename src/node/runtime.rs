@@ -30,7 +30,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
-use iroh_gossip::{api::Event, proto::TopicId};
+use iroh_gossip::{Event, TopicId};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -305,7 +305,9 @@ impl Daemon {
             }
             Event::NeighborDown(source) => self.presence_sources.remove(source),
             Event::NeighborUp(_) => self.on_presence_neighbor_up(),
-            Event::Lagged => {}
+            // Lagged and event kinds added by later iroh-gossip releases need
+            // no presence handling.
+            _ => {}
         }
     }
 
