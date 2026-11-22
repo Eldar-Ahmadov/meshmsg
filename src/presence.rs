@@ -298,6 +298,7 @@ impl Directory {
 
     /// Admits one signed record and returns the lifecycle event it causes, if
     /// any. The caller must publish that event: its revision is already taken.
+    #[must_use = "the lifecycle event's revision is already taken; publish it"]
     pub(crate) fn receive(&mut self, bytes: &[u8], topic: TopicId) -> Result<Option<Event>> {
         self.receive_at(bytes, topic, unix_timestamp_ms()?, Instant::now())
     }
@@ -362,6 +363,7 @@ impl Directory {
 
     /// Expires overdue leases and returns their lifecycle events in key order.
     /// The caller must publish them: their revisions are already taken.
+    #[must_use = "the lifecycle events' revisions are already taken; publish them"]
     pub(crate) fn cleanup(&mut self) -> Vec<Event> {
         self.cleanup_at(Instant::now())
     }

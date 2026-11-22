@@ -440,7 +440,7 @@ mod tests {
         assert!(expired.admit(id1, fp1, retry, now + Duration::from_millis(2)));
 
         // The cache is intentionally daemon-lifetime scoped. A fresh daemon
-        // admits the same ID again; status/docs tell clients not to infer
+        // admits the same ID again; the docs tell clients not to infer
         // restart-persistent idempotency.
         let mut restarted = OperationCache::new(2, Duration::from_secs(10));
         let (retry, _retry_response) = oneshot::channel();

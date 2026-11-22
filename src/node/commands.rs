@@ -560,22 +560,62 @@ mod tests {
 
         // An offer that can never succeed is reported as such, not as busy,
         // and a retry of the same operation replays that result.
-        let download = OperationId::new_random();
-        let request = Request::Download {
-            operation_id: download,
-            offer: "not-a-signed-offer".parse().unwrap(),
-            output: std::env::temp_dir().join("meshmsg-invalid-offer-output"),
-        };
-        for _attempt in ["first", "retry"] {
-            let response = execute(&mut daemon, request.clone()).await;
-            assert_eq!(
-                expect_error(response, download),
-                (ErrorCode::InvalidAttachmentOffer, Outcome::NotStarted)
-            );
+        let provider = iroh::SecretKey::generate();
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            iroh::EndpointAddr::new(provider.public()),
+            iroh_blobs::Hash::new(b"content"),
+            iroh_blobs::BlobFormat::Raw,
+        );
+        let offer_id = OperationId::new_random();
+        let other_topic_offer = crate::attachment::protocol::encode_signed_offer(
+            &provider,
+            iroh_gossip::proto::TopicId::from_bytes([8; 32]),
+            &offer_id,
+            crate::attachment::AttachmentOffer {
+                offer_id: offer_id.to_string(),
+                kind: crate::attachment::AttachmentKind::File,
+                name: "report.txt".to_owned(),
+                size: 7,
+                ticket: ticket.to_string(),
+            },
+            42,
+        )
+        .unwrap();
+        let output = std::env::temp_dir().join(format!(
+            "meshmsg-invalid-offer-output-{}",
+            rand::random::<u64>()
+        ));
+        let invalid_offers = [
+            ("raw blob ticket", ticket.to_string()),
+            ("arbitrary text", "not-a-signed-offer".to_owned()),
+            (
+                "signed offer for another topic",
+                data_encoding::BASE64URL_NOPAD.encode(&other_topic_offer.encoded),
+            ),
+        ];
+        for (label, offer) in &invalid_offers {
+            let download = OperationId::new_random();
+            let request = Request::Download {
+                operation_id: download,
+                offer: offer.parse().unwrap(),
+                output: output.clone(),
+            };
+            for attempt in ["first", "retry"] {
+                let response = execute(&mut daemon, request.clone()).await;
+                assert_eq!(
+                    expect_error(response, download),
+                    (ErrorCode::InvalidAttachmentOffer, Outcome::NotStarted),
+                    "{label} ({attempt})"
+                );
+            }
         }
-        assert_eq!(daemon.operation_cache.counts(), (0, 2));
+        assert_eq!(
+            daemon.operation_cache.counts(),
+            (0, 1 + invalid_offers.len())
+        );
         assert!(daemon.tasks.is_empty());
         assert!(events.try_recv().is_err(), "a rejected transfer is silent");
+        assert!(!output.exists(), "a rejected transfer touches no output");
 
         drop(held);
         daemon.stop_for_test().await;
