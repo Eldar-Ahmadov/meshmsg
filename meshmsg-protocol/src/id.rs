@@ -21,30 +21,29 @@ impl std::error::Error for IdError {}
 
 macro_rules! hex_id {
     ($name:ident, $bytes:expr, $kind:literal) => {
-        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(String);
+        /// Fixed-width binary ID. Lowercase hexadecimal exists only at the
+        /// text edges (`Display`, `FromStr`, serde); the derived ordering on
+        /// the bytes equals the lexical ordering of that text.
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name([u8; $bytes]);
 
         impl $name {
             pub const HEX_LEN: usize = $bytes * 2;
 
             pub fn new_random() -> Self {
-                Self(data_encoding::HEXLOWER.encode(&rand::random::<[u8; $bytes]>()))
+                Self(rand::random())
             }
 
-            pub fn as_str(&self) -> &str {
-                &self.0
+            pub const fn from_bytes(bytes: [u8; $bytes]) -> Self {
+                Self(bytes)
             }
 
-            pub fn into_string(self) -> String {
+            pub const fn to_bytes(self) -> [u8; $bytes] {
                 self.0
             }
 
-            pub fn to_bytes(&self) -> [u8; $bytes] {
-                let mut bytes = [0_u8; $bytes];
-                data_encoding::HEXLOWER
-                    .decode_mut(self.0.as_bytes(), &mut bytes)
-                    .expect("canonical hexadecimal ID");
-                bytes
+            pub const fn as_bytes(&self) -> &[u8; $bytes] {
+                &self.0
             }
         }
 
@@ -52,28 +51,16 @@ macro_rules! hex_id {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter
                     .debug_tuple(stringify!($name))
-                    .field(&self.0)
+                    .field(&self.to_string())
                     .finish()
             }
         }
 
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
-            }
-        }
-
-        impl std::ops::Deref for $name {
-            type Target = str;
-
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
+                let mut text = [0_u8; $bytes * 2];
+                data_encoding::HEXLOWER.encode_mut(&self.0, &mut text);
+                formatter.write_str(std::str::from_utf8(&text).expect("hexadecimal is ASCII"))
             }
         }
 
@@ -81,14 +68,22 @@ macro_rules! hex_id {
             type Err = IdError;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
+                let error = IdError {
+                    kind: $kind,
+                    expected_hex_chars: Self::HEX_LEN,
+                };
                 let valid = value.len() == Self::HEX_LEN
                     && value
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-                valid.then(|| Self(value.to_owned())).ok_or(IdError {
-                    kind: $kind,
-                    expected_hex_chars: Self::HEX_LEN,
-                })
+                if !valid {
+                    return Err(error);
+                }
+                let mut bytes = [0_u8; $bytes];
+                data_encoding::HEXLOWER
+                    .decode_mut(value.as_bytes(), &mut bytes)
+                    .map_err(|_| error)?;
+                Ok(Self(bytes))
             }
         }
 
@@ -97,7 +92,7 @@ macro_rules! hex_id {
             where
                 S: Serializer,
             {
-                serializer.serialize_str(&self.0)
+                serializer.collect_str(self)
             }
         }
 
@@ -139,6 +134,28 @@ mod tests {
         let id = RequestId::new_random();
         let encoded = serde_json::to_string(&id).unwrap();
         assert_eq!(serde_json::from_str::<RequestId>(&encoded).unwrap(), id);
+    }
+
+    #[test]
+    fn ids_are_bytes_with_lowercase_hex_only_at_the_text_edges() {
+        let bytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0xff];
+        let text = "000102030405060708090a0b0c0d0eff";
+        let id = MessageId::from_bytes(bytes);
+        assert_eq!(id.to_string(), text);
+        assert_eq!(text.parse::<MessageId>().unwrap(), id);
+        assert_eq!(id.as_bytes(), &bytes);
+        assert_eq!(serde_json::to_string(&id).unwrap(), format!("\"{text}\""));
+        assert_eq!(format!("{id:?}"), format!("MessageId(\"{text}\")"));
+    }
+
+    #[test]
+    fn byte_order_matches_the_lexical_order_of_the_hex_text() {
+        let mut ids: Vec<PeerId> = (0..64).map(|_| PeerId::new_random()).collect();
+        ids.sort_unstable();
+        let text: Vec<String> = ids.iter().map(PeerId::to_string).collect();
+        let mut sorted_text = text.clone();
+        sorted_text.sort_unstable();
+        assert_eq!(text, sorted_text);
     }
 
     #[test]

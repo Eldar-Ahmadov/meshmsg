@@ -1,7 +1,7 @@
 use crate::{
     alias::{normalize_alias, validate_alias},
     clock::unix_timestamp_ms,
-    peers::{self as peer_api, PeerTransition, PeerTransitionKind, RemotePeer, PEER_LEASE_MS},
+    ids::peer_id,
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -13,6 +13,7 @@ use iroh_gossip::{
     api::{GossipReceiver, GossipSender},
     proto::TopicId,
 };
+use meshmsg_protocol::{Event, OperationId, PeerId, PeerSnapshot, RemotePeer};
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 use sha2::{Digest, Sha256};
@@ -22,6 +23,15 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::broadcast;
+
+/// Maximum lifetime of a signed remote presence lease. Snapshot expiry is
+/// locally derived and never extends beyond this bound.
+pub(crate) const PEER_LEASE_MS: u64 = meshmsg_protocol::PEER_LEASE_MS;
+/// Documented ceiling for one encoded lifecycle event. The typed field bounds
+/// guarantee it; the test below proves the worst case.
+#[cfg(test)]
+pub(crate) const MAX_PEER_LIFECYCLE_EVENT_BYTES: usize = 512;
+pub(crate) const MAX_DYNAMIC_IDENTITIES: usize = meshmsg_protocol::MAX_PEERS;
 
 pub(crate) const ALPN: &[u8] = b"/meshmsg/presence-gossip/1";
 pub(crate) const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
@@ -212,11 +222,19 @@ struct DynamicDirectoryEntry {
 }
 
 impl DynamicDirectoryEntry {
+    /// The sanitized local-API view: no routing data ever leaves the daemon.
     fn public(&self, key: PublicKey) -> RemotePeer {
         RemotePeer {
-            public_key: key.to_string(),
-            alias: self.alias.clone(),
+            public_key: peer_id(key),
+            alias: self
+                .alias
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .expect("validated alias"),
+            // Local receipt time, never the peer-controlled signed issue time.
             last_seen_ms: self.last_seen_ms,
+            // Locally bounded lease deadline.
             expires_at_ms: self.expires_at_ms,
         }
     }
@@ -235,6 +253,10 @@ pub(crate) struct Directory {
     dynamic: HashMap<PublicKey, DynamicDirectoryEntry>,
     replay_watermarks: HashMap<PublicKey, PresenceReplayWatermark>,
     presence_lookup: MemoryLookup,
+    /// Names this daemon lifetime's revision sequence to local subscribers.
+    epoch: OperationId,
+    /// Advanced once for every lifecycle event this directory produces.
+    revision: u64,
 }
 
 impl Directory {
@@ -244,7 +266,25 @@ impl Directory {
             dynamic: HashMap::new(),
             replay_watermarks: HashMap::new(),
             presence_lookup,
+            epoch: OperationId::new_random(),
+            revision: 0,
         }
+    }
+
+    fn lifecycle_event(
+        &mut self,
+        kind: fn(meshmsg_protocol::PeerTransition) -> Event,
+        peer: RemotePeer,
+    ) -> Event {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("directory revision overflow");
+        kind(meshmsg_protocol::PeerTransition {
+            directory_epoch: self.epoch,
+            directory_revision: self.revision,
+            peer,
+        })
     }
 
     pub(crate) fn pin(&mut self, endpoint: EndpointAddr) -> Result<()> {
@@ -257,11 +297,9 @@ impl Directory {
         Ok(())
     }
 
-    pub(crate) fn receive(
-        &mut self,
-        bytes: &[u8],
-        topic: TopicId,
-    ) -> Result<Option<PeerTransition>> {
+    /// Admits one signed record and returns the lifecycle event it causes, if
+    /// any. The caller must publish that event: its revision is already taken.
+    pub(crate) fn receive(&mut self, bytes: &[u8], topic: TopicId) -> Result<Option<Event>> {
         self.receive_at(bytes, topic, unix_timestamp_ms()?, Instant::now())
     }
 
@@ -271,7 +309,7 @@ impl Directory {
         topic: TopicId,
         wall_ms: u64,
         monotonic_now: Instant,
-    ) -> Result<Option<PeerTransition>> {
+    ) -> Result<Option<Event>> {
         let payload = SignedPresence::decode(bytes, topic, wall_ms)?;
         let ordering = (payload.issued_ms, payload.id);
         if self
@@ -289,19 +327,18 @@ impl Directory {
             || self.replay_watermarks.contains_key(&payload.sender);
         anyhow::ensure!(
             already_tracked
-                || self.dynamic.len() + self.replay_watermarks.len()
-                    < peer_api::MAX_DYNAMIC_IDENTITIES,
+                || self.dynamic.len() + self.replay_watermarks.len() < MAX_DYNAMIC_IDENTITIES,
             "dynamic presence identity capacity reached"
         );
         let remaining = Duration::from_millis(payload.expires_ms.saturating_sub(wall_ms))
             .min(PRESENCE_LIFETIME);
         anyhow::ensure!(!remaining.is_zero(), "presence record is expired");
         let endpoint = payload.endpoint;
-        let kind = match self.dynamic.get(&payload.sender) {
-            None => Some(PeerTransitionKind::Discovered),
+        let kind: Option<fn(_) -> _> = match self.dynamic.get(&payload.sender) {
+            None => Some(Event::PeerDiscovered),
             // Routing changes remain internal: only changes to public directory
             // fields produce an externally observable lifecycle event.
-            Some(entry) if entry.alias != payload.alias => Some(PeerTransitionKind::Updated),
+            Some(entry) if entry.alias != payload.alias => Some(Event::PeerUpdated),
             Some(_) => None,
         };
         let last_seen_ms = wall_ms;
@@ -316,10 +353,7 @@ impl Directory {
             last_seen_ms,
             expires_at_ms,
         };
-        let transition = kind.map(|kind| PeerTransition {
-            kind,
-            peer: entry.public(payload.sender),
-        });
+        let transition = kind.map(|kind| self.lifecycle_event(kind, entry.public(payload.sender)));
         self.dynamic.insert(payload.sender, entry);
         // MemoryLookup::add_endpoint_info merges direct addresses forever. Presence
         // records are snapshots, so replace this source's record in full instead.
@@ -327,11 +361,13 @@ impl Directory {
         Ok(transition)
     }
 
-    pub(crate) fn cleanup(&mut self) -> Vec<PeerTransition> {
+    /// Expires overdue leases and returns their lifecycle events in key order.
+    /// The caller must publish them: their revisions are already taken.
+    pub(crate) fn cleanup(&mut self) -> Vec<Event> {
         self.cleanup_at(Instant::now())
     }
 
-    fn cleanup_at(&mut self, now: Instant) -> Vec<PeerTransition> {
+    fn cleanup_at(&mut self, now: Instant) -> Vec<Event> {
         self.replay_watermarks
             .retain(|_, watermark| watermark.forget_at > now);
         let mut expired: Vec<_> = self
@@ -352,22 +388,44 @@ impl Directory {
                         forget_at: now + PRESENCE_REPLAY_LIFETIME,
                     },
                 );
-                transitions.push(PeerTransition {
-                    kind: PeerTransitionKind::Expired,
-                    peer: entry.public(key),
-                });
+                transitions.push(self.lifecycle_event(Event::PeerExpired, entry.public(key)));
             }
         }
         transitions
     }
 
-    pub(crate) fn peers(&self) -> Vec<RemotePeer> {
+    pub(crate) fn snapshot(
+        &self,
+        connectivity: LocalConnectivity,
+        self_peer: PeerId,
+        self_alias: Option<&str>,
+        generated_at_ms: u64,
+    ) -> PeerSnapshot {
         let now = Instant::now();
-        self.dynamic
+        // Never depend on Gossip loopback behavior. Self has one explicit,
+        // authoritative object and is excluded from the remote lease array.
+        let mut peers: Vec<RemotePeer> = self
+            .dynamic
             .iter()
             .filter(|(_, entry)| entry.expires > now)
             .map(|(key, entry)| entry.public(*key))
-            .collect()
+            .filter(|peer| peer.public_key != self_peer)
+            .collect();
+        peers.sort_unstable_by_key(|peer| peer.public_key);
+        PeerSnapshot {
+            generated_at_ms,
+            directory_epoch: self.epoch,
+            directory_revision: self.revision,
+            self_peer: meshmsg_protocol::SelfPeer {
+                public_key: self_peer,
+                alias: self_alias
+                    .map(str::parse)
+                    .transpose()
+                    .expect("validated alias"),
+                online: connectivity.peer_online(),
+            },
+            peers,
+        }
     }
 
     pub(crate) fn resolve(&mut self, recipient: &str) -> Result<EndpointAddr> {
@@ -513,62 +571,12 @@ pub(crate) fn local_connectivity(
     }
 }
 
-pub(crate) fn snapshot(
-    local_network: (&Endpoint, &GossipReceiver),
-    directory: &Directory,
-    self_peer: &str,
-    self_alias: Option<&str>,
-    generated_at_ms: u64,
-    directory_epoch: &str,
-    directory_revision: u64,
-) -> meshmsg_protocol::PeerSnapshot {
-    snapshot_with_connectivity(
-        local_connectivity(local_network.0, local_network.1),
-        directory,
-        self_peer,
-        self_alias,
-        generated_at_ms,
-        directory_epoch,
-        directory_revision,
-    )
-}
-
-pub(crate) fn snapshot_with_connectivity(
-    connectivity: LocalConnectivity,
-    directory: &Directory,
-    self_peer: &str,
-    self_alias: Option<&str>,
-    generated_at_ms: u64,
-    directory_epoch: &str,
-    directory_revision: u64,
-) -> meshmsg_protocol::PeerSnapshot {
-    peer_api::snapshot_value(
-        self_peer,
-        self_alias,
-        connectivity.peer_online(),
-        generated_at_ms,
-        directory_epoch,
-        directory_revision,
-        directory.peers(),
-    )
-}
-
 pub(crate) fn emit_transitions(
-    transitions: impl IntoIterator<Item = PeerTransition>,
-    events: &broadcast::Sender<meshmsg_protocol::Event>,
-    directory_epoch: &str,
-    directory_revision: &mut u64,
+    transitions: impl IntoIterator<Item = Event>,
+    events: &broadcast::Sender<Event>,
 ) {
     for transition in transitions {
-        let candidate_revision = directory_revision
-            .checked_add(1)
-            .expect("directory revision overflow");
-        *directory_revision = candidate_revision;
-        let _ = events.send(peer_api::transition_value(
-            transition,
-            directory_epoch,
-            candidate_revision,
-        ));
+        let _ = events.send(transition);
     }
 }
 
@@ -578,6 +586,34 @@ mod tests {
 
     fn endpoint(secret: &SecretKey, port: u16) -> EndpointAddr {
         EndpointAddr::new(secret.public()).with_ip_addr(([127, 0, 0, 1], port).into())
+    }
+
+    fn snapshot(directory: &Directory, self_peer: PeerId) -> PeerSnapshot {
+        directory.snapshot(
+            LocalConnectivity {
+                endpoint_online: false,
+                topic_joined: false,
+            },
+            self_peer,
+            None,
+            0,
+        )
+    }
+
+    fn snapshot_frame_value(snapshot: PeerSnapshot) -> serde_json::Value {
+        serde_json::to_value(meshmsg_protocol::ResponseFrame::new(
+            Some(meshmsg_protocol::RequestId::new_random()),
+            meshmsg_protocol::Response::PeersSnapshot(snapshot),
+        ))
+        .unwrap()
+    }
+
+    fn event_frame_value(event: Event) -> serde_json::Value {
+        serde_json::to_value(meshmsg_protocol::EventFrame::new(
+            meshmsg_protocol::RequestId::new_random(),
+            event,
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -713,7 +749,7 @@ mod tests {
         let mut directory = Directory::new(lookup.clone());
         let mut admitted = Vec::new();
 
-        for index in 0..peer_api::MAX_DYNAMIC_IDENTITIES {
+        for index in 0..MAX_DYNAMIC_IDENTITIES {
             let secret = SecretKey::generate();
             let bytes = SignedPresence::encode_at(
                 &secret,
@@ -745,7 +781,7 @@ mod tests {
             .to_string()
             .contains("capacity"));
 
-        assert_eq!(directory.dynamic.len(), peer_api::MAX_DYNAMIC_IDENTITIES);
+        assert_eq!(directory.dynamic.len(), MAX_DYNAMIC_IDENTITIES);
         assert_eq!(directory.replay_watermarks.len(), 0);
         assert!(lookup.get_endpoint_info(rejected.public()).is_none());
         assert!(admitted
@@ -868,8 +904,11 @@ mod tests {
             .receive_at(&first, topic, wall, monotonic)
             .unwrap()
             .unwrap();
-        assert_eq!(discovered.kind, PeerTransitionKind::Discovered);
-        assert_eq!(discovered.peer.alias.as_deref(), Some("first"));
+        let Event::PeerDiscovered(discovered) = discovered else {
+            panic!("expected a discovery, got {discovered:?}")
+        };
+        assert_eq!(discovered.peer.alias, Some("first".parse().unwrap()));
+        assert_eq!(discovered.directory_revision, 1);
 
         let refresh = SignedPresence::encode_at(
             &secret,
@@ -889,7 +928,10 @@ mod tests {
             )
             .unwrap()
             .is_none());
-        let refreshed = directory.peers().pop().unwrap();
+        let refreshed = snapshot(&directory, PeerId::from_bytes([0; 32]))
+            .peers
+            .pop()
+            .unwrap();
         assert_eq!(refreshed.last_seen_ms, wall + 1_000);
         assert!(refreshed.expires_at_ms - refreshed.last_seen_ms <= PEER_LEASE_MS);
 
@@ -911,8 +953,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(updated.kind, PeerTransitionKind::Updated);
-        assert_eq!(updated.peer.alias.as_deref(), Some("renamed"));
+        let Event::PeerUpdated(updated) = updated else {
+            panic!("expected an update, got {updated:?}")
+        };
+        assert_eq!(updated.peer.alias, Some("renamed".parse().unwrap()));
+        assert_eq!(updated.directory_revision, 2);
 
         let route_update = SignedPresence::encode_at(
             &secret,
@@ -940,7 +985,11 @@ mod tests {
         let after_expiry = monotonic + PRESENCE_LIFETIME + Duration::from_secs(2);
         let expired = directory.cleanup_at(after_expiry);
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].kind, PeerTransitionKind::Expired);
+        let Event::PeerExpired(expiry) = &expired[0] else {
+            panic!("expected an expiry, got {expired:?}")
+        };
+        assert_eq!(expiry.directory_epoch, discovered.directory_epoch);
+        assert_eq!(expiry.directory_revision, 3);
         assert!(directory.cleanup_at(after_expiry).is_empty());
 
         let rediscovery_wall = wall + PEER_LEASE_MS + 3_000;
@@ -957,7 +1006,168 @@ mod tests {
             .receive_at(&rediscovery, topic, rediscovery_wall, after_expiry)
             .unwrap()
             .unwrap();
-        assert_eq!(rediscovered.kind, PeerTransitionKind::Discovered);
+        assert!(matches!(rediscovered, Event::PeerDiscovered(_)));
+        assert_eq!(
+            snapshot(&directory, PeerId::from_bytes([0; 32])).directory_revision,
+            4
+        );
+    }
+
+    #[test]
+    fn snapshot_is_sorted_with_one_separate_authoritative_self() {
+        let topic = TopicId::from_bytes([13; 32]);
+        let wall = unix_timestamp_ms().unwrap();
+        let monotonic = Instant::now();
+        let mut directory = Directory::new(MemoryLookup::new());
+        let local = SecretKey::generate();
+        let mut remotes = Vec::new();
+        // The local record models Gossip loopback; it must not become a remote.
+        for (index, (secret, alias)) in [
+            (SecretKey::generate(), None),
+            (local.clone(), Some("loopback")),
+            (SecretKey::generate(), Some("one")),
+            (SecretKey::generate(), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = SignedPresence::encode_at(
+                &secret,
+                topic,
+                alias,
+                endpoint(&secret, 42_000 + index as u16),
+                wall,
+                [index as u8; 16],
+            )
+            .unwrap();
+            directory
+                .receive_at(&bytes, topic, wall, monotonic)
+                .unwrap();
+            if secret.public() != local.public() {
+                remotes.push(secret.public().to_string());
+            }
+        }
+        remotes.sort_unstable();
+
+        let value = snapshot_frame_value(directory.snapshot(
+            LocalConnectivity {
+                endpoint_online: true,
+                topic_joined: true,
+            },
+            peer_id(local.public()),
+            Some("local"),
+            wall,
+        ));
+        assert_eq!(value["type"], "peers_snapshot");
+        assert_eq!(value["protocol_version"], 5);
+        assert!(value["request_id"].as_str().is_some());
+        assert_eq!(value["directory_epoch"], directory.epoch.to_string());
+        assert_eq!(value["directory_revision"], 4);
+        assert_eq!(value["self"]["public_key"], local.public().to_string());
+        assert_eq!(value["self"]["alias"], "local");
+        assert_eq!(value["self"]["online"], true);
+        assert_eq!(
+            value["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["public_key"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            remotes
+        );
+    }
+
+    #[test]
+    fn maximum_complete_snapshot_fits_the_bounded_ipc_frame() {
+        let topic = TopicId::from_bytes([14; 32]);
+        let wall = unix_timestamp_ms().unwrap();
+        let monotonic = Instant::now();
+        let mut directory = Directory::new(MemoryLookup::new());
+        let alias = "a".repeat(crate::alias::MAX_ALIAS_BYTES);
+        for index in 0..MAX_DYNAMIC_IDENTITIES {
+            let secret = SecretKey::generate();
+            let bytes = SignedPresence::encode_at(
+                &secret,
+                topic,
+                Some(&alias),
+                endpoint(&secret, 10_000 + index as u16),
+                wall,
+                [index as u8; 16],
+            )
+            .unwrap();
+            directory
+                .receive_at(&bytes, topic, wall, monotonic)
+                .unwrap();
+        }
+        let snapshot = directory.snapshot(
+            LocalConnectivity {
+                endpoint_online: true,
+                topic_joined: true,
+            },
+            PeerId::from_bytes([0xff; 32]),
+            Some("self"),
+            wall,
+        );
+        assert_eq!(snapshot.peers.len(), MAX_DYNAMIC_IDENTITIES);
+        let frame = meshmsg_protocol::ResponseFrame::new(
+            Some(meshmsg_protocol::RequestId::new_random()),
+            meshmsg_protocol::Response::PeersSnapshot(snapshot),
+        );
+        assert!(
+            serde_json::to_vec(&frame).unwrap().len() <= crate::ipc::MAX_IPC_EVENT_SIZE,
+            "maximum canonical peer snapshot response exceeds IPC frame"
+        );
+    }
+
+    #[test]
+    fn maximum_lifecycle_event_has_a_small_fixed_bound() {
+        let mut directory = Directory::new(MemoryLookup::new());
+        directory.revision = u64::MAX - 1;
+        let value = event_frame_value(directory.lifecycle_event(
+            Event::PeerExpired,
+            RemotePeer {
+                public_key: PeerId::from_bytes([0xff; 32]),
+                alias: Some("a".repeat(crate::alias::MAX_ALIAS_BYTES).parse().unwrap()),
+                last_seen_ms: u64::MAX,
+                expires_at_ms: u64::MAX,
+            },
+        ));
+        assert_eq!(value["directory_revision"], u64::MAX);
+        assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_PEER_LIFECYCLE_EVENT_BYTES);
+        assert!(value.get("body").is_none());
+    }
+
+    #[test]
+    fn wire_objects_have_only_the_documented_sanitized_fields() {
+        let secret = SecretKey::generate();
+        let topic = TopicId::from_bytes([15; 32]);
+        let mut directory = Directory::new(MemoryLookup::new());
+        let bytes =
+            SignedPresence::encode(&secret, topic, None, endpoint(&secret, 43_001)).unwrap();
+        let discovered = directory.receive(&bytes, topic).unwrap().unwrap();
+        let discovered = event_frame_value(discovered);
+        assert_eq!(discovered["type"], "peer_discovered");
+        assert_eq!(discovered["protocol_version"], 5);
+        assert!(discovered["request_id"].as_str().is_some());
+        assert_eq!(discovered["directory_epoch"], directory.epoch.to_string());
+        assert_eq!(discovered["directory_revision"], 1);
+        assert_eq!(
+            discovered["peer"]["public_key"],
+            secret.public().to_string()
+        );
+        assert_eq!(discovered["peer"]["alias"], serde_json::Value::Null);
+        let encoded = discovered.to_string();
+        for forbidden in [
+            "endpoint",
+            "address",
+            "relay",
+            "socket",
+            "record",
+            "signature",
+            "body",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
     }
 
     #[test]

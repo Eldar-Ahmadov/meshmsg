@@ -22,16 +22,16 @@ struct InviteWire {
     invite: Invite,
 }
 
+/// `(has_invite, bootstrap_peer_count, self_advertised)` of a configured invite.
 pub(crate) fn configured_details(
-    token: Option<&str>,
+    invite: Option<&Invite>,
     self_id: PublicKey,
-) -> Result<(bool, usize, bool)> {
-    let Some(token) = token else {
-        return Ok((false, 0, false));
+) -> (bool, usize, bool) {
+    let Some(invite) = invite else {
+        return (false, 0, false);
     };
-    let invite: Invite = token.parse()?;
     let self_advertised = invite.bootstrap_peers.iter().any(|peer| peer.id == self_id);
-    Ok((true, invite.bootstrap_peers.len(), self_advertised))
+    (true, invite.bootstrap_peers.len(), self_advertised)
 }
 
 impl Invite {

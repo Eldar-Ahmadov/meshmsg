@@ -907,7 +907,7 @@ impl AttachmentStorage {
             let _ = sync_error;
             return Ok(meshmsg_protocol::Response::Error(
                 meshmsg_protocol::ProtocolError::new(
-                    Some(operation_id.clone()),
+                    Some(*operation_id),
                     meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
                     if removed.is_empty() {
                         meshmsg_protocol::Outcome::Unknown
@@ -939,7 +939,7 @@ impl AttachmentStorage {
             self.recalculate_cached_status().await?;
             return Ok(meshmsg_protocol::Response::Error(
                 meshmsg_protocol::ProtocolError::new(
-                    Some(operation_id.clone()),
+                    Some(*operation_id),
                     meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
                     if removed.is_empty() {
                         meshmsg_protocol::Outcome::Unknown
@@ -973,10 +973,10 @@ fn lifecycle_response(
         Some(offer_id) => {
             anyhow::ensure!(cutoff_ms.is_none(), "remove unexpectedly resolved a cutoff");
             meshmsg_protocol::Response::OfferRemoved(meshmsg_protocol::OfferRemoved {
-                operation_id: spec.operation_id.clone(),
-                offer_id: offer_id.clone(),
+                operation_id: *spec.operation_id,
+                offer_id: *offer_id,
                 direction: spec.direction,
-                provider: spec.provider.cloned(),
+                provider: spec.provider.copied(),
                 maximum: spec.maximum,
                 selected_tags,
                 removed_tags,
@@ -985,7 +985,7 @@ fn lifecycle_response(
             })
         }
         None => meshmsg_protocol::Response::OffersPruned(meshmsg_protocol::OffersPruned {
-            operation_id: spec.operation_id.clone(),
+            operation_id: *spec.operation_id,
             direction: spec.direction,
             older_than_secs: spec.older_than_secs.unwrap_or(0),
             maximum: spec.maximum,

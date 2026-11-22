@@ -70,7 +70,7 @@ pub(crate) async fn send_request(
 ) -> Result<meshmsg_protocol::ResponseFrame> {
     let request_id = RequestId::new_random();
     let mut stream = connect_daemon(dir).await?;
-    write_request(&mut stream, request, request_id.clone()).await?;
+    write_request(&mut stream, request, request_id).await?;
     let mut reader = meshmsg_protocol::FrameReader::new(stream);
     let bytes = reader
         .read_frame(meshmsg_protocol::FrameLimit::Event)
@@ -153,7 +153,7 @@ impl<S: AsyncRead + Unpin> SubscriptionReader<S> {
 pub(crate) async fn subscribe(dir: &Path) -> Result<SubscriptionReader<LocalClientStream>> {
     let request_id = RequestId::new_random();
     let mut stream = connect_daemon(dir).await?;
-    write_request(&mut stream, &Request::Subscribe, request_id.clone()).await?;
+    write_request(&mut stream, &Request::Subscribe, request_id).await?;
     Ok(SubscriptionReader::new(stream, request_id))
 }
 
@@ -257,7 +257,7 @@ mod tests {
     fn ipc_uses_protocol_request_response_family_and_operation_validation() {
         let operation_id = meshmsg_protocol::OperationId::new_random();
         let request = Request::Send {
-            operation_id: operation_id.clone(),
+            operation_id,
             body: meshmsg_protocol::BroadcastBody::new("hello").unwrap(),
         };
         let wrong_operation = meshmsg_protocol::OperationId::new_random();

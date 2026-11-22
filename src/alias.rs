@@ -132,8 +132,8 @@ impl AliasConfig {
 
     fn mutate(dir: &Path, update: impl FnOnce(&mut Self) -> Result<()>) -> Result<Self> {
         let lock = StateLock::acquire(dir)?;
-        let (state, secret) = State::load_locked(dir, &lock)?;
-        state.validate_for_identity(secret.public())?;
+        // Loading under the lock already validated the state for this identity.
+        let (_, secret, _) = State::load_locked(dir, &lock)?;
         let mut config = Self::load_for_identity(dir, secret.public())?;
         update(&mut config)?;
         config.bind_identity(secret.public());

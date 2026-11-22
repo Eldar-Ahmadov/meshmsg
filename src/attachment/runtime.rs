@@ -45,7 +45,7 @@ fn storage_operation_error(
         None => operation.fallback(),
     };
     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-        Some(operation_id.clone()),
+        Some(*operation_id),
         code,
         outcome,
     ))
@@ -148,17 +148,16 @@ pub(crate) async fn share_request(
 ) -> meshmsg_protocol::Response {
     let gate = resources.storage.gate.clone();
     match gate.acquire_owned().await {
-        Ok(_permit) => match transfer::share_attachment(
-            resources,
-            operation_id.clone(),
-            path,
-            max_attachment_bytes,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => storage_operation_error(StorageOperation::Share, &error, &operation_id),
-        },
+        Ok(_permit) => {
+            match transfer::share_attachment(resources, operation_id, path, max_attachment_bytes)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    storage_operation_error(StorageOperation::Share, &error, &operation_id)
+                }
+            }
+        }
         Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
             Some(operation_id),
             meshmsg_protocol::ErrorCode::DaemonStopping,
@@ -189,7 +188,7 @@ pub(crate) async fn download_request(
     match gate.acquire_owned().await {
         Ok(_permit) => {
             let _ = events.send(meshmsg_protocol::Event::DownloadStarted {
-                operation_id: operation_id.clone(),
+                operation_id,
                 output: output.clone(),
             });
             match transfer::download_attachment(
@@ -325,7 +324,7 @@ mod tests {
                     topic: test_topic(),
                 },
                 events,
-                operation_id.clone(),
+                operation_id,
                 meshmsg_protocol::AttachmentToken::new(token).unwrap(),
                 output.clone(),
                 DEFAULT_MAX_ATTACHMENT_BYTES,

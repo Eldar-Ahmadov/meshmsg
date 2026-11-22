@@ -1051,7 +1051,7 @@ impl AttachmentOffer {
 
 impl AttachmentShared {
     fn validate(&self) -> Result<(), &'static str> {
-        (self.operation_id.as_str() == self.offer_id.as_str()
+        (self.operation_id.as_bytes() == self.offer_id.as_bytes()
             && self.timestamp_ms != 0
             && valid_signed_offer_shape(&self.offer))
         .then_some(())
@@ -1511,7 +1511,7 @@ mod tests {
     fn request_response_validation_centralizes_family_and_operation_correlation() {
         let operation_id = OperationId::new_random();
         let request = Request::Send {
-            operation_id: operation_id.clone(),
+            operation_id,
             body: BroadcastBody::new("hello").unwrap(),
         };
         let queued = |operation_id: OperationId| {
@@ -1523,9 +1523,7 @@ mod tests {
             })
         };
 
-        assert!(request
-            .validate_response(&queued(operation_id.clone()))
-            .is_ok());
+        assert!(request.validate_response(&queued(operation_id)).is_ok());
         assert!(request
             .validate_response(&queued(OperationId::new_random()))
             .is_err());
@@ -1567,13 +1565,13 @@ mod tests {
         );
         let operation_id = OperationId::new_random();
         assert!(Request::Share {
-            operation_id: operation_id.clone(),
+            operation_id,
             path: exact.clone(),
         }
         .validate()
         .is_ok());
         assert!(Request::Share {
-            operation_id: operation_id.clone(),
+            operation_id,
             path: oversized.clone(),
         }
         .validate()
@@ -1684,9 +1682,9 @@ mod tests {
         let operation_id = OperationId::new_random();
         let frame = ResponseFrame {
             protocol_version: ProtocolVersion,
-            request_id: Some(request_id.clone()),
+            request_id: Some(request_id),
             response: Response::Error(ProtocolError::new(
-                Some(operation_id.clone()),
+                Some(operation_id),
                 ErrorCode::CommandTimeout,
                 Outcome::Unknown,
             )),
@@ -1746,7 +1744,7 @@ mod tests {
         let request = RequestFrame::new(
             RequestId::new_random(),
             Request::Send {
-                operation_id: operation_id.clone(),
+                operation_id,
                 body: BroadcastBody::new("hello\n世界\u{0}").unwrap(),
             },
         );
@@ -1986,9 +1984,9 @@ mod tests {
         let request_id = RequestId::new_random();
         let operation_id = OperationId::new_random();
         let removed = ResponseFrame::new(
-            Some(request_id.clone()),
+            Some(request_id),
             Response::OfferRemoved(OfferRemoved {
-                operation_id: operation_id.clone(),
+                operation_id,
                 offer_id: OfferId::new_random(),
                 direction: Some(OfferDirection::Incoming),
                 provider: Some("7".repeat(64).parse().unwrap()),
@@ -2009,7 +2007,7 @@ mod tests {
         );
 
         let pruned = ResponseFrame::new(
-            Some(request_id.clone()),
+            Some(request_id),
             Response::OffersPruned(OffersPruned {
                 operation_id,
                 direction: None,
@@ -2031,7 +2029,7 @@ mod tests {
             pruned
         );
 
-        let stopping = ResponseFrame::new(Some(request_id.clone()), Response::Stopping {});
+        let stopping = ResponseFrame::new(Some(request_id), Response::Stopping {});
         let stopping_wire = serde_json::to_value(&stopping).unwrap();
         assert!(stopping_wire.get("outcome").is_none());
         assert_eq!(

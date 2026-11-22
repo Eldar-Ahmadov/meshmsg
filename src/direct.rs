@@ -1,7 +1,7 @@
 use crate::{
     clock::unix_timestamp_ms,
     direct_replay::{ReplayDecision, ReplayStore},
-    ids::id_string,
+    ids::peer_id,
     presence::validate_endpoint_addr,
 };
 use anyhow::{Context, Result};
@@ -246,12 +246,8 @@ struct IncomingDirect {
 
 fn incoming_event(msg: IncomingDirect) -> meshmsg_protocol::Event {
     meshmsg_protocol::Event::PrivateMessage(meshmsg_protocol::PrivateMessage {
-        from: msg
-            .from
-            .to_string()
-            .parse()
-            .expect("public key is canonical"),
-        message_id: id_string(&msg.id).parse().expect("message ID is canonical"),
+        from: peer_id(msg.from),
+        message_id: meshmsg_protocol::MessageId::from_bytes(msg.id),
         timestamp_ms: msg.timestamp_ms,
         body: meshmsg_protocol::PrivateBody::new(msg.body).expect("validated direct body"),
     })
@@ -498,7 +494,7 @@ impl DirectSendPermit {
         self,
         address: EndpointAddr,
         body: String,
-        operation_id: [u8; 16],
+        operation_id: meshmsg_protocol::OperationId,
     ) -> meshmsg_protocol::Response {
         match send(
             self.sender.endpoint,
@@ -506,20 +502,14 @@ impl DirectSendPermit {
             self.sender.topic,
             address,
             body,
-            operation_id,
+            operation_id.to_bytes(),
         )
         .await
         {
             Ok(DirectSendOutcome::Accepted(accepted)) => {
                 meshmsg_protocol::Response::PrivateAccepted(meshmsg_protocol::PrivateAccepted {
-                    operation_id: id_string(&operation_id)
-                        .parse()
-                        .expect("operation ID is canonical"),
-                    to: accepted
-                        .recipient
-                        .to_string()
-                        .parse()
-                        .expect("public key is canonical"),
+                    operation_id,
+                    to: peer_id(accepted.recipient),
                     timestamp_ms: accepted.timestamp_ms,
                     body_bytes: accepted.body_bytes,
                     duplicate_accepted: accepted.duplicate,
@@ -529,11 +519,7 @@ impl DirectSendPermit {
                 rejection_response(rejection, operation_id)
             }
             Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                Some(
-                    id_string(&operation_id)
-                        .parse()
-                        .expect("operation ID is canonical"),
-                ),
+                Some(operation_id),
                 meshmsg_protocol::ErrorCode::PrivateSendFailed,
                 meshmsg_protocol::Outcome::Unknown,
             )),
@@ -543,18 +529,14 @@ impl DirectSendPermit {
 
 fn rejection_response(
     rejection: DirectRejection,
-    operation_id: [u8; 16],
+    operation_id: meshmsg_protocol::OperationId,
 ) -> meshmsg_protocol::Response {
     let code = match rejection {
         DirectRejection::Conflict => meshmsg_protocol::ErrorCode::PrivateMessageConflict,
         DirectRejection::Busy => meshmsg_protocol::ErrorCode::PrivateRecipientBusy,
     };
     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-        Some(
-            id_string(&operation_id)
-                .parse()
-                .expect("operation ID is canonical"),
-        ),
+        Some(operation_id),
         code,
         meshmsg_protocol::Outcome::NotStarted,
     ))
@@ -719,7 +701,10 @@ mod tests {
                 meshmsg_protocol::RetryAdvice::NewOperationAfterConditionsChange,
             ),
         ] {
-            let response = rejection_response(rejection, [1; 16]);
+            let response = rejection_response(
+                rejection,
+                meshmsg_protocol::OperationId::from_bytes([1; 16]),
+            );
             let meshmsg_protocol::Response::Error(error) = response else {
                 panic!("expected error response");
             };

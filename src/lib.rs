@@ -15,7 +15,6 @@ mod ipc;
 mod message;
 mod node;
 mod output;
-mod peers;
 mod persistent;
 mod presence;
 
@@ -155,11 +154,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Daemon { options } => node::run_daemon(&dir, options).await?,
         Command::Invite => {
             let (state, secret) = State::load_for_doctor(&dir)?;
-            state.validate()?;
-            let token = state
+            let invite = state.validate()?;
+            let (token, invite) = state
                 .invite
+                .zip(invite)
                 .context("invite is not available yet; run `meshmsg daemon` first")?;
-            let invite: Invite = token.parse()?;
             let self_advertised = invite
                 .bootstrap_peers
                 .iter()

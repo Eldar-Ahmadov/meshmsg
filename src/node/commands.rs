@@ -22,7 +22,7 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, Instant as StdInstant, SystemTime},
+    time::{Instant as StdInstant, SystemTime},
 };
 use tokio::sync::{broadcast, oneshot, Semaphore};
 
@@ -32,30 +32,6 @@ pub(crate) enum DaemonCommand {
         reply: oneshot::Sender<meshmsg_protocol::Response>,
     },
     Stop,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct CommandTimeouts {
-    pub(crate) ordinary: Duration,
-    pub(crate) private: Duration,
-    pub(crate) list: Duration,
-    pub(crate) transfer: Duration,
-}
-
-impl CommandTimeouts {
-    /// The daemon-side deadline for a request the command loop executes;
-    /// `None` for the requests the IPC session handles itself.
-    pub(crate) fn deadline(self, request: &Request) -> Option<Duration> {
-        match request {
-            Request::Send { .. } | Request::Status | Request::Peers => Some(self.ordinary),
-            Request::PrivateSend { .. } => Some(self.private),
-            Request::Offers | Request::OffersRemove { .. } | Request::OffersPrune { .. } => {
-                Some(self.list)
-            }
-            Request::Share { .. } | Request::Download { .. } => Some(self.transfer),
-            Request::Subscribe | Request::Stop => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,9 +54,7 @@ pub(super) struct ExecutionContext<'a> {
     pub(super) operation_cache: &'a Arc<Mutex<OperationCache>>,
     pub(super) directory: &'a mut Directory,
     pub(super) event_tx: &'a broadcast::Sender<meshmsg_protocol::Event>,
-    pub(super) directory_epoch: &'a str,
-    pub(super) directory_revision: &'a mut u64,
-    pub(super) peer: &'a str,
+    pub(super) peer: meshmsg_protocol::PeerId,
     pub(super) offer_list_limit: &'a Arc<Semaphore>,
     pub(super) transfer_limit: &'a Arc<Semaphore>,
     pub(super) transfer_tasks: &'a mut tokio::task::JoinSet<AttachmentTaskCompletion>,
@@ -128,8 +102,6 @@ pub(super) async fn execute(
         operation_cache,
         directory,
         event_tx,
-        directory_epoch,
-        directory_revision,
         peer,
         offer_list_limit,
         transfer_limit,
@@ -148,7 +120,7 @@ pub(super) async fn execute(
             if !operation_cache
                 .lock()
                 .expect("operation cache poisoned")
-                .admit(operation_id.clone(), fingerprint, reply, StdInstant::now())
+                .admit(operation_id, fingerprint, reply, StdInstant::now())
             {
                 return Ok(CommandAction::Continue);
             }
@@ -163,13 +135,13 @@ pub(super) async fn execute(
                     Ok(envelope) => match node.sender.broadcast(envelope).await {
                         Ok(()) => meshmsg_protocol::Response::Queued(gossip::queued_event(
                             peer,
-                            operation_id.to_bytes(),
-                            body.into_string(),
+                            operation_id,
+                            body,
                             timestamp_ms,
                         )),
                         Err(_error) => {
                             meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                                Some(operation_id.clone()),
+                                Some(operation_id),
                                 meshmsg_protocol::ErrorCode::SendFailed,
                                 meshmsg_protocol::Outcome::Unknown,
                             ))
@@ -177,7 +149,7 @@ pub(super) async fn execute(
                     },
                     Err(_error) => {
                         meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                            Some(operation_id.clone()),
+                            Some(operation_id),
                             meshmsg_protocol::ErrorCode::InvalidMessage,
                             meshmsg_protocol::Outcome::NotStarted,
                         ))
@@ -185,7 +157,7 @@ pub(super) async fn execute(
                 },
                 Err(_error) => {
                     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                        Some(operation_id.clone()),
+                        Some(operation_id),
                         meshmsg_protocol::ErrorCode::InvalidMessage,
                         meshmsg_protocol::Outcome::NotStarted,
                     ))
@@ -213,16 +185,11 @@ pub(super) async fn execute(
             if !operation_cache
                 .lock()
                 .expect("operation cache poisoned")
-                .admit(operation_id.clone(), fingerprint, reply, StdInstant::now())
+                .admit(operation_id, fingerprint, reply, StdInstant::now())
             {
                 return Ok(CommandAction::Continue);
             }
-            presence::emit_transitions(
-                directory.cleanup(),
-                event_tx,
-                directory_epoch,
-                directory_revision,
-            );
+            presence::emit_transitions(directory.cleanup(), event_tx);
             let address = match directory.resolve(to.as_str()) {
                 Ok(address) => address,
                 Err(_error) => {
@@ -233,7 +200,7 @@ pub(super) async fn execute(
                             &operation_id,
                             meshmsg_protocol::Response::Error(
                                 meshmsg_protocol::ProtocolError::new(
-                                    Some(operation_id.clone()),
+                                    Some(operation_id),
                                     meshmsg_protocol::ErrorCode::RecipientUnresolved,
                                     meshmsg_protocol::Outcome::NotStarted,
                                 ),
@@ -243,7 +210,7 @@ pub(super) async fn execute(
                     return Ok(CommandAction::Continue);
                 }
             };
-            let permit = match direct_sender.try_reserve(operation_id.clone()) {
+            let permit = match direct_sender.try_reserve(operation_id) {
                 Ok(permit) => permit,
                 Err(error) => {
                     operation_cache
@@ -257,7 +224,6 @@ pub(super) async fn execute(
                     return Ok(CommandAction::Continue);
                 }
             };
-            let task_operation_id = operation_id.clone();
             spawn_attachment_task(
                 transfer_tasks,
                 attachment_task_metadata,
@@ -270,11 +236,9 @@ pub(super) async fn execute(
                     space_refresh: false,
                 },
                 async move {
-                    let response = permit
-                        .send(address, body.into_string(), task_operation_id.to_bytes())
-                        .await;
+                    let response = permit.send(address, body.into_string(), operation_id).await;
                     AttachmentTaskCompletion::Operation {
-                        operation_id: task_operation_id,
+                        operation_id,
                         response,
                         event: OperationEventKind::None,
                     }
@@ -288,8 +252,8 @@ pub(super) async fn execute(
             let connectivity = presence::local_connectivity(&node.endpoint, &node.receiver);
             let neighbors = node.receiver.neighbors().count();
             let status = meshmsg_protocol::Status {
-                peer: peer.parse()?,
-                topic: state.topic.parse()?,
+                peer,
+                topic: state.topic,
                 advertises_self: state.advertise_self,
                 has_invite,
                 bootstrap_peer_count,
@@ -313,22 +277,14 @@ pub(super) async fn execute(
             request: Request::Peers,
             reply,
         }) => {
-            presence::emit_transitions(
-                directory.cleanup(),
-                event_tx,
-                directory_epoch,
-                directory_revision,
-            );
+            presence::emit_transitions(directory.cleanup(), event_tx);
             let generated_at_ms = unix_timestamp_ms()?;
             let _ = reply.send(meshmsg_protocol::Response::PeersSnapshot(
-                presence::snapshot(
-                    (&node.endpoint, &node.receiver),
-                    directory,
+                directory.snapshot(
+                    presence::local_connectivity(&node.endpoint, &node.receiver),
                     peer,
                     alias_config.effective(),
                     generated_at_ms,
-                    directory_epoch,
-                    *directory_revision,
                 ),
             ));
         }
@@ -374,11 +330,11 @@ pub(super) async fn execute(
             let direction_fingerprint =
                 optional_text_fingerprint(direction.map(|value| value.to_string()).as_deref());
             let provider_fingerprint =
-                optional_text_fingerprint(provider.as_ref().map(|value| value.as_str()));
+                optional_text_fingerprint(provider.map(|value| value.to_string()).as_deref());
             let fingerprint = operation_fingerprint(
                 "offers_remove",
                 &[
-                    offer_id.as_str().as_bytes(),
+                    offer_id.to_string().as_bytes(),
                     &direction_fingerprint,
                     &provider_fingerprint,
                 ],
@@ -386,12 +342,11 @@ pub(super) async fn execute(
             if !operation_cache
                 .lock()
                 .expect("operation cache poisoned")
-                .admit(operation_id.clone(), fingerprint, reply, StdInstant::now())
+                .admit(operation_id, fingerprint, reply, StdInstant::now())
             {
                 return Ok(CommandAction::Continue);
             }
             let storage = attachment_storage.clone();
-            let task_operation_id = operation_id.clone();
             spawn_attachment_task(
                 offer_list_tasks,
                 attachment_task_metadata,
@@ -406,14 +361,14 @@ pub(super) async fn execute(
                 async move {
                     let response = remove_offer_request(
                         storage,
-                        &task_operation_id,
+                        &operation_id,
                         &offer_id,
                         direction,
                         provider.as_ref(),
                     )
                     .await;
                     AttachmentTaskCompletion::Operation {
-                        operation_id: task_operation_id,
+                        operation_id,
                         response,
                         event: OperationEventKind::None,
                     }
@@ -453,7 +408,7 @@ pub(super) async fn execute(
             if !operation_cache
                 .lock()
                 .expect("operation cache poisoned")
-                .admit(operation_id.clone(), fingerprint, reply, StdInstant::now())
+                .admit(operation_id, fingerprint, reply, StdInstant::now())
             {
                 return Ok(CommandAction::Continue);
             }
@@ -466,7 +421,6 @@ pub(super) async fn execute(
                 age,
             );
             let storage = attachment_storage.clone();
-            let task_operation_id = operation_id.clone();
             spawn_attachment_task(
                 offer_list_tasks,
                 attachment_task_metadata,
@@ -481,7 +435,7 @@ pub(super) async fn execute(
                 async move {
                     let response = prune_offers_request(
                         storage,
-                        &task_operation_id,
+                        &operation_id,
                         age,
                         cutoff,
                         direction,
@@ -490,7 +444,7 @@ pub(super) async fn execute(
                     )
                     .await;
                     AttachmentTaskCompletion::Operation {
-                        operation_id: task_operation_id,
+                        operation_id,
                         response,
                         event: OperationEventKind::None,
                     }
@@ -506,7 +460,7 @@ pub(super) async fn execute(
             if !operation_cache
                 .lock()
                 .expect("operation cache poisoned")
-                .admit(operation_id.clone(), fingerprint, reply, StdInstant::now())
+                .admit(operation_id, fingerprint, reply, StdInstant::now())
             {
                 return Ok(CommandAction::Continue);
             }
@@ -514,7 +468,7 @@ pub(super) async fn execute(
                 Ok(permit) => permit,
                 Err(_) => {
                     let error = meshmsg_protocol::ProtocolError::new(
-                        Some(operation_id.clone()),
+                        Some(operation_id),
                         meshmsg_protocol::ErrorCode::AttachmentStorageBusy,
                         meshmsg_protocol::Outcome::NotStarted,
                     );
@@ -535,7 +489,6 @@ pub(super) async fn execute(
             let secret = node.secret.clone();
             let sender = node.sender.clone();
             let state_dir = dir.to_path_buf();
-            let task_operation_id = operation_id.clone();
             spawn_attachment_task(
                 transfer_tasks,
                 attachment_task_metadata,
@@ -559,13 +512,13 @@ pub(super) async fn execute(
                             sender,
                             state_dir,
                         },
-                        task_operation_id.clone(),
+                        operation_id,
                         path,
                         max_attachment_bytes,
                     )
                     .await;
                     AttachmentTaskCompletion::Operation {
-                        operation_id: task_operation_id,
+                        operation_id,
                         response,
                         event: OperationEventKind::AttachmentShared,
                     }
@@ -591,7 +544,7 @@ pub(super) async fn execute(
             if !operation_cache
                 .lock()
                 .expect("operation cache poisoned")
-                .admit(operation_id.clone(), fingerprint, reply, StdInstant::now())
+                .admit(operation_id, fingerprint, reply, StdInstant::now())
             {
                 return Ok(CommandAction::Continue);
             }
@@ -599,7 +552,7 @@ pub(super) async fn execute(
                 Ok(permit) => permit,
                 Err(_) => {
                     let error = meshmsg_protocol::ProtocolError::new(
-                        Some(operation_id.clone()),
+                        Some(operation_id),
                         meshmsg_protocol::ErrorCode::AttachmentStorageBusy,
                         meshmsg_protocol::Outcome::NotStarted,
                     );
@@ -620,7 +573,6 @@ pub(super) async fn execute(
             let endpoint = node.endpoint.clone();
             let lookup = node.lookup.clone();
             let events = event_tx.clone();
-            let task_operation_id = operation_id.clone();
             spawn_attachment_task(
                 transfer_tasks,
                 attachment_task_metadata,
@@ -644,14 +596,14 @@ pub(super) async fn execute(
                             lookup,
                         },
                         events,
-                        task_operation_id.clone(),
+                        operation_id,
                         offer,
                         output,
                         max_attachment_bytes,
                     )
                     .await;
                     AttachmentTaskCompletion::Operation {
-                        operation_id: task_operation_id,
+                        operation_id,
                         response,
                         event: OperationEventKind::DownloadComplete,
                     }
@@ -715,8 +667,8 @@ mod tests {
             .unwrap();
         let (state, secret) = State::load_for_doctor(&dir).unwrap();
         let alias_config = AliasConfig::load_for_identity(&dir, secret.public()).unwrap();
-        let topic = state.topic_id().unwrap();
-        let node = bootstrap::start(&state, secret, &dir).await.unwrap();
+        let topic = state.topic_id();
+        let node = bootstrap::start(topic, None, secret, &dir).await.unwrap();
         let blob_root = dir.join("blobs-v1").join(node.secret.public().to_string());
         let attachment_storage =
             AttachmentStorage::open(node.blob_store.clone(), blob_root, &dir, 1024, 0, 0)
@@ -754,7 +706,7 @@ mod tests {
         ));
         let operation_id = meshmsg_protocol::OperationId::new_random();
         let request = Request::PrivateSend {
-            operation_id: operation_id.clone(),
+            operation_id,
             to: recipient.to_string().parse().unwrap(),
             body: meshmsg_protocol::PrivateBody::new("saturated").unwrap(),
         };
@@ -775,8 +727,7 @@ mod tests {
         let mut transfer_tasks = tokio::task::JoinSet::new();
         let mut offer_list_tasks = tokio::task::JoinSet::new();
         let mut attachment_task_metadata = HashMap::new();
-        let mut directory_revision = 0;
-        let peer = node.endpoint.id().to_string();
+        let peer = crate::ids::peer_id(node.endpoint.id());
         let action = execute(
             command_rx.recv().await,
             ExecutionContext {
@@ -793,9 +744,7 @@ mod tests {
                 operation_cache: &operation_cache,
                 directory: &mut directory,
                 event_tx: &events,
-                directory_epoch: "command-dispatch-test-epoch",
-                directory_revision: &mut directory_revision,
-                peer: &peer,
+                peer,
                 offer_list_limit: &offer_list_limit,
                 transfer_limit: &transfer_limit,
                 transfer_tasks: &mut transfer_tasks,
@@ -843,8 +792,8 @@ mod tests {
             .unwrap();
         let (state, secret) = State::load_for_doctor(&dir).unwrap();
         let alias_config = AliasConfig::load_for_identity(&dir, secret.public()).unwrap();
-        let topic = state.topic_id().unwrap();
-        let node = bootstrap::start(&state, secret, &dir).await.unwrap();
+        let topic = state.topic_id();
+        let node = bootstrap::start(topic, None, secret, &dir).await.unwrap();
         let blob_root = dir.join("blobs-v1").join(node.secret.public().to_string());
         let attachment_storage =
             AttachmentStorage::open(node.blob_store.clone(), blob_root, &dir, 1024, 0, 0)
@@ -863,9 +812,8 @@ mod tests {
         let mut transfer_tasks = tokio::task::JoinSet::new();
         let mut offer_list_tasks = tokio::task::JoinSet::new();
         let mut attachment_task_metadata = HashMap::new();
-        let mut directory_revision = 0;
         let mut space_refresh_active = false;
-        let peer = node.endpoint.id().to_string();
+        let peer = crate::ids::peer_id(node.endpoint.id());
 
         let default_age = meshmsg_protocol::OperationId::new_random();
         let disabled_retention = meshmsg_protocol::OperationId::new_random();
@@ -886,7 +834,7 @@ mod tests {
             let action = execute(
                 Some(DaemonCommand::Execute {
                     request: Request::OffersPrune {
-                        operation_id: operation_id.clone(),
+                        operation_id: *operation_id,
                         older_than_secs,
                         direction: None,
                         dry_run: true,
@@ -908,9 +856,7 @@ mod tests {
                     operation_cache: &operation_cache,
                     directory: &mut directory,
                     event_tx: &events,
-                    directory_epoch: "prune-default-age-test-epoch",
-                    directory_revision: &mut directory_revision,
-                    peer: &peer,
+                    peer,
                     offer_list_limit: &offer_list_limit,
                     transfer_limit: &transfer_limit,
                     transfer_tasks: &mut transfer_tasks,
@@ -963,91 +909,5 @@ mod tests {
         drop(attachment_storage);
         node.router.shutdown().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn command_deadline_covers_each_request_family_and_preserves_correlation() {
-        use meshmsg_protocol::OfferDirection;
-
-        let timeouts = CommandTimeouts {
-            ordinary: Duration::from_millis(40),
-            private: Duration::from_millis(60),
-            list: Duration::from_millis(70),
-            transfer: Duration::from_millis(80),
-        };
-        let operation_id = meshmsg_protocol::OperationId::new_random();
-        let requests = [
-            (
-                Request::Send {
-                    operation_id: operation_id.clone(),
-                    body: meshmsg_protocol::BroadcastBody::new("broadcast").unwrap(),
-                },
-                timeouts.ordinary,
-            ),
-            (
-                Request::PrivateSend {
-                    operation_id: operation_id.clone(),
-                    to: "peer".parse().unwrap(),
-                    body: meshmsg_protocol::PrivateBody::new("private").unwrap(),
-                },
-                timeouts.private,
-            ),
-            (Request::Status, timeouts.ordinary),
-            (Request::Peers, timeouts.ordinary),
-            (Request::Offers, timeouts.list),
-            (
-                Request::OffersRemove {
-                    operation_id: operation_id.clone(),
-                    offer_id: meshmsg_protocol::OfferId::new_random(),
-                    direction: Some(OfferDirection::Incoming),
-                    provider: Some(meshmsg_protocol::PeerId::new_random()),
-                },
-                timeouts.list,
-            ),
-            (
-                Request::OffersPrune {
-                    operation_id: operation_id.clone(),
-                    older_than_secs: Some(7),
-                    direction: Some(OfferDirection::Outgoing),
-                    dry_run: true,
-                    max_delete: 3,
-                },
-                timeouts.list,
-            ),
-            (
-                Request::Share {
-                    operation_id: operation_id.clone(),
-                    path: std::env::temp_dir().join("meshmsg-policy-share"),
-                },
-                timeouts.transfer,
-            ),
-            (
-                Request::Download {
-                    operation_id: operation_id.clone(),
-                    offer: "typed-token".parse().unwrap(),
-                    output: std::env::temp_dir().join("meshmsg-policy-download"),
-                },
-                timeouts.transfer,
-            ),
-        ];
-
-        for (request, deadline) in requests {
-            assert_eq!(timeouts.deadline(&request), Some(deadline));
-            assert_eq!(
-                request.operation_id(),
-                matches!(
-                    request,
-                    Request::Send { .. }
-                        | Request::PrivateSend { .. }
-                        | Request::OffersRemove { .. }
-                        | Request::OffersPrune { .. }
-                        | Request::Share { .. }
-                        | Request::Download { .. }
-                )
-                .then_some(&operation_id)
-            );
-        }
-        assert!(timeouts.deadline(&Request::Subscribe).is_none());
-        assert!(timeouts.deadline(&Request::Stop).is_none());
     }
 }

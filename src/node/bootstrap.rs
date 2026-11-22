@@ -1,7 +1,6 @@
 use super::common::BLOB_GC_INTERVAL;
 use crate::{
     attachment,
-    config::State,
     direct::{self, DIRECT_ALPN},
     gossip,
     invite::Invite,
@@ -45,15 +44,16 @@ pub(super) struct RunningNode {
     pub(super) direct_incoming: mpsc::Receiver<meshmsg_protocol::Event>,
 }
 
+/// Starts networking for validated state: `invite` is what `State::validate`
+/// returned for the state that owns `topic`.
 pub(super) async fn start(
-    state: &State,
+    topic: TopicId,
+    invite: Option<&Invite>,
     secret: SecretKey,
     state_dir: &Path,
 ) -> Result<RunningNode> {
-    state.validate()?;
     attachment::cleanup_stale_state_staging(state_dir)
         .context("recover stale attachment share staging")?;
-    let topic: TopicId = state.topic_id()?;
     // Keep stable invite/attachment routes isolated from expiring presence.
     // Each MemoryLookup owns one source so presence cleanup cannot erase another.
     let lookup = MemoryLookup::with_provenance("meshmsg_stable");
@@ -96,16 +96,16 @@ pub(super) async fn start(
         .spawn();
     let mut bootstrap = Vec::new();
     let mut bootstrap_addrs = Vec::new();
-    if let Some(token) = &state.invite {
-        let invite: Invite = token.parse()?;
-        for peer in invite.bootstrap_peers {
-            if peer.id != endpoint.id() {
-                presence::validate_endpoint_addr(&peer, peer.id)
-                    .context("invalid bootstrap endpoint address")?;
-                bootstrap.push(peer.id);
-                bootstrap_addrs.push(peer.clone());
-                lookup.set_endpoint_info(peer);
-            }
+    for peer in invite
+        .into_iter()
+        .flat_map(|invite| &invite.bootstrap_peers)
+    {
+        if peer.id != endpoint.id() {
+            presence::validate_endpoint_addr(peer, peer.id)
+                .context("invalid bootstrap endpoint address")?;
+            bootstrap.push(peer.id);
+            bootstrap_addrs.push(peer.clone());
+            lookup.set_endpoint_info(peer.clone());
         }
     }
     let subscription = if bootstrap.is_empty() {

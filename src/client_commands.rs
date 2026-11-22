@@ -20,13 +20,13 @@ pub(crate) async fn send_once(
 ) -> Result<()> {
     let request = if let Some(to) = to {
         Request::PrivateSend {
-            operation_id: operation_id.clone(),
+            operation_id,
             to: to.parse()?,
             body: meshmsg_protocol::PrivateBody::new(body)?,
         }
     } else {
         Request::Send {
-            operation_id: operation_id.clone(),
+            operation_id,
             body: meshmsg_protocol::BroadcastBody::new(body)?,
         }
     };
@@ -57,15 +57,9 @@ pub(crate) async fn share(
 ) -> Result<()> {
     let operation_id = operation_id.unwrap_or_else(OperationId::new_random);
     let path = caller_path(path)?;
-    let frame = send_request_checked(
-        dir,
-        &Request::Share {
-            operation_id: operation_id.clone(),
-            path,
-        },
-    )
-    .await
-    .with_context(|| format!("operation {operation_id}"))?;
+    let frame = send_request_checked(dir, &Request::Share { operation_id, path })
+        .await
+        .with_context(|| format!("operation {operation_id}"))?;
     output::response(json, &frame)?;
     Ok(())
 }
@@ -138,7 +132,7 @@ fn invalid_attachment_offer(
     diagnostic: meshmsg_protocol::TextError,
 ) -> anyhow::Error {
     let error = meshmsg_protocol::ProtocolError::new(
-        Some(operation_id.clone()),
+        Some(*operation_id),
         meshmsg_protocol::ErrorCode::InvalidAttachmentOffer,
         meshmsg_protocol::Outcome::NotStarted,
     );
@@ -259,7 +253,7 @@ fn stream_send_failure(
     }
     // A lost/malformed IPC reply or interruption cannot prove non-execution.
     let failure = meshmsg_protocol::ProtocolError::new(
-        Some(operation_id.clone()),
+        Some(*operation_id),
         if private {
             meshmsg_protocol::ErrorCode::PrivateSendFailed
         } else {
@@ -310,7 +304,7 @@ pub(crate) async fn send_stream(dir: &Path, to: Option<&str>, json: bool) -> Res
         // reports its ID and unknown outcome rather than silently losing it.
         let result = tokio::select! {
             biased;
-            result = send_once(dir, operation_id.clone(), to, &body, json) => result,
+            result = send_once(dir, operation_id, to, &body, json) => result,
             signal = &mut shutdown => match signal {
                 Ok(()) => Err(anyhow::anyhow!("send interrupted; outcome may be unknown")),
                 Err(error) => Err(error.into()),
@@ -365,12 +359,12 @@ pub(crate) async fn stop(dir: &Path, json: bool) -> Result<()> {
 
 pub(crate) async fn doctor(dir: &Path, json: bool) -> Result<()> {
     let (state, secret) = State::load_for_doctor(dir)?;
-    state.validate_for_identity(secret.public())?;
+    let invite = state.validate_for_identity(secret.public())?;
     let alias_config = AliasConfig::load_for_identity(dir, secret.public())?;
     let (has_invite, bootstrap_peer_count, self_advertised) =
-        configured_details(state.invite.as_deref(), secret.public())?;
+        configured_details(invite.as_ref(), secret.public());
     let value = serde_json::json!({
-        "type":"doctor", "request_id":RequestId::new_random().into_string(),
+        "type":"doctor", "request_id":RequestId::new_random().to_string(),
         "ok":true, "peer":secret.public().to_string(), "topic":state.topic,
         "advertises_self":state.advertise_self, "has_invite":has_invite,
         "bootstrap_peer_count":bootstrap_peer_count, "self_advertised":self_advertised,
@@ -460,7 +454,7 @@ mod tests {
         let original = contracts::ContractFailure::new(
             Some(RequestId::new_random()),
             ProtocolError::new(
-                Some(operation_id.clone()),
+                Some(operation_id),
                 ErrorCode::PrivateRecipientBusy,
                 Outcome::NotStarted,
             ),

@@ -1,5 +1,8 @@
 use super::AttachmentKind;
-use crate::attachment;
+use crate::{
+    attachment,
+    ids::{content_digest, peer_id},
+};
 use anyhow::{Context, Result};
 use data_encoding::BASE64URL_NOPAD;
 use futures_util::StreamExt;
@@ -110,15 +113,11 @@ pub(super) fn parse_pinned_blob_tag(name: &[u8]) -> Option<PinnedBlobTag> {
             if provider.len() > MAX_ENCODED_PUBLIC_KEY_BYTES {
                 return None;
             }
-            let canonical_provider = provider.parse::<PublicKey>().ok()?.to_string();
-            if canonical_provider != provider {
+            let key = provider.parse::<PublicKey>().ok()?;
+            if key.to_string() != provider {
                 return None;
             }
-            (
-                OfferDirection::Incoming,
-                Some(canonical_provider.parse::<PeerId>().ok()?),
-                remainder,
-            )
+            (OfferDirection::Incoming, Some(peer_id(key)), remainder)
         };
     let mut parts = remainder.split('/');
     let offer_id = parts.next()?;
@@ -190,7 +189,7 @@ pub(super) async fn list_pinned_blobs(
                         meshmsg_protocol::AttachmentKind::DirectoryTarV1
                     }
                 },
-                hash: tag.hash.to_string().parse()?,
+                hash: content_digest(tag.hash),
                 size,
             });
         }

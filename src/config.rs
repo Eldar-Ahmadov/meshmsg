@@ -89,7 +89,9 @@ pub fn prepare_state_dir(dir: &Path) -> Result<()> {
 pub struct State {
     schema_version: u8,
     pub advertise_self: bool,
-    pub topic: String,
+    pub topic: meshmsg_protocol::TopicId,
+    /// The token exactly as it was issued: it is stored and printed verbatim,
+    /// never re-encoded. `validate` returns its parsed form.
     pub invite: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<IdentityBinding>,
@@ -114,7 +116,7 @@ impl State {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             advertise_self: true,
-            topic: TopicId::from_bytes(rand::random()).to_string(),
+            topic: meshmsg_protocol::TopicId::new_random(),
             invite: None,
             identity: None,
         }
@@ -124,47 +126,54 @@ impl State {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             advertise_self,
-            topic: invite.topic.to_string(),
+            topic: crate::ids::topic_id(invite.topic),
             invite: Some(token),
             identity: None,
         }
     }
 
-    pub fn topic_id(&self) -> Result<TopicId> {
-        TopicId::from_str(&self.topic).context("invalid topic in state")
+    /// The gossip topic this state joins.
+    pub fn topic_id(&self) -> TopicId {
+        TopicId::from_bytes(self.topic.to_bytes())
     }
 
-    pub fn validate(&self) -> Result<()> {
+    /// Checks the state and returns its invite, parsed once for the caller.
+    pub fn validate(&self) -> Result<Option<Invite>> {
         anyhow::ensure!(
             self.schema_version == CONFIG_SCHEMA_VERSION,
             "unsupported config.json schema version {}",
             self.schema_version
         );
-        let topic = self.topic_id()?;
-        if let Some(token) = &self.invite {
-            let invite: Invite = token.parse().context("invalid invite in state")?;
-            anyhow::ensure!(
-                invite.topic == topic,
+        let invite = self
+            .invite
+            .as_deref()
+            .map(|token| token.parse::<Invite>().context("invalid invite in state"))
+            .transpose()?;
+        match &invite {
+            Some(invite) => anyhow::ensure!(
+                invite.topic == self.topic_id(),
                 "configured invite topic does not match state topic"
-            );
-        } else {
-            anyhow::ensure!(
+            ),
+            None => anyhow::ensure!(
                 self.advertise_self,
                 "state without an invite must advertise itself"
-            );
+            ),
         }
-        Ok(())
+        Ok(invite)
     }
 
-    pub fn validate_for_identity(&self, identity: PublicKey) -> Result<()> {
-        self.validate()?;
-        if self.advertise_self {
-            if let Some(token) = &self.invite {
-                let invite: Invite = token.parse().context("invalid invite in state")?;
-                invite.ensure_can_advertise(identity)?;
-            }
+    /// `validate`, plus the check that `identity` can be advertised.
+    pub fn validate_for_identity(&self, identity: PublicKey) -> Result<Option<Invite>> {
+        let invite = self.validate()?;
+        self.ensure_can_advertise(invite.as_ref(), identity)?;
+        Ok(invite)
+    }
+
+    fn ensure_can_advertise(&self, invite: Option<&Invite>, identity: PublicKey) -> Result<()> {
+        match invite {
+            Some(invite) if self.advertise_self => invite.ensure_can_advertise(identity),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     pub fn load(dir: &Path) -> Result<Self> {
@@ -173,11 +182,13 @@ impl State {
         decode_state(&bytes)
     }
 
-    pub fn load_locked(dir: &Path, _lock: &StateLock) -> Result<(Self, SecretKey)> {
+    /// Loads and fully validates the state for its owner, returning the parsed
+    /// invite alongside so the owner does not parse the token again.
+    pub fn load_locked(dir: &Path, _lock: &StateLock) -> Result<(Self, SecretKey, Option<Invite>)> {
         let bytes =
             persistent::read_file_bounded(&dir.join(CONFIG_NAME), CONFIG_NAME, MAX_CONFIG_BYTES)?;
         let state = decode_state(&bytes)?;
-        state.validate().context("validate config.json")?;
+        let invite = state.validate().context("validate config.json")?;
         let secret = load_bound_secret(
             dir,
             state
@@ -186,9 +197,9 @@ impl State {
                 .context("identity binding missing from config.json")?,
         )?;
         state
-            .validate_for_identity(secret.public())
+            .ensure_can_advertise(invite.as_ref(), secret.public())
             .context("validate config.json for selected identity")?;
-        Ok((state, secret))
+        Ok((state, secret, invite))
     }
 
     /// Current state is immutable while the daemon runs and can be diagnosed lock-free.
@@ -808,7 +819,7 @@ mod tests {
         let state = State {
             schema_version: CONFIG_SCHEMA_VERSION,
             advertise_self: false,
-            topic: TopicId::from_bytes(rand::random()).to_string(),
+            topic: meshmsg_protocol::TopicId::new_random(),
             invite: Some(invite.to_string()),
             identity: None,
         };
@@ -825,7 +836,7 @@ mod tests {
         let state = State {
             schema_version: CONFIG_SCHEMA_VERSION,
             advertise_self: false,
-            topic: TopicId::from_bytes(rand::random()).to_string(),
+            topic: meshmsg_protocol::TopicId::new_random(),
             invite: None,
             identity: None,
         };

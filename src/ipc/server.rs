@@ -2,7 +2,7 @@
 
 use super::SubscriptionStream;
 use crate::{
-    node::{CommandTimeouts, DaemonCommand},
+    node::DaemonCommand,
     presence::{self, Directory},
 };
 use anyhow::{Context, Result};
@@ -43,12 +43,17 @@ pub(crate) struct LocalIpcTimeouts {
 }
 
 impl LocalIpcTimeouts {
-    fn command_timeouts(self) -> CommandTimeouts {
-        CommandTimeouts {
-            ordinary: self.ordinary_command,
-            private: self.private_command,
-            list: self.list_command,
-            transfer: self.transfer_command,
+    /// The daemon-side deadline for a request the command loop executes;
+    /// `None` for the requests the IPC session handles itself.
+    fn command_deadline(self, request: &Request) -> Option<Duration> {
+        match request {
+            Request::Send { .. } | Request::Status | Request::Peers => Some(self.ordinary_command),
+            Request::PrivateSend { .. } => Some(self.private_command),
+            Request::Offers | Request::OffersRemove { .. } | Request::OffersPrune { .. } => {
+                Some(self.list_command)
+            }
+            Request::Share { .. } | Request::Download { .. } => Some(self.transfer_command),
+            Request::Subscribe | Request::Stop => None,
         }
     }
 }
@@ -206,21 +211,10 @@ where
     let request = request_frame.request;
     match request {
         Request::Subscribe => {
-            write_local_event(
-                &mut stream,
-                request_id.clone(),
-                connected,
-                timeouts.response_write,
-            )
-            .await?;
+            write_local_event(&mut stream, request_id, connected, timeouts.response_write).await?;
             if let Some(snapshot) = startup_peers {
-                write_local_event(
-                    &mut stream,
-                    request_id.clone(),
-                    snapshot,
-                    timeouts.response_write,
-                )
-                .await?;
+                write_local_event(&mut stream, request_id, snapshot, timeouts.response_write)
+                    .await?;
             }
             let mut read_closed = false;
             loop {
@@ -243,14 +237,14 @@ where
                     value = events.recv() => match value {
                         Ok(value) => write_local_event(
                             &mut stream,
-                            request_id.clone(),
+                            request_id,
                             value,
                             timeouts.response_write,
                         ).await?,
                         Err(broadcast::error::RecvError::Lagged(count)) => {
                             write_local_event(
                                 &mut stream,
-                                request_id.clone(),
+                                request_id,
                                 meshmsg_protocol::Event::Lagged {
                                     source: meshmsg_protocol::EventSource::Local,
                                     dropped: count,
@@ -274,10 +268,9 @@ where
         | Request::Share { .. }
         | Request::Download { .. }) => {
             let deadline = timeouts
-                .command_timeouts()
-                .deadline(&request)
+                .command_deadline(&request)
                 .expect("executable requests have a command deadline");
-            let operation_id = request.operation_id().cloned();
+            let operation_id = request.operation_id().copied();
             let (reply, response) = oneshot::channel();
             let value = command_response(
                 send_command(
@@ -353,27 +346,17 @@ where
 pub(crate) fn subscription_startup_events(
     connectivity: presence::LocalConnectivity,
     directory: &Directory,
-    peer: &str,
+    peer: meshmsg_protocol::PeerId,
     alias: Option<&str>,
     generated_at_ms: u64,
-    directory_epoch: &str,
-    directory_revision: u64,
 ) -> Result<(meshmsg_protocol::Event, meshmsg_protocol::Event)> {
     let connected = meshmsg_protocol::Event::Connected(meshmsg_protocol::Connected {
-        peer: peer.parse()?,
+        peer,
         endpoint_online: connectivity.endpoint_online,
         topic_joined: connectivity.topic_joined,
         alias: alias.map(str::parse).transpose()?,
     });
-    let snapshot = presence::snapshot_with_connectivity(
-        connectivity,
-        directory,
-        peer,
-        alias,
-        generated_at_ms,
-        directory_epoch,
-        directory_revision,
-    );
+    let snapshot = directory.snapshot(connectivity, peer, alias, generated_at_ms);
     Ok((connected, meshmsg_protocol::Event::PeersSnapshot(snapshot)))
 }
 
@@ -809,7 +792,7 @@ mod tests {
         let connectivity = Arc::new(std::sync::atomic::AtomicBool::new(true));
         connectivity.store(false, Ordering::SeqCst);
         let directory = Directory::new(MemoryLookup::new());
-        let peer = SecretKey::generate().public().to_string();
+        let peer = crate::ids::peer_id(SecretKey::generate().public());
         let (mut client, server) = tokio::io::duplex(4096);
         let (commands, _command_rx) = mpsc::channel(1);
         let (events, _) = broadcast::channel(1);
@@ -821,15 +804,8 @@ mod tests {
                     endpoint_online: current.load(Ordering::SeqCst),
                     topic_joined: true,
                 };
-                let (connected, startup_peers) = subscription_startup_events(
-                    connectivity,
-                    &directory,
-                    &peer,
-                    None,
-                    1,
-                    "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a",
-                    0,
-                )?;
+                let (connected, startup_peers) =
+                    subscription_startup_events(connectivity, &directory, peer, None, 1)?;
                 Ok(LocalClientSession {
                     commands,
                     events: events.subscribe(),
@@ -1007,26 +983,26 @@ mod tests {
             "11111111111111111111111111111111".parse().unwrap();
         let mutations = vec![
             Request::Send {
-                operation_id: operation.clone(),
+                operation_id: operation,
                 body: meshmsg_protocol::BroadcastBody::new("x").unwrap(),
             },
             Request::PrivateSend {
-                operation_id: operation.clone(),
+                operation_id: operation,
                 to: "2".repeat(64).parse().unwrap(),
                 body: meshmsg_protocol::PrivateBody::new("x").unwrap(),
             },
             Request::Share {
-                operation_id: operation.clone(),
+                operation_id: operation,
                 path: PathBuf::from("x"),
             },
             Request::OffersRemove {
-                operation_id: operation.clone(),
+                operation_id: operation,
                 offer_id: "4".repeat(32).parse().unwrap(),
                 direction: None,
                 provider: None,
             },
             Request::OffersPrune {
-                operation_id: operation.clone(),
+                operation_id: operation,
                 older_than_secs: Some(1),
                 direction: None,
                 dry_run: false,
@@ -1334,7 +1310,7 @@ mod tests {
         let timeout_value = command_response(
             async move { Ok(receiver.await?) },
             deadline,
-            Some(operation_id.clone()),
+            Some(operation_id),
         )
         .await;
         let timeout = response_error(&timeout_value);
@@ -1355,5 +1331,89 @@ mod tests {
         let shutdown = response_error(&shutdown_value);
         assert_eq!(shutdown.code, meshmsg_protocol::ErrorCode::DaemonStopping);
         assert_eq!(shutdown.outcome, meshmsg_protocol::Outcome::Unknown);
+    }
+
+    #[test]
+    fn command_deadline_covers_each_request_family_and_preserves_correlation() {
+        use meshmsg_protocol::OfferDirection;
+
+        let timeouts = LocalIpcTimeouts {
+            list_command: Duration::from_millis(70),
+            ..short_ipc_timeouts()
+        };
+        let operation_id = meshmsg_protocol::OperationId::new_random();
+        let requests = [
+            (
+                Request::Send {
+                    operation_id,
+                    body: meshmsg_protocol::BroadcastBody::new("broadcast").unwrap(),
+                },
+                timeouts.ordinary_command,
+            ),
+            (
+                Request::PrivateSend {
+                    operation_id,
+                    to: "peer".parse().unwrap(),
+                    body: meshmsg_protocol::PrivateBody::new("private").unwrap(),
+                },
+                timeouts.private_command,
+            ),
+            (Request::Status, timeouts.ordinary_command),
+            (Request::Peers, timeouts.ordinary_command),
+            (Request::Offers, timeouts.list_command),
+            (
+                Request::OffersRemove {
+                    operation_id,
+                    offer_id: meshmsg_protocol::OfferId::new_random(),
+                    direction: Some(OfferDirection::Incoming),
+                    provider: Some(meshmsg_protocol::PeerId::new_random()),
+                },
+                timeouts.list_command,
+            ),
+            (
+                Request::OffersPrune {
+                    operation_id,
+                    older_than_secs: Some(7),
+                    direction: Some(OfferDirection::Outgoing),
+                    dry_run: true,
+                    max_delete: 3,
+                },
+                timeouts.list_command,
+            ),
+            (
+                Request::Share {
+                    operation_id,
+                    path: std::env::temp_dir().join("meshmsg-policy-share"),
+                },
+                timeouts.transfer_command,
+            ),
+            (
+                Request::Download {
+                    operation_id,
+                    offer: "typed-token".parse().unwrap(),
+                    output: std::env::temp_dir().join("meshmsg-policy-download"),
+                },
+                timeouts.transfer_command,
+            ),
+        ];
+
+        for (request, deadline) in requests {
+            assert_eq!(timeouts.command_deadline(&request), Some(deadline));
+            assert_eq!(
+                request.operation_id(),
+                matches!(
+                    request,
+                    Request::Send { .. }
+                        | Request::PrivateSend { .. }
+                        | Request::OffersRemove { .. }
+                        | Request::OffersPrune { .. }
+                        | Request::Share { .. }
+                        | Request::Download { .. }
+                )
+                .then_some(&operation_id)
+            );
+        }
+        assert!(timeouts.command_deadline(&Request::Subscribe).is_none());
+        assert!(timeouts.command_deadline(&Request::Stop).is_none());
     }
 }

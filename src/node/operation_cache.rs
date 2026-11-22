@@ -44,7 +44,7 @@ impl OperationCache {
         code: meshmsg_protocol::ErrorCode,
     ) -> meshmsg_protocol::Response {
         meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-            Some(operation_id.clone()),
+            Some(*operation_id),
             code,
             meshmsg_protocol::Outcome::NotStarted,
         ))
@@ -115,14 +115,14 @@ impl OperationCache {
             let _ = waiter.send(response.clone());
         }
         self.completed.insert(
-            operation_id.clone(),
+            *operation_id,
             CompletedOperation {
                 fingerprint: in_flight.fingerprint,
                 response,
                 expires_at: now + self.ttl,
             },
         );
-        self.order.push_back(operation_id.clone());
+        self.order.push_back(*operation_id);
         self.completed
             .get(operation_id)
             .expect("completed operation was inserted")
@@ -224,34 +224,27 @@ mod tests {
         );
 
         let (reply1, response1) = oneshot::channel();
-        assert!(cache.admit(id1.clone(), fp1, reply1, now));
+        assert!(cache.admit(id1, fp1, reply1, now));
         let (duplicate, duplicate_response) = oneshot::channel();
-        assert!(!cache.admit(id1.clone(), fp1, duplicate, now));
+        assert!(!cache.admit(id1, fp1, duplicate, now));
         let (conflict, conflict_response) = oneshot::channel();
-        assert!(!cache.admit(id1.clone(), different, conflict, now));
+        assert!(!cache.admit(id1, different, conflict, now));
         assert_eq!(
             response_error(&conflict_response.await.unwrap()).code,
             meshmsg_protocol::ErrorCode::OperationIdConflict,
         );
 
         let terminal = meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-            Some(id1.clone()),
+            Some(id1),
             meshmsg_protocol::ErrorCode::SendFailed,
             meshmsg_protocol::Outcome::Unknown,
         ));
         let stored = cache.complete(&id1, terminal, now);
-        assert_eq!(
-            response_error(&stored)
-                .operation_id
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            id1.as_str()
-        );
+        assert_eq!(response_error(&stored).operation_id, Some(id1));
         assert_eq!(response1.await.unwrap(), stored);
         assert_eq!(duplicate_response.await.unwrap(), stored);
         let (cached, cached_response) = oneshot::channel();
-        assert!(!cache.admit(id1.clone(), fp1, cached, now));
+        assert!(!cache.admit(id1, fp1, cached, now));
         assert_eq!(cached_response.await.unwrap(), stored);
 
         let partial = meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
@@ -264,18 +257,18 @@ mod tests {
         let partial_fp = operation_fingerprint("download", &[b"token", b"output"]);
         let mut partial_cache = OperationCache::new(2, Duration::from_secs(10));
         let (partial_reply, partial_response) = oneshot::channel();
-        assert!(partial_cache.admit(partial_id.clone(), partial_fp, partial_reply, now));
+        assert!(partial_cache.admit(partial_id, partial_fp, partial_reply, now));
         let partial = partial_cache.complete(&partial_id, partial, now);
         assert_eq!(partial_response.await.unwrap(), partial);
         let (partial_retry, partial_retry_response) = oneshot::channel();
-        assert!(!partial_cache.admit(partial_id.clone(), partial_fp, partial_retry, now));
+        assert!(!partial_cache.admit(partial_id, partial_fp, partial_retry, now));
         assert_eq!(partial_retry_response.await.unwrap(), partial);
 
         let removal_id: meshmsg_protocol::OperationId =
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
         let removal_fp = operation_fingerprint("offers_remove", &[b"selector"]);
         let (removal_reply, removal_response) = oneshot::channel();
-        assert!(partial_cache.admit(removal_id.clone(), removal_fp, removal_reply, now));
+        assert!(partial_cache.admit(removal_id, removal_fp, removal_reply, now));
         let removal = partial_cache.complete(
             &removal_id,
             meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
@@ -287,16 +280,16 @@ mod tests {
         );
         assert_eq!(removal_response.await.unwrap(), removal);
         let (removal_retry, removal_retry_response) = oneshot::channel();
-        assert!(!partial_cache.admit(removal_id.clone(), removal_fp, removal_retry, now));
+        assert!(!partial_cache.admit(removal_id, removal_fp, removal_retry, now));
         assert_eq!(removal_retry_response.await.unwrap(), removal);
 
         let fp2 = operation_fingerprint("send", &[b"two"]);
         let (reply2, _response2) = oneshot::channel();
-        assert!(cache.admit(id2.clone(), fp2, reply2, now));
+        assert!(cache.admit(id2, fp2, reply2, now));
         cache.complete(
             &id2,
             meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                Some(id2.clone()),
+                Some(id2),
                 meshmsg_protocol::ErrorCode::SendFailed,
                 meshmsg_protocol::Outcome::Unknown,
             )),
@@ -304,7 +297,7 @@ mod tests {
         );
         let fp3 = operation_fingerprint("send", &[b"three"]);
         let (reply3, _response3) = oneshot::channel();
-        assert!(cache.admit(id3.clone(), fp3, reply3, now));
+        assert!(cache.admit(id3, fp3, reply3, now));
         assert!(
             !cache.completed.contains_key(&id1),
             "oldest terminal entry was not evicted"
@@ -312,25 +305,25 @@ mod tests {
 
         let mut expired = OperationCache::new(2, Duration::from_millis(1));
         let (reply, _response) = oneshot::channel();
-        assert!(expired.admit(id1.clone(), fp1, reply, now));
+        assert!(expired.admit(id1, fp1, reply, now));
         expired.complete(
             &id1,
             meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                Some(id1.clone()),
+                Some(id1),
                 meshmsg_protocol::ErrorCode::SendFailed,
                 meshmsg_protocol::Outcome::Unknown,
             )),
             now,
         );
         let (retry, _retry_response) = oneshot::channel();
-        assert!(expired.admit(id1.clone(), fp1, retry, now + Duration::from_millis(2)));
+        assert!(expired.admit(id1, fp1, retry, now + Duration::from_millis(2)));
 
         // The cache is intentionally daemon-lifetime scoped. A fresh daemon
         // admits the same ID again; status/docs tell clients not to infer
         // restart-persistent idempotency.
         let mut restarted = OperationCache::new(2, Duration::from_secs(10));
         let (retry, _retry_response) = oneshot::channel();
-        assert!(restarted.admit(id1.clone(), fp1, retry, now));
+        assert!(restarted.admit(id1, fp1, retry, now));
     }
 
     #[tokio::test]
@@ -345,9 +338,9 @@ mod tests {
         let mut cache = OperationCache::new(1, Duration::from_secs(60));
 
         let (active, _active_response) = oneshot::channel();
-        assert!(cache.admit(active_id.clone(), active_fingerprint, active, now));
+        assert!(cache.admit(active_id, active_fingerprint, active, now));
         let (rejected, rejected_response) = oneshot::channel();
-        assert!(!cache.admit(rejected_id.clone(), rejected_fingerprint, rejected, now));
+        assert!(!cache.admit(rejected_id, rejected_fingerprint, rejected, now));
         let rejection = rejected_response.await.unwrap();
         assert_eq!(
             response_error(&rejection).code,
@@ -362,7 +355,7 @@ mod tests {
         cache.complete(
             &active_id,
             meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                Some(active_id.clone()),
+                Some(active_id),
                 meshmsg_protocol::ErrorCode::SendFailed,
                 meshmsg_protocol::Outcome::Unknown,
             )),
@@ -382,16 +375,16 @@ mod tests {
         let mut cache = OperationCache::new(2, Duration::from_secs(60));
 
         let (owner, _owner_response) = oneshot::channel();
-        assert!(cache.admit(operation_id.clone(), fingerprint, owner, now));
+        assert!(cache.admit(operation_id, fingerprint, owner, now));
         let terminal = meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-            Some(operation_id.clone()),
+            Some(operation_id),
             meshmsg_protocol::ErrorCode::DownloadFailed,
             meshmsg_protocol::Outcome::NotStarted,
         ));
         cache.complete(&operation_id, terminal.clone(), now);
 
         let (same, same_response) = oneshot::channel();
-        assert!(!cache.admit(operation_id.clone(), fingerprint, same, now));
+        assert!(!cache.admit(operation_id, fingerprint, same, now));
         let replay = same_response.await.unwrap();
         assert_eq!(replay, terminal);
         assert_eq!(
@@ -413,14 +406,14 @@ mod tests {
         let operation: meshmsg_protocol::OperationId =
             "11111111111111111111111111111111".parse().unwrap();
         let producer = meshmsg_protocol::ProtocolError::new(
-            Some(operation.clone()),
+            Some(operation),
             meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
             meshmsg_protocol::Outcome::Partial,
         );
         let mut cache = OperationCache::new(2, Duration::from_secs(60));
         let now = StdInstant::now();
         let (reply, _receiver) = oneshot::channel();
-        assert!(cache.admit(operation.clone(), [7; 32], reply, now));
+        assert!(cache.admit(operation, [7; 32], reply, now));
         let value = cache.complete(&operation, meshmsg_protocol::Response::Error(producer), now);
         let error = response_error(&value);
         assert_eq!(error.operation_id.as_ref(), Some(&operation));
@@ -454,13 +447,13 @@ mod tests {
         };
         let mut cache = OperationCache::new(4, ttl);
         let (first_reply, _first_receiver) = oneshot::channel();
-        assert!(cache.admit(operation.clone(), fingerprint(60), first_reply, now));
+        assert!(cache.admit(operation, fingerprint(60), first_reply, now));
         // The owner resolves the cutoff once at admission; the cached terminal
         // response is the only place it is retained.
         let cutoff_ms = crate::attachment::prune_cutoff_upper_bound(100_000, 60);
         assert_eq!(cutoff_ms, 40_000);
         let terminal = meshmsg_protocol::Response::OffersPruned(meshmsg_protocol::OffersPruned {
-            operation_id: operation.parse().unwrap(),
+            operation_id: operation,
             direction: Some(meshmsg_protocol::OfferDirection::Outgoing),
             older_than_secs: 60,
             maximum: 1,
@@ -477,7 +470,7 @@ mod tests {
         // stable caller-intent fingerprint does not derive another cutoff.
         let (replay_reply, replay_receiver) = oneshot::channel();
         assert!(!cache.admit(
-            operation.clone(),
+            operation,
             fingerprint(60),
             replay_reply,
             now + ttl - Duration::from_millis(1),
@@ -487,7 +480,7 @@ mod tests {
 
         let (conflict_reply, conflict_receiver) = oneshot::channel();
         assert!(!cache.admit(
-            operation.clone(),
+            operation,
             fingerprint(61),
             conflict_reply,
             now + Duration::from_secs(1),
@@ -497,13 +490,6 @@ mod tests {
             response_error(&conflict).code,
             meshmsg_protocol::ErrorCode::OperationIdConflict
         );
-        assert_eq!(
-            response_error(&conflict)
-                .operation_id
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            operation.as_str()
-        );
+        assert_eq!(response_error(&conflict).operation_id, Some(operation));
     }
 }

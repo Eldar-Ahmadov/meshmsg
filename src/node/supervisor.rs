@@ -154,7 +154,7 @@ pub(super) fn complete_attachment_task(
             if let Some((operation_id, code)) = task_metadata.unexpected_operation {
                 let response =
                     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                        Some(operation_id.clone()),
+                        Some(operation_id),
                         code,
                         meshmsg_protocol::Outcome::Unknown,
                     ));
@@ -209,7 +209,7 @@ pub(super) async fn abort_and_drain_attachment_tasks(
             if let Some((operation_id, code)) = task_metadata.unexpected_operation {
                 let response =
                     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-                        Some(operation_id.clone()),
+                        Some(operation_id),
                         code,
                         meshmsg_protocol::Outcome::Unknown,
                     ));
@@ -260,12 +260,10 @@ mod tests {
         let fingerprint = operation_fingerprint("share", &[b"panic"]);
         let cache = Arc::new(Mutex::new(OperationCache::new(4, Duration::from_secs(10))));
         let (reply, response) = oneshot::channel();
-        assert!(cache.lock().unwrap().admit(
-            operation_id.clone(),
-            fingerprint,
-            reply,
-            StdInstant::now(),
-        ));
+        assert!(cache
+            .lock()
+            .unwrap()
+            .admit(operation_id, fingerprint, reply, StdInstant::now(),));
         let (events, _) = broadcast::channel(1);
         let mut tasks = tokio::task::JoinSet::new();
         let mut metadata = HashMap::new();
@@ -276,7 +274,7 @@ mod tests {
             AttachmentTaskMetadata {
                 kind: "panicking test attachment share",
                 unexpected_operation: Some((
-                    operation_id.clone(),
+                    operation_id,
                     meshmsg_protocol::ErrorCode::ShareFailed,
                 )),
                 space_refresh: false,
@@ -304,12 +302,10 @@ mod tests {
         assert_eq!(error.operation_id.as_ref(), Some(&operation_id));
 
         let (retry, retry_response) = oneshot::channel();
-        assert!(!cache.lock().unwrap().admit(
-            operation_id.clone(),
-            fingerprint,
-            retry,
-            StdInstant::now(),
-        ));
+        assert!(!cache
+            .lock()
+            .unwrap()
+            .admit(operation_id, fingerprint, retry, StdInstant::now(),));
         assert_eq!(retry_response.await.unwrap(), response);
         assert!(metadata.is_empty());
     }
@@ -320,7 +316,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(OperationCache::new(2, Duration::from_secs(10))));
         let (reply, response) = oneshot::channel();
         assert!(cache.lock().unwrap().admit(
-            operation_id.clone(),
+            operation_id,
             operation_fingerprint("download", &[b"cancel"]),
             reply,
             StdInstant::now(),
@@ -335,7 +331,7 @@ mod tests {
             AttachmentTaskMetadata {
                 kind: "cancelled test attachment download",
                 unexpected_operation: Some((
-                    operation_id.clone(),
+                    operation_id,
                     meshmsg_protocol::ErrorCode::DownloadFailed,
                 )),
                 space_refresh: false,
@@ -377,7 +373,7 @@ mod tests {
         ));
         let operation_id = meshmsg_protocol::OperationId::new_random();
         let request = Request::PrivateSend {
-            operation_id: operation_id.clone(),
+            operation_id,
             to: SecretKey::generate().public().to_string().parse().unwrap(),
             body: meshmsg_protocol::PrivateBody::new("shutdown in flight").unwrap(),
         };
@@ -404,7 +400,7 @@ mod tests {
             operation_fingerprint("private_send", &[to.as_str().as_bytes(), body.as_bytes()]);
         let cache = Arc::new(Mutex::new(OperationCache::new(4, Duration::from_secs(10))));
         assert!(cache.lock().unwrap().admit(
-            command_operation_id.clone(),
+            command_operation_id,
             fingerprint,
             reply,
             StdInstant::now(),
@@ -420,7 +416,7 @@ mod tests {
             AttachmentTaskMetadata {
                 kind: "shutdown test private send",
                 unexpected_operation: Some((
-                    command_operation_id.clone(),
+                    command_operation_id,
                     meshmsg_protocol::ErrorCode::PrivateSendFailed,
                 )),
                 space_refresh: false,
@@ -449,12 +445,10 @@ mod tests {
         client_task.await.unwrap().unwrap();
 
         let (retry, retry_response) = oneshot::channel();
-        assert!(!cache.lock().unwrap().admit(
-            operation_id.clone(),
-            fingerprint,
-            retry,
-            StdInstant::now(),
-        ));
+        assert!(!cache
+            .lock()
+            .unwrap()
+            .admit(operation_id, fingerprint, retry, StdInstant::now(),));
         assert_eq!(retry_response.await.unwrap(), frame.response);
         let cache = cache.lock().unwrap();
         assert_eq!(cache.counts(), (0, 1));

@@ -1,4 +1,4 @@
-use crate::ids::id_string;
+use crate::ids::peer_id;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use iroh::{PublicKey, SecretKey};
@@ -669,31 +669,23 @@ where
 }
 
 pub(crate) fn queued_event(
-    peer: &str,
-    operation_id: [u8; 16],
-    body: String,
+    peer: meshmsg_protocol::PeerId,
+    operation_id: meshmsg_protocol::OperationId,
+    body: meshmsg_protocol::BroadcastBody,
     timestamp_ms: u64,
 ) -> meshmsg_protocol::Queued {
     meshmsg_protocol::Queued {
-        operation_id: id_string(&operation_id)
-            .parse()
-            .expect("operation ID is canonical"),
-        from: peer.parse().expect("public key is canonical"),
+        operation_id,
+        from: peer,
         timestamp_ms,
-        body: meshmsg_protocol::BroadcastBody::new(body).expect("validated broadcast body"),
+        body,
     }
 }
 
 pub(crate) fn message_event(msg: &Envelope) -> meshmsg_protocol::Event {
     meshmsg_protocol::Event::Message(meshmsg_protocol::Message {
-        from: msg
-            .from
-            .to_string()
-            .parse()
-            .expect("public key is canonical"),
-        message_id: id_string(&msg.message_id)
-            .parse()
-            .expect("message ID is canonical"),
+        from: peer_id(msg.from),
+        message_id: meshmsg_protocol::MessageId::from_bytes(msg.message_id),
         timestamp_ms: msg.timestamp_ms,
         body: meshmsg_protocol::BroadcastBody::new(msg.body.clone())
             .expect("validated broadcast body"),
@@ -818,9 +810,9 @@ mod tests {
     }
 
     fn queued_event(
-        peer: &str,
-        operation_id: [u8; 16],
-        body: String,
+        peer: meshmsg_protocol::PeerId,
+        operation_id: meshmsg_protocol::OperationId,
+        body: meshmsg_protocol::BroadcastBody,
         timestamp_ms: u64,
     ) -> serde_json::Value {
         serde_json::to_value(meshmsg_protocol::ResponseFrame::new(
@@ -1643,9 +1635,9 @@ mod tests {
     #[test]
     fn queued_event_has_canonical_send_metadata_and_does_not_claim_delivery() {
         let value = queued_event(
-            &"1".repeat(64),
-            [4; 16],
-            "hello".to_owned(),
+            meshmsg_protocol::PeerId::from_bytes([0x11; 32]),
+            meshmsg_protocol::OperationId::from_bytes([4; 16]),
+            meshmsg_protocol::BroadcastBody::new("hello").unwrap(),
             1_700_000_000_000,
         );
 

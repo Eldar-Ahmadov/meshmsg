@@ -1,7 +1,7 @@
 use super::{validate_display_name, AttachmentOffer};
 use crate::{
     gossip::{Envelope, EnvelopeKind},
-    ids::id_string,
+    ids::peer_id,
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -92,7 +92,7 @@ pub(crate) fn validate_offer_binding(
     let offer = parse_attachment_body(body)?
         .context("attachment envelope does not contain a typed offer")?;
     anyhow::ensure!(
-        id_string(&message_id) == offer.offer_id,
+        meshmsg_protocol::OfferId::from_bytes(message_id).to_string() == offer.offer_id,
         "attachment envelope message ID does not match offer ID"
     );
     let ticket: BlobTicket = offer.ticket.parse().context("parse attachment ticket")?;
@@ -134,7 +134,7 @@ pub(crate) fn encode_signed_offer(
     timestamp_ms: u64,
 ) -> Result<EncodedOffer> {
     anyhow::ensure!(
-        operation_id.as_str() == offer.offer_id,
+        operation_id.to_string() == offer.offer_id,
         "attachment operation ID does not match offer ID"
     );
     let message_id = operation_id.to_bytes();
@@ -163,7 +163,7 @@ pub(crate) fn offer_event(
     offer: AttachmentOffer,
 ) -> meshmsg_protocol::Event {
     meshmsg_protocol::Event::AttachmentOffer(meshmsg_protocol::AttachmentOffer {
-        from: from.to_string().parse().expect("public key is canonical"),
+        from: peer_id(from),
         timestamp_ms,
         offer_id: offer.offer_id.parse().expect("validated offer ID"),
         kind: match offer.kind {
@@ -203,7 +203,7 @@ pub(crate) fn signed_attachment_fixture(
         _ => anyhow::bail!("invalid fixture attachment kind"),
     };
     let (state, secret) = crate::config::State::load_for_doctor(dir)?;
-    let topic = state.topic_id()?;
+    let topic = state.topic_id();
     let timestamp_ms =
         crate::clock::unix_timestamp_ms().context("system clock is before the Unix epoch")?;
     let offer = AttachmentOffer {

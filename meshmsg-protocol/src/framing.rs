@@ -355,10 +355,10 @@ mod tests {
         let attachment = crate::EventFrame::new(
             crate::RequestId::new_random(),
             crate::Event::AttachmentShared(crate::AttachmentShared {
-                operation_id: operation.clone(),
-                from: peer.clone(),
+                operation_id: operation,
+                from: peer,
                 timestamp_ms: u64::MAX,
-                offer_id: operation.as_str().parse().unwrap(),
+                offer_id: crate::OfferId::from_bytes(operation.to_bytes()),
                 kind: crate::AttachmentKind::File,
                 name: crate::AttachmentName::new("x".repeat(100)).unwrap(),
                 size: u64::MAX,
@@ -381,8 +381,8 @@ mod tests {
         let completion = crate::ResponseFrame::new(
             Some(crate::RequestId::new_random()),
             crate::Response::DownloadComplete(crate::DownloadResult {
-                operation_id: operation.clone(),
-                offer_id: operation.as_str().parse().unwrap(),
+                operation_id: operation,
+                offer_id: crate::OfferId::from_bytes(operation.to_bytes()),
                 kind: crate::AttachmentKind::File,
                 name: crate::AttachmentName::new("x".repeat(100)).unwrap(),
                 size: u64::MAX,

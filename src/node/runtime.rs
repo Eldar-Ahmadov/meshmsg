@@ -17,6 +17,7 @@ use crate::{
     config::{State, StateLock},
     direct,
     gossip::EventHandler as GossipEventHandler,
+    ids::peer_id,
     invite::Invite,
     ipc::{
         bind_local_endpoint,
@@ -179,11 +180,13 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
     let mut shutdown = shutdown_signals()?;
     // Claim local ownership before reading the identity, starting networking, or mutating state.
     let state_lock = StateLock::acquire(dir)?;
-    let (mut state, secret) = State::load_locked(dir, &state_lock)?;
-    state.validate_for_identity(secret.public())?;
+    // Loading under the lock validates the state for this identity and yields
+    // the one parsed copy of its invite.
+    let (mut state, secret, mut invite) = State::load_locked(dir, &state_lock)?;
+    let topic = state.topic_id();
     let alias_config = AliasConfig::load_for_identity(dir, secret.public())?;
     let startup = tokio::select! {
-        result = tokio::time::timeout(STARTUP_TIMEOUT, start(&state, secret, dir)) => result,
+        result = tokio::time::timeout(STARTUP_TIMEOUT, start(topic, invite.as_ref(), secret, dir)) => result,
         _ = shutdown.recv() => return Ok(()),
     };
     let mut node = match startup {
@@ -215,20 +218,17 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
     }
 
     if state.advertise_self {
-        let mut invite = match &state.invite {
-            Some(token) => token.parse::<Invite>()?,
-            None => Invite {
-                topic: state.topic_id()?,
-                bootstrap_peers: Vec::new(),
-            },
-        };
-        invite.upsert_bootstrap_peer(node.endpoint.addr())?;
-        state.invite = Some(invite.to_string());
+        let advertised = invite.get_or_insert(Invite {
+            topic,
+            bootstrap_peers: Vec::new(),
+        });
+        advertised.upsert_bootstrap_peer(node.endpoint.addr())?;
+        state.invite = Some(advertised.to_string());
         state.save(dir, &state_lock)?;
     }
 
     let (has_invite, bootstrap_peer_count, self_advertised) =
-        crate::invite::configured_details(state.invite.as_deref(), node.endpoint.id())?;
+        crate::invite::configured_details(invite.as_ref(), node.endpoint.id());
     let blob_root = dir.join("blobs-v1").join(node.secret.public().to_string());
     let attachment_storage = AttachmentStorage::open(
         node.blob_store.clone(),
@@ -243,28 +243,22 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
     // Expose IPC only after networking is ready, so clients never connect to a
     // socket whose daemon is still blocked during bootstrap.
     let (mut listener, _endpoint_guard) = bind_local_endpoint(dir, &state_lock).await?;
-    let peer = node.endpoint.id().to_string();
+    let peer = peer_id(node.endpoint.id());
     eprintln!("daemon running as {peer}");
 
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (event_tx, _) = broadcast::channel(IPC_EVENT_CAPACITY);
     let transfer_limit = Arc::new(Semaphore::new(2));
     let offer_list_limit = Arc::new(Semaphore::new(1));
-    let direct_sender = direct::DirectSender::new(
-        node.endpoint.clone(),
-        node.secret.clone(),
-        state.topic_id()?,
-    );
+    let direct_sender =
+        direct::DirectSender::new(node.endpoint.clone(), node.secret.clone(), topic);
     // Deliberately daemon-lifetime scoped: status advertises the bounded TTL and
     // restart semantics so callers never infer durable command history.
     let operation_cache = Arc::new(Mutex::new(OperationCache::new(
         OPERATION_CACHE_CAPACITY,
         OPERATION_CACHE_TTL,
     )));
-    let topic = state.topic_id()?;
     let mut directory = Directory::new(node.presence_lookup.clone());
-    let directory_epoch = data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>());
-    let mut directory_revision = 0_u64;
     for address in &node.bootstrap_addrs {
         if directory.pin(address.clone()).is_ok() {
             // Invite validation already bounds bootstrap addresses; invalid direct
@@ -312,7 +306,7 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
                         // Expiration is authoritative in the daemon. Emit it before
                         // capturing the new subscriber's snapshot so queued events
                         // are strictly later than that snapshot.
-                        presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                        presence::emit_transitions(directory.cleanup(), &event_tx);
                         let generated_at_ms = unix_timestamp_ms()?;
                         let connectivity = presence::local_connectivity(
                             &node.endpoint,
@@ -321,11 +315,9 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
                         let (connected, startup_peers) = subscription_startup_events(
                             connectivity,
                             &directory,
-                            &peer,
+                            peer,
                             alias_config.effective(),
                             generated_at_ms,
-                            &directory_epoch,
-                            directory_revision,
                         )?;
                         Ok(LocalClientSession {
                             commands: command_tx.clone(),
@@ -353,9 +345,7 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
                         operation_cache: &operation_cache,
                         directory: &mut directory,
                         event_tx: &event_tx,
-                        directory_epoch: &directory_epoch,
-                        directory_revision: &mut directory_revision,
-                        peer: &peer,
+                        peer,
                         offer_list_limit: &offer_list_limit,
                         transfer_limit: &transfer_limit,
                         transfer_tasks: &mut transfer_tasks,
@@ -399,11 +389,11 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
                     if presence_sources.allow(message.delivered_from) {
                         // Never let receive-time cleanup swallow an expiry. The
                         // explicit cleanup transition is emitted first.
-                        presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                        presence::emit_transitions(directory.cleanup(), &event_tx);
                         if let Ok(transition) = directory.receive(&message.content, topic) {
                             presence_health.received(tokio::time::Instant::now());
                             if let Some(transition) = transition {
-                                presence::emit_transitions([transition], &event_tx, &directory_epoch, &mut directory_revision);
+                                presence::emit_transitions([transition], &event_tx);
                             }
                         }
                     }
@@ -444,7 +434,7 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
                 ).await;
             },
             _ = presence_cleanup.tick() => {
-                presence::emit_transitions(directory.cleanup(), &event_tx, &directory_epoch, &mut directory_revision);
+                presence::emit_transitions(directory.cleanup(), &event_tx);
                 presence_sources.cleanup();
             },
             _ = attachment_space_refresh.tick() => {

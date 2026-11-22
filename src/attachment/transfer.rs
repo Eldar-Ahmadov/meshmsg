@@ -7,7 +7,7 @@ use super::{
     },
     AttachmentKind, AttachmentOffer,
 };
-use crate::{attachment, clock::unix_timestamp_ms};
+use crate::{attachment, clock::unix_timestamp_ms, ids::peer_id};
 use anyhow::{Context, Result};
 use data_encoding::BASE64URL_NOPAD;
 use futures_util::StreamExt;
@@ -145,12 +145,8 @@ pub(super) async fn share_attachment(
             .context("broadcast attachment offer after durable pin")?;
         Ok(meshmsg_protocol::Response::AttachmentShared(
             meshmsg_protocol::AttachmentShared {
-                operation_id: operation_id.clone(),
-                from: signed
-                    .from
-                    .to_string()
-                    .parse()
-                    .expect("public key is canonical"),
+                operation_id,
+                from: peer_id(signed.from),
                 timestamp_ms,
                 offer_id: offer.offer_id.parse().expect("validated offer ID"),
                 kind: protocol_attachment_kind(offer.kind),
@@ -494,7 +490,7 @@ pub(super) async fn download_attachment(
                                 || received_bytes == verified_size) =>
                     {
                         let _ = events.send(meshmsg_protocol::Event::DownloadProgress {
-                            operation_id: operation_id.clone(),
+                            operation_id: *operation_id,
                             received_bytes: received_bytes.min(verified_size),
                             total_bytes: verified_size,
                             output: output.clone(),
@@ -519,7 +515,7 @@ pub(super) async fn download_attachment(
     };
     if size == 0 {
         let _ = events.send(meshmsg_protocol::Event::DownloadProgress {
-            operation_id: operation_id.clone(),
+            operation_id: *operation_id,
             received_bytes: 0,
             total_bytes: 0,
             output: output.clone(),
@@ -584,17 +580,12 @@ pub(super) async fn download_attachment(
     };
     Ok(meshmsg_protocol::Response::DownloadComplete(
         meshmsg_protocol::DownloadResult {
-            operation_id: operation_id.clone(),
+            operation_id: *operation_id,
             offer_id: offer.offer_id.parse().expect("validated offer ID"),
             kind: protocol_attachment_kind(offer.kind),
             name: response_name,
             size,
-            from: ticket
-                .addr()
-                .id
-                .to_string()
-                .parse()
-                .expect("public key is canonical"),
+            from: peer_id(ticket.addr().id),
             output,
             destination_synced: commit.destination_synced,
             cleanup_complete: commit.cleanup_complete,

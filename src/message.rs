@@ -3,7 +3,7 @@ pub(crate) fn invalid_local_message(
     diagnostic: anyhow::Error,
 ) -> anyhow::Error {
     let error = meshmsg_protocol::ProtocolError::new(
-        Some(operation_id.clone()),
+        Some(*operation_id),
         meshmsg_protocol::ErrorCode::InvalidMessage,
         meshmsg_protocol::Outcome::NotStarted,
     );
