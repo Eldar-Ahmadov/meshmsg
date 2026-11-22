@@ -330,7 +330,6 @@ pub(crate) async fn chat(dir: &Path, json: bool) -> Result<()> {
                     if body.is_empty() {
                         continue;
                     }
-                    crate::message::validate_broadcast_body(&body)?;
                     send_request_checked(
                         dir,
                         &Request::Send {

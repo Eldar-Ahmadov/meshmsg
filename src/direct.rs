@@ -85,7 +85,7 @@ impl DirectFrame {
         body: String,
         id: [u8; 16],
     ) -> Result<Self> {
-        crate::message::validate_private_body(&body)?;
+        meshmsg_protocol::PrivateBody::validate(&body)?;
         let payload = DirectPayload {
             version: DIRECT_VERSION,
             sender: secret.public(),
@@ -126,7 +126,7 @@ impl DirectFrame {
             frame.payload.version == DIRECT_VERSION,
             "unsupported private message version"
         );
-        crate::message::validate_private_body(&frame.payload.body)?;
+        meshmsg_protocol::PrivateBody::validate(&frame.payload.body)?;
         let signed = postcard::to_stdvec(&(MESSAGE_DOMAIN, &frame.payload))?;
         frame
             .payload
@@ -246,7 +246,6 @@ struct IncomingDirect {
 
 fn incoming_event(msg: IncomingDirect) -> meshmsg_protocol::Event {
     meshmsg_protocol::Event::PrivateMessage(meshmsg_protocol::PrivateMessage {
-        private: true,
         from: msg
             .from
             .to_string()
@@ -255,9 +254,6 @@ fn incoming_event(msg: IncomingDirect) -> meshmsg_protocol::Event {
         message_id: id_string(&msg.id).parse().expect("message ID is canonical"),
         timestamp_ms: msg.timestamp_ms,
         body: meshmsg_protocol::PrivateBody::new(msg.body).expect("validated direct body"),
-        acceptance_acknowledged: true,
-        durable: false,
-        read: false,
     })
 }
 
@@ -377,7 +373,6 @@ pub(crate) fn setup(
 #[derive(Debug)]
 struct AcceptedDirect {
     recipient: PublicKey,
-    id: [u8; 16],
     timestamp_ms: u64,
     body_bytes: usize,
     duplicate: bool,
@@ -408,7 +403,6 @@ async fn send(
     let encoded = frame.encode()?;
     let body_bytes = frame.payload.body.len();
     let recipient = frame.payload.recipient;
-    let id = frame.payload.id;
     let timestamp_ms = frame.payload.timestamp_ms;
     let operation = async {
         let connection = endpoint
@@ -436,7 +430,6 @@ async fn send(
             AckResult::Accepted | AckResult::DuplicateAccepted => {
                 Ok(DirectSendOutcome::Accepted(AcceptedDirect {
                     recipient,
-                    id,
                     timestamp_ms,
                     body_bytes,
                     duplicate: ack.payload.result == AckResult::DuplicateAccepted,
@@ -527,15 +520,9 @@ impl DirectSendPermit {
                         .to_string()
                         .parse()
                         .expect("public key is canonical"),
-                    message_id: id_string(&accepted.id)
-                        .parse()
-                        .expect("message ID is canonical"),
                     timestamp_ms: accepted.timestamp_ms,
                     body_bytes: accepted.body_bytes,
-                    acceptance_acknowledged: true,
                     duplicate_accepted: accepted.duplicate,
-                    durable: false,
-                    read: false,
                 })
             }
             Ok(DirectSendOutcome::Rejected(rejection)) => {

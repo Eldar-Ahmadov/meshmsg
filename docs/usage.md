@@ -112,19 +112,19 @@ An alias is signed discovery metadata, not a verified person, account, or author
 `meshmsg peers` asks the running daemon for a sanitized, point-in-time directory. Use `meshmsg --json peers` for the canonical protocol-v5 frame:
 
 ```json
-{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peers_snapshot","generated_at_ms":1700000000000,"directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":7,"self":{"public_key":"<local-key>","alias":"laptop","online":true},"peers":[{"public_key":"<remote-key>","alias":"build-node-2","online":true,"last_seen_ms":1699999999000,"expires_at_ms":1700000149000}]}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peers_snapshot","generated_at_ms":1700000000000,"directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":7,"self":{"public_key":"<local-key>","alias":"laptop","online":true},"peers":[{"public_key":"<remote-key>","alias":"build-node-2","last_seen_ms":1699999999000,"expires_at_ms":1700000149000}]}
 ```
 
-`self` is always a separate object and the remote `peers` array always excludes it. The array is sorted bytewise by canonical `public_key`; `alias` is always present and is either a normalized alias or JSON `null`. `self.online` is true only when the local endpoint is online **and** its topic is joined. A remote is present with `online:true` only while its authenticated signed-presence lease is current. This is a local freshness judgment, not an active reachability probe, trust assertion, Gossip-neighbor relationship, or delivery guarantee. Expired remotes are omitted.
+`self` is always a separate object and the remote `peers` array always excludes it. The array is sorted bytewise by canonical `public_key`; `alias` is always present and is either a normalized alias or JSON `null`. `self.online` is true only when the local endpoint is online **and** its topic is joined. A remote is present only while its authenticated signed-presence lease is current. This is a local freshness judgment, not an active reachability probe, trust assertion, Gossip-neighbor relationship, or delivery guarantee. Expired remotes are omitted.
 
 `last_seen_ms` is the local daemon's receipt time, not the sender-controlled signed timestamp. `expires_at_ms` is locally derived from the presence lifetime. The snapshot is bounded by the [authoritative peer and response/event limits](contracts.md#ipc); notably, responses and events use the roughly 4.3 MiB event limit, not the smaller request limit. It never contains endpoint addresses, relays, sockets, raw signed records, signatures, invites, capabilities, or message bodies.
 
 Local subscriptions start with `connected`, then an atomic `peers_snapshot`, then live events that occurred after that snapshot:
 
 ```json
-{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_discovered","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":8,"peer":{"public_key":"<remote-key>","alias":"node-1","online":true,"last_seen_ms":1700000000000,"expires_at_ms":1700000150000}}
-{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_updated","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":9,"peer":{"public_key":"<remote-key>","alias":"node-2","online":true,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
-{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_expired","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":10,"peer":{"public_key":"<remote-key>","alias":"node-2","online":false,"last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_discovered","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":8,"peer":{"public_key":"<remote-key>","alias":"node-1","last_seen_ms":1700000000000,"expires_at_ms":1700000150000}}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_updated","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":9,"peer":{"public_key":"<remote-key>","alias":"node-2","last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"peer_expired","directory_epoch":"0123456789abcdef0123456789abcdef","directory_revision":10,"peer":{"public_key":"<remote-key>","alias":"node-2","last_seen_ms":1700000030000,"expires_at_ms":1700000180000}}
 ```
 
 These events are reconstructed from an explicit metadata allowlist, are limited to 512 encoded JSON bytes, and contain no message body or routing data. An identical periodic presence refresh advances freshness in later snapshots without emitting an event. First observation emits `peer_discovered`; an alias change emits `peer_updated`; hidden routing-only changes emit no public event; lease cleanup emits one `peer_expired`; a later valid presence emits `peer_discovered` again. Low-level broadcast-Gossip neighbor changes are not local IPC directory events.
@@ -153,7 +153,7 @@ Client commands use owner-only local IPC and never create another Iroh endpoint.
 A successful send reports `queued`:
 
 ```json
-{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"queued","operation_id":"<32-lowercase-hex>","from":"<peer-id>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body":"hello","delivery_acknowledged":false}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"queued","operation_id":"<32-lowercase-hex>","from":"<peer-id>","timestamp_ms":1700000000000,"body":"hello"}
 ```
 
 `queued` means the local Gossip implementation accepted the broadcast request. It is not a delivery acknowledgement. The operation ID is also the signed V3 wire message ID, so a retry uses the same replay identity. Remote `message` IPC records use the same canonical frame. Broadcast body and envelope bounds, rejection behavior, and wire-version invariants are defined in the [authoritative IPC contract](contracts.md#ipc). Signed remote envelopes with invalid text or attachment semantics are dropped before replay admission.
@@ -195,7 +195,7 @@ The CLI submits the strict protocol-v5 `private_send` IPC command directly; it n
 A private message travels over a separate authenticated, encrypted Iroh connection and is signed and bound to the sender, recipient, and topic. It is not placed in the broadcast message stream. On success, human output says the private message was accepted; JSON reports metadata, never the sent body:
 
 ```json
-{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"private_accepted","operation_id":"<32-lowercase-hex>","to":"<full-peer-key>","message_id":"<same-operation-id>","timestamp_ms":1700000000000,"body_bytes":13,"acceptance_acknowledged":true,"duplicate_accepted":false,"durable":false,"read":false}
+{"protocol_version":5,"request_id":"0123456789abcdef0123456789abcdef","type":"private_accepted","operation_id":"<32-lowercase-hex>","to":"<full-peer-key>","timestamp_ms":1700000000000,"body_bytes":13,"duplicate_accepted":false}
 ```
 
 A new acceptance means the authenticated recipient recorded a domain-separated SHA-256 fingerprint of the signed semantic payload and queued the volatile body before signing success. `duplicate_accepted:true` means the running recipient daemon had already accepted the same sender/ID/fingerprint and did not queue it again. Neither result means a person or `listen` client read it or that the body survives process failure.
@@ -204,7 +204,7 @@ Replay suppression lives only in the recipient daemon's memory, for about 10.5 m
 
 The direct v2 signed rejection results are mapped to stable daemon errors. `private_message_conflict` means the sender/ID is already bound to different content. `private_recipient_busy` means no record was created because a rate/quota bound or the full delivery queue rejected it; after that condition changes, a new attempt requires a new ID because the old not-started result is cached. Transport loss or an undecodable acknowledgement is `private_send_failed` with an unknown outcome: reconcile or retry only the exact input with the same ID; changing to a new ID can duplicate the message.
 
-`listen` and `chat` subscribers receive accepted messages as `private_message` events containing `private:true`, the canonical `from`, message ID, timestamp, body, and explicit `durable:false`/`read:false` fields. Live IDs are never pressure-evicted: a new ID is answered with signed `Busy` when the global 8,192-ID quota, per-sender 512-ID quota, per-sender 8/second (burst 16) rate, global 128/second (burst 256) rate, or volatile delivery queue is exhausted.
+`listen` and `chat` subscribers receive accepted messages as `private_message` events containing the canonical `from`, message ID, timestamp, and body. Live IDs are never pressure-evicted: a new ID is answered with signed `Busy` when the global 8,192-ID quota, per-sender 512-ID quota, per-sender 8/second (burst 16) rate, global 128/second (burst 256) rate, or volatile delivery queue is exhausted.
 
 Nonempty lines entered in `chat` are still broadcasts; blank lines are ignored without allocating an operation ID or contacting the daemon. It has no direct-reply mode. Private bodies are suppressed from unattended daemon logs.
 
@@ -290,7 +290,7 @@ meshmsg --json doctor
 ```
 
 The strict status frame includes local identity/topic and connectivity fields, alias
-state, operation-cache bounds, attachment limits and storage
+state, attachment limits and storage
 pressure, plus its protocol version and request correlation. See
 [`Status`](../meshmsg-protocol/src/model.rs) for the complete typed field inventory.
 

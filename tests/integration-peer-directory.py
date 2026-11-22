@@ -9,7 +9,7 @@ import time
 
 BIN = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/meshmsg").resolve())
 LEASE_MS = 150_000
-REMOTE_KEYS = {"public_key", "alias", "online", "last_seen_ms", "expires_at_ms"}
+REMOTE_KEYS = {"public_key", "alias", "last_seen_ms", "expires_at_ms"}
 SELF_KEYS = {"public_key", "alias", "online"}
 EVENT_KEYS = {
     "protocol_version", "type", "request_id", "directory_epoch",
@@ -53,7 +53,7 @@ def main():
             )
             processes[node] = process
             wait_for(
-                lambda: process.poll() is None and cli(node, "status")["running"] is True,
+                lambda: process.poll() is None and cli(node, "status")["type"] == "status",
                 f"{node} daemon startup", 90,
             )
 
@@ -111,15 +111,14 @@ def main():
                 for child in value:
                     assert_no_private_fields(child)
 
-        def validate_remote(entry, generated_at_ms, expected_alias):
+        def validate_remote(entry, generated_at_ms, expected_alias, lease_current):
             assert set(entry) == REMOTE_KEYS, entry
             assert entry["public_key"]
             assert entry["alias"] == expected_alias
-            assert isinstance(entry["online"], bool)
             assert isinstance(entry["last_seen_ms"], int)
             assert isinstance(entry["expires_at_ms"], int)
             assert 0 <= entry["expires_at_ms"] - entry["last_seen_ms"] <= LEASE_MS
-            if entry["online"]:
+            if lease_current:
                 assert entry["last_seen_ms"] <= generated_at_ms <= entry["expires_at_ms"]
             assert_no_private_fields(entry)
 
@@ -146,8 +145,9 @@ def main():
             assert self_peer not in keys
             assert set(keys) == set(remotes)
             for entry in entries:
-                validate_remote(entry, value["generated_at_ms"], remotes[entry["public_key"]])
-                assert entry["online"] is True
+                validate_remote(
+                    entry, value["generated_at_ms"], remotes[entry["public_key"]], True,
+                )
             assert_no_private_fields(value)
             return {entry["public_key"]: entry for entry in entries}
 
@@ -157,12 +157,9 @@ def main():
             assert len(value["request_id"]) == 32
             assert len(value["directory_epoch"]) == 32
             assert isinstance(value["directory_revision"], int)
-            peer = value["peer"]
-            validate_remote(peer, int(time.time() * 1000), alias)
-            if kind == "peer_expired":
-                assert peer["online"] is False
-            else:
-                assert peer["online"] is True
+            validate_remote(
+                value["peer"], int(time.time() * 1000), alias, kind != "peer_expired",
+            )
             assert_no_private_fields(value)
 
         try:

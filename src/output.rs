@@ -82,13 +82,12 @@ fn print_peer_snapshot(value: &meshmsg_protocol::PeerSnapshot) {
     );
     for peer in &value.peers {
         println!(
-            "peer: {}{} ({})",
+            "peer: {}{} (online)",
             peer.public_key,
             peer.alias
                 .as_ref()
                 .map(|alias| format!(" ({})", alias.as_str()))
-                .unwrap_or_default(),
-            if peer.online { "online" } else { "offline" }
+                .unwrap_or_default()
         );
     }
 }
@@ -274,9 +273,14 @@ pub(crate) fn event(json: bool, frame: &meshmsg_protocol::EventFrame) -> Result<
             value.size,
             value.output.display()
         ),
-        meshmsg_protocol::Event::Lagged { message, .. } => {
-            println!("warning: {}", terminal_safe(message))
-        }
+        meshmsg_protocol::Event::Lagged {
+            source: meshmsg_protocol::EventSource::Local,
+            dropped,
+        } => println!("warning: local listener missed {dropped} events"),
+        meshmsg_protocol::Event::Lagged {
+            source: meshmsg_protocol::EventSource::Gossip,
+            ..
+        } => println!("warning: receiver fell behind; one or more events were dropped"),
     }
     Ok(())
 }

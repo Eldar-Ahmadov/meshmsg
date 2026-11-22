@@ -16,9 +16,6 @@ pub(crate) struct RemotePeer {
     pub(crate) public_key: String,
     /// Always serialized; null means the peer did not advertise an alias.
     pub(crate) alias: Option<String>,
-    /// True exactly while the authenticated presence lease is current. This is
-    /// not a reachability probe and is independent of Gossip neighbor state.
-    pub(crate) online: bool,
     /// Local receipt time, never the peer-controlled signed issue time.
     pub(crate) last_seen_ms: u64,
     /// Locally bounded lease deadline.
@@ -96,7 +93,6 @@ fn protocol_remote(peer: RemotePeer) -> meshmsg_protocol::RemotePeer {
             .map(|alias| alias.parse())
             .transpose()
             .expect("validated alias"),
-        online: peer.online,
         last_seen_ms: peer.last_seen_ms,
         expires_at_ms: peer.expires_at_ms,
     }
@@ -110,7 +106,6 @@ mod tests {
         RemotePeer {
             public_key: public_key.into(),
             alias: alias.map(str::to_owned),
-            online: true,
             last_seen_ms: 100,
             expires_at_ms: 1_100,
         }
@@ -172,7 +167,6 @@ mod tests {
             .map(|index| RemotePeer {
                 public_key: format!("{index:064x}"),
                 alias: Some("a".repeat(crate::alias::MAX_ALIAS_BYTES)),
-                online: true,
                 last_seen_ms: 1_000,
                 expires_at_ms: 1_000 + PEER_LEASE_MS,
             })
@@ -203,7 +197,6 @@ mod tests {
                 peer: RemotePeer {
                     public_key: "f".repeat(64),
                     alias: Some("a".repeat(crate::alias::MAX_ALIAS_BYTES)),
-                    online: false,
                     last_seen_ms: u64::MAX,
                     expires_at_ms: u64::MAX,
                 },

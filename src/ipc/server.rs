@@ -2,7 +2,7 @@
 
 use super::SubscriptionStream;
 use crate::{
-    node::{CommandPolicy, CommandTimeouts, DaemonCommand},
+    node::{CommandTimeouts, DaemonCommand},
     presence::{self, Directory},
 };
 use anyhow::{Context, Result};
@@ -113,21 +113,21 @@ where
 
 async fn command_response<F>(
     operation: F,
-    policy: CommandPolicy,
+    deadline: Duration,
     operation_id: Option<meshmsg_protocol::OperationId>,
 ) -> meshmsg_protocol::Response
 where
     F: std::future::Future<Output = Result<meshmsg_protocol::Response>>,
 {
-    let (code, value) = match tokio::time::timeout(policy.deadline, operation).await {
+    let code = match tokio::time::timeout(deadline, operation).await {
         Ok(Ok(value)) => return value,
-        Ok(Err(_)) => (policy.unavailable_code, meshmsg_protocol::Outcome::Unknown),
-        Err(_) => (policy.timeout_code, meshmsg_protocol::Outcome::Unknown),
+        Ok(Err(_)) => meshmsg_protocol::ErrorCode::DaemonStopping,
+        Err(_) => meshmsg_protocol::ErrorCode::CommandTimeout,
     };
     meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
         operation_id,
         code,
-        value,
+        meshmsg_protocol::Outcome::Unknown,
     ))
 }
 
@@ -254,7 +254,6 @@ where
                                 meshmsg_protocol::Event::Lagged {
                                     source: meshmsg_protocol::EventSource::Local,
                                     dropped: count,
-                                    message: format!("local listener missed {count} events"),
                                 },
                                 timeouts.response_write,
                             )
@@ -274,8 +273,10 @@ where
         | Request::OffersPrune { .. }
         | Request::Share { .. }
         | Request::Download { .. }) => {
-            let policy = CommandPolicy::for_request(&request, timeouts.command_timeouts())
-                .expect("executable requests have a command policy");
+            let deadline = timeouts
+                .command_timeouts()
+                .deadline(&request)
+                .expect("executable requests have a command deadline");
             let operation_id = request.operation_id().cloned();
             let (reply, response) = oneshot::channel();
             let value = command_response(
@@ -284,7 +285,7 @@ where
                     DaemonCommand::Execute { request, reply },
                     response,
                 ),
-                policy,
+                deadline,
                 operation_id,
             )
             .await;
@@ -517,7 +518,6 @@ mod tests {
             peer: meshmsg_protocol::RemotePeer {
                 public_key: "3".repeat(64).parse().unwrap(),
                 alias: None,
-                online: true,
                 last_seen_ms: 1,
                 expires_at_ms: 2,
             },
@@ -1327,25 +1327,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_timeout_and_shutdown_errors_have_typed_retry_advice() {
+    async fn command_timeout_and_shutdown_errors_have_typed_retry_advice() {
         let (sender, receiver) = oneshot::channel::<meshmsg_protocol::Response>();
-        let policy = CommandPolicy {
-            deadline: Duration::from_millis(1),
-            timeout_code: meshmsg_protocol::ErrorCode::AttachmentCommandTimeout,
-            unavailable_code: meshmsg_protocol::ErrorCode::AttachmentStorageShutdown,
-        };
+        let deadline = Duration::from_millis(1);
         let operation_id = meshmsg_protocol::OperationId::new_random();
         let timeout_value = command_response(
             async move { Ok(receiver.await?) },
-            policy,
+            deadline,
             Some(operation_id.clone()),
         )
         .await;
         let timeout = response_error(&timeout_value);
-        assert_eq!(
-            timeout.code,
-            meshmsg_protocol::ErrorCode::AttachmentCommandTimeout
-        );
+        assert_eq!(timeout.code, meshmsg_protocol::ErrorCode::CommandTimeout);
         assert_eq!(timeout.outcome, meshmsg_protocol::Outcome::Unknown);
         assert_eq!(
             timeout.retry_advice(),
@@ -1355,15 +1348,12 @@ mod tests {
 
         let shutdown_value = command_response(
             async { anyhow::bail!("closed") },
-            policy,
+            deadline,
             Some(operation_id),
         )
         .await;
         let shutdown = response_error(&shutdown_value);
-        assert_eq!(
-            shutdown.code,
-            meshmsg_protocol::ErrorCode::AttachmentStorageShutdown
-        );
+        assert_eq!(shutdown.code, meshmsg_protocol::ErrorCode::DaemonStopping);
         assert_eq!(shutdown.outcome, meshmsg_protocol::Outcome::Unknown);
     }
 }

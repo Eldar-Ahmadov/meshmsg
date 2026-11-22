@@ -315,10 +315,16 @@ macro_rules! message_body {
 
             pub fn new(value: impl Into<String>) -> Result<Self, TextError> {
                 let value = value.into();
+                Self::validate(&value)?;
+                Ok(Self(value))
+            }
+
+            /// Checks the body bound without taking ownership of the text.
+            pub fn validate(value: &str) -> Result<(), TextError> {
                 if value.is_empty() || value.len() > Self::MAX_BYTES {
                     return Err(TextError($description, Self::MAX_BYTES));
                 }
-                Ok(Self(value))
+                Ok(())
             }
 
             pub fn as_str(&self) -> &str {
@@ -680,7 +686,6 @@ pub enum Event {
     Lagged {
         source: EventSource,
         dropped: u64,
-        message: String,
     },
 }
 
@@ -717,8 +722,9 @@ impl Event {
             Self::AttachmentOffer(value) => value.validate(),
             Self::AttachmentShared(value) => value.validate(),
             Self::PeersSnapshot(value) => value.validate(),
-            Self::PeerDiscovered(value) | Self::PeerUpdated(value) => value.validate(true),
-            Self::PeerExpired(value) => value.validate(false),
+            Self::PeerDiscovered(value) | Self::PeerUpdated(value) | Self::PeerExpired(value) => {
+                value.validate()
+            }
             Self::DownloadStarted { output, .. } if safe_ipc_path(output) => Ok(()),
             Self::DownloadStarted { .. } => Err("unsafe download output path"),
             Self::DownloadProgress {
@@ -729,10 +735,7 @@ impl Event {
             } if received_bytes <= total_bytes && safe_ipc_path(output) => Ok(()),
             Self::DownloadProgress { .. } => Err("invalid download progress"),
             Self::DownloadComplete(value) => value.validate(),
-            Self::Lagged { message, .. } if valid_public_text(message, MAX_PUBLIC_TEXT_BYTES) => {
-                Ok(())
-            }
-            Self::Lagged { .. } => Err("invalid lag event"),
+            Self::Lagged { .. } => Ok(()),
         }
     }
 }
@@ -770,7 +773,6 @@ impl AttachmentStorageStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Status {
-    pub running: bool,
     pub peer: PeerId,
     pub topic: TopicId,
     pub advertises_self: bool,
@@ -785,9 +787,6 @@ pub struct Status {
     pub captured_hostname: Option<String>,
     pub custom_alias: Option<String>,
     pub advertised_aliases: usize,
-    pub operation_cache_capacity: usize,
-    pub operation_cache_ttl_ms: u64,
-    pub operation_cache_persistent: bool,
     pub max_attachment_bytes: u64,
     pub attachment_storage: AttachmentStorageStatus,
     pub attachment_retention_secs: u64,
@@ -799,8 +798,7 @@ impl Status {
             !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
         }
 
-        if !self.running
-            || self.max_attachment_bytes == 0
+        if self.max_attachment_bytes == 0
             || self
                 .captured_hostname
                 .as_deref()
@@ -837,14 +835,10 @@ pub struct Message {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateMessage {
-    pub private: bool,
     pub from: PeerId,
     pub message_id: MessageId,
     pub timestamp_ms: u64,
     pub body: PrivateBody,
-    pub acceptance_acknowledged: bool,
-    pub durable: bool,
-    pub read: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -852,10 +846,8 @@ pub struct PrivateMessage {
 pub struct Queued {
     pub operation_id: OperationId,
     pub from: PeerId,
-    pub message_id: MessageId,
     pub timestamp_ms: u64,
     pub body: BroadcastBody,
-    pub delivery_acknowledged: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -863,13 +855,9 @@ pub struct Queued {
 pub struct PrivateAccepted {
     pub operation_id: OperationId,
     pub to: PeerId,
-    pub message_id: MessageId,
     pub timestamp_ms: u64,
     pub body_bytes: usize,
-    pub acceptance_acknowledged: bool,
     pub duplicate_accepted: bool,
-    pub durable: bool,
-    pub read: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -897,7 +885,6 @@ pub struct SelfPeer {
 pub struct RemotePeer {
     pub public_key: PeerId,
     pub alias: Option<Alias>,
-    pub online: bool,
     pub last_seen_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -1025,35 +1012,23 @@ impl Message {
 
 impl PrivateMessage {
     fn validate(&self) -> Result<(), &'static str> {
-        (self.private
-            && self.timestamp_ms != 0
-            && self.acceptance_acknowledged
-            && !self.durable
-            && !self.read)
+        (self.timestamp_ms != 0)
             .then_some(())
-            .ok_or("invalid private-message acceptance flags")
+            .ok_or("invalid private-message timestamp")
     }
 }
 
 impl Queued {
     fn validate(&self) -> Result<(), &'static str> {
-        (self.operation_id.as_str() == self.message_id.as_str()
-            && self.timestamp_ms != 0
-            && !self.delivery_acknowledged)
+        (self.timestamp_ms != 0)
             .then_some(())
-            .ok_or("invalid queued-message correlation")
+            .ok_or("invalid queued-message timestamp")
     }
 }
 
 impl PrivateAccepted {
     fn validate(&self) -> Result<(), &'static str> {
-        (self.operation_id.as_str() == self.message_id.as_str()
-            && self.timestamp_ms != 0
-            && self.body_bytes > 0
-            && self.body_bytes <= PrivateBody::MAX_BYTES
-            && self.acceptance_acknowledged
-            && !self.durable
-            && !self.read)
+        (self.timestamp_ms != 0 && (1..=PrivateBody::MAX_BYTES).contains(&self.body_bytes))
             .then_some(())
             .ok_or("invalid private acceptance")
     }
@@ -1085,9 +1060,8 @@ impl AttachmentShared {
 }
 
 impl RemotePeer {
-    fn validate(&self, expected_online: bool) -> Result<(), &'static str> {
-        (self.online == expected_online
-            && self.expires_at_ms >= self.last_seen_ms
+    fn validate(&self) -> Result<(), &'static str> {
+        (self.expires_at_ms >= self.last_seen_ms
             && self.expires_at_ms.saturating_sub(self.last_seen_ms) <= PEER_LEASE_MS)
             .then_some(())
             .ok_or("invalid peer lease")
@@ -1101,7 +1075,7 @@ impl PeerSnapshot {
         }
         let mut previous: Option<&PeerId> = None;
         for peer in &self.peers {
-            peer.validate(true)?;
+            peer.validate()?;
             if peer.public_key == self.self_peer.public_key
                 || previous.is_some_and(|value| value >= &peer.public_key)
                 || peer.last_seen_ms > self.generated_at_ms
@@ -1117,11 +1091,11 @@ impl PeerSnapshot {
 }
 
 impl PeerTransition {
-    fn validate(&self, online: bool) -> Result<(), &'static str> {
+    fn validate(&self) -> Result<(), &'static str> {
         if self.directory_revision == 0 {
             return Err("invalid peer directory revision");
         }
-        self.peer.validate(online)
+        self.peer.validate()
     }
 }
 
@@ -1323,8 +1297,6 @@ pub enum ErrorCode {
     DaemonDisconnected,
     DaemonStopping,
     CommandTimeout,
-    AttachmentCommandTimeout,
-    AttachmentStorageShutdown,
     IpcCapacity,
     OperationCapacity,
     AttachmentStorageBusy,
@@ -1356,12 +1328,8 @@ impl ErrorCode {
     pub fn message(self) -> &'static str {
         match self {
             Self::DaemonOffline => "Daemon is offline.",
-            Self::CommandTimeout | Self::AttachmentCommandTimeout => {
-                "The request timed out; reconcile before retrying."
-            }
-            Self::DaemonStopping | Self::AttachmentStorageShutdown => {
-                "The daemon is shutting down or unavailable."
-            }
+            Self::CommandTimeout => "The request timed out; reconcile before retrying.",
+            Self::DaemonStopping => "The daemon is shutting down or unavailable.",
             Self::IpcCapacity | Self::OperationCapacity | Self::AttachmentStorageBusy => {
                 "Local capacity is currently unavailable."
             }
@@ -1423,8 +1391,6 @@ impl ErrorCode {
                         | Self::DaemonDisconnected
                         | Self::DaemonStopping
                         | Self::CommandTimeout
-                        | Self::AttachmentCommandTimeout
-                        | Self::AttachmentStorageShutdown
                         | Self::AttachmentStorageBusy
                         | Self::PrivateSendBusy
                         | Self::PrivateRecipientBusy
@@ -1550,12 +1516,10 @@ mod tests {
         };
         let queued = |operation_id: OperationId| {
             Response::Queued(Queued {
-                message_id: operation_id.as_str().parse().unwrap(),
                 operation_id,
                 from: "1".repeat(64).parse().unwrap(),
                 timestamp_ms: 1,
                 body: BroadcastBody::new("hello").unwrap(),
-                delivery_acknowledged: false,
             })
         };
 
@@ -1810,21 +1774,142 @@ mod tests {
         let request_id = RequestId::new_random();
         let peer = "0".repeat(64);
         let message_id = MessageId::new_random();
-        let decode_event = |kind: &str, body: &str, private_fields: &str| {
+        let decode_event = |kind: &str, body: &str| {
             serde_json::from_str::<EventFrame>(&format!(
-                r#"{{"protocol_version":5,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"{private_fields}}}"#
+                r#"{{"protocol_version":5,"request_id":"{request_id}","type":"{kind}","from":"{peer}","message_id":"{message_id}","timestamp_ms":1,"body":"{body}"}}"#
             ))
         };
-        assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES), "").is_ok());
-        assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES + 1), "").is_err());
-        let private_fields =
-            r#","private":true,"acceptance_acknowledged":true,"durable":false,"read":false"#;
-        assert!(decode_event(
-            "private_message",
-            &"x".repeat(PrivateBody::MAX_BYTES),
-            private_fields
-        )
-        .is_ok());
+        assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES)).is_ok());
+        assert!(decode_event("message", &"x".repeat(BroadcastBody::MAX_BYTES + 1)).is_err());
+        assert!(decode_event("private_message", &"x".repeat(PrivateBody::MAX_BYTES)).is_ok());
+        assert!(decode_event("private_message", &"x".repeat(PrivateBody::MAX_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn message_body_bounds_are_byte_based_and_shared_by_new_and_validate() {
+        assert!(BroadcastBody::new(" ").is_ok());
+        assert!(BroadcastBody::new("").is_err());
+        let exact_multibyte = "界".repeat(BroadcastBody::MAX_BYTES / "界".len());
+        assert_eq!(exact_multibyte.len(), BroadcastBody::MAX_BYTES);
+        assert!(BroadcastBody::validate(&exact_multibyte).is_ok());
+        let oversized = exact_multibyte + "界";
+        assert!(BroadcastBody::new(oversized.as_str()).is_err());
+        assert_eq!(
+            BroadcastBody::validate(&oversized).unwrap_err().to_string(),
+            format!(
+                "invalid broadcast message body (expected 1..={} UTF-8 bytes)",
+                BroadcastBody::MAX_BYTES
+            )
+        );
+
+        assert!(PrivateBody::validate(&"a".repeat(PrivateBody::MAX_BYTES)).is_ok());
+        assert!(PrivateBody::validate("").is_err());
+        assert!(
+            PrivateBody::validate(&"a".repeat(PrivateBody::MAX_BYTES + 1))
+                .unwrap_err()
+                .to_string()
+                .contains("private message body")
+        );
+    }
+
+    #[test]
+    fn constant_and_derivable_fields_are_not_part_of_the_wire() {
+        let request = "1".repeat(32);
+        let operation = "2".repeat(32);
+        let peer = "4".repeat(64);
+        let other_peer = "5".repeat(64);
+        let head = format!(r#"{{"protocol_version":5,"request_id":"{request}""#);
+
+        let responses = [
+            (
+                format!(
+                    r#"{head},"type":"queued","operation_id":"{operation}","from":"{peer}","timestamp_ms":1,"body":"x"}}"#
+                ),
+                vec![
+                    format!(r#""message_id":"{operation}""#),
+                    r#""delivery_acknowledged":false"#.to_owned(),
+                ],
+            ),
+            (
+                format!(
+                    r#"{head},"type":"private_accepted","operation_id":"{operation}","to":"{peer}","timestamp_ms":1,"body_bytes":1,"duplicate_accepted":false}}"#
+                ),
+                vec![
+                    format!(r#""message_id":"{operation}""#),
+                    r#""acceptance_acknowledged":true"#.to_owned(),
+                    r#""durable":false"#.to_owned(),
+                    r#""read":false"#.to_owned(),
+                ],
+            ),
+        ];
+        for (frame, removed_fields) in responses {
+            assert!(
+                serde_json::from_str::<ResponseFrame>(&frame).is_ok(),
+                "{frame}"
+            );
+            for field in removed_fields {
+                let extended = format!("{},{field}}}", frame.strip_suffix('}').unwrap());
+                assert!(
+                    serde_json::from_str::<ResponseFrame>(&extended).is_err(),
+                    "{extended}"
+                );
+            }
+        }
+
+        let remote = |extra: &str| {
+            format!(
+                r#"{{"public_key":"{other_peer}","alias":null{extra},"last_seen_ms":1,"expires_at_ms":2}}"#
+            )
+        };
+        let expired = |extra: &str| {
+            format!(
+                r#"{head},"type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{}}}"#,
+                remote(extra)
+            )
+        };
+        assert!(serde_json::from_str::<EventFrame>(&expired("")).is_ok());
+        assert!(serde_json::from_str::<EventFrame>(&expired(r#","online":false"#)).is_err());
+
+        let events = [
+            (
+                format!(
+                    r#"{head},"type":"private_message","from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x"}}"#
+                ),
+                vec![
+                    r#""private":true"#,
+                    r#""acceptance_acknowledged":true"#,
+                    r#""durable":false"#,
+                    r#""read":false"#,
+                ],
+            ),
+            (
+                format!(r#"{head},"type":"lagged","source":"gossip","dropped":0}}"#),
+                vec![r#""message":"receiver fell behind""#],
+            ),
+        ];
+        for (frame, removed_fields) in events {
+            assert!(
+                serde_json::from_str::<EventFrame>(&frame).is_ok(),
+                "{frame}"
+            );
+            for field in removed_fields {
+                let extended = format!("{},{field}}}", frame.strip_suffix('}').unwrap());
+                assert!(
+                    serde_json::from_str::<EventFrame>(&extended).is_err(),
+                    "{extended}"
+                );
+            }
+        }
+
+        for merged_code in ["attachment_command_timeout", "attachment_storage_shutdown"] {
+            let frame = format!(
+                r#"{head},"type":"error","operation_id":"{operation}","code":"{merged_code}","outcome":"unknown"}}"#
+            );
+            assert!(
+                serde_json::from_str::<ResponseFrame>(&frame).is_err(),
+                "{frame}"
+            );
+        }
     }
 
     #[test]
@@ -1837,10 +1922,10 @@ mod tests {
 
         let invalid_responses = [
             format!(
-                r#"{{"protocol_version":5,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","message_id":"{other}","timestamp_ms":1,"body":"x","delivery_acknowledged":false}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"queued","operation_id":"{operation}","from":"{peer}","timestamp_ms":0,"body":"x"}}"#
             ),
             format!(
-                r#"{{"protocol_version":5,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","message_id":"{operation}","timestamp_ms":1,"body_bytes":1,"acceptance_acknowledged":false,"duplicate_accepted":false,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"private_accepted","operation_id":"{operation}","to":"{peer}","timestamp_ms":1,"body_bytes":0,"duplicate_accepted":false}}"#
             ),
             format!(
                 r#"{{"protocol_version":5,"request_id":"{request}","type":"offer_removed","operation_id":"{operation}","offer_id":"{other}","direction":null,"provider":null,"maximum":1,"selected_tags":1,"removed_tags":0,"released_bytes":0,"limited":false}}"#
@@ -1858,7 +1943,7 @@ mod tests {
                 r#"{{"protocol_version":5,"request_id":"{request}","type":"attachment_shared","operation_id":"{operation}","from":"{peer}","timestamp_ms":1,"offer_id":"{other}","kind":"file","name":"x","size":0,"offer":"eA"}}"#
             ),
             format!(
-                r#"{{"protocol_version":5,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"online":true,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"peers_snapshot","generated_at_ms":10,"directory_epoch":"{operation}","directory_revision":1,"self":{{"public_key":"{peer}","alias":null,"online":true}},"peers":[{{"public_key":"{other_peer}","alias":null,"last_seen_ms":11,"expires_at_ms":12}}]}}"#
             ),
             format!(
                 r#"{{"protocol_version":5,"request_id":"{request}","type":"offers","blobs":[],"truncated":false,"item_errors":1}}"#
@@ -1873,7 +1958,7 @@ mod tests {
 
         let invalid_events = [
             format!(
-                r#"{{"protocol_version":5,"request_id":"{request}","type":"private_message","private":false,"from":"{peer}","message_id":"{operation}","timestamp_ms":1,"body":"x","acceptance_acknowledged":true,"durable":false,"read":false}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"private_message","from":"{peer}","message_id":"{operation}","timestamp_ms":0,"body":"x"}}"#
             ),
             format!(
                 r#"{{"protocol_version":5,"request_id":"{request}","type":"attachment_offer","from":"{peer}","timestamp_ms":0,"offer_id":"{other}","kind":"file","name":"x","size":0,"offer":"eA"}}"#
@@ -1885,10 +1970,7 @@ mod tests {
                 r#"{{"protocol_version":5,"request_id":"{request}","type":"download_progress","operation_id":"{operation}","received_bytes":2,"total_bytes":1,"output":"/tmp/x"}}"#
             ),
             format!(
-                r#"{{"protocol_version":5,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"online":true,"last_seen_ms":1,"expires_at_ms":2}}}}"#
-            ),
-            format!(
-                r#"{{"protocol_version":5,"request_id":"{request}","type":"lagged","source":"local","dropped":1,"message":"bad\nmessage"}}"#
+                r#"{{"protocol_version":5,"request_id":"{request}","type":"peer_expired","directory_epoch":"{operation}","directory_revision":1,"peer":{{"public_key":"{peer}","alias":null,"last_seen_ms":2,"expires_at_ms":1}}}}"#
             ),
         ];
         for frame in invalid_events {

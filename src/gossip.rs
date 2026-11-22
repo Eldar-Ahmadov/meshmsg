@@ -480,7 +480,7 @@ impl Envelope {
         timestamp_ms: u64,
     ) -> Result<Bytes> {
         if kind == EnvelopeKind::Message {
-            crate::message::validate_broadcast_body(&body)?;
+            meshmsg_protocol::BroadcastBody::validate(&body)?;
         }
         let payload = EnvelopeSignaturePayload {
             domain: ENVELOPE_DOMAIN,
@@ -560,7 +560,7 @@ impl Envelope {
 
     fn validate_general_semantics(&self) -> Result<()> {
         if self.kind == EnvelopeKind::Message {
-            crate::message::validate_broadcast_body(&self.body)?;
+            meshmsg_protocol::BroadcastBody::validate(&self.body)?;
         }
         Ok(())
     }
@@ -634,7 +634,6 @@ where
         Event::Lagged => vec![meshmsg_protocol::Event::Lagged {
             source: meshmsg_protocol::EventSource::Gossip,
             dropped: 0,
-            message: "receiver fell behind; one or more events were dropped".into(),
         }],
     }
 }
@@ -671,21 +670,17 @@ where
 
 pub(crate) fn queued_event(
     peer: &str,
-    message_id: [u8; 16],
+    operation_id: [u8; 16],
     body: String,
     timestamp_ms: u64,
 ) -> meshmsg_protocol::Queued {
     meshmsg_protocol::Queued {
-        operation_id: id_string(&message_id)
+        operation_id: id_string(&operation_id)
             .parse()
             .expect("operation ID is canonical"),
         from: peer.parse().expect("public key is canonical"),
-        message_id: id_string(&message_id)
-            .parse()
-            .expect("message ID is canonical"),
         timestamp_ms,
         body: meshmsg_protocol::BroadcastBody::new(body).expect("validated broadcast body"),
-        delivery_acknowledged: false,
     }
 }
 
@@ -824,7 +819,7 @@ mod tests {
 
     fn queued_event(
         peer: &str,
-        message_id: [u8; 16],
+        operation_id: [u8; 16],
         body: String,
         timestamp_ms: u64,
     ) -> serde_json::Value {
@@ -832,7 +827,7 @@ mod tests {
             Some(meshmsg_protocol::RequestId::new_random()),
             meshmsg_protocol::Response::Queued(super::queued_event(
                 peer,
-                message_id,
+                operation_id,
                 body,
                 timestamp_ms,
             )),
@@ -1662,11 +1657,9 @@ mod tests {
             .parse::<meshmsg_protocol::RequestId>()
             .is_ok());
         assert_eq!(value["operation_id"], "04040404040404040404040404040404");
-        assert_eq!(value["message_id"], "04040404040404040404040404040404");
         assert_eq!(value["from"], "1".repeat(64));
         assert_eq!(value["body"], "hello");
         assert_eq!(value["timestamp_ms"], 1_700_000_000_000_u64);
-        assert_eq!(value["delivery_acknowledged"], false);
         assert_object_keys(
             &value,
             &[
@@ -1675,10 +1668,8 @@ mod tests {
                 "type",
                 "from",
                 "operation_id",
-                "message_id",
                 "timestamp_ms",
                 "body",
-                "delivery_acknowledged",
             ],
         );
     }

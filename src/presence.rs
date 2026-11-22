@@ -212,11 +212,10 @@ struct DynamicDirectoryEntry {
 }
 
 impl DynamicDirectoryEntry {
-    fn public(&self, key: PublicKey, online: bool) -> RemotePeer {
+    fn public(&self, key: PublicKey) -> RemotePeer {
         RemotePeer {
             public_key: key.to_string(),
             alias: self.alias.clone(),
-            online,
             last_seen_ms: self.last_seen_ms,
             expires_at_ms: self.expires_at_ms,
         }
@@ -319,7 +318,7 @@ impl Directory {
         };
         let transition = kind.map(|kind| PeerTransition {
             kind,
-            peer: entry.public(payload.sender, true),
+            peer: entry.public(payload.sender),
         });
         self.dynamic.insert(payload.sender, entry);
         // MemoryLookup::add_endpoint_info merges direct addresses forever. Presence
@@ -355,7 +354,7 @@ impl Directory {
                 );
                 transitions.push(PeerTransition {
                     kind: PeerTransitionKind::Expired,
-                    peer: entry.public(key, false),
+                    peer: entry.public(key),
                 });
             }
         }
@@ -367,7 +366,7 @@ impl Directory {
         self.dynamic
             .iter()
             .filter(|(_, entry)| entry.expires > now)
-            .map(|(key, entry)| entry.public(*key, true))
+            .map(|(key, entry)| entry.public(*key))
             .collect()
     }
 
@@ -942,7 +941,6 @@ mod tests {
         let expired = directory.cleanup_at(after_expiry);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].kind, PeerTransitionKind::Expired);
-        assert!(!expired[0].peer.online);
         assert!(directory.cleanup_at(after_expiry).is_empty());
 
         let rediscovery_wall = wall + PEER_LEASE_MS + 3_000;

@@ -161,7 +161,7 @@ pub(crate) async fn share_request(
         },
         Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
             Some(operation_id),
-            meshmsg_protocol::ErrorCode::AttachmentStorageShutdown,
+            meshmsg_protocol::ErrorCode::DaemonStopping,
             meshmsg_protocol::Outcome::Unknown,
         )),
     }
@@ -211,7 +211,7 @@ pub(crate) async fn download_request(
         }
         Err(_) => meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
             Some(operation_id),
-            meshmsg_protocol::ErrorCode::AttachmentStorageShutdown,
+            meshmsg_protocol::ErrorCode::DaemonStopping,
             meshmsg_protocol::Outcome::Unknown,
         )),
     }

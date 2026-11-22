@@ -23,17 +23,15 @@ ID = re.compile(r"^[0-9a-f]{32}$")
 
 def accepted(frame, _connection):
     request = frame["request"]
-    common = {"operation_id": request["operation_id"],
-              "message_id": request["operation_id"], "timestamp_ms": 1}
+    common = {"operation_id": request["operation_id"], "timestamp_ms": 1}
     if request["command"] == "private_send":
         assert request["to"] == PEER
         return {**common, "type": "private_accepted", "to": PEER,
                 "body_bytes": len(request["body"].encode()),
-                "acceptance_acknowledged": True, "duplicate_accepted": False,
-                "durable": False, "read": False}
+                "duplicate_accepted": False}
     assert request["command"] == "send"
     return {**common, "type": "queued", "from": PEER,
-            "body": request["body"], "delivery_acknowledged": False}
+            "body": request["body"]}
 
 
 @contextlib.contextmanager

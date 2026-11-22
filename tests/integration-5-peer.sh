@@ -30,7 +30,7 @@ wait_for() {
     sleep 0.2
   done
 }
-status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"running":true'; }
+status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"type":"status"'; }
 status_joined() {
   "$BIN" --state-dir "$ROOT/$1" --json status | python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["topic_joined"] and value["neighbors"] >= 1'
@@ -104,8 +104,8 @@ M2="integration-c2-$(date +%s%N)"
 printf '%s' "$M1" >"$ROOT/message.txt"
 Q1=$("$BIN" --state-dir "$ROOT/c1" --json send --message-file "$ROOT/message.txt")
 Q2=$(printf '%s' "$M2" | "$BIN" --state-dir "$ROOT/c2" --json send --message-stdin)
-python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["protocol_version"] == 5 and len(v["request_id"]) == 32 and v["operation_id"] == v["message_id"] and len(v["message_id"]) == 32' "$Q1"
-python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["protocol_version"] == 5 and len(v["request_id"]) == 32 and v["operation_id"] == v["message_id"] and len(v["message_id"]) == 32' "$Q2"
+python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["protocol_version"] == 5 and len(v["request_id"]) == 32 and len(v["operation_id"]) == 32 and "message_id" not in v and "delivery_acknowledged" not in v' "$Q1"
+python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["type"] == "queued" and v["protocol_version"] == 5 and len(v["request_id"]) == 32 and len(v["operation_id"]) == 32 and "message_id" not in v and "delivery_acknowledged" not in v' "$Q2"
 wait_log 30 "$ROOT/c2.listen.log" "\"body\":\"$M1\""
 wait_log 30 "$ROOT/c1.listen.log" "\"body\":\"$M2\""
 python3 - "$Q1" "$Q2" "$ROOT/c2.listen.log" "$ROOT/c1.listen.log" <<'PY'
@@ -113,7 +113,7 @@ import json, pathlib, sys
 for queued_text, log_path in [(sys.argv[1], sys.argv[3]), (sys.argv[2], sys.argv[4])]:
     queued = json.loads(queued_text)
     received = next(v for v in map(json.loads, pathlib.Path(log_path).read_text().splitlines())
-                    if v.get("type") == "message" and v.get("message_id") == queued["message_id"])
+                    if v.get("type") == "message" and v.get("message_id") == queued["operation_id"])
     assert received["protocol_version"] == 5 and len(received["request_id"]) == 32
     assert received["from"] == queued["from"]
     assert received["timestamp_ms"] == queued["timestamp_ms"]
@@ -176,7 +176,7 @@ printf '%s\n' "$MAX_POSITIONAL" | timeout 30 "$BIN" --state-dir "$ROOT/c1" --jso
 for queued in "$QMAX_FILE" "$QMAX_STDIN" "$QMAX_POSITIONAL"; do
   python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v["protocol_version"] == 5 and v["type"] == "queued" and len(v["body"].encode()) == 65358' "$queued" || fail "maximum broadcast response was invalid"
 done
-MAX_ID=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["message_id"])' "$QMAX_FILE")
+MAX_ID=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["operation_id"])' "$QMAX_FILE")
 wait_for 30 "maximum broadcast subscription event" python3 -c 'import json,sys; assert any(v.get("message_id") == sys.argv[2] and len(v.get("body", "").encode()) == 65358 for v in map(json.loads, open(sys.argv[1])))' "$ROOT/c2.listen.log" "$MAX_ID"
 test ! -s "$ROOT/max-chat.err" || fail "exact maximum chat wrote an error"
 

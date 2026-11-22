@@ -421,7 +421,6 @@ mod tests {
             .map(|index| crate::RemotePeer {
                 public_key: format!("{index:064x}").parse().unwrap(),
                 alias: Some(crate::Alias::new("x".repeat(63)).unwrap()),
-                online: true,
                 last_seen_ms: generated_at_ms,
                 expires_at_ms: generated_at_ms + crate::PEER_LEASE_MS,
             })

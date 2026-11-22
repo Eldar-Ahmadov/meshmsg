@@ -30,7 +30,7 @@ wait_for() {
     sleep 0.2
   done
 }
-status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"running":true'; }
+status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"type":"status"'; }
 start_node() {
   local node=$1
   timeout 300 "$BIN" --state-dir "$ROOT/$node" --json daemon >"$ROOT/$node.daemon.log" 2>"$ROOT/$node.daemon.err" &

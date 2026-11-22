@@ -11,14 +11,8 @@ BASE_KEYS = {"protocol_version", "request_id", "type"}
 EVENT_FIELDS = {
     "connected": {"peer", "endpoint_online", "topic_joined", "alias"},
     "message": {"from", "message_id", "timestamp_ms", "body"},
-    "private_message": {
-        "private", "from", "message_id", "timestamp_ms", "body",
-        "acceptance_acknowledged", "durable", "read",
-    },
-    "queued": {
-        "operation_id", "from", "message_id", "timestamp_ms", "body",
-        "delivery_acknowledged",
-    },
+    "private_message": {"from", "message_id", "timestamp_ms", "body"},
+    "queued": {"operation_id", "from", "timestamp_ms", "body"},
     "attachment_offer": {
         "from", "timestamp_ms", "offer_id", "kind", "name", "size", "offer",
     },
@@ -38,7 +32,7 @@ EVENT_FIELDS = {
         "operation_id", "offer_id", "kind", "name", "size", "from", "output",
         "destination_synced", "cleanup_complete", "warnings",
     },
-    "lagged": {"source", "dropped", "message"},
+    "lagged": {"source", "dropped"},
 }
 ERROR_KEYS = {
     "protocol_version",

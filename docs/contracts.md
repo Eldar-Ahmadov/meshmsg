@@ -137,7 +137,7 @@ positive and `received_bytes <= total_bytes`. Listen/chat never print an
 unrecognized daemon event. Beyond strict typed decoding, request/response correlation,
 response family, and operation ID, the CLI trusts its own daemon (same binary,
 owner-only socket) and does not re-verify signatures or echoed request fields.
-Error objects are strictly decoded against the closed error contract. Status includes mutation-cache semantics, attachment limits, and
+Error objects are strictly decoded against the closed error contract. Status includes attachment limits and
 attachment-storage pressure. Clients and the daemon are one protocol-v5 component
 set, so commands are submitted directly without status capability probes.
 
@@ -245,6 +245,21 @@ Relative to v4:
   `direct_replay_*_rate_*` fields; the limits are fixed and listed under
   [Operations](operations.md#trust-and-privacy-model). Error codes
   `private_replay_unavailable` and `private_delivery_unknown` are removed.
+- Constant and derivable fields are removed. `queued` drops `message_id` (always the
+  `operation_id`) and `delivery_acknowledged`. `private_accepted` drops `message_id`
+  (always the `operation_id`), `acceptance_acknowledged`, `durable`, and `read`.
+  `private_message` drops `private`, `acceptance_acknowledged`, `durable`, and
+  `read`. `queued` is still not a delivery acknowledgement, and private acceptance
+  is still neither durable nor a read receipt.
+- Remote peer objects drop `online`: a peer in `peers_snapshot`, `peer_discovered`,
+  or `peer_updated` has a current lease, and `peer_expired` means it no longer does.
+  `self.online` remains.
+- `status` drops `running`, `operation_cache_capacity`, `operation_cache_ttl_ms`,
+  and `operation_cache_persistent`; the cache bounds are fixed and listed under
+  [Operation retries and cache](#operation-retries-and-cache).
+- `lagged` drops `message` and carries only `source` and `dropped`.
+- Error code `attachment_command_timeout` is merged into `command_timeout` and
+  `attachment_storage_shutdown` into `daemon_stopping`.
 
 Clients send only strict protocol-v5 IPC envelopes and require exact
 correlated replies. Older clients and daemons are rejected before any
@@ -280,7 +295,7 @@ network/export/install work. A cached partial-success `download_complete` remain
 success; callers inspect durability warnings rather than retrying the installed
 path. Once the memory-only entry expires, is evicted, or the daemon restarts, the
 retry guarantee ends: a retry is a new execution and an existing output fails closed
-without clobbering. Status exposes these bounds and `operation_cache_persistent:false`. Unit tests
+without clobbering. Unit tests
 exercise synthetic expiry and pressure eviction deterministically; integrations
 exercise real response loss and daemon restart, not a ten-minute wall-clock wait.
 

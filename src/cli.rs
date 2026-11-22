@@ -772,7 +772,7 @@ mod tests {
         let empty = input(String::new())
             .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
             .unwrap();
-        assert!(crate::message::validate_broadcast_body(&empty).is_err());
+        assert!(meshmsg_protocol::BroadcastBody::new(empty).is_err());
         assert!(
             input("界".repeat(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES / 3))
                 .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
@@ -810,7 +810,7 @@ mod tests {
         }
         .into_message(meshmsg_protocol::MAX_BROADCAST_BODY_BYTES)
         .unwrap();
-        assert!(crate::message::validate_broadcast_body(&empty).is_err());
+        assert!(meshmsg_protocol::BroadcastBody::new(empty).is_err());
 
         let oversized_path = dir.join("oversized");
         fs::write(

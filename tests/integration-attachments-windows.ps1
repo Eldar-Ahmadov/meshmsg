@@ -54,7 +54,7 @@ function Start-MeshmsgDaemon {
         }
         try {
             $status = Invoke-Meshmsg -CommandArgs @("--state-dir", $StateDir, "--json", "status") | ConvertFrom-Json
-            if ($status.running -eq $true) {
+            if ($status.type -eq "status") {
                 return
             }
         } catch {

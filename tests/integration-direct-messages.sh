@@ -34,7 +34,7 @@ wait_for() {
     sleep 0.2
   done
 }
-status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"running":true'; }
+status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"type":"status"'; }
 status_aliases() {
   "$BIN" --state-dir "$ROOT/$1" --json status | python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["advertised_aliases"] >= int(sys.argv[1])' "$2"
@@ -199,9 +199,11 @@ wait_for 30 "invite-pinned private delivery" grep -Fq "\"body\":\"$PINNED\"" "$R
 
 PRIVATE="private-alias-$(date +%s%N)"
 PRIVATE_RESULT=$("$BIN" --state-dir "$ROOT/sender" --json send --to target-node "$PRIVATE")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["protocol_version"] == 5 and len(v["request_id"]) == 32; assert v["operation_id"] == v["message_id"]; assert v["acceptance_acknowledged"] is True and v["duplicate_accepted"] is False and v["durable"] is False and v["read"] is False; assert v["body_bytes"] == int(sys.argv[1]) and "body" not in v; assert len(v["message_id"]) == 32' "${#PRIVATE}" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["protocol_version"] == 5 and len(v["request_id"]) == 32; assert len(v["operation_id"]) == 32 and v["duplicate_accepted"] is False; assert v["body_bytes"] == int(sys.argv[1]) and "body" not in v; assert all(k not in v for k in ("message_id", "acceptance_acknowledged", "durable", "read"))' "${#PRIVATE}" \
   <<<"$PRIVATE_RESULT" || fail "private alias send did not return the bounded acceptance acknowledgement"
 wait_for 30 "private alias delivery" grep -Fq "\"body\":\"$PRIVATE\"" "$ROOT/receiver.listen.log"
+python3 -c 'import json,sys; sent=json.loads(sys.argv[2]); v=next(v for v in map(json.loads, open(sys.argv[1])) if v.get("body") == sys.argv[3]); assert v["type"] == "private_message" and v["message_id"] == sent["operation_id"] and v["timestamp_ms"] == sent["timestamp_ms"] and set(v) == {"protocol_version", "request_id", "type", "from", "message_id", "timestamp_ms", "body"}' \
+  "$ROOT/receiver.listen.log" "$PRIVATE_RESULT" "$PRIVATE" || fail "private delivery event did not carry the sender operation ID as its message ID"
 sleep 1
 ! grep -Fq "$PRIVATE" "$ROOT/sender.listen.log" || fail "sender subscription received its outgoing private body"
 ! grep -Fq "$PRIVATE" "$ROOT/spy.listen.log" || fail "third topic peer received private body"
@@ -217,7 +219,7 @@ wait_for 30 "canonical-key private delivery" grep -Fq "\"body\":\"$CANONICAL\"" 
 # The no---to path remains the current gossip broadcast.
 BROADCAST="broadcast-control-$(date +%s%N)"
 BROADCAST_RESULT=$("$BIN" --state-dir "$ROOT/sender" --json send "$BROADCAST")
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "queued" and v["body"] == sys.argv[1] and v["delivery_acknowledged"] is False' "$BROADCAST" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "queued" and v["body"] == sys.argv[1] and "delivery_acknowledged" not in v' "$BROADCAST" \
   <<<"$BROADCAST_RESULT" || fail "ordinary send no longer followed broadcast semantics"
 wait_for 30 "receiver broadcast" grep -Fq "\"body\":\"$BROADCAST\"" "$ROOT/receiver.listen.log"
 wait_for 30 "spy broadcast" grep -Fq "\"body\":\"$BROADCAST\"" "$ROOT/spy.listen.log"
@@ -248,7 +250,7 @@ import json, sys
 frames = [json.loads(line) for line in open(sys.argv[1])]
 assert len(frames) == 2
 assert len({frame["operation_id"] for frame in frames}) == 2
-assert all(frame["type"] == "queued" and not frame["delivery_acknowledged"] for frame in frames)
+assert all(frame["type"] == "queued" and "delivery_acknowledged" not in frame for frame in frames)
 assert [frame["body"] for frame in frames] == [sys.argv[2] + "-1", sys.argv[2] + "-2"]
 PY
 for suffix in 1 2; do

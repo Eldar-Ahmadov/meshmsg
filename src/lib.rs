@@ -199,9 +199,9 @@ async fn run(cli: Cli) -> Result<()> {
                 .into_message(maximum)
                 .and_then(|body| {
                     if private {
-                        message::validate_private_body(&body)?;
+                        meshmsg_protocol::PrivateBody::validate(&body)?;
                     } else {
-                        message::validate_broadcast_body(&body)?;
+                        meshmsg_protocol::BroadcastBody::validate(&body)?;
                     }
                     Ok(body)
                 })

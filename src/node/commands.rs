@@ -2,7 +2,6 @@
 
 use super::{
     bootstrap::RunningNode,
-    common::{OPERATION_CACHE_CAPACITY, OPERATION_CACHE_TTL},
     operation_cache::OperationCache,
     supervisor::{
         spawn_attachment_task, AttachmentTaskCompletion, AttachmentTaskMetadata, OperationEventKind,
@@ -35,13 +34,6 @@ pub(crate) enum DaemonCommand {
     Stop,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CommandPolicy {
-    pub(crate) deadline: Duration,
-    pub(crate) timeout_code: meshmsg_protocol::ErrorCode,
-    pub(crate) unavailable_code: meshmsg_protocol::ErrorCode,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct CommandTimeouts {
     pub(crate) ordinary: Duration,
@@ -50,43 +42,19 @@ pub(crate) struct CommandTimeouts {
     pub(crate) transfer: Duration,
 }
 
-impl CommandPolicy {
-    pub(crate) fn for_request(request: &Request, timeouts: CommandTimeouts) -> Option<Self> {
-        use meshmsg_protocol::ErrorCode;
-
-        let (deadline, timeout_code, unavailable_code) = match request {
-            Request::Send { .. } | Request::Status | Request::Peers => (
-                timeouts.ordinary,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
-            ),
-            Request::PrivateSend { .. } => (
-                timeouts.private,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
-            ),
-            Request::Offers => (
-                timeouts.list,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
-            ),
-            Request::OffersRemove { .. } | Request::OffersPrune { .. } => (
-                timeouts.list,
-                ErrorCode::AttachmentCommandTimeout,
-                ErrorCode::AttachmentStorageShutdown,
-            ),
-            Request::Share { .. } | Request::Download { .. } => (
-                timeouts.transfer,
-                ErrorCode::AttachmentCommandTimeout,
-                ErrorCode::AttachmentStorageShutdown,
-            ),
-            Request::Subscribe | Request::Stop => return None,
-        };
-        Some(Self {
-            deadline,
-            timeout_code,
-            unavailable_code,
-        })
+impl CommandTimeouts {
+    /// The daemon-side deadline for a request the command loop executes;
+    /// `None` for the requests the IPC session handles itself.
+    pub(crate) fn deadline(self, request: &Request) -> Option<Duration> {
+        match request {
+            Request::Send { .. } | Request::Status | Request::Peers => Some(self.ordinary),
+            Request::PrivateSend { .. } => Some(self.private),
+            Request::Offers | Request::OffersRemove { .. } | Request::OffersPrune { .. } => {
+                Some(self.list)
+            }
+            Request::Share { .. } | Request::Download { .. } => Some(self.transfer),
+            Request::Subscribe | Request::Stop => None,
+        }
     }
 }
 
@@ -320,7 +288,6 @@ pub(super) async fn execute(
             let connectivity = presence::local_connectivity(&node.endpoint, &node.receiver);
             let neighbors = node.receiver.neighbors().count();
             let status = meshmsg_protocol::Status {
-                running: true,
                 peer: peer.parse()?,
                 topic: state.topic.parse()?,
                 advertises_self: state.advertise_self,
@@ -335,9 +302,6 @@ pub(super) async fn execute(
                 captured_hostname: alias_config.hostname().map(str::to_owned),
                 custom_alias: alias_config.custom().map(str::to_owned),
                 advertised_aliases: directory.advertised_aliases(),
-                operation_cache_capacity: OPERATION_CACHE_CAPACITY,
-                operation_cache_ttl_ms: OPERATION_CACHE_TTL.as_millis() as u64,
-                operation_cache_persistent: false,
                 max_attachment_bytes,
                 attachment_storage: attachment_storage.status(),
                 attachment_retention_secs,
@@ -721,7 +685,10 @@ mod tests {
             server::{handle_local_client, LocalClientSession, LocalIpcTimeouts},
             write_request, MAX_IPC_EVENT_SIZE,
         },
-        node::bootstrap,
+        node::{
+            bootstrap,
+            common::{OPERATION_CACHE_CAPACITY, OPERATION_CACHE_TTL},
+        },
     };
     use iroh::{EndpointAddr, SecretKey};
     use tokio::sync::mpsc;
@@ -999,8 +966,8 @@ mod tests {
     }
 
     #[test]
-    fn command_policy_covers_each_request_family_and_preserves_correlation() {
-        use meshmsg_protocol::{ErrorCode, OfferDirection};
+    fn command_deadline_covers_each_request_family_and_preserves_correlation() {
+        use meshmsg_protocol::OfferDirection;
 
         let timeouts = CommandTimeouts {
             ordinary: Duration::from_millis(40),
@@ -1016,8 +983,6 @@ mod tests {
                     body: meshmsg_protocol::BroadcastBody::new("broadcast").unwrap(),
                 },
                 timeouts.ordinary,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
             ),
             (
                 Request::PrivateSend {
@@ -1026,27 +991,10 @@ mod tests {
                     body: meshmsg_protocol::PrivateBody::new("private").unwrap(),
                 },
                 timeouts.private,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
             ),
-            (
-                Request::Status,
-                timeouts.ordinary,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
-            ),
-            (
-                Request::Peers,
-                timeouts.ordinary,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
-            ),
-            (
-                Request::Offers,
-                timeouts.list,
-                ErrorCode::CommandTimeout,
-                ErrorCode::DaemonStopping,
-            ),
+            (Request::Status, timeouts.ordinary),
+            (Request::Peers, timeouts.ordinary),
+            (Request::Offers, timeouts.list),
             (
                 Request::OffersRemove {
                     operation_id: operation_id.clone(),
@@ -1055,8 +1003,6 @@ mod tests {
                     provider: Some(meshmsg_protocol::PeerId::new_random()),
                 },
                 timeouts.list,
-                ErrorCode::AttachmentCommandTimeout,
-                ErrorCode::AttachmentStorageShutdown,
             ),
             (
                 Request::OffersPrune {
@@ -1067,8 +1013,6 @@ mod tests {
                     max_delete: 3,
                 },
                 timeouts.list,
-                ErrorCode::AttachmentCommandTimeout,
-                ErrorCode::AttachmentStorageShutdown,
             ),
             (
                 Request::Share {
@@ -1076,8 +1020,6 @@ mod tests {
                     path: std::env::temp_dir().join("meshmsg-policy-share"),
                 },
                 timeouts.transfer,
-                ErrorCode::AttachmentCommandTimeout,
-                ErrorCode::AttachmentStorageShutdown,
             ),
             (
                 Request::Download {
@@ -1086,16 +1028,11 @@ mod tests {
                     output: std::env::temp_dir().join("meshmsg-policy-download"),
                 },
                 timeouts.transfer,
-                ErrorCode::AttachmentCommandTimeout,
-                ErrorCode::AttachmentStorageShutdown,
             ),
         ];
 
-        for (request, deadline, timeout_code, unavailable_code) in requests {
-            let policy = CommandPolicy::for_request(&request, timeouts).unwrap();
-            assert_eq!(policy.deadline, deadline);
-            assert_eq!(policy.timeout_code, timeout_code);
-            assert_eq!(policy.unavailable_code, unavailable_code);
+        for (request, deadline) in requests {
+            assert_eq!(timeouts.deadline(&request), Some(deadline));
             assert_eq!(
                 request.operation_id(),
                 matches!(
@@ -1110,7 +1047,7 @@ mod tests {
                 .then_some(&operation_id)
             );
         }
-        assert!(CommandPolicy::for_request(&Request::Subscribe, timeouts).is_none());
-        assert!(CommandPolicy::for_request(&Request::Stop, timeouts).is_none());
+        assert!(timeouts.deadline(&Request::Subscribe).is_none());
+        assert!(timeouts.deadline(&Request::Stop).is_none());
     }
 }

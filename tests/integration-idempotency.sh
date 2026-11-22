@@ -30,7 +30,7 @@ wait_until() {
   done
   fail "timeout waiting for $description"
 }
-status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"running":true'; }
+status_ok() { "$BIN" --state-dir "$ROOT/$1" --json status | grep -q '"type":"status"'; }
 knows_peer() { "$BIN" --state-dir "$ROOT/$1" --json status | python3 -c 'import json,sys; assert json.load(sys.stdin)["advertised_aliases"] >= 1'; }
 start_node() {
   local node=$1
@@ -111,8 +111,10 @@ s.close()
 PY
 wait_for 30 "lost-response broadcast" grep -q '"body":"lost-response-message"' "$ROOT/receiver.listen"
 RETRY=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$SEND_ID" lost-response-message)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["protocol_version"] == 5 and v["operation_id"] == sys.argv[1] and v["message_id"] == sys.argv[1]' "$SEND_ID" <<<"$RETRY" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["protocol_version"] == 5 and v["type"] == "queued" and v["operation_id"] == sys.argv[1]' "$SEND_ID" <<<"$RETRY" \
   || fail "broadcast retry did not return its original operation outcome"
+python3 -c 'import json,sys; v=next(v for v in map(json.loads, open(sys.argv[1])) if v.get("body") == "lost-response-message"); assert v["type"] == "message" and v["message_id"] == sys.argv[2]' "$ROOT/receiver.listen" "$SEND_ID" \
+  || fail "broadcast operation ID was not the wire message ID"
 sleep 1
 grep -c '"body":"lost-response-message"' "$ROOT/receiver.listen" | grep -qx 1 \
   || fail "broadcast retry repeated the wire side effect"
@@ -131,9 +133,11 @@ import json,sys
 left=json.load(open(sys.argv[1])); right=json.load(open(sys.argv[2]))
 left.pop('request_id'); right.pop('request_id'); assert left == right
 PY
-python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["protocol_version"] == 5 and v["operation_id"] == sys.argv[2] and v["message_id"] == sys.argv[2] and v["duplicate_accepted"] is False' "$ROOT/private.1" "$PRIVATE_ID" \
-  || fail "private operation ID did not reach the wire response"
+python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["protocol_version"] == 5 and v["operation_id"] == sys.argv[2] and v["duplicate_accepted"] is False' "$ROOT/private.1" "$PRIVATE_ID" \
+  || fail "private operation ID did not reach the response"
 wait_for 30 "private delivery" grep -q '"body":"private-idempotent"' "$ROOT/receiver.listen"
+python3 -c 'import json,sys; v=next(v for v in map(json.loads, open(sys.argv[1])) if v.get("body") == "private-idempotent"); assert v["type"] == "private_message" and v["message_id"] == sys.argv[2]' "$ROOT/receiver.listen" "$PRIVATE_ID" \
+  || fail "private operation ID was not the wire message ID"
 sleep 1
 grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
   || fail "concurrent private duplicate was delivered twice"
@@ -323,8 +327,8 @@ stop_node sender
 # deadline remains below the daemon's startup-relative 30-second refresh.
 RESTART_DISCOVERY_DEADLINE=$((SECONDS + 25))
 start_node sender
-"$BIN" --state-dir "$ROOT/sender" --json status | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_cache_persistent"] is False and v["operation_cache_capacity"] == 1024 and v["operation_cache_ttl_ms"] == 600000; assert not any(key.startswith("direct_replay") for key in v)' \
-  || fail "status omitted operation cache bounds or still reports direct replay fields"
+"$BIN" --state-dir "$ROOT/sender" --json status | python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "status"; assert not any(key == "running" or key.startswith(("operation_cache", "direct_replay")) for key in v)' \
+  || fail "status still reports constant daemon, operation cache, or direct replay fields"
 
 # The sender cache was cleared by restart, so this retry reaches the recipient.
 # The recipient has not restarted, so its in-memory replay store must
@@ -333,7 +337,7 @@ start_node sender
 # slide with daemon startup or overlap the periodic refresh.
 wait_until "$RESTART_DISCOVERY_DEADLINE" "immediate receiver presence after sender restart" knows_peer sender
 PRIVATE_RETRY=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$PRIVATE_ID" --to "$RECEIVER" private-idempotent)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_id"] == v["message_id"] == sys.argv[1] and v["duplicate_accepted"] is True' "$PRIVATE_ID" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["operation_id"] == sys.argv[1] and v["duplicate_accepted"] is True' "$PRIVATE_ID" \
   <<<"$PRIVATE_RETRY" || fail "post-restart private retry was not identified as a duplicate acceptance"
 sleep 1
 grep -c '"body":"private-idempotent"' "$ROOT/receiver.listen" | grep -qx 1 \
@@ -370,7 +374,7 @@ FORGOTTEN_DISCOVERY_DEADLINE=$((SECONDS + 25))
 start_node sender
 wait_until "$FORGOTTEN_DISCOVERY_DEADLINE" "immediate receiver presence after recipient restart" knows_peer sender
 PRIVATE_FORGOTTEN=$("$BIN" --state-dir "$ROOT/sender" --json send --operation-id "$PRIVATE_ID" --to "$RECEIVER" private-idempotent)
-python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["operation_id"] == v["message_id"] == sys.argv[1] and v["duplicate_accepted"] is False' "$PRIVATE_ID" \
+python3 -c 'import json,sys; v=json.load(sys.stdin); assert v["type"] == "private_accepted" and v["operation_id"] == sys.argv[1] and v["duplicate_accepted"] is False' "$PRIVATE_ID" \
   <<<"$PRIVATE_FORGOTTEN" || fail "same-ID private send after recipient restart was not accepted as new"
 wait_for 30 "private redelivery after recipient restart" grep -q '"body":"private-idempotent"' "$ROOT/receiver-restarted.listen"
 sleep 1

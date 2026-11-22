@@ -219,10 +219,8 @@ mod tests {
             "type": "queued",
             "operation_id": "11111111111111111111111111111111",
             "from": "2".repeat(64),
-            "message_id": "33333333333333333333333333333333",
-            "timestamp_ms": 1,
-            "body": "accepted JSON, forged semantics",
-            "delivery_acknowledged": false
+            "timestamp_ms": 0,
+            "body": "accepted JSON, forged semantics"
         });
         assert!(decode_response_frame(
             &serde_json::to_vec(&malformed).unwrap(),
@@ -264,12 +262,10 @@ mod tests {
         };
         let wrong_operation = meshmsg_protocol::OperationId::new_random();
         let mismatched = meshmsg_protocol::Response::Queued(meshmsg_protocol::Queued {
-            message_id: wrong_operation.as_str().parse().unwrap(),
             operation_id: wrong_operation,
             from: "1".repeat(64).parse().unwrap(),
             timestamp_ms: 1,
             body: meshmsg_protocol::BroadcastBody::new("hello").unwrap(),
-            delivery_acknowledged: false,
         });
         assert!(request.validate_response(&mismatched).is_err());
 
