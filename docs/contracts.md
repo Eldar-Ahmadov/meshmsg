@@ -123,8 +123,11 @@ download tokens deliberately do not expire by timestamp, but revalidate the nonz
 signature, configured topic, identity, and complete metadata before any network work.
 `download` accepts only such a signed offer token: any other input, including a raw
 Iroh blob ticket or an offer signed for another topic, fails with
-`code:"invalid_attachment_offer"` and `outcome:"not_started"` before storage
-admission, events, or network work.
+`code:"invalid_attachment_offer"` and `outcome:"not_started"` before transfer or
+storage admission, events, or network work. An `offer` that is empty, over the token
+bound, or contains control characters is not a valid request frame at all and is
+rejected as `invalid_request` at the protocol boundary; the CLI reports that case as
+`invalid_attachment_offer` locally.
 Daemon-created message, queued, and attachment events cross the same typed event
 boundary before publication. Subscription frames are decoded directly into the closed
 typed event union; unknown families, protocol versions, unknown fields, malformed
@@ -343,9 +346,9 @@ For the first admitted owner, the daemon resolves an omitted age to its configur
 `cutoff_ms = daemon_now_ms.saturating_sub(
 older_than_secs.saturating_mul(1000))`; multiplication and subtraction cannot
 overflow, age zero uses admission time, and sufficiently large ages resolve to zero.
-That resolution is retained as authoritative in the in-flight and completed cache
-entry, drives selection, and is repeated as the effective `older_than_secs` and
-`cutoff_ms` in success output.
+That resolution is made once by the admitted owner, drives selection, and is
+repeated as the effective `older_than_secs` and `cutoff_ms` in success output, which
+is replayed from the cached terminal response.
 Concurrent duplicates join it and terminal retries replay it without consulting the
 clock. This preserves delayed execution, backward-clock behavior, and retries up to
 the cache TTL while ensuring an identical CLI retry does not need a value from the

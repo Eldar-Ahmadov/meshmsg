@@ -174,7 +174,6 @@ fn validate_declared_attachment_size(declared_size: u64, actual_size: u64) -> Re
 pub(crate) struct DownloadResources {
     pub(crate) store: Store,
     pub(crate) storage: AttachmentStorage,
-    pub(crate) topic: TopicId,
     pub(crate) downloader: Downloader,
     pub(crate) endpoint: Endpoint,
     pub(crate) lookup: MemoryLookup,

@@ -252,8 +252,8 @@ pub(crate) async fn run_daemon(dir: &Path, options: DaemonOptions) -> Result<()>
     let offer_list_limit = Arc::new(Semaphore::new(1));
     let direct_sender =
         direct::DirectSender::new(node.endpoint.clone(), node.secret.clone(), topic);
-    // Deliberately daemon-lifetime scoped: status advertises the bounded TTL and
-    // restart semantics so callers never infer durable command history.
+    // Deliberately daemon-lifetime scoped: the cache is bounded, memory-only, and
+    // cleared by restart, so callers never infer durable command history.
     let operation_cache = Arc::new(Mutex::new(OperationCache::new(
         OPERATION_CACHE_CAPACITY,
         OPERATION_CACHE_TTL,

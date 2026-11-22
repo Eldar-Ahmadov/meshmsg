@@ -166,24 +166,35 @@ pub(crate) async fn share_request(
     }
 }
 
+/// A download's authenticated offer and the blob ticket it carries.
+pub(crate) type SignedOffer = (super::AttachmentOffer, iroh_blobs::ticket::BlobTicket);
+
+/// Only a signed offer for this daemon's topic is accepted. The daemon calls
+/// this before transfer admission, so any other input is a stable
+/// `invalid_attachment_offer` rather than a load-dependent busy result, and is
+/// rejected before storage admission, events, or network work.
+pub(crate) fn parse_download_offer(
+    operation_id: meshmsg_protocol::OperationId,
+    offer: &meshmsg_protocol::AttachmentToken,
+    topic: iroh_gossip::proto::TopicId,
+) -> Result<SignedOffer, meshmsg_protocol::ProtocolError> {
+    protocol::parse_signed_offer_token(offer.as_str(), topic).map_err(|_| {
+        meshmsg_protocol::ProtocolError::new(
+            Some(operation_id),
+            meshmsg_protocol::ErrorCode::InvalidAttachmentOffer,
+            meshmsg_protocol::Outcome::NotStarted,
+        )
+    })
+}
+
 pub(crate) async fn download_request(
     resources: DownloadResources,
     events: broadcast::Sender<meshmsg_protocol::Event>,
     operation_id: meshmsg_protocol::OperationId,
-    offer: meshmsg_protocol::AttachmentToken,
+    (offer, ticket): SignedOffer,
     output: PathBuf,
     max_attachment_bytes: u64,
 ) -> meshmsg_protocol::Response {
-    // Only a signed offer for this daemon's topic is accepted; anything else
-    // is rejected before storage admission, events, or network work.
-    let Ok((offer, ticket)) = protocol::parse_signed_offer_token(offer.as_str(), resources.topic)
-    else {
-        return meshmsg_protocol::Response::Error(meshmsg_protocol::ProtocolError::new(
-            Some(operation_id),
-            meshmsg_protocol::ErrorCode::InvalidAttachmentOffer,
-            meshmsg_protocol::Outcome::NotStarted,
-        ));
-    };
     let gate = resources.storage.gate.clone();
     match gate.acquire_owned().await {
         Ok(_permit) => {
@@ -219,38 +230,12 @@ pub(crate) async fn download_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attachment::DEFAULT_MAX_ATTACHMENT_BYTES;
-    use iroh::{
-        address_lookup::memory::MemoryLookup, endpoint::presets, Endpoint, EndpointAddr, SecretKey,
-    };
-    use iroh_blobs::{
-        store::fs::{options::Options as FsStoreOptions, FsStore},
-        ticket::BlobTicket,
-        BlobFormat,
-    };
+    use iroh::{EndpointAddr, SecretKey};
+    use iroh_blobs::{ticket::BlobTicket, BlobFormat};
     use iroh_gossip::proto::TopicId;
 
     fn test_topic() -> TopicId {
         TopicId::from_bytes([7; 32])
-    }
-    fn response_error(response: &meshmsg_protocol::Response) -> &meshmsg_protocol::ProtocolError {
-        match response {
-            meshmsg_protocol::Response::Error(error) => error,
-            _ => panic!("expected protocol error"),
-        }
-    }
-    async fn lifecycle_test_store(label: &str) -> (PathBuf, PathBuf, Store) {
-        let root =
-            std::env::temp_dir().join(format!("meshmsg-runtime-{label}-{}", rand::random::<u64>()));
-        let state = root.join("state");
-        let blob_root = root.join("blobs");
-        std::fs::create_dir_all(&state).unwrap();
-        let store: Store =
-            FsStore::load_with_opts(blob_root.join("blobs.db"), FsStoreOptions::new(&blob_root))
-                .await
-                .unwrap()
-                .into();
-        (root, state, store)
     }
     #[test]
     fn concurrent_offer_listing_returns_same_request_advice() {
@@ -268,20 +253,8 @@ mod tests {
         assert!(try_admit_offer_listing(&limit).is_ok());
     }
 
-    #[tokio::test]
-    async fn inputs_other_than_a_signed_offer_for_this_topic_are_rejected_before_side_effects() {
-        let (root, state, store) = lifecycle_test_store("invalid-offer").await;
-        let storage = AttachmentStorage::open(store.clone(), root.join("blobs"), &state, 100, 0, 0)
-            .await
-            .unwrap();
-        // A storage-gate failure would win if validation happened after storage
-        // admission, making this a sentinel for pre-work rejection ordering.
-        storage.gate.close();
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(SecretKey::generate())
-            .bind()
-            .await
-            .unwrap();
+    #[test]
+    fn inputs_other_than_a_signed_offer_for_this_topic_are_rejected() {
         let provider = SecretKey::generate();
         let ticket = BlobTicket::new(
             EndpointAddr::new(provider.public()),
@@ -289,49 +262,42 @@ mod tests {
             BlobFormat::Raw,
         );
         let offer_id = meshmsg_protocol::OperationId::new_random();
-        let other_topic_offer = protocol::encode_signed_offer(
-            &provider,
-            TopicId::from_bytes([8; 32]),
-            &offer_id,
-            crate::attachment::AttachmentOffer {
-                offer_id: offer_id.to_string(),
-                kind: crate::attachment::AttachmentKind::File,
-                name: "report.txt".to_owned(),
-                size: 7,
-                ticket: ticket.to_string(),
-            },
-            42,
-        )
-        .unwrap();
-        let output = root.join("output");
+        let signed_offer = |topic| {
+            let signed = protocol::encode_signed_offer(
+                &provider,
+                topic,
+                &offer_id,
+                crate::attachment::AttachmentOffer {
+                    offer_id: offer_id.to_string(),
+                    kind: crate::attachment::AttachmentKind::File,
+                    name: "report.txt".to_owned(),
+                    size: 7,
+                    ticket: ticket.to_string(),
+                },
+                42,
+            )
+            .unwrap();
+            data_encoding::BASE64URL_NOPAD.encode(&signed.encoded)
+        };
+        let parse = |token: String| {
+            let operation_id = meshmsg_protocol::OperationId::new_random();
+            let token = meshmsg_protocol::AttachmentToken::new(token).unwrap();
+            (
+                operation_id,
+                parse_download_offer(operation_id, &token, test_topic()),
+            )
+        };
+
         for (label, token) in [
             ("raw blob ticket", ticket.to_string()),
             ("arbitrary text", "not-a-signed-offer".to_owned()),
             (
                 "signed offer for another topic",
-                data_encoding::BASE64URL_NOPAD.encode(&other_topic_offer.encoded),
+                signed_offer(TopicId::from_bytes([8; 32])),
             ),
         ] {
-            let (events, mut event_rx) = broadcast::channel(4);
-            let operation_id = meshmsg_protocol::OperationId::new_random();
-            let response = download_request(
-                DownloadResources {
-                    downloader: store.downloader(&endpoint),
-                    endpoint: endpoint.clone(),
-                    lookup: MemoryLookup::new(),
-                    store: store.clone(),
-                    storage: storage.clone(),
-                    topic: test_topic(),
-                },
-                events,
-                operation_id,
-                meshmsg_protocol::AttachmentToken::new(token).unwrap(),
-                output.clone(),
-                DEFAULT_MAX_ATTACHMENT_BYTES,
-            )
-            .await;
-
-            let error = response_error(&response);
+            let (operation_id, result) = parse(token);
+            let error = result.expect_err(label);
             assert_eq!(
                 error.code,
                 meshmsg_protocol::ErrorCode::InvalidAttachmentOffer,
@@ -339,15 +305,12 @@ mod tests {
             );
             assert_eq!(error.outcome, meshmsg_protocol::Outcome::NotStarted);
             assert_eq!(error.operation_id.as_ref(), Some(&operation_id));
-            assert!(event_rx.try_recv().is_err(), "{label}: event was emitted");
-            assert!(!output.exists(), "{label}: output was touched");
-            assert_eq!(storage.status().tags, 0, "{label}: storage was mutated");
         }
 
-        endpoint.close().await;
-        drop(storage);
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
+        let (_, result) = parse(signed_offer(test_topic()));
+        let (offer, parsed_ticket) = result.expect("signed offer for this topic");
+        assert_eq!(offer.name, "report.txt");
+        assert_eq!(parsed_ticket, ticket);
     }
 }
 

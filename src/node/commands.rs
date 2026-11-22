@@ -548,6 +548,22 @@ pub(super) async fn execute(
             {
                 return Ok(CommandAction::Continue);
             }
+            // Validate before transfer admission: an input that can never
+            // succeed must not be reported as a transient busy condition.
+            let offer = match parse_download_offer(operation_id, &offer, topic) {
+                Ok(offer) => offer,
+                Err(error) => {
+                    operation_cache
+                        .lock()
+                        .expect("operation cache poisoned")
+                        .complete(
+                            &operation_id,
+                            meshmsg_protocol::Response::Error(error),
+                            StdInstant::now(),
+                        );
+                    return Ok(CommandAction::Continue);
+                }
+            };
             let permit = match try_admit_transfer(transfer_limit) {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -590,7 +606,6 @@ pub(super) async fn execute(
                         DownloadResources {
                             store,
                             storage,
-                            topic,
                             downloader,
                             endpoint,
                             lookup,
