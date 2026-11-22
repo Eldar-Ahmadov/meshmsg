@@ -125,7 +125,13 @@ pub(crate) struct AttachmentStorage {
     quota_bytes: u64,
     min_free_bytes: u64,
     retention_secs: u64,
+    #[cfg(test)]
+    fault_hook: Option<FaultHook>,
 }
+
+/// Decides, per named fault boundary, whether a crash-safety test fails there.
+#[cfg(test)]
+type FaultHook = Arc<dyn Fn(&'static str) -> Result<()> + Send + Sync>;
 
 struct AttachmentStorageState {
     index: AttachmentRetentionIndex,
@@ -232,11 +238,11 @@ struct StorageTag {
 /// Typed selector for one offer removal (`offer_id` present) or prune (absent).
 /// The response shape follows from `offer_id`, so no separate context is needed.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RemovalSpec<'a> {
-    pub(crate) operation_id: &'a meshmsg_protocol::OperationId,
-    pub(crate) offer_id: Option<&'a OfferId>,
+pub(crate) struct RemovalSpec {
+    pub(crate) operation_id: meshmsg_protocol::OperationId,
+    pub(crate) offer_id: Option<OfferId>,
     pub(crate) direction: Option<OfferDirection>,
-    pub(crate) provider: Option<&'a PeerId>,
+    pub(crate) provider: Option<PeerId>,
     pub(crate) older_than_secs: Option<u64>,
     pub(crate) maximum: usize,
     pub(crate) dry_run: bool,
@@ -324,7 +330,36 @@ impl AttachmentStorage {
             quota_bytes,
             min_free_bytes,
             retention_secs,
+            #[cfg(test)]
+            fault_hook: None,
         })
+    }
+
+    /// A named point at which a crash-safety test can fail the operation.
+    /// It never fails outside tests.
+    #[cfg(not(test))]
+    fn fault(&self, _boundary: &'static str) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fault(&self, boundary: &'static str) -> Result<()> {
+        match &self.fault_hook {
+            Some(hook) => hook(boundary),
+            None => Ok(()),
+        }
+    }
+
+    /// A handle on this storage whose fault boundaries consult `hook`.
+    #[cfg(test)]
+    fn with_fault_hook(
+        &self,
+        hook: impl Fn(&'static str) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            fault_hook: Some(Arc::new(hook)),
+            ..self.clone()
+        }
     }
 
     pub(crate) fn status(&self) -> meshmsg_protocol::AttachmentStorageStatus {
@@ -459,7 +494,6 @@ impl AttachmentStorage {
         parsed: PinnedBlobTag,
         hash_and_format: iroh_blobs::HashAndFormat,
         size: u64,
-        fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
     ) -> Result<bool> {
         let authoritative_size = complete_blob_size(&self.store, hash_and_format).await?;
         anyhow::ensure!(
@@ -481,14 +515,14 @@ impl AttachmentStorage {
             );
         }
         let result = async {
-            fault("before_attachment_tag_set")?;
+            self.fault("before_attachment_tag_set")?;
             self.store
                 .tags()
                 .set(tag_name.as_bytes(), hash_and_format)
                 .await?;
-            fault("after_attachment_tag_set")?;
+            self.fault("after_attachment_tag_set")?;
             self.store.sync_db().await?;
-            fault("after_attachment_tag_sync")?;
+            self.fault("after_attachment_tag_sync")?;
             let now = unix_timestamp_ms()?;
             let index = {
                 let mut state = self
@@ -516,15 +550,15 @@ impl AttachmentStorage {
                 );
                 clone_attachment_index(&state.index)
             };
-            fault("before_attachment_index_persist")?;
+            self.fault("before_attachment_index_persist")?;
             persist_attachment_index_off_loop(self.state_dir.clone(), index).await?;
-            fault("after_attachment_index_persist")?;
+            self.fault("after_attachment_index_persist")?;
             self.recalculate_cached_status().await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
         if let Err(error) = result {
-            let rollback = self.rollback_new_pin(tag_name, fault).await;
+            let rollback = self.rollback_new_pin(tag_name).await;
             return match rollback {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(error.context(format!(
@@ -535,16 +569,12 @@ impl AttachmentStorage {
         Ok(true)
     }
 
-    async fn rollback_new_pin(
-        &self,
-        tag_name: &str,
-        fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
-    ) -> Result<()> {
+    async fn rollback_new_pin(&self, tag_name: &str) -> Result<()> {
         let rollback = async {
-            fault("before_attachment_tag_rollback")?;
+            self.fault("before_attachment_tag_rollback")?;
             self.store.tags().delete(tag_name.as_bytes()).await?;
             self.store.sync_db().await?;
-            fault("after_attachment_tag_rollback")?;
+            self.fault("after_attachment_tag_rollback")?;
             let index = {
                 let mut state = self
                     .state
@@ -582,7 +612,7 @@ impl AttachmentStorage {
         newly_created: bool,
     ) -> Result<()> {
         if newly_created {
-            self.rollback_new_pin(tag_name, &|_| Ok(())).await
+            self.rollback_new_pin(tag_name).await
         } else {
             Ok(())
         }
@@ -655,16 +685,18 @@ impl AttachmentStorage {
         if self.retention_secs == 0 {
             return Ok(None);
         }
-        let operation_id = meshmsg_protocol::OperationId::new_random();
-        self.remove(RemovalSpec {
-            operation_id: &operation_id,
-            offer_id: None,
-            direction: None,
-            provider: None,
-            older_than_secs: Some(self.retention_secs),
-            maximum: MAX_PRUNE_TAGS,
-            dry_run: false,
-        })
+        self.remove(
+            RemovalSpec {
+                operation_id: meshmsg_protocol::OperationId::new_random(),
+                offer_id: None,
+                direction: None,
+                provider: None,
+                older_than_secs: Some(self.retention_secs),
+                maximum: MAX_PRUNE_TAGS,
+                dry_run: false,
+            },
+            None,
+        )
         .await
         .map(Some)
     }
@@ -737,7 +769,7 @@ impl AttachmentStorage {
 
     /// Resolves the cutoff an unanchored selector implies: an age-based prune
     /// uses that age, and a selector-free prune covers every tag up to now.
-    fn resolve_cutoff(spec: &RemovalSpec<'_>) -> Result<Option<u64>> {
+    fn resolve_cutoff(spec: &RemovalSpec) -> Result<Option<u64>> {
         Ok(match spec.older_than_secs {
             Some(age) => Some(prune_cutoff_upper_bound(unix_timestamp_ms()?, age)),
             None if spec.offer_id.is_none() => Some(unix_timestamp_ms()?),
@@ -745,39 +777,17 @@ impl AttachmentStorage {
         })
     }
 
-    async fn remove(&self, spec: RemovalSpec<'_>) -> Result<meshmsg_protocol::Response> {
-        let cutoff_ms = Self::resolve_cutoff(&spec)?;
-        self.remove_with_fault_at_cutoff(spec, cutoff_ms, &|_| Ok(()))
-            .await
-    }
-
-    /// Removes the selection against a cutoff the daemon resolved at admission.
-    pub(super) async fn remove_at_cutoff(
+    /// Removes the selection. A daemon prune supplies the cutoff it resolved at
+    /// admission; without one, the cutoff is whatever the selector implies now.
+    pub(super) async fn remove(
         &self,
-        spec: RemovalSpec<'_>,
-        cutoff_ms: Option<u64>,
+        spec: RemovalSpec,
+        admitted_cutoff_ms: Option<u64>,
     ) -> Result<meshmsg_protocol::Response> {
-        self.remove_with_fault_at_cutoff(spec, cutoff_ms, &|_| Ok(()))
-            .await
-    }
-
-    #[cfg(test)]
-    async fn remove_with_fault(
-        &self,
-        spec: RemovalSpec<'_>,
-        fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
-    ) -> Result<meshmsg_protocol::Response> {
-        let cutoff_ms = Self::resolve_cutoff(&spec)?;
-        self.remove_with_fault_at_cutoff(spec, cutoff_ms, fault)
-            .await
-    }
-
-    async fn remove_with_fault_at_cutoff(
-        &self,
-        spec: RemovalSpec<'_>,
-        cutoff_ms: Option<u64>,
-        fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
-    ) -> Result<meshmsg_protocol::Response> {
+        let cutoff = match admitted_cutoff_ms {
+            Some(cutoff_ms) => Some(cutoff_ms),
+            None => Self::resolve_cutoff(&spec)?,
+        };
         let RemovalSpec {
             operation_id,
             offer_id,
@@ -795,10 +805,9 @@ impl AttachmentStorage {
         })?;
         let now = unix_timestamp_ms()?;
         anyhow::ensure!(
-            offer_id.is_some() == cutoff_ms.is_none(),
+            offer_id.is_some() == cutoff.is_none(),
             "invalid internal lifecycle cutoff context"
         );
-        let cutoff = cutoff_ms;
         match (offer_id, older_than_secs) {
             (Some(_), Some(_)) => anyhow::bail!("invalid internal lifecycle request context"),
             (None, _) => {
@@ -815,9 +824,9 @@ impl AttachmentStorage {
                 .tags
                 .values()
                 .filter(|tag| {
-                    offer_id.is_none_or(|id| tag.parsed.offer_id == *id)
+                    offer_id.is_none_or(|id| tag.parsed.offer_id == id)
                         && direction.is_none_or(|value| tag.parsed.direction == value)
-                        && provider.is_none_or(|value| tag.parsed.provider.as_ref() == Some(value))
+                        && provider.is_none_or(|value| tag.parsed.provider == Some(value))
                         && cutoff.is_none_or(|boundary| {
                             state
                                 .index
@@ -875,7 +884,7 @@ impl AttachmentStorage {
         let mut failures = 0_usize;
         let mut possibly_unpinned = HashSet::new();
         for name in &selected_names {
-            if fault("attachment_tag_delete").is_err() {
+            if self.fault("attachment_tag_delete").is_err() {
                 failures += 1;
                 continue;
             }
@@ -890,7 +899,7 @@ impl AttachmentStorage {
                 Err(_) => failures += 1,
             }
         }
-        let sync_error = match fault("attachment_removal_sync") {
+        let sync_error = match self.fault("attachment_removal_sync") {
             Ok(()) => self
                 .store
                 .sync_db()
@@ -907,7 +916,7 @@ impl AttachmentStorage {
             let _ = sync_error;
             return Ok(meshmsg_protocol::Response::Error(
                 meshmsg_protocol::ProtocolError::new(
-                    Some(*operation_id),
+                    Some(operation_id),
                     meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
                     if removed.is_empty() {
                         meshmsg_protocol::Outcome::Unknown
@@ -931,7 +940,7 @@ impl AttachmentStorage {
             }
             clone_attachment_index(&state.index)
         };
-        if fault("attachment_removal_index_persist").is_err()
+        if self.fault("attachment_removal_index_persist").is_err()
             || persist_attachment_index_off_loop(self.state_dir.clone(), index)
                 .await
                 .is_err()
@@ -939,7 +948,7 @@ impl AttachmentStorage {
             self.recalculate_cached_status().await?;
             return Ok(meshmsg_protocol::Response::Error(
                 meshmsg_protocol::ProtocolError::new(
-                    Some(*operation_id),
+                    Some(operation_id),
                     meshmsg_protocol::ErrorCode::AttachmentRemovalPartial,
                     if removed.is_empty() {
                         meshmsg_protocol::Outcome::Unknown
@@ -962,7 +971,7 @@ impl AttachmentStorage {
 }
 
 fn lifecycle_response(
-    spec: &RemovalSpec<'_>,
+    spec: &RemovalSpec,
     selected_tags: usize,
     removed_tags: usize,
     released_bytes: u64,
@@ -973,10 +982,10 @@ fn lifecycle_response(
         Some(offer_id) => {
             anyhow::ensure!(cutoff_ms.is_none(), "remove unexpectedly resolved a cutoff");
             meshmsg_protocol::Response::OfferRemoved(meshmsg_protocol::OfferRemoved {
-                operation_id: *spec.operation_id,
-                offer_id: *offer_id,
+                operation_id: spec.operation_id,
+                offer_id,
                 direction: spec.direction,
-                provider: spec.provider.copied(),
+                provider: spec.provider,
                 maximum: spec.maximum,
                 selected_tags,
                 removed_tags,
@@ -985,7 +994,7 @@ fn lifecycle_response(
             })
         }
         None => meshmsg_protocol::Response::OffersPruned(meshmsg_protocol::OffersPruned {
-            operation_id: *spec.operation_id,
+            operation_id: spec.operation_id,
             direction: spec.direction,
             older_than_secs: spec.older_than_secs.unwrap_or(0),
             maximum: spec.maximum,
@@ -1447,13 +1456,7 @@ mod tests {
         let parsed = parse_pinned_blob_tag(tag.as_bytes()).unwrap();
         let hash_and_format = iroh_blobs::HashAndFormat::raw(hash);
         let error = storage
-            .commit_pin(
-                &tag,
-                parsed.clone(),
-                hash_and_format,
-                data.len() as u64,
-                &|_| Ok(()),
-            )
+            .commit_pin(&tag, parsed.clone(), hash_and_format, data.len() as u64)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("incomplete"));
@@ -1476,21 +1479,17 @@ mod tests {
         });
         barrier.wait().await;
         completion.await.unwrap();
-        let observed_during_commit = std::sync::atomic::AtomicU64::new(0);
+        let observed_during_commit = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observer = storage.clone();
+        let observed = observed_during_commit.clone();
         assert!(storage
-            .commit_pin(
-                &tag,
-                parsed,
-                hash_and_format,
-                data.len() as u64,
-                &|boundary| {
-                    if boundary == "before_attachment_index_persist" {
-                        observed_during_commit
-                            .store(storage.status().tagged_bytes, Ordering::SeqCst);
-                    }
-                    Ok(())
+            .with_fault_hook(move |boundary| {
+                if boundary == "before_attachment_index_persist" {
+                    observed.store(observer.status().tagged_bytes, Ordering::SeqCst);
                 }
-            )
+                Ok(())
+            })
+            .commit_pin(&tag, parsed, hash_and_format, data.len() as u64)
             .await
             .unwrap());
         assert_eq!(
@@ -1539,34 +1538,33 @@ mod tests {
         let delete_release = Arc::new(std::sync::Barrier::new(2));
         let sync_entered = Arc::new(std::sync::Barrier::new(2));
         let sync_release = Arc::new(std::sync::Barrier::new(2));
-        let task_storage = storage.clone();
         let task_delete_entered = delete_entered.clone();
         let task_delete_release = delete_release.clone();
         let task_sync_entered = sync_entered.clone();
         let task_sync_release = sync_release.clone();
+        let task_storage = storage.with_fault_hook(move |boundary| {
+            if boundary == "attachment_tag_delete" {
+                task_delete_entered.wait();
+                task_delete_release.wait();
+            } else if boundary == "attachment_removal_sync" {
+                task_sync_entered.wait();
+                task_sync_release.wait();
+            }
+            Ok(())
+        });
         let removal = tokio::spawn(async move {
-            let fault = move |boundary| {
-                if boundary == "attachment_tag_delete" {
-                    task_delete_entered.wait();
-                    task_delete_release.wait();
-                } else if boundary == "attachment_removal_sync" {
-                    task_sync_entered.wait();
-                    task_sync_release.wait();
-                }
-                Ok(())
-            };
             task_storage
-                .remove_with_fault(
+                .remove(
                     RemovalSpec {
-                        operation_id: &TEST_OPERATION_ID,
-                        offer_id: Some(&"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap()),
+                        operation_id: *TEST_OPERATION_ID,
+                        offer_id: Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap()),
                         direction: None,
                         provider: None,
                         older_than_secs: None,
                         maximum: 1,
                         dry_run: false,
                     },
-                    &fault,
+                    None,
                 )
                 .await
         });
@@ -1656,9 +1654,15 @@ mod tests {
             },
         );
         let result = storage
-            .remove_with_fault(
+            .with_fault_hook(move |boundary| {
+                if boundary == "attachment_tag_delete" {
+                    anyhow::bail!("stopped before deletion")
+                }
+                Ok(())
+            })
+            .remove(
                 RemovalSpec {
-                    operation_id: &TEST_OPERATION_ID,
+                    operation_id: *TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -1666,12 +1670,7 @@ mod tests {
                     maximum: 2,
                     dry_run: false,
                 },
-                &|boundary| {
-                    if boundary == "attachment_tag_delete" {
-                        anyhow::bail!("stopped before deletion")
-                    }
-                    Ok(())
-                },
+                None,
             )
             .await
             .unwrap();
@@ -1691,9 +1690,15 @@ mod tests {
 
         let failed_sync_started = StdInstant::now();
         let result = storage
-            .remove_with_fault(
+            .with_fault_hook(move |boundary| {
+                if boundary == "attachment_removal_sync" {
+                    anyhow::bail!("injected sync failure")
+                }
+                Ok(())
+            })
+            .remove(
                 RemovalSpec {
-                    operation_id: &TEST_OPERATION_ID,
+                    operation_id: *TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -1701,12 +1706,7 @@ mod tests {
                     maximum: 2,
                     dry_run: false,
                 },
-                &|boundary| {
-                    if boundary == "attachment_removal_sync" {
-                        anyhow::bail!("injected sync failure")
-                    }
-                    Ok(())
-                },
+                None,
             )
             .await
             .unwrap();
@@ -1789,15 +1789,18 @@ mod tests {
         reader.read_exact(&mut prefix).await.unwrap();
         assert_eq!(prefix, data[..prefix.len()]);
         storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: Some(&"fffffffffffffffffffffffffffffff1".parse().unwrap()),
-                direction: None,
-                provider: None,
-                older_than_secs: None,
-                maximum: 1,
-                dry_run: false,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: Some("fffffffffffffffffffffffffffffff1".parse().unwrap()),
+                    direction: None,
+                    provider: None,
+                    older_than_secs: None,
+                    maximum: 1,
+                    dry_run: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(storage.status().tags, 0);
@@ -1874,29 +1877,35 @@ mod tests {
         );
 
         let removed = storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: Some(&"00000000000000000000000000000001".parse().unwrap()),
-                direction: None,
-                provider: None,
-                older_than_secs: None,
-                maximum: 512,
-                dry_run: false,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: Some("00000000000000000000000000000001".parse().unwrap()),
+                    direction: None,
+                    provider: None,
+                    older_than_secs: None,
+                    maximum: 512,
+                    dry_run: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(lifecycle_result(&removed).removed_tags, 1);
         assert_eq!(lifecycle_result(&removed).released_bytes, 0);
         let removed = storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: Some(&"00000000000000000000000000000002".parse().unwrap()),
-                direction: None,
-                provider: None,
-                older_than_secs: None,
-                maximum: 512,
-                dry_run: false,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: Some("00000000000000000000000000000002".parse().unwrap()),
+                    direction: None,
+                    provider: None,
+                    older_than_secs: None,
+                    maximum: 512,
+                    dry_run: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(lifecycle_result(&removed).released_bytes, 10);
@@ -2060,15 +2069,18 @@ mod tests {
             persist_attachment_index(&state, &lifecycle.index).unwrap();
         }
         let dry = storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: None,
-                direction: None,
-                provider: None,
-                older_than_secs: Some(10),
-                maximum: 1,
-                dry_run: true,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: None,
+                    direction: None,
+                    provider: None,
+                    older_than_secs: Some(10),
+                    maximum: 1,
+                    dry_run: true,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(lifecycle_result(&dry).selected_tags, 1);
@@ -2076,15 +2088,18 @@ mod tests {
         assert!(lifecycle_result(&dry).limited);
         assert_eq!(storage.status().tags, 3);
         let pruned = storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: None,
-                direction: None,
-                provider: None,
-                older_than_secs: Some(10),
-                maximum: 2,
-                dry_run: false,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: None,
+                    direction: None,
+                    provider: None,
+                    older_than_secs: Some(10),
+                    maximum: 2,
+                    dry_run: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2095,15 +2110,18 @@ mod tests {
         assert_eq!(storage.status().tags, 1);
         let held = storage.gate.clone().acquire_owned().await.unwrap();
         let busy = storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: None,
-                direction: None,
-                provider: None,
-                older_than_secs: Some(0),
-                maximum: 1,
-                dry_run: false,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: None,
+                    direction: None,
+                    provider: None,
+                    older_than_secs: Some(0),
+                    maximum: 1,
+                    dry_run: false,
+                },
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -2199,15 +2217,18 @@ mod tests {
             .to_string()
             .contains("hash_seq"));
         storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: Some(&"11111111111111111111111111111111".parse().unwrap()),
-                direction: None,
-                provider: None,
-                older_than_secs: None,
-                maximum: 1,
-                dry_run: false,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: Some("11111111111111111111111111111111".parse().unwrap()),
+                    direction: None,
+                    provider: None,
+                    older_than_secs: None,
+                    maximum: 1,
+                    dry_run: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert!(store.tags().get(b"foreign/keep").await.unwrap().is_some());
@@ -2261,19 +2282,14 @@ mod tests {
             );
             let parsed = parse_pinned_blob_tag(tag_name.as_bytes()).unwrap();
             let error = storage
-                .commit_pin(
-                    &tag_name,
-                    parsed,
-                    imported.hash_and_format(),
-                    1,
-                    &|current| {
-                        if current == boundary {
-                            anyhow::bail!("injected {boundary}")
-                        } else {
-                            Ok(())
-                        }
-                    },
-                )
+                .with_fault_hook(move |current| {
+                    if current == boundary {
+                        anyhow::bail!("injected {boundary}")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .commit_pin(&tag_name, parsed, imported.hash_and_format(), 1)
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("injected"));
@@ -2321,17 +2337,20 @@ mod tests {
             "x",
         );
         let _ = storage
+            .with_fault_hook({
+                let phase = phase.clone();
+                move |current| {
+                    if current == phase {
+                        std::process::exit(87);
+                    }
+                    Ok(())
+                }
+            })
             .commit_pin(
                 &tag_name,
                 parse_pinned_blob_tag(tag_name.as_bytes()).unwrap(),
                 imported.hash_and_format(),
                 1,
-                &|current| {
-                    if current == phase {
-                        std::process::exit(87);
-                    }
-                    Ok(())
-                },
             )
             .await;
         panic!("child did not exit at {phase}");
@@ -2375,15 +2394,18 @@ mod tests {
                 assert!(lifecycle.reservations.is_empty());
             }
             storage
-                .remove(RemovalSpec {
-                    operation_id: &TEST_OPERATION_ID,
-                    offer_id: Some(&"dddddddddddddddddddddddddddddddd".parse().unwrap()),
-                    direction: None,
-                    provider: None,
-                    older_than_secs: None,
-                    maximum: 1,
-                    dry_run: false,
-                })
+                .remove(
+                    RemovalSpec {
+                        operation_id: *TEST_OPERATION_ID,
+                        offer_id: Some("dddddddddddddddddddddddddddddddd".parse().unwrap()),
+                        direction: None,
+                        provider: None,
+                        older_than_secs: None,
+                        maximum: 1,
+                        dry_run: false,
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(storage.status().tags, 0);
@@ -2406,33 +2428,31 @@ mod tests {
         let parsed = parse_pinned_blob_tag(tag_name.as_bytes()).unwrap();
         let imported = store.blobs().add_slice(b"x").await.unwrap();
         let error = storage
-            .commit_pin(
-                &tag_name,
-                parsed,
-                imported.hash_and_format(),
-                1,
-                &|current| match current {
-                    "after_attachment_tag_set" | "before_attachment_tag_rollback" => {
-                        anyhow::bail!("injected rollback fault")
-                    }
-                    _ => Ok(()),
-                },
-            )
+            .with_fault_hook(move |current| match current {
+                "after_attachment_tag_set" | "before_attachment_tag_rollback" => {
+                    anyhow::bail!("injected rollback fault")
+                }
+                _ => Ok(()),
+            })
+            .commit_pin(&tag_name, parsed, imported.hash_and_format(), 1)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("rollback failed"));
         assert_eq!(storage.status().tags, 1, "authoritative tag was hidden");
         assert!(storage.state.lock().unwrap().reservations.is_empty());
         storage
-            .remove(RemovalSpec {
-                operation_id: &TEST_OPERATION_ID,
-                offer_id: Some(&"44444444444444444444444444444444".parse().unwrap()),
-                direction: None,
-                provider: None,
-                older_than_secs: None,
-                maximum: 1,
-                dry_run: false,
-            })
+            .remove(
+                RemovalSpec {
+                    operation_id: *TEST_OPERATION_ID,
+                    offer_id: Some("44444444444444444444444444444444".parse().unwrap()),
+                    direction: None,
+                    provider: None,
+                    older_than_secs: None,
+                    maximum: 1,
+                    dry_run: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(storage.status().tags, 0);
@@ -2458,23 +2478,24 @@ mod tests {
                     .await
                     .unwrap();
             let value = storage
-                .remove_with_fault(
+                .with_fault_hook(move |current| {
+                    if current == boundary {
+                        anyhow::bail!("injected {boundary}")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .remove(
                     RemovalSpec {
-                        operation_id: &TEST_OPERATION_ID,
-                        offer_id: Some(&"66666666666666666666666666666666".parse().unwrap()),
+                        operation_id: *TEST_OPERATION_ID,
+                        offer_id: Some("66666666666666666666666666666666".parse().unwrap()),
                         direction: None,
                         provider: None,
                         older_than_secs: None,
                         maximum: 1,
                         dry_run: false,
                     },
-                    &|current| {
-                        if current == boundary {
-                            anyhow::bail!("injected {boundary}")
-                        } else {
-                            Ok(())
-                        }
-                    },
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2516,9 +2537,15 @@ mod tests {
                 .unwrap();
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let value = storage
-            .remove_with_fault(
+            .with_fault_hook(move |current| {
+                if current == "attachment_tag_delete" && calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("first delete failed")
+                }
+                Ok(())
+            })
+            .remove(
                 RemovalSpec {
-                    operation_id: &TEST_OPERATION_ID,
+                    operation_id: *TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -2526,14 +2553,7 @@ mod tests {
                     maximum: 2,
                     dry_run: false,
                 },
-                &|current| {
-                    if current == "attachment_tag_delete"
-                        && calls.fetch_add(1, Ordering::SeqCst) == 0
-                    {
-                        anyhow::bail!("first delete failed")
-                    }
-                    Ok(())
-                },
+                None,
             )
             .await
             .unwrap();
@@ -2571,9 +2591,16 @@ mod tests {
             persist_attachment_index(&state, &lifecycle.index).unwrap();
         }
         let partial = enabled
-            .remove_with_fault(
+            .with_fault_hook(move |boundary| {
+                if boundary == "attachment_tag_delete" {
+                    anyhow::bail!("delete fault")
+                } else {
+                    Ok(())
+                }
+            })
+            .remove(
                 RemovalSpec {
-                    operation_id: &TEST_OPERATION_ID,
+                    operation_id: *TEST_OPERATION_ID,
                     offer_id: None,
                     direction: None,
                     provider: None,
@@ -2581,13 +2608,7 @@ mod tests {
                     maximum: 1,
                     dry_run: false,
                 },
-                &|boundary| {
-                    if boundary == "attachment_tag_delete" {
-                        anyhow::bail!("delete fault")
-                    } else {
-                        Ok(())
-                    }
-                },
+                None,
             )
             .await
             .unwrap();

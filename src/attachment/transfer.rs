@@ -133,7 +133,6 @@ pub(super) async fn share_attachment(
                 },
                 imported.hash_and_format(),
                 size,
-                &|_| Ok(()),
             )
             .await
             .context("commit attachment pin before publication")?;
@@ -222,14 +221,30 @@ struct DownloadCommit<'a> {
     pin_already_committed: bool,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Decides, per named fault boundary, whether the download commit running
+    /// in this task fails there.
+    static FAULT_HOOK: Box<dyn Fn(&'static str) -> Result<()>>;
+}
+
+/// A named point at which a crash-safety test can fail the download commit.
+/// It never fails outside tests.
+#[cfg(not(test))]
+fn fault(_boundary: &'static str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn fault(boundary: &'static str) -> Result<()> {
+    FAULT_HOOK.try_with(|hook| hook(boundary)).unwrap_or(Ok(()))
+}
+
 /// Commits the local half of a download. The named blob pin is made durable
 /// before the no-clobber destination operation. Once installation succeeds,
 /// subsequent sync/cleanup errors are partial-success metadata, never a false
 /// `download_failed` result that would make a safe retry impossible.
-async fn commit_download(
-    commit: DownloadCommit<'_>,
-    fault: &(dyn Fn(&'static str) -> Result<()> + Sync),
-) -> Result<DownloadCommitOutcome> {
+async fn commit_download(commit: DownloadCommit<'_>) -> Result<DownloadCommitOutcome> {
     let DownloadCommit {
         store,
         tag_name,
@@ -544,28 +559,19 @@ pub(super) async fn download_attachment(
     let parsed_tag = parse_pinned_blob_tag(tag_name.as_bytes())
         .context("generated attachment tag is invalid")?;
     let newly_created = storage
-        .commit_pin(
-            &tag_name,
-            parsed_tag,
-            ticket.hash_and_format(),
-            size,
-            &|_| Ok(()),
-        )
+        .commit_pin(&tag_name, parsed_tag, ticket.hash_and_format(), size)
         .await
         .context("commit downloaded attachment pin")?;
-    let commit_result = commit_download(
-        DownloadCommit {
-            store: &store,
-            tag_name: tag_name.as_bytes(),
-            hash_and_format: ticket.hash_and_format(),
-            staging,
-            output: &output,
-            kind: offer.kind,
-            max_attachment_bytes,
-            pin_already_committed: true,
-        },
-        &|_| Ok(()),
-    )
+    let commit_result = commit_download(DownloadCommit {
+        store: &store,
+        tag_name: tag_name.as_bytes(),
+        hash_and_format: ticket.hash_and_format(),
+        staging,
+        output: &output,
+        kind: offer.kind,
+        max_attachment_bytes,
+        pin_already_committed: true,
+    })
     .await;
     let commit = match commit_result {
         Ok(commit) => commit,
@@ -615,6 +621,16 @@ mod tests {
         assert!(validate_declared_attachment_size(1, 0).is_err());
     }
 
+    /// Runs the download commit with `hook` deciding each fault boundary.
+    async fn commit_download_with_fault(
+        commit: DownloadCommit<'_>,
+        hook: impl Fn(&'static str) -> Result<()> + 'static,
+    ) -> Result<DownloadCommitOutcome> {
+        FAULT_HOOK
+            .scope(Box::new(hook), commit_download(commit))
+            .await
+    }
+
     const CRASH_OFFER_ID: &str = "0123456789abcdef0123456789abcdef";
 
     fn crash_recovery_tag(ticket: &BlobTicket) -> String {
@@ -649,7 +665,8 @@ mod tests {
         let staging = root.join(".meshmsg-part-1111111111111111.download");
         std::fs::write(&staging, b"crash payload").unwrap();
         let output = root.join("output");
-        let _ = commit_download(
+        let exit_phase = phase.clone();
+        let _ = commit_download_with_fault(
             DownloadCommit {
                 store: &store,
                 tag_name: tag.as_bytes(),
@@ -660,8 +677,8 @@ mod tests {
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                 pin_already_committed: false,
             },
-            &|boundary| {
-                if boundary == phase {
+            move |boundary| {
+                if boundary == exit_phase {
                     std::process::exit(86);
                 }
                 Ok(())
@@ -725,19 +742,16 @@ mod tests {
             assert!(staging.exists());
 
             if phase == "after_blob_tag_sync" {
-                let outcome = commit_download(
-                    DownloadCommit {
-                        store: &store,
-                        tag_name: tag.as_bytes(),
-                        hash_and_format: ticket.hash_and_format(),
-                        staging: attachment::StagedFile::new(staging.clone()),
-                        output: &output,
-                        kind: AttachmentKind::File,
-                        max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
-                        pin_already_committed: false,
-                    },
-                    &|_| Ok(()),
-                )
+                let outcome = commit_download(DownloadCommit {
+                    store: &store,
+                    tag_name: tag.as_bytes(),
+                    hash_and_format: ticket.hash_and_format(),
+                    staging: attachment::StagedFile::new(staging.clone()),
+                    output: &output,
+                    kind: AttachmentKind::File,
+                    max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                    pin_already_committed: false,
+                })
                 .await
                 .unwrap();
                 assert!(outcome.destination_synced);
@@ -792,14 +806,14 @@ mod tests {
             let output = root.join("output");
             let staging = root.join("first.download");
             std::fs::write(&staging, b"blob").unwrap();
-            let injected = |current| {
+            let injected = move |current| {
                 if current == boundary {
                     anyhow::bail!("injected {boundary} failure")
                 }
                 Ok(())
             };
 
-            let error = commit_download(
+            let error = commit_download_with_fault(
                 DownloadCommit {
                     store: &store,
                     tag_name: tag.as_bytes(),
@@ -810,7 +824,7 @@ mod tests {
                     max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                     pin_already_committed: false,
                 },
-                &injected,
+                injected,
             )
             .await
             .unwrap_err();
@@ -834,19 +848,16 @@ mod tests {
             // tag sync and a durable pin left by an install failure.
             let retry_staging = root.join("retry.download");
             std::fs::write(&retry_staging, b"blob").unwrap();
-            let outcome = commit_download(
-                DownloadCommit {
-                    store: &store,
-                    tag_name: tag.as_bytes(),
-                    hash_and_format,
-                    staging: attachment::StagedFile::new(retry_staging),
-                    output: &output,
-                    kind: AttachmentKind::File,
-                    max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
-                    pin_already_committed: false,
-                },
-                &|_| Ok(()),
-            )
+            let outcome = commit_download(DownloadCommit {
+                store: &store,
+                tag_name: tag.as_bytes(),
+                hash_and_format,
+                staging: attachment::StagedFile::new(retry_staging),
+                output: &output,
+                kind: AttachmentKind::File,
+                max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                pin_already_committed: false,
+            })
             .await
             .unwrap();
             assert!(outcome.destination_synced);
@@ -904,14 +915,14 @@ mod tests {
             let output = root.join("output");
             let staging = root.join("part.download");
             std::fs::write(&staging, b"blob").unwrap();
-            let injected = |current| {
+            let injected = move |current| {
                 if current == boundary {
                     anyhow::bail!("injected {boundary} failure")
                 }
                 Ok(())
             };
 
-            let outcome = commit_download(
+            let outcome = commit_download_with_fault(
                 DownloadCommit {
                     store: &store,
                     tag_name: tag.as_bytes(),
@@ -922,7 +933,7 @@ mod tests {
                     max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                     pin_already_committed: false,
                 },
-                &injected,
+                injected,
             )
             .await
             .unwrap();
@@ -983,7 +994,7 @@ mod tests {
             .unwrap()
             .into();
         let output = root.join("installed");
-        let outcome = commit_download(
+        let outcome = commit_download_with_fault(
             DownloadCommit {
                 store: &store,
                 tag_name: tag.as_bytes(),
@@ -994,7 +1005,7 @@ mod tests {
                 max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
                 pin_already_committed: false,
             },
-            &|boundary| {
+            |boundary| {
                 if boundary == "after_destination_install" {
                     anyhow::bail!("simulated interruption")
                 }
@@ -1061,7 +1072,6 @@ mod tests {
                 parse_pinned_blob_tag(tag_name.as_bytes()).unwrap(),
                 hash_and_format,
                 1,
-                &|_| Ok(()),
             )
             .await
             .unwrap();
@@ -1070,19 +1080,16 @@ mod tests {
         let output = root.join("existing");
         std::fs::write(&staging, b"x").unwrap();
         std::fs::write(&output, b"keep").unwrap();
-        let error = commit_download(
-            DownloadCommit {
-                store: &store,
-                tag_name: tag_name.as_bytes(),
-                hash_and_format,
-                staging: attachment::StagedFile::new(staging),
-                output: &output,
-                kind: AttachmentKind::File,
-                max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
-                pin_already_committed: true,
-            },
-            &|_| Ok(()),
-        )
+        let error = commit_download(DownloadCommit {
+            store: &store,
+            tag_name: tag_name.as_bytes(),
+            hash_and_format,
+            staging: attachment::StagedFile::new(staging),
+            output: &output,
+            kind: AttachmentKind::File,
+            max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            pin_already_committed: true,
+        })
         .await
         .unwrap_err();
         assert!(error.to_string().contains("already exists"));

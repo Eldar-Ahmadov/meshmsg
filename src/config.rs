@@ -3,7 +3,7 @@ use crate::{
     invite::Invite,
     persistent::{self, PersistentError},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use data_encoding::HEXLOWER;
 use fs2::FileExt;
 use iroh::{PublicKey, SecretKey};
@@ -218,7 +218,7 @@ impl State {
     /// Test helper for committing state without alias metadata.
     #[cfg(test)]
     pub fn save_new(&self, dir: &Path, force: bool) -> Result<String> {
-        self.save_new_inner(dir, force, false)
+        self.save_new_inner(dir, force, None)
     }
 
     /// Commit identity/state and its separately stored alias selection under
@@ -230,28 +230,20 @@ impl State {
         force: bool,
         alias: &mut AliasConfig,
     ) -> Result<String> {
-        self.save_new_inner_impl(dir, force, false, Some(alias))
+        self.save_new_inner(dir, force, Some(alias))
     }
 
-    #[cfg(test)]
-    fn save_new_inner(&self, dir: &Path, force: bool, fail_after_identity: bool) -> Result<String> {
-        self.save_new_inner_impl(dir, force, fail_after_identity, None)
-    }
-
-    fn save_new_inner_impl(
+    fn save_new_inner(
         &self,
         dir: &Path,
         force: bool,
-        fail_after_identity: bool,
         alias: Option<&mut AliasConfig>,
     ) -> Result<String> {
         let lock = StateLock::acquire(dir)?;
         let secret = SecretKey::generate();
         let generation = new_generation();
         write_generation(dir, &generation, &secret)?;
-        if fail_after_identity {
-            bail!("injected failure after identity installation");
-        }
+        fault("after_identity_install")?;
         let public_key = secret.public().to_string();
         let mut committed = self.clone();
         committed.identity = Some(IdentityBinding {
@@ -363,42 +355,48 @@ impl std::fmt::Display for NoReplaceCollision {
 
 impl std::error::Error for NoReplaceCollision {}
 
-pub(crate) fn atomic_write(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
-    atomic_write_impl(dir, name, contents, mode, true, || {})
+/// Decides, per named fault boundary, what happens there to a state commit.
+#[cfg(test)]
+type FaultHook = Box<dyn Fn(&'static str) -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// The hook for state commits made on this test thread.
+    static FAULT_HOOK: std::cell::RefCell<Option<FaultHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-fn atomic_write_new(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
-    atomic_write_new_with_hook_impl(dir, name, contents, mode, || {})
+/// A named point at which a crash-safety test can fail or race a state commit.
+/// It never fails outside tests.
+#[cfg(not(test))]
+fn fault(_boundary: &'static str) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
-fn atomic_write_new_with_hook(
-    dir: &Path,
-    name: &str,
-    contents: &[u8],
-    mode: u32,
-    before_commit: impl FnOnce(),
-) -> Result<()> {
-    atomic_write_new_with_hook_impl(dir, name, contents, mode, before_commit)
+fn fault(boundary: &'static str) -> Result<()> {
+    FAULT_HOOK.with(|hook| match hook.borrow().as_ref() {
+        Some(hook) => hook(boundary),
+        None => Ok(()),
+    })
 }
 
-fn atomic_write_new_with_hook_impl(
-    dir: &Path,
-    name: &str,
-    contents: &[u8],
-    mode: u32,
-    before_commit: impl FnOnce(),
-) -> Result<()> {
-    atomic_write_impl(dir, name, contents, mode, false, before_commit)
+/// Atomically installs `name`, replacing any existing file.
+pub(crate) fn atomic_write(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
+    atomic_install(dir, name, contents, mode, true)
 }
 
-fn atomic_write_impl(
+/// Atomically installs `name`, failing if anything already exists there.
+fn atomic_write_new(dir: &Path, name: &str, contents: &[u8], mode: u32) -> Result<()> {
+    atomic_install(dir, name, contents, mode, false)
+}
+
+fn atomic_install(
     dir: &Path,
     name: &str,
     contents: &[u8],
     _mode: u32,
     replace: bool,
-    before_commit: impl FnOnce(),
 ) -> Result<()> {
     prepare_state_dir(dir)?;
     let destination = dir.join(name);
@@ -415,7 +413,7 @@ fn atomic_write_impl(
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        before_commit();
+        fault("atomic_write_commit")?;
         if replace {
             atomic_replace(&temporary, &destination)?;
             sync_state_dir(dir)?;
@@ -509,6 +507,17 @@ mod tests {
         ))
     }
 
+    /// Runs `commit` with `hook` deciding each fault boundary on this thread.
+    fn with_fault_hook<T>(
+        hook: impl Fn(&'static str) -> Result<()> + 'static,
+        commit: impl FnOnce() -> T,
+    ) -> T {
+        FAULT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let result = commit();
+        FAULT_HOOK.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
     fn load_bundle(dir: &Path) -> Result<(State, SecretKey)> {
         let state = State::load(dir)?;
         let secret = load_bound_secret(dir, state.identity.as_ref().context("missing identity")?)?;
@@ -543,13 +552,20 @@ mod tests {
             let dir = test_dir();
             prepare_state_dir(&dir).unwrap();
             let destination = dir.join(CONFIG_NAME);
-            let error = atomic_write_new_with_hook(&dir, CONFIG_NAME, b"new config", 0o600, || {
-                match destination_kind {
-                    "file" => fs::write(&destination, b"concurrent config").unwrap(),
-                    "directory" => fs::create_dir(&destination).unwrap(),
-                    _ => unreachable!(),
-                }
-            })
+            let concurrent = destination.clone();
+            let error = with_fault_hook(
+                move |boundary| {
+                    if boundary == "atomic_write_commit" {
+                        match destination_kind {
+                            "file" => fs::write(&concurrent, b"concurrent config").unwrap(),
+                            "directory" => fs::create_dir(&concurrent).unwrap(),
+                            _ => unreachable!(),
+                        }
+                    }
+                    Ok(())
+                },
+                || atomic_write_new(&dir, CONFIG_NAME, b"new config", 0o600),
+            )
             .unwrap_err();
             assert!(error.to_string().contains("state already exists"));
             if destination_kind == "file" {
@@ -588,9 +604,16 @@ mod tests {
         let destination = dir.join(CONFIG_NAME);
         let target = dir.join("concurrent-target");
         fs::write(&target, b"target").unwrap();
-        let error = atomic_write_new_with_hook(&dir, CONFIG_NAME, b"new config", 0o600, || {
-            symlink(&target, &destination).unwrap();
-        })
+        let (link_target, link) = (target.clone(), destination.clone());
+        let error = with_fault_hook(
+            move |boundary| {
+                if boundary == "atomic_write_commit" {
+                    symlink(&link_target, &link).unwrap();
+                }
+                Ok(())
+            },
+            || atomic_write_new(&dir, CONFIG_NAME, b"new config", 0o600),
+        )
         .unwrap_err();
         assert!(error.to_string().contains("state already exists"));
         assert!(fs::symlink_metadata(&destination)
@@ -610,9 +633,16 @@ mod tests {
         let destination = dir.join(CONFIG_NAME);
         let target = dir.join("concurrent-target");
         fs::write(&target, b"target").unwrap();
-        let error = atomic_write_new_with_hook(&dir, CONFIG_NAME, b"new config", 0o600, || {
-            symlink_file(&target, &destination).unwrap();
-        })
+        let (link_target, link) = (target.clone(), destination.clone());
+        let error = with_fault_hook(
+            move |boundary| {
+                if boundary == "atomic_write_commit" {
+                    symlink_file(&link_target, &link).unwrap();
+                }
+                Ok(())
+            },
+            || atomic_write_new(&dir, CONFIG_NAME, b"new config", 0o600),
+        )
         .unwrap_err();
         assert!(error.to_string().contains("state already exists"));
         assert!(fs::symlink_metadata(&destination)
@@ -719,9 +749,16 @@ mod tests {
         let old = State::new_topic();
         let old_peer = old.save_new(&dir, false).unwrap();
 
-        let error = State::new_topic()
-            .save_new_inner(&dir, true, true)
-            .unwrap_err();
+        let error = with_fault_hook(
+            |boundary| {
+                if boundary == "after_identity_install" {
+                    anyhow::bail!("injected failure after identity installation");
+                }
+                Ok(())
+            },
+            || State::new_topic().save_new(&dir, true),
+        )
+        .unwrap_err();
         let (loaded, secret) = load_bundle(&dir).unwrap();
 
         assert!(error.to_string().contains("injected failure"));

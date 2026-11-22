@@ -245,14 +245,7 @@ impl Daemon {
             operation_id,
             ErrorCode::AttachmentLifecycleInternal,
             async move {
-                remove_offer_request(
-                    storage,
-                    &operation_id,
-                    &offer_id,
-                    direction,
-                    provider.as_ref(),
-                )
-                .await
+                remove_offer_request(storage, operation_id, offer_id, direction, provider).await
             },
         );
     }
@@ -281,7 +274,7 @@ impl Daemon {
             async move {
                 prune_offers_request(
                     storage,
-                    &operation_id,
+                    operation_id,
                     age,
                     cutoff,
                     direction,

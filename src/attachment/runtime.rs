@@ -86,13 +86,13 @@ pub(crate) async fn list_offers_request(store: Store) -> meshmsg_protocol::Respo
 
 pub(crate) async fn remove_offer_request(
     storage: AttachmentStorage,
-    operation_id: &meshmsg_protocol::OperationId,
-    offer_id: &meshmsg_protocol::OfferId,
+    operation_id: meshmsg_protocol::OperationId,
+    offer_id: meshmsg_protocol::OfferId,
     direction: Option<meshmsg_protocol::OfferDirection>,
-    provider: Option<&meshmsg_protocol::PeerId>,
+    provider: Option<meshmsg_protocol::PeerId>,
 ) -> meshmsg_protocol::Response {
     match storage
-        .remove_at_cutoff(
+        .remove(
             RemovalSpec {
                 operation_id,
                 offer_id: Some(offer_id),
@@ -107,13 +107,15 @@ pub(crate) async fn remove_offer_request(
         .await
     {
         Ok(value) => value,
-        Err(error) => storage_operation_error(StorageOperation::OffersRemove, &error, operation_id),
+        Err(error) => {
+            storage_operation_error(StorageOperation::OffersRemove, &error, &operation_id)
+        }
     }
 }
 
 pub(crate) async fn prune_offers_request(
     storage: AttachmentStorage,
-    operation_id: &meshmsg_protocol::OperationId,
+    operation_id: meshmsg_protocol::OperationId,
     older_than_secs: u64,
     cutoff_ms: u64,
     direction: Option<meshmsg_protocol::OfferDirection>,
@@ -121,7 +123,7 @@ pub(crate) async fn prune_offers_request(
     max_delete: usize,
 ) -> meshmsg_protocol::Response {
     match storage
-        .remove_at_cutoff(
+        .remove(
             RemovalSpec {
                 operation_id,
                 offer_id: None,
@@ -136,7 +138,7 @@ pub(crate) async fn prune_offers_request(
         .await
     {
         Ok(value) => value,
-        Err(error) => storage_operation_error(StorageOperation::OffersPrune, &error, operation_id),
+        Err(error) => storage_operation_error(StorageOperation::OffersPrune, &error, &operation_id),
     }
 }
 
